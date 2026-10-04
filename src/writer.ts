@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, open, rename, readdir, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { json, now } from './config.ts';
 import type { Store } from './store.ts';
 import { requireStorageSpace } from './storage-space.ts';
@@ -22,6 +22,10 @@ export async function syncPath(path: string) {
 
 export async function recoverFiles(store: Store, root: string) {
   const registered = new Set((await store.rows<{ path: string }>('SELECT path FROM files')).map(row => row.path));
+  // After a move, registrations point at the old root; cleanup would delete every published file.
+  if ([...registered].some(path => relative(root, path).startsWith('..'))) {
+    throw new Error('Registered files are outside the data root; run relocate before resuming');
+  }
   async function visit(directory: string) {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const path = join(directory, entry.name);
