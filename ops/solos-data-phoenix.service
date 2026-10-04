@@ -1,0 +1,25 @@
+[Unit]
+Description=solos-data Phoenix finalized transaction collector
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/solos-data
+EnvironmentFile=%h/.config/solos-data/collector.env
+Environment=SOLOS_DATA_DB_MEMORY=32GB
+ExecStart=%h/.local/share/solos-data/runtime/bin/node src/cli.ts run --config config/phoenix.json
+Restart=always
+RestartSec=15
+TimeoutStopSec=60
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=64G
+TasksMax=256
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,15 @@
+[package]
+name = "solos-data-phoenix-codec"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.89"
+
+[dependencies]
+phoenix-rise-events = { version = "=0.6.12", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+borsh = { version = "1.7", features = ["derive"] }

@@ -1,0 +1,30 @@
+{
+  "programId": "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih",
+  "exchangeUrl": "https://perp-api.phoenix.trade/v1/view/exchange",
+  "dataDir": "data/phoenix_raw",
+  "cuPerSecond": 10000,
+  "utilization": 0.8,
+  "tailShare": 0.2,
+  "concurrency": { "tail": 24, "backfill": 32 },
+  "cuWeights": {
+    "getGenesisHash": 10, "getSlot": 20, "getAccountInfo": 10,
+    "getSignaturesForAddress": 40, "getTransaction": 40, "getBlock": 40,
+    "getProgramAccountsV2": 20, "getTransactionsForAddress": 100
+  },
+  "tailIntervalSeconds": 30,
+  "overlapSlots": 150,
+  "maxSlotsPerChunk": 20000,
+  "backfillChunkSlots": 1000,
+  "fetchBatchSize": 500,
+  "freshnessSloSeconds": 300,
+  "backfillEnabled": true,
+  "bulkFetchEnabled": true,
+  "bulkFetchWindowSlots": 128,
+  "bulkFetchConcurrency": 8,
+  "maxSupportedTransactionVersion": 1,
+  "exchangeRefreshSeconds": 300,
+  "compactionIntervalSeconds": 3600,
+  "maxRetries": 6,
+  "probeTransactionLimit": 200,
+  "probePageLimit": 20
+}

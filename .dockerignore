@@ -1,0 +1,8 @@
+.git
+node_modules
+.env*
+data
+codec/target
+bin
+*.duckdb*
+*.parquet

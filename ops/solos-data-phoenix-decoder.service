@@ -1,0 +1,24 @@
+[Unit]
+Description=solos-data Phoenix portable decoded Parquet tables
+After=solos-data-phoenix.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/solos-data
+Environment=SOLOS_DATA_RAW_DIR=%h/.local/share/solos-data/phoenix_raw
+Environment=SOLOS_DATA_DECODED_DIR=%h/.local/share/solos-data/phoenix_decoded/v1
+ExecStart=%h/.local/share/solos-data/runtime/bin/node src/decode/cli.ts watch
+Restart=always
+RestartSec=15
+TimeoutStopSec=60
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=8G
+TasksMax=128
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

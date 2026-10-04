@@ -1,0 +1,20 @@
+services:
+  collector:
+    image: solos-data:local
+    build: .
+    command: [node, src/cli.ts, run]
+    environment:
+      SOLANA_RPC_URL: ${SOLANA_RPC_URL:?Load the RPC URL without printing it}
+      SOLOS_DATA_CU_PER_SECOND: ${SOLOS_DATA_CU_PER_SECOND:-1000}
+    volumes:
+      - ./data/phoenix_raw:/data/raw
+    restart: unless-stopped
+    stop_grace_period: 60s
+  decoder:
+    image: solos-data:local
+    build: .
+    volumes:
+      - ./data/phoenix_raw:/data/raw:ro
+      - ./data/phoenix_decoded:/data/decoded
+    restart: unless-stopped
+    stop_grace_period: 60s

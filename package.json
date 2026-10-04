@@ -1,0 +1,29 @@
+{
+  "name": "solos-data",
+  "version": "0.1.0",
+  "description": "Collect Phoenix perpetuals transactions and decode them into portable Parquet tables.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "start": "node src/cli.ts run",
+    "collector": "node src/cli.ts",
+    "decoder": "node src/decode/cli.ts",
+    "codec:build": "cargo build --release --locked --manifest-path codec/Cargo.toml",
+    "codec:test": "cargo test --locked --manifest-path codec/Cargo.toml",
+    "check": "tsc --noEmit",
+    "test": "node --test tests/*.test.ts",
+    "verify": "npm run check && npm run codec:test && npm run codec:build && npm test"
+  },
+  "dependencies": {
+    "@duckdb/node-api": "1.4.4-r.3",
+    "@solana/kit": "8.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  }
+}
