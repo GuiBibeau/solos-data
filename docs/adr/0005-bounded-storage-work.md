@@ -24,6 +24,10 @@ then loads only that batch's full payloads and processed identities. Retain the
 original descending logical row offsets, including legacy partially consumed files
 and unsorted inputs. Bound processed revision updates to the batch's signatures.
 Empty replay batches commit progress without rewriting the public catalog.
+Choose unconsumed sources by their newest transaction range, with publication
+time breaking ties. Freshly written historical files cannot take priority over
+live transactions. Cache the actual newest slot for legacy compacted sources.
+Use 10,000-transaction decode batches to amortize publication and catalog writes.
 
 Compaction selects a newest publication prefix containing at least ten files and
 at most 250,000 input rows and 256 MiB of compressed input. Never merge an older subset above an excluded newer

@@ -17,10 +17,28 @@ export function sourcePath(root: string, path: string) {
 export async function nextSource(store: Store, rawRoot: string) {
   const catalog: Catalog = JSON.parse(await readFile(join(rawRoot, 'catalog.json'), 'utf8'));
   const progress = new Map((await store.rows('SELECT * FROM sources')).map(row => [row.source_hash, Number(row.row_offset)]));
-  const file = catalog.files.filter(file => file.table_name === 'transactions' &&
-    (progress.get(file.sha256) ?? 0) < Number(file.row_count))
-    .sort((a,b) => b.created_at.localeCompare(a.created_at) || b.path.localeCompare(a.path))[0];
+  const candidates = [];
+  for (const file of catalog.files.filter(file => file.table_name === 'transactions' &&
+    (progress.get(file.sha256) ?? 0) < Number(file.row_count))) {
+    candidates.push({ file,slot:await sourcePriority(store,rawRoot,file) });
+  }
+  const file = candidates.sort((a,b) => b.slot-a.slot || b.file.created_at.localeCompare(a.file.created_at)
+    || b.file.path.localeCompare(a.file.path))[0]?.file;
   return file ? { file, offset: progress.get(file.sha256) ?? 0, catalogAt: catalog.at } : undefined;
+}
+
+async function sourcePriority(store: Store, root: string, file: CatalogFile) {
+  const range = file.path.match(/(?:^|\/)(\d+)-(\d+)-[^/]+\.parquet$/);
+  if (range) return Number(range[2]);
+  // Older compacted files have no range in their name. Cache an immutable
+  // source's actual newest slot so newly written history cannot displace live data.
+  const key = `source-priority/${file.sha256}`;
+  let slot = await store.get<number>(key);
+  if (slot === undefined) {
+    const [bounds] = await store.rows(`SELECT max(slot) AS newest FROM read_parquet(${sqlString(sourcePath(root,file.path))})`);
+    slot = Number(bounds.newest ?? 0); await store.set(key,slot);
+  }
+  return slot;
 }
 
 export async function sourceRows(store: Store, rawRoot: string, file: CatalogFile, offset: number, limit: number,

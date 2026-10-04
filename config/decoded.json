@@ -2,6 +2,6 @@
   "rawDir": "data/phoenix_raw",
   "dataDir": "data/phoenix_decoded/v1",
   "codecPath": "bin/solos-data-phoenix-codec",
-  "batchSize": 2500,
+  "batchSize": 10000,
   "pollMs": 2000
 }

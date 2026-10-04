@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Store } from '../src/store.ts';
 import { schema } from '../src/decode/schema.ts';
-import { sourceRows } from '../src/decode/source.ts';
+import { sourceRows, nextSource } from '../src/decode/source.ts';
 import { sqlString, fileHash } from '../src/writer.ts';
 
 test('deep decoder resume uses bounded payload memory and preserves descending cursor order', async () => {
@@ -33,4 +33,24 @@ test('deep decoder resume uses bounded payload memory and preserves descending c
     assert.ok(rows.every(row => row.meta_json!.length === 6400 && row.previous_hash === null));
     assert.equal(new Set(rows.map(row => row.signature)).size, 25);
   } finally { await store.close(); await rm(root, { recursive:true, force:true }); }
+});
+
+test('live transaction ranges take priority over newly published history and legacy compacted files', async () => {
+  const root = await mkdtemp(join(tmpdir(),'decode-priority-'));
+  const store = await Store.open(root,schema);
+  try {
+    const legacy = join(root,'compact.parquet');
+    await store.exec(`COPY (SELECT 200 AS slot) TO ${sqlString(legacy)} (FORMAT PARQUET)`);
+    const file = (path:string,hash:string,at:string) => ({path,sha256:hash,created_at:at,table_name:'transactions',row_count:1});
+    await writeFile(join(root,'catalog.json'),JSON.stringify({at:'fixture',files:[
+      file('staging/100-150-history.parquet','history','2026-10-04T04:00:00Z'),
+      file('staging/300-350-live.parquet','live','2026-10-04T02:00:00Z'),
+      file(legacy,'legacy','2026-10-04T05:00:00Z'),
+    ]}));
+    assert.equal((await nextSource(store,root))!.file.sha256,'live');
+    await store.exec('INSERT INTO sources VALUES (?, ?, ?)', ['live','live',1]);
+    assert.equal((await nextSource(store,root))!.file.sha256,'legacy');
+    await store.exec('INSERT INTO sources VALUES (?, ?, ?)', ['legacy',legacy,1]);
+    assert.equal((await nextSource(store,root))!.file.sha256,'history');
+  } finally { await store.close(); await rm(root,{recursive:true,force:true}); }
 });
