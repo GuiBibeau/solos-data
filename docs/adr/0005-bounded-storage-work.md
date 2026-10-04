@@ -41,6 +41,13 @@ operation/table, without statement text, parameters or provider details.
 Validate both lanes and decoder progress on the accumulated production dataset.
 Short benchmark improvements alone do not establish a sustained freshness SLO.
 
+Regression validation passes 33 JavaScript tests and one Rust codec test through
+`npm run verify`. Coverage includes a million-row wide Parquet file under a
+384 MB resume-query budget, SIGKILL before checkpoint, interrupted buffered bulk
+pages, live-range priority over newer historical publications, and correction
+ordering around a compaction size barrier. Long-term freshness evidence remains
+in the acceptance backlog.
+
 DuckDB supports physical row numbers and projection/filter pushdown:
 [Parquet documentation](https://duckdb.org/docs/current/data/parquet/overview).
 The checkpoint threshold is described in the
