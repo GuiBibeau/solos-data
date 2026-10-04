@@ -1,4 +1,4 @@
-import { mkdir, rename } from 'node:fs/promises';
+import { mkdir, rename, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { now } from './config.ts';
@@ -10,9 +10,22 @@ export async function compact(store: Store, root: string) {
   const groups = await store.rows(`SELECT table_name, epoch FROM files WHERE status='active'
     GROUP BY table_name, epoch HAVING count(*)>=10`);
   for (const group of groups) await store.exclusive(async connection => {
-    const reader = await connection.runAndReadAll("SELECT path FROM files WHERE status='active' AND table_name=? AND epoch=?",
+    const reader = await connection.runAndReadAll(`SELECT path, row_count FROM files
+      WHERE status='active' AND table_name=? AND epoch=? ORDER BY created_at DESC, path DESC`,
       [group.table_name, Number(group.epoch)]);
-    const paths = reader.getRowObjectsJson().map(row => String(row.path));
+    const paths: string[] = [];
+    let rows = 0;
+    let bytes = 0;
+    // Only a newest prefix is safe: assigning a new publication time must not
+    // promote an old revision above a newer file that was excluded from this merge.
+    for (const file of reader.getRowObjectsJson()) {
+      if (rows + Number(file.row_count) > 250000) break;
+      const size = (await stat(String(file.path))).size;
+      if (bytes + size > 256 * 1024 * 1024) break;
+      bytes += size;
+      rows += Number(file.row_count); paths.push(String(file.path));
+    }
+    if (paths.length < 10) return;
     const pathList = `[${paths.map(sqlString).join(',')}]`;
     const query = `SELECT p.* EXCLUDE(filename) FROM read_parquet(${pathList}, filename=true) p
       JOIN files f ON f.path=p.filename QUALIFY row_number() OVER

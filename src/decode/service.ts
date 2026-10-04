@@ -70,8 +70,9 @@ export async function runDecoder(config: DecoderConfig, once = false) {
 async function snapshot(store: Store, progress: Record<string, unknown>) {
   const [counts] = await store.rows(`SELECT count(*) AS transactions_processed FROM processed`);
   const files = await store.rows('SELECT table_name, sum(row_count) AS published_rows, count(*) AS files FROM files GROUP BY table_name');
-  const value = { at: now(), decoderVersion: version, ...counts, ...progress, tables: files };
+  const value = { at: now(), decoderVersion: version, ...counts, ...progress, tables: files,
+    storageTimings:store.timings };
   await writeFile(join(store.root, 'status.json.tmp'), JSON.stringify(value) + '\n');
   await rename(join(store.root, 'status.json.tmp'), join(store.root, 'status.json'));
-  if (!progress.idle) log('decoded_batch', value);
+  if (!progress.idle) log('decoded_batch', { ...progress, ...counts });
 }

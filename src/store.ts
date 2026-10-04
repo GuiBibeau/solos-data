@@ -10,16 +10,31 @@ export class Store {
   instance: DuckDBInstance;
   root = '';
   queue: Promise<unknown> = Promise.resolve();
+  timings: Record<string, { calls:number; seconds:number; maxSeconds:number }> = {};
 
   constructor(instance: DuckDBInstance, connection: DuckDBConnection) {
     this.instance = instance;
     this.connection = connection;
+    const run = connection.run.bind(connection);
+    connection.run = async (...args: Parameters<typeof connection.run>) => {
+      const started = performance.now();
+      const verb = args[0].trim().split(/\s+/)[0].toUpperCase();
+      const table = args[0].match(/(?:INTO|UPDATE|FROM)\s+([a-z_]+)/i)?.[1].toLowerCase() ?? '';
+      const label = `${verb}:${table}`;
+      try { return await run(...args); }
+      finally {
+        const seconds = (performance.now()-started)/1000;
+        const timing = this.timings[label] ??= { calls:0,seconds:0,maxSeconds:0 };
+        timing.calls++; timing.seconds += seconds; timing.maxSeconds = Math.max(timing.maxSeconds,seconds);
+      }
+    };
   }
 
   static async open(dataDir: string, ddl = schema) {
     await mkdir(dataDir, { recursive: true });
     const memory = process.env.SOLOS_DATA_DB_MEMORY ?? '4GB';
-    const instance = await DuckDBInstance.create(join(dataDir, 'checkpoint.duckdb'), { threads: '4', memory_limit: memory });
+    const instance = await DuckDBInstance.create(join(dataDir, 'checkpoint.duckdb'), { threads: '4', memory_limit: memory,
+      checkpoint_threshold:process.env.SOLOS_DATA_DB_CHECKPOINT ?? '256MB' });
     const store = new Store(instance, await instance.connect());
     store.root = dataDir;
     await store.exec(ddl);

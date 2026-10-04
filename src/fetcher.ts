@@ -2,6 +2,7 @@ import { json, now, sleep, type Config, type Lane } from './config.ts';
 import type { Provider } from './rpc.ts';
 import type { Store } from './store.ts';
 import { bulkFetchRange, wireSignature } from './bulk-fetcher.ts';
+import { insertRaw } from './insert-raw.ts';
 
 export async function parallel<T>(items: T[], concurrency: number, job: (item: T) => Promise<void>) {
   let cursor = 0;
@@ -30,10 +31,11 @@ export async function fetchTransaction(provider: Provider, store: Store, row: an
   if (!Array.isArray(result.transaction) || result.transaction[1] !== 'base64' || !result.meta) throw new Error('Invalid raw transaction response');
   if (wireSignature(result.transaction[0]) !== row.signature) throw new Error('Wire signature does not match manifest');
   const raw = provider.rawTransactions.get(row.signature);
-  await store.exec(`INSERT INTO transactions VALUES (?, ?, ?, NULL, NULL, ?::JSON, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
-    ON CONFLICT(signature) DO NOTHING`, [row.signature, row.slot, result.blockTime,
-    json(result.meta.err), result.meta.fee, result.meta.computeUnitsConsumed ?? null,
-    result.transaction[0], json(result.meta), raw ?? json(result), row.mode, provider.provider, now()]);
+  await store.exclusive(connection => insertRaw(connection, [{ signature:row.signature,slot:Number(row.slot),
+    block_time:result.blockTime,err:result.meta.err,fee:result.meta.fee,
+    compute_units_consumed:result.meta.computeUnitsConsumed ?? null,tx_b64:result.transaction[0],
+    meta_json:json(result.meta),raw_rpc_json:raw ?? json(result),mode:row.mode,
+    provider:provider.provider,fetched_at:now() }], Number(row.slot), Number(row.slot)));
   provider.rawTransactions.delete(row.signature);
 }
 

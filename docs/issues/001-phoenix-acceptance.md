@@ -19,6 +19,8 @@ from being mistaken for complete acceptance. Checkmarks require recorded evidenc
   interruption/retry fixtures and short live throughput/freshness observation.
 - [x] W only advances after V1/V6 and durable registrations; overlap and catch-up chunks.
 - [x] Atomic Parquet output, hashes/counts, orphan cleanup and revision compaction.
+- [x] Range-bounded duplicate checks and ordering writes; bounded compaction prefix;
+  decoder payload reads selected by narrow keys with compatible resume offsets.
 - [x] Independently supervised live decoded Parquet/DuckDB pipeline, official pinned
   MIT event codec, failed-attempt exclusion, unknown payload quarantine, precise
   integers, durable resume/dedupe and portable relative catalog; offline golden fixtures.

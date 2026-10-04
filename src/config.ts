@@ -12,6 +12,7 @@ export interface Config {
   maxRetries: number; probeTransactionLimit: number; probePageLimit: number;
   bulkFetchEnabled: boolean;
   bulkFetchWindowSlots: number; bulkFetchConcurrency: number;
+  bulkCommitPages: number;
   maxSupportedTransactionVersion: number;
   backfillChunkSlots: number;
 }
@@ -21,15 +22,17 @@ export async function loadConfig(path = 'config/phoenix.json'): Promise<Config> 
   config.backfillChunkSlots ??= 1000;
   config.bulkFetchWindowSlots ??= 128;
   config.bulkFetchConcurrency ??= 8;
+  config.bulkCommitPages ??= 10;
   config.dataDir = resolve(process.env.SOLOS_DATA_DIR ?? config.dataDir);
   if (process.env.SOLOS_DATA_CU_PER_SECOND) config.cuPerSecond = Number(process.env.SOLOS_DATA_CU_PER_SECOND);
   if (config.cuPerSecond <= 0 || !Number.isFinite(config.cuPerSecond)) throw new Error('Invalid CU/s');
   if (config.tailShare <= 0 || config.tailShare >= 1) throw new Error('Invalid tail share');
   if (config.utilization <= 0 || config.utilization > 1) throw new Error('Invalid utilization');
   for (const key of ['overlapSlots', 'maxSlotsPerChunk', 'backfillChunkSlots', 'fetchBatchSize', 'maxRetries',
-    'bulkFetchWindowSlots', 'bulkFetchConcurrency'] as const) {
+    'bulkFetchWindowSlots', 'bulkFetchConcurrency', 'bulkCommitPages'] as const) {
     if (!Number.isInteger(config[key]) || config[key] <= 0) throw new Error(`Invalid ${key}`);
   }
+  if (config.bulkCommitPages > 32) throw new Error('bulkCommitPages must be at most 32');
   return config;
 }
 

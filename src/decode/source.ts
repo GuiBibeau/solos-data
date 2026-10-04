@@ -30,10 +30,23 @@ export async function sourceRows(store: Store, rawRoot: string, file: CatalogFil
     if (await fileHash(path) !== file.sha256) throw new Error('raw source checksum mismatch');
     verified.add(file.sha256);
   }
-  const rows = await store.rows<RawTransaction & { previous_hash: string | null; previous_at: string | null }>(`SELECT p.*,
-    seen.source_hash AS previous_hash, seen.publication_at AS previous_at
-    FROM (SELECT * FROM read_parquet(${sqlString(path)}) ORDER BY slot DESC, signature DESC LIMIT ? OFFSET ?) p
-    LEFT JOIN processed seen USING(signature) ORDER BY p.slot DESC, p.signature DESC`, [limit, offset]);
+  // Keep legacy logical OFFSET ordering, but never sort wire/meta payloads for the entire file.
+  const keys = await store.rows(`SELECT file_row_number FROM (
+    SELECT file_row_number, row_number() OVER (ORDER BY slot DESC, signature DESC) AS ordinal
+    FROM read_parquet(${sqlString(path)}, file_row_number=true))
+    WHERE ordinal>? AND ordinal<=?`, [offset,offset+limit]);
+  if (!keys.length && offset < Number(file.row_count)) throw new Error('raw source row count mismatch');
+  if (!keys.length) return [];
+  const raw = await store.rows<RawTransaction>(`SELECT * EXCLUDE(file_row_number)
+    FROM read_parquet(${sqlString(path)}, file_row_number=true)
+    WHERE file_row_number IN (${keys.map(row => Number(row.file_row_number)).join(',')})
+    ORDER BY slot DESC, signature DESC`);
+  // Point lookups avoid building a hash table for all previously decoded signatures.
+  const previous = new Map((await store.rows(`SELECT * FROM processed WHERE signature IN
+    (${raw.map(row => sqlString(row.signature)).join(',')})`))
+    .map(row => [row.signature, row]));
+  const rows = raw.map(row => ({ ...row, previous_hash:previous.get(row.signature)?.source_hash ?? null,
+    previous_at:previous.get(row.signature)?.publication_at ?? null }));
   if (!rows.length && offset < Number(file.row_count)) throw new Error('raw source row count mismatch');
   return rows;
 }

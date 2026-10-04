@@ -37,13 +37,19 @@ export async function walkPage(rpc: Rpc, store: Store, key: string, walk: Walk):
   };
   const selected = page.filter(row => row.slot >= walk.floor && row.slot <= walk.ceiling);
   await store.transaction(async connection => {
-    if (selected.length) await connection.run(`
+    if (selected.length) {
+      const from = selected.at(-1)!.slot; const to = selected[0].slot;
+      await connection.run(`UPDATE signatures SET source_addresses=list_append(source_addresses, ?)
+        WHERE slot BETWEEN ? AND ? AND NOT list_contains(source_addresses, ?)
+        AND signature IN (SELECT value->>'signature' FROM json_each(?::JSON))`,
+      [walk.address,from,to,walk.address,json(selected)]);
+      await connection.run(`
       INSERT INTO signatures
       SELECT value->>'signature', (value->>'slot')::BIGINT, (value->>'blockTime')::BIGINT,
         value->'err', [?]::VARCHAR[], ?, ?, ? FROM json_each(?::JSON)
-      ON CONFLICT(signature) DO UPDATE SET
-        source_addresses=list_distinct(list_concat(signatures.source_addresses, excluded.source_addresses))`,
-    [walk.address, walk.mode, walk.cycleId, now(), json(selected)]);
+      WHERE value->>'signature' NOT IN (SELECT signature FROM signatures WHERE slot BETWEEN ? AND ?)`,
+      [walk.address, walk.mode, walk.cycleId, now(), json(selected),from,to]);
+    }
     await connection.run('INSERT OR REPLACE INTO kv VALUES (?, ?::JSON)', [key, json(next)]);
   });
   return next;

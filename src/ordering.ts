@@ -47,12 +47,16 @@ export async function orderRange(rpc: Rpc, store: Store, lane: Lane, from: numbe
       }
     });
     await store.transaction(async connection => {
-      if (ordered.length) await connection.run(`INSERT OR REPLACE INTO slot_order
+      await connection.run('DELETE FROM slot_order WHERE slot BETWEEN ? AND ?',
+        [Number(batch[0].slot),Number(batch.at(-1)!.slot)]);
+      if (ordered.length) await connection.run(`INSERT INTO slot_order
         SELECT value->>'signature', (value->>'slot')::BIGINT, (value->>'tx_index')::INTEGER,
         (value->>'block_signature_count')::INTEGER FROM json_each(?::JSON)`, [json(ordered)]);
       await connection.run(`UPDATE transactions SET tx_index=o.tx_index, single_in_slot=false
-        FROM slot_order o WHERE transactions.signature=o.signature AND o.slot BETWEEN ? AND ?`,
-      [Number(batch[0].slot), Number(batch.at(-1)!.slot)]);
+        FROM slot_order o WHERE transactions.signature=o.signature AND o.slot BETWEEN ? AND ?
+        AND transactions.slot BETWEEN ? AND ?
+        AND (transactions.tx_index IS DISTINCT FROM o.tx_index OR transactions.single_in_slot IS DISTINCT FROM false)`,
+      [Number(batch[0].slot), Number(batch.at(-1)!.slot), Number(batch[0].slot), Number(batch.at(-1)!.slot)]);
       if (singles.length) await connection.run(`UPDATE transactions SET tx_index=NULL, single_in_slot=true
         WHERE slot IN (SELECT value::BIGINT FROM json_each(?::JSON))`, [json(singles)]);
     });

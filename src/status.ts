@@ -17,6 +17,7 @@ export async function status(store: Store, provider?: Provider) {
     backfill: await store.get('backfill'), walk: await store.get('walk/backfill'),
     tailCycle: await store.get('tail-active'), tailHealth: await store.get('tail-health'),
     exchange: await store.get('exchange'), metrics: provider?.counters,
+    storageTimings: store.timings,
     effectiveCuPerSecond: provider?.limiter.rate, maximumCuPerSecond: provider?.limiter.maximumRate,
     concurrency: provider?.limiter.windows, lastError: await store.get('last-error'),
     acceptance: 'collecting; independent validation and sealing pending' };

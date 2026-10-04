@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { json, now, type Config, type Lane } from './config.ts';
 import type { Provider } from './rpc.ts';
 import type { Store } from './store.ts';
+import { insertRaw } from './insert-raw.ts';
 
 export function wireSignature(base64: string) {
   const bytes = Buffer.from(base64, 'base64');
@@ -17,6 +18,8 @@ export async function bulkFetchRange(provider: Provider, store: Store, config: C
   // This range's standard manifest is already complete. Load it once, not once per page.
   const manifestRows = await store.rows('SELECT signature, slot, mode FROM signatures WHERE slot BETWEEN ? AND ?', [from, to]);
   const manifests = new Map(manifestRows.map(row => [row.signature, row]));
+  let first = true;
+  let pending: { id:string; raw:string; at:string; slot:number; rows:any[] }[] = [];
   while (!state.done) {
     const result = await provider.call('getTransactionsForAddress', [config.programId, {
       commitment: 'finalized', transactionDetails: 'full', sortOrder: 'asc', limit: 100,
@@ -48,16 +51,16 @@ export async function bulkFetchRange(provider: Provider, store: Store, config: C
     }
     if (result.paginationToken && result.paginationToken === state.token) throw new Error('Bulk cursor did not advance');
     state = { token: result.paginationToken ?? undefined, done: !result.paginationToken };
+    pending.push({ id:pageId,raw:provider.rawPages.get(result) ?? json(result),at:now(),slot:entries[0]?.slot ?? from,rows });
+    // Establish an immediate durable anchor; subsequent bounded batches amortize
+    // commits. On interruption, uncommitted pages replay from the stored token.
+    if (!first && !state.done && pending.length < config.bulkCommitPages) continue;
     await store.transaction(async connection => {
-      await connection.run('INSERT INTO rpc_pages VALUES (?, ?, ?, ?, ?, ?)',
-        [pageId, 'getTransactionsForAddress', provider.provider, provider.rawPages.get(result) ?? json(result), now(), entries[0]?.slot ?? from]);
-      if (rows.length) await connection.run(`INSERT INTO transactions
-        SELECT value->>'signature', (value->>'slot')::BIGINT, (value->>'block_time')::BIGINT,
-        NULL, NULL, value->'err', (value->>'fee')::BIGINT, (value->>'compute_units_consumed')::BIGINT,
-        value->>'tx_b64', value->>'meta_json', value->>'raw_rpc_json', value->>'mode',
-        value->>'provider', value->>'fetched_at', NULL FROM json_each(?::JSON)
-        ON CONFLICT(signature) DO NOTHING`, [json(rows)]);
+      for (const page of pending) await connection.run('INSERT INTO rpc_pages VALUES (?, ?, ?, ?, ?, ?)',
+        [page.id, 'getTransactionsForAddress', provider.provider, page.raw, page.at, page.slot]);
+      await insertRaw(connection, pending.flatMap(page => page.rows), from, to);
       await connection.run('INSERT OR REPLACE INTO kv VALUES (?, ?::JSON)', [key, json(state)]);
     });
+    first = false; pending = [];
   }
 }

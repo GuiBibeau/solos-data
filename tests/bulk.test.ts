@@ -106,3 +106,28 @@ test('parallel bulk windows drain on failure and a narrower retry fills every ma
       WHERE t.signature IS NULL`)).length, 0);
   } finally { await f.close(); }
 });
+
+test('buffered bulk pages never advance the durable cursor past committed raw responses', async () => {
+  const f = await fixture();
+  try {
+    const signatures = [100,101,102,103].map(slot => sig(wireSignature(wire(1,slot)),slot)).reverse();
+    await walkPage(new FixtureRpc([signatures]),f.store,'manifest',makeWalk(f.config.programId,'tail','c',0,103));
+    let fail = true;
+    const provider = { provider:'fixture',rawPages:new WeakMap(), async call(_method:string,params:any[]) {
+      const index = Number(params[1].paginationToken ?? 0);
+      if (fail && index === 3) throw new Error('interrupted buffered pages');
+      const slot = 100+index;
+      return { data:[{ slot,blockTime:slot,transaction:[wire(1,slot),'base64'],meta:{err:null,fee:5000} }],
+        paginationToken:index === 3 ? null : String(index+1) };
+    } } as unknown as Provider;
+    await assert.rejects(bulkFetchRange(provider,f.store,f.config,'tail',100,103),/interrupted/);
+    assert.equal((await f.store.get('bulk/tail/100/103')).token,'1');
+    assert.equal((await f.store.rows('SELECT count(*) AS n FROM transactions'))[0].n,'1');
+    assert.equal((await f.store.rows('SELECT count(*) AS n FROM rpc_pages'))[0].n,'1');
+    fail = false;
+    await bulkFetchRange(provider,f.store,f.config,'tail',100,103);
+    assert.equal((await f.store.rows('SELECT count(*) AS n FROM transactions'))[0].n,'4');
+    assert.equal((await f.store.rows('SELECT count(*) AS n FROM rpc_pages'))[0].n,'4');
+    assert.equal((await f.store.get('bulk/tail/100/103')).done,true);
+  } finally { await f.close(); }
+});

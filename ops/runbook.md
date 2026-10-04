@@ -42,6 +42,8 @@ Set `SOLOS_DATA_DIR` to the raw path used by the decoder unit. Its default is
 `~/.local/share/solos-data/phoenix_raw`. The unit memory limits are examples;
 adjust them for your server. DuckDB defaults to 4GB unless `SOLOS_DATA_DB_MEMORY`
 is set. Effective CU/s is the configured rate multiplied by utilization.
+`SOLOS_DATA_DB_CHECKPOINT` defaults to `256MB`. It controls automatic checkpoint
+frequency; committed changes stay durable in the write-ahead log between checkpoints.
 
 ```sh
 chmod 600 ~/.config/solos-data/collector.env

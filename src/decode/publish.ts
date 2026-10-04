@@ -41,16 +41,24 @@ export async function publish(store: Store, rows: Rows, source: SourceProgress) 
     try {
       for (const file of files) await connection.run('INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)',
         [file.path, file.table, file.count, file.hash, batch, now()]);
-      await connection.run(`INSERT INTO processed SELECT value->>'signature', value->>'source_hash', ?
-        FROM json_each(?::JSON) ON CONFLICT(signature) DO UPDATE SET source_hash=excluded.source_hash,
-        publication_at=excluded.publication_at WHERE coalesce(processed.publication_at,'')<=excluded.publication_at`,
-        [source.at ?? '', JSON.stringify(source.seen ?? rows.decoded_transactions)]);
+      const seen = source.seen ?? rows.decoded_transactions;
+      if (seen.length) {
+        const keys = seen.map(row => sqlString(String(row.signature))).join(',');
+        await connection.run('DELETE FROM processed_batch');
+        await connection.run(`INSERT INTO processed_batch SELECT value->>'signature', value->>'source_hash', ?
+          FROM json_each(?::JSON)`, [source.at ?? '',JSON.stringify(seen)]);
+        await connection.run(`UPDATE processed SET source_hash=b.source_hash, publication_at=b.publication_at
+          FROM processed_batch b WHERE processed.signature=b.signature AND processed.signature IN (${keys})
+          AND coalesce(processed.publication_at,'')<=b.publication_at`);
+        await connection.run(`INSERT INTO processed SELECT * FROM processed_batch
+          WHERE signature NOT IN (SELECT signature FROM processed WHERE signature IN (${keys}))`);
+      }
       await connection.run('INSERT OR REPLACE INTO sources VALUES (?, ?, ?)', [source.hash, source.path, source.offset]);
       await connection.run('INSERT OR REPLACE INTO kv VALUES (?, ?::JSON)', ['batch', String(batch)]);
       await connection.run('COMMIT');
     } catch (error) { await connection.run('ROLLBACK'); throw error; }
   });
-  await writeCatalog(store);
+  if (tables.some(table => rows[table].length)) await writeCatalog(store);
 }
 
 export async function writeCatalog(store: Store) {

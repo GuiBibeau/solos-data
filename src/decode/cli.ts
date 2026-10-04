@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { runDecoder } from './service.ts';
 import { queryDecoded } from './reader.ts';
+import { safeError } from '../service.ts';
 
 async function main() {
   const command = process.argv[2] ?? 'help';
@@ -26,5 +27,5 @@ async function main() {
   if (!['once', 'watch'].includes(command)) throw new Error('unknown decoder command');
   await runDecoder(config, command === 'once');
 }
-main().catch(() => { console.error(JSON.stringify({ at: new Date().toISOString(), event: 'decoder_fatal',
-  error: 'decoder stopped; inspect offline fixture checks and source data before retrying' })); process.exitCode = 1; });
+main().catch(error => { console.error(JSON.stringify({ at: new Date().toISOString(), event: 'decoder_fatal',
+  error: safeError(error) })); process.exitCode = 1; });
