@@ -73,7 +73,7 @@ names. Add your RPC URL, choose your rate, and use an absolute raw data path:
 ```dotenv
 SOLANA_RPC_URL=https://solana-mainnet.g.alchemy.com/v2/YOUR_API_KEY
 SOLOS_DATA_DIR=/path/to/phoenix_raw
-SOLOS_DATA_CU_PER_SECOND=1000
+SOLOS_DATA_CU_PER_SECOND=300
 ```
 
 Set `SOLOS_DATA_DIR` to the raw path used by the decoder unit. Its default is
@@ -81,6 +81,18 @@ Set `SOLOS_DATA_DIR` to the raw path used by the decoder unit. Its default is
 adjust them for your server. DuckDB defaults to 4GB unless `SOLOS_DATA_DB_MEMORY`
 is set. `SOLOS_DATA_QUERY_MEMORY` independently controls analytical query memory
 (default 4GB); increase it for full-history scans on a larger server. Effective CU/s is the configured rate multiplied by utilization.
+
+Set `SOLOS_DATA_CU_PER_SECOND` to the provider account's real ceiling, not above it. Alchemy
+enforces compute units per second per account over a 10-second rolling window (300 CU/s on the
+free tier), and a configured rate above that ceiling produces bursts of 429s that collapse the
+limiter far below the ceiling. Alchemy's costs match `cuWeights` (getBlock 40, getSignaturesForAddress
+40, getTransactionsForAddress 100). `tailShare` in `config/phoenix.json` is the fraction reserved for
+the live tail; the tail cannot borrow the backfill's share, so size it from the tail's cost (about
+48,000 CU per 1,000 slots at twenty transactions per slot, 180 CU/s at the chain's pace; more
+when the venue is busier). The archive
+lane spends compute units only on the manifest walk (40 CU per 1,000 signatures) and the sampled
+ordering check (`archiveOrderingSample`). Check the ceiling with a short burst of
+`getSignaturesForAddress` pages: the first 429 arrives when the window is spent.
 `SOLOS_DATA_DB_CHECKPOINT` defaults to `256MB`. It controls automatic checkpoint
 frequency; committed changes stay durable in the write-ahead log between checkpoints.
 
