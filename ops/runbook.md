@@ -93,6 +93,11 @@ when the venue is busier). The archive
 lane spends compute units only on the manifest walk (40 CU per 1,000 signatures) and the sampled
 ordering check (`archiveOrderingSample`). Check the ceiling with a short burst of
 `getSignaturesForAddress` pages: the first 429 arrives when the window is spent.
+
+`tailEnabled: false` in `config/phoenix.json` runs the collector without the live tail: the archive
+lane backfills history (about 1.1 CU per slot for the manifest check, roughly 10M CU per wall-day
+at 280 CU/s) and the retention pass keeps running. The watermark stays put. Switching the tail back
+on resumes it from the watermark over RPC, so the gap costs about 65k CU per 1,000 slots.
 `SOLOS_DATA_DB_CHECKPOINT` defaults to `256MB`. It controls automatic checkpoint
 frequency; committed changes stay durable in the write-ahead log between checkpoints.
 
