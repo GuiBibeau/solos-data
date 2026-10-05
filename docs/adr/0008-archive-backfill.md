@@ -62,3 +62,13 @@ checkpoint insert and validation dominate a range; `archiveChunkSlots` moves fro
 to amortize them. The reverse direction stays available through `SOLOS_DATA_ARCHIVE_REVERSE=1`.
 Routine retention trimmed 16,000 slots per minute, below what the lane now publishes, so
 `retentionSlotsPerPass` becomes a setting and is 100,000 on the box.
+
+Budget, 15:00 UTC: the provider account answered 429 ("exceeded its compute units per second
+capacity") at about 300 CU/s, measured with sequential `getSignaturesForAddress` pages, where the
+TypeScript run of the previous day had averaged about 776 CU/s with two throttles in thirty hours.
+At that ceiling the lane's manifest walk (over 1,000 pages per 50,000-slot range) starved the tail,
+whose share was 20 % and which cannot borrow the backfill's tokens; the watermark fell 85 minutes
+behind the finalized slot. The limiter is now configured at the measured ceiling, `tailShare` is
+0.65 and `archiveOrderingSample` 0.005. The lane is bound by the manifest walk, not by the archive:
+about 15 chain-hours per wall-hour at 300 CU/s, against about 30 while the tail starved. More
+provider throughput, or a second provider for the tail, is the way to raise it.
