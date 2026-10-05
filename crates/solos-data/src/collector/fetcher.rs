@@ -141,6 +141,56 @@ pub fn insert_raw(
     Ok(())
 }
 
+#[derive(serde::Deserialize)]
+struct RawEnvelope<'a> {
+    #[serde(borrow)]
+    result: Option<RawResult<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawResult<'a> {
+    #[serde(borrow)]
+    meta: Option<&'a serde_json::value::RawValue>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawPage<'a> {
+    #[serde(borrow)]
+    result: Option<RawPageResult<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct RawPageResult<'a> {
+    #[serde(borrow, default)]
+    data: Vec<RawResult<'a>>,
+}
+
+/// The exact `result.meta` text of a `getTransaction` body, as the provider sent it.
+#[must_use]
+pub fn raw_meta(body: &str) -> Option<String> {
+    serde_json::from_str::<RawEnvelope>(body)
+        .ok()?
+        .result?
+        .meta
+        .map(|m| m.get().to_owned())
+}
+
+/// The exact `meta` text of every entry of a `getTransactionsForAddress` page body.
+#[must_use]
+pub fn raw_metas(body: &str) -> Vec<Option<String>> {
+    serde_json::from_str::<RawPage>(body)
+        .ok()
+        .and_then(|page| page.result)
+        .map(|result| {
+            result
+                .data
+                .into_iter()
+                .map(|entry| entry.meta.map(|m| m.get().to_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Fetch one transaction by signature and store it.
 pub async fn fetch_transaction(
     rpc: &dyn Rpc,
@@ -226,7 +276,7 @@ pub async fn fetch_transaction(
             .cloned()
             .unwrap_or(Value::Null),
         tx_b64,
-        meta_json: meta.to_string(),
+        meta_json: raw_meta(&reply.raw).unwrap_or_else(|| meta.to_string()),
         raw_rpc_json: reply.raw,
         mode,
         provider: rpc.provider_name().to_owned(),

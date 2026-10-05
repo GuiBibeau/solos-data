@@ -2,7 +2,7 @@
 //! completeness; pages and their cursor commit together. A port of `bulk-fetcher.ts`.
 
 use super::config::{Config, Lane};
-use super::fetcher::{RawRow, insert_raw};
+use super::fetcher::{RawRow, insert_raw, raw_metas};
 use super::rpc::Rpc;
 use crate::db::Db;
 use crate::jsonout::now;
@@ -72,6 +72,7 @@ pub async fn bulk_fetch_range(
             )
             .await
             .map_err(|e| StoreError::Check(e.to_string()))?;
+        let metas = raw_metas(&reply.raw);
         let result = reply.result;
         let Some(entries) = result.get("data").and_then(Value::as_array) else {
             return Err(StoreError::Check("Invalid bulk transaction page".into()));
@@ -138,7 +139,11 @@ pub async fn bulk_fetch_range(
                     .cloned()
                     .unwrap_or(Value::Null),
                 tx_b64,
-                meta_json: meta.to_string(),
+                meta_json: metas
+                    .get(index)
+                    .cloned()
+                    .flatten()
+                    .unwrap_or_else(|| meta.to_string()),
                 mode: mode.clone(),
                 raw_rpc_json: json!({ "pageId": page_id, "arrayIndex": index }).to_string(),
                 provider: rpc.provider_name().to_owned(),

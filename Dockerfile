@@ -5,6 +5,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY tests/data/ tests/data/
+COPY config/ config/
 RUN cargo test --locked --workspace && cargo build --release --locked -p solos-data --features archive
 
 # Runtime: one binary, the config files, no credential baked in.
