@@ -336,17 +336,16 @@ mod enabled {
         store.close()?;
         let _ = std::fs::remove_dir_all(&scratch);
         collected?;
-        let published = crate::collector::reader::query_dataset(
+        let published_rows: Vec<Value> = crate::collector::reader::range_rows(
             &config.data_dir,
-            &format!(
-                "SELECT signature, slot, tx_index, single_in_slot, tx_b64, meta_json FROM transactions WHERE slot BETWEEN {from} AND {to} ORDER BY slot, signature"
-            ),
-        )?;
-        let published_text = published.to_json();
-        let published_rows: Vec<Value> = serde_json::from_str::<Value>(&published_text)
-            .ok()
-            .and_then(|v| v.get("rows").and_then(Value::as_array).cloned())
-            .unwrap_or_default();
+            "transactions",
+            "signature, slot, tx_index, single_in_slot, tx_b64, meta_json",
+            from,
+            to,
+        )?
+        .iter()
+        .map(Obj::to_value)
+        .collect();
         let key = |v: &Value, k: &str| {
             v.get(k)
                 .map(|x| x.as_str().map_or_else(|| x.to_string(), str::to_owned))
