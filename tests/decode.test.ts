@@ -15,7 +15,7 @@ import { fileHash } from '../src/writer.ts';
 import { rawFixture } from './decode-fixtures.ts';
 
 const fixtures = JSON.parse(await readFile(new URL('data/phoenix-events.json', import.meta.url), 'utf8')).transactions;
-const binary = process.env.SOLOS_DATA_CODEC ?? resolve('codec/target/release/solos-data-phoenix-codec');
+const binary = process.env.SOLOS_DATA_CODEC ?? resolve('target/release/solos-data-phoenix-codec');
 
 test('official Phoenix golden events, instruction attribution, and failed transaction isolation', async () => {
   const codec = new Codec(binary);

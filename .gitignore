@@ -7,5 +7,5 @@ node_modules/
 *.tmp
 coverage/
 .DS_Store
-codec/target/
+/target/
 bin/

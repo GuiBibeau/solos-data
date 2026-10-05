@@ -1,20 +1,34 @@
-use std::collections::{BTreeMap, VecDeque};
-use phoenix_rise_events::{PhoenixLogInstruction, PhoenixLogInstructionKind};
+//! Envelope integrity for length-guided Phoenix log batches.
 
-// The upstream parser tolerates truncated length vectors and trailing bytes.
-// Require the complete envelope before publishing a stable ordinal sequence.
+use phoenix_rise_events::{PhoenixLogInstruction, PhoenixLogInstructionKind};
+use std::collections::{BTreeMap, VecDeque};
+
+/// The upstream parser tolerates truncated length vectors and trailing bytes. Require the
+/// complete envelope before publishing a stable ordinal sequence; `Some` names the defect.
 pub fn check(instructions: &[PhoenixLogInstruction<'_>]) -> Option<String> {
-    if !instructions.iter().any(|ix| ix.kind == PhoenixLogInstructionKind::LogEventLengths) { return None; }
+    if !instructions
+        .iter()
+        .any(|ix| ix.kind == PhoenixLogInstructionKind::LogEventLengths)
+    {
+        return None;
+    }
     let mut lengths = BTreeMap::<u32, VecDeque<Vec<usize>>>::new();
     for ix in instructions {
         let data = ix.data;
-        if data.len() < 8 { return Some("short log envelope".into()); }
+        if data.len() < 8 {
+            return Some("short log envelope".into());
+        }
         let batch = u32::from_le_bytes(data[0..4].try_into().unwrap());
         let count = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
         match ix.kind {
             PhoenixLogInstructionKind::LogEventLengths => {
-                if data.len() != 8 + count * 2 { return Some("length vector size mismatch".into()); }
-                let sizes = data[8..].chunks_exact(2).map(|b| u16::from_le_bytes(b.try_into().unwrap()) as usize).collect();
+                if data.len() != 8 + count * 2 {
+                    return Some("length vector size mismatch".into());
+                }
+                let sizes = data[8..]
+                    .chunks_exact(2)
+                    .map(|b| u16::from_le_bytes(b.try_into().unwrap()) as usize)
+                    .collect();
                 lengths.entry(batch).or_default().push_back(sizes);
             }
             PhoenixLogInstructionKind::Log => {
@@ -27,6 +41,8 @@ pub fn check(instructions: &[PhoenixLogInstruction<'_>]) -> Option<String> {
             }
         }
     }
-    if lengths.values().any(|q| !q.is_empty()) { return Some("unconsumed event lengths".into()); }
+    if lengths.values().any(|q| !q.is_empty()) {
+        return Some("unconsumed event lengths".into());
+    }
     None
 }
