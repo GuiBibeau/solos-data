@@ -57,7 +57,7 @@ Native setup requires Node >=22.18 and Rust >=1.89:
 npm ci
 npm run verify
 mkdir -p bin
-cp codec/target/release/solos-data-phoenix-codec bin/
+cp target/release/solos-data-phoenix-codec bin/
 export SOLOS_DATA_RAW_DIR=/path/to/published/raw
 export SOLOS_DATA_DECODED_DIR=/path/to/decoded/v1
 npm run decoder -- watch

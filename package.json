@@ -12,8 +12,8 @@
     "start": "node src/cli.ts run",
     "collector": "node src/cli.ts",
     "decoder": "node src/decode/cli.ts",
-    "codec:build": "cargo build --release --locked --manifest-path codec/Cargo.toml",
-    "codec:test": "cargo test --locked --manifest-path codec/Cargo.toml",
+    "codec:build": "cargo build --release --locked -p phoenix-codec",
+    "codec:test": "cargo test --locked --workspace",
     "check": "tsc --noEmit",
     "test": "node --test tests/*.test.ts",
     "verify": "npm run check && npm run codec:test && npm run codec:build && npm test"

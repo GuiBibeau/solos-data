@@ -61,7 +61,8 @@ records the missing checks, snapshots and reconstructed state.
 | --- | --- |
 | `src/` | RPC collection, checkpoints, validation and raw publication |
 | `src/decode/` | Event extraction, decoded tables and readers |
-| `codec/` | Rust wrapper around the official Phoenix event SDK |
+| `crates/phoenix-codec/` | Rust library and stdio binary around the official Phoenix event SDK |
+| `crates/solana-wire/` | Rust parser for legacy, v0 and v1 transaction envelopes |
 | `tests/` | Offline fixtures and interruption/restart tests |
 | `config/` | Rates, batch sizes and default data paths |
 | `ops/` | Linux services and installation notes |

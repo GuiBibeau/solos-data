@@ -1,0 +1,27 @@
+[package]
+name = "phoenix-codec"
+description = "Phoenix Rise event decoding for solos-data, in-process and over stdio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "solos-data-phoenix-codec"
+path = "src/main.rs"
+
+[dependencies]
+phoenix-rise-events = { version = "=0.6.12", features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+borsh = { version = "1.7", features = ["derive"] }
+
+[lints]
+workspace = true
