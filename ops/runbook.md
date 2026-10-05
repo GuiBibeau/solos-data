@@ -53,13 +53,15 @@ The example units expect the checkout at `~/solos-data` and the binary at
 server (the archive lane needs clang and cmake, which the build image installs):
 
 ```sh
-docker build --target build -t solos-data:build .
-container=$(docker create solos-data:build)
+DOCKER_BUILDKIT=1 docker build --target artifact --output type=local,dest=/tmp/solos-data-out .
 mkdir -p ~/.local/share/solos-data/bin
-docker cp "$container":/build/target/release/solos-data ~/.local/share/solos-data/bin/solos-data
-docker rm "$container"
+install -m 0755 /tmp/solos-data-out/solos-data ~/.local/share/solos-data/bin/solos-data
 ~/.local/share/solos-data/bin/solos-data collector help
 ```
+
+The build stage runs the test suite first. Set `JETSTREAMER_THREADS` in `collector.env` to bound
+the archive lane's parallelism (64 is a good start on a large machine); without it Jetstreamer
+assumes a 1 GB/s link and picks very few threads.
 
 Create `~/.config/solos-data/collector.env` in a text editor with these variable
 names. Add your RPC URL, choose your rate, and use an absolute raw data path:

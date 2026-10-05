@@ -111,6 +111,10 @@ impl RawRow {
     }
 }
 
+/// Rows per `INSERT` statement; one JSON payload per statement keeps DuckDB's working set bounded
+/// when an archive range carries hundreds of thousands of rows.
+pub const INSERT_BATCH: usize = 5_000;
+
 /// Insert rows, deduplicated within the manifest window; the primary key is the final gate.
 pub fn insert_raw(
     store: &mut Store,
@@ -124,20 +128,19 @@ pub fn insert_raw(
         .filter(|row| seen.insert(row.signature.clone()))
         .map(RawRow::to_json)
         .collect();
-    if unique.is_empty() {
-        return Ok(());
-    }
     // DuckDB's ON CONFLICT builds a join over the entire existing table. Limit the anti-join to
     // this manifest window, then use a normal constraint-checked insert.
-    store.exec(
-        "INSERT INTO transactions
+    for batch in unique.chunks(INSERT_BATCH) {
+        store.exec(
+            "INSERT INTO transactions
     SELECT value->>'signature', (value->>'slot')::BIGINT, (value->>'block_time')::BIGINT,
     NULL, NULL, value->'err', (value->>'fee')::BIGINT, (value->>'compute_units_consumed')::BIGINT,
     value->>'tx_b64', value->>'meta_json', value->>'raw_rpc_json', value->>'mode',
     value->>'provider', value->>'fetched_at', NULL FROM json_each(?::JSON)
     WHERE value->>'signature' NOT IN (SELECT signature FROM transactions WHERE slot BETWEEN ? AND ?)",
-        &[&Value::Array(unique).to_string(), &from, &to],
-    )?;
+            &[&Value::Array(batch.to_vec()).to_string(), &from, &to],
+        )?;
+    }
     Ok(())
 }
 

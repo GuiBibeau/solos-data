@@ -104,9 +104,13 @@ mod enabled {
         to: i64,
     ) -> Result<(), StoreError> {
         let started = std::time::Instant::now();
-        let watched: Arc<HashSet<String>> = Arc::new(
-            [config.program_id.clone(), program_data.to_owned()]
+        let watched: Arc<HashSet<[u8; 32]>> = Arc::new(
+            [config.program_id.as_str(), program_data]
                 .into_iter()
+                .filter_map(|address| {
+                    let bytes = bs58::decode(address).into_vec().ok()?;
+                    <[u8; 32]>::try_from(bytes.as_slice()).ok()
+                })
                 .collect(),
         );
         let collected = Arc::new(Mutex::new(Collected {
@@ -120,16 +124,15 @@ mod enabled {
             let collected = Arc::clone(&c_tx);
             let watched = Arc::clone(&watched_tx);
             async move {
-                let keys: Vec<String> = tx
-                    .transaction
-                    .message
+                let message = &tx.transaction.message;
+                let loaded = &tx.transaction_status_meta.loaded_addresses;
+                let touches = message
                     .static_account_keys()
                     .iter()
-                    .map(ToString::to_string)
-                    .chain(tx.transaction_status_meta.loaded_addresses.writable.iter().map(ToString::to_string))
-                    .chain(tx.transaction_status_meta.loaded_addresses.readonly.iter().map(ToString::to_string))
-                    .collect();
-                if !keys.iter().any(|k| watched.contains(k)) {
+                    .chain(loaded.writable.iter())
+                    .chain(loaded.readonly.iter())
+                    .any(|address| watched.contains(address.as_ref()));
+                if !touches {
                     return Ok(());
                 }
                 let wire = wincode::serialize(&tx.transaction).map_err(|e| -> jetstreamer_firehose::SharedError { Box::new(std::io::Error::other(e.to_string())) })?;
@@ -268,12 +271,15 @@ mod enabled {
             }
         }
         let fetched = rows.len();
+        let streamed_seconds = started.elapsed().as_secs_f64();
+        let blocks_seen = blocks.len();
+        let insert_started = std::time::Instant::now();
         db.run(move |store| {
             store.transaction(|store| {
                 insert_raw(store, &rows, from, to)?;
                 store.exec("DELETE FROM slot_order WHERE slot BETWEEN ? AND ?", &[&from, &to])?;
-                if !ordered.is_empty() {
-                    let payload = Value::Array(ordered.iter().map(|o| json!({ "signature": o.signature, "slot": o.slot, "tx_index": o.tx_index, "block_signature_count": o.block_signature_count })).collect()).to_string();
+                for batch in ordered.chunks(super::super::fetcher::INSERT_BATCH) {
+                    let payload = Value::Array(batch.iter().map(|o| json!({ "signature": o.signature, "slot": o.slot, "tx_index": o.tx_index, "block_signature_count": o.block_signature_count })).collect()).to_string();
                     store.exec(
                         "INSERT INTO slot_order SELECT value->>'signature', (value->>'slot')::BIGINT, (value->>'tx_index')::INTEGER, (value->>'block_signature_count')::INTEGER FROM json_each(?::JSON)",
                         &[&payload],
@@ -298,6 +304,9 @@ mod enabled {
                 .with("from", from)
                 .with("to", to)
                 .with("transactions", fetched)
+                .with("blocks", blocks_seen)
+                .with("streamSeconds", streamed_seconds)
+                .with("insertSeconds", insert_started.elapsed().as_secs_f64())
                 .with("seconds", started.elapsed().as_secs_f64()),
         );
         Ok(())
