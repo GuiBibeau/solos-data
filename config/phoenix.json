@@ -41,5 +41,6 @@
   "probePageLimit": 20,
   "archiveBackfillEnabled": true,
   "archiveChunkSlots": 50000,
-  "archiveOrderingSample": 0.02
+  "archiveOrderingSample": 0.02,
+  "retentionSlotsPerPass": 100000
 }

@@ -60,4 +60,5 @@ First live range after cutover (reverse, 450,217,137 to 450,227,136): 212,435 tr
 `source: archive`. With forward streaming the stream phase is seconds, so the manifest walk, the
 checkpoint insert and validation dominate a range; `archiveChunkSlots` moves from 10,000 to 50,000
 to amortize them. The reverse direction stays available through `SOLOS_DATA_ARCHIVE_REVERSE=1`.
-
+Routine retention trimmed 16,000 slots per minute, below what the lane now publishes, so
+`retentionSlotsPerPass` becomes a setting and is 100,000 on the box.

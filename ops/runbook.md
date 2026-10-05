@@ -19,6 +19,9 @@ during the verified rewrite; immutable Parquet remains queryable.
 Superseded inputs are removed after ten minutes when no local reader is using
 an old catalog and the replacement passes checksum/count verification.
 `status` counters describe the hot checkpoint; use `query` for historical totals.
+`retentionSlotsPerPass` (default 16,000) bounds one routine trimming pass; raise it when the
+archive lane publishes faster than the checkpoint is trimmed, or the checkpoint grows until the
+next rewrite.
 
 Historical collection below the last published Old Faithful epoch comes from the
 archive lane (ADR-0008) when `archiveBackfillEnabled` is true in `config/phoenix.json`.

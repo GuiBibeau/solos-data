@@ -56,7 +56,11 @@ pub fn maintain(
             store,
             &config.data_dir,
             config.checkpoint_hot_slots,
-            if all { 1_000_000_000 } else { 16_000 },
+            if all {
+                1_000_000_000
+            } else {
+                config.retention_slots_per_pass
+            },
         )?;
         let removed = result.int("removedRows").unwrap_or(0);
         let count = result.int("ranges").unwrap_or(0);

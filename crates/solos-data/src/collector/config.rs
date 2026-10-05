@@ -123,6 +123,9 @@ pub struct Config {
     /// Share of multi-transaction slots cross-checked with `getBlock` in archive ranges.
     #[serde(default = "d_archive_sample")]
     pub archive_ordering_sample: f64,
+    /// Slots a routine retention pass may trim from the checkpoint (`maintain --all` is unbounded).
+    #[serde(default = "d_retention_pass")]
+    pub retention_slots_per_pass: i64,
 }
 
 fn d_bulk_window() -> i64 {
@@ -151,6 +154,9 @@ fn d_archive_chunk() -> i64 {
 }
 fn d_archive_sample() -> f64 {
     0.02
+}
+fn d_retention_pass() -> i64 {
+    16_000
 }
 
 /// Load, apply `SOLOS_DATA_DIR` and `SOLOS_DATA_CU_PER_SECOND`, validate.
@@ -214,6 +220,9 @@ fn validate(config: &Config) -> Result<(), StoreError> {
         return Err(StoreError::Check(
             "bulkCommitPages must be at most 32".into(),
         ));
+    }
+    if config.retention_slots_per_pass <= 0 {
+        return Err(StoreError::Check("Invalid retentionSlotsPerPass".into()));
     }
     if config.archive_chunk_slots <= 0 || !(0.0..=1.0).contains(&config.archive_ordering_sample) {
         return Err(StoreError::Check("Invalid archive settings".into()));
