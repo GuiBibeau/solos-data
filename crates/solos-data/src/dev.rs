@@ -127,3 +127,22 @@ pub fn compare_decoded(left: &Path, right: &Path) -> Result<Obj, StoreError> {
         .with("identical", identical)
         .with_obj("tables", report))
 }
+
+/// Test fixture for crash recovery: commit one row and one key, leave a second transaction
+/// open, print `ready`, then wait to be killed.
+pub fn crash_writer(root: &Path) -> Result<(), StoreError> {
+    let mut store = crate::store::Store::open(root, crate::collector::schema::SCHEMA)?;
+    store.transaction(|store| {
+        store.exec_batch("INSERT INTO kv VALUES ('durable','true')")?;
+        store.exec_batch(
+            "INSERT INTO signatures VALUES ('durable',100,100,'null',[],'tail','c','fixture')",
+        )?;
+        Ok(())
+    })?;
+    store.exec_batch("BEGIN")?;
+    store.exec_batch("INSERT INTO kv VALUES ('unfinished','true')")?;
+    println!("ready");
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+}

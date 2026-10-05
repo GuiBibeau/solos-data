@@ -39,10 +39,10 @@ Run a query without opening the live checkpoint writer:
 
 ```sh
 export SOLOS_DATA_DECODED_DIR=./data/phoenix_decoded/v1
-npm run decoder -- status
-npm run decoder -- query --sql 'SELECT asset_symbol, count(*) AS fills FROM fills GROUP BY asset_symbol ORDER BY fills DESC LIMIT 20'
-npm run decoder -- query --sql 'SELECT status, count(*) AS transactions FROM decoded_transactions GROUP BY status'
-npm run decoder -- query --sql 'SELECT event_type, count(*) AS n FROM events GROUP BY event_type ORDER BY n DESC'
+solos-data decoder status
+solos-data decoder query --sql 'SELECT asset_symbol, count(*) AS fills FROM fills GROUP BY asset_symbol ORDER BY fills DESC LIMIT 20'
+solos-data decoder query --sql 'SELECT status, count(*) AS transactions FROM decoded_transactions GROUP BY status'
+solos-data decoder query --sql 'SELECT event_type, count(*) AS n FROM events GROUP BY event_type ORDER BY n DESC'
 ```
 
 Use the registered-file reader, not an arbitrary Parquet glob: overlap/corrections
@@ -51,16 +51,13 @@ can have other fully decoded instructions; check its status when strict whole-
 transaction completeness matters. Raw independent validation and partition sealing
 remain pending. This dataset is incrementally useful, not certified complete.
 
-Native setup requires Node >=22.18 and Rust >=1.89:
+Native setup requires Rust 1.96:
 
 ```sh
-npm ci
-npm run verify
-mkdir -p bin
-cp target/release/solos-data-phoenix-codec bin/
+cargo build --release -p solos-data
 export SOLOS_DATA_RAW_DIR=/path/to/published/raw
 export SOLOS_DATA_DECODED_DIR=/path/to/decoded/v1
-npm run decoder -- watch
+target/release/solos-data decoder watch
 ```
 
 Portable deployment can use `docker compose build` and `docker compose up -d`.

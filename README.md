@@ -33,8 +33,8 @@ Both jobs resume from saved progress after a restart.
 ## 3. See the progress
 
 ```sh
-docker compose exec collector node src/cli.ts status
-docker compose exec decoder node src/decode/cli.ts status
+docker compose exec collector solos-data collector status
+docker compose exec decoder solos-data decoder status
 ```
 
 ## 4. Ask a question
@@ -42,7 +42,7 @@ docker compose exec decoder node src/decode/cli.ts status
 For example: which markets have the most recorded fills?
 
 ```sh
-docker compose exec decoder node src/decode/cli.ts query --sql \
+docker compose exec decoder solos-data decoder query --sql \
   'SELECT asset_symbol, count(*) AS fills FROM fills GROUP BY asset_symbol ORDER BY fills DESC LIMIT 10'
 ```
 
@@ -66,6 +66,8 @@ still pending. See the [remaining work](docs/issues/001-phoenix-acceptance.md).
 [How it works](docs/architecture.md) · [Table details](docs/decoded-tables.md) ·
 [Server setup](ops/runbook.md)
 
-For development, use Node.js 24 and Rust 1.96: `npm ci && npm run verify`.
+The collector and decoder are one Rust binary, `solos-data`. History below the last
+published Old Faithful epoch is replayed from the archive through Jetstreamer; the
+live tail follows RPC. For development, use Rust 1.96: `cargo test --workspace`.
 The code is [MIT licensed](LICENSE). This repo contains code and test fixtures;
 collected data is stored separately.

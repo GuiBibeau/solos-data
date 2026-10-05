@@ -8,9 +8,10 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-solana-transaction = { version = "4.3", features = ["wincode"] }
-solana-message = { version = "4.6", features = ["wincode"] }
-wincode = "0.6"
+# Pinned to the versions Jetstreamer (anza-xyz/jetstreamer main) locks, so one type graph.
+solana-transaction = { version = "=4.1.6", features = ["wincode"] }
+solana-message = { version = "=4.4.1", features = ["wincode"] }
+wincode = "0.5"
 base64.workspace = true
 thiserror.workspace = true
 

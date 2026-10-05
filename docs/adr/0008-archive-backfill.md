@@ -1,0 +1,47 @@
+# ADR-0008: Historical backfill from the Old Faithful archive
+
+Status: accepted, October 5, 2026. Amends ADR-0001's independence rule for historical ranges.
+
+The RPC backfill is bound by the provider's compute-unit ceiling: about 68k CU per 1,000-slot
+chunk, most of it `getBlock` for ordering, which gave about nine chain-hours of history per
+wall-hour. The Old Faithful archive (Triton One, Project Yellowstone) holds every finalized block
+of every completed epoch as CAR files on a public mirror, and Anza's Jetstreamer replays them from
+Rust at memory speed. The user chose it for the backfill on October 5, 2026.
+
+## Decision
+
+- **Three lanes.** Live tail over RPC (unchanged). Gap backfill over RPC for slots above the
+  archive tip. Archive backfill through `jetstreamer-firehose` for ranges whose newest slot is at
+  or below the archive tip, when `archiveBackfillEnabled` is set. The archive tip is the last
+  slot of the newest epoch whose CAR the mirror serves, probed downward from the current epoch
+  and refreshed every ten minutes.
+- **Independence kept where it matters.** The signature manifest still comes from RPC
+  `getSignaturesForAddress` for the program and its ProgramData address. V1 completeness is
+  exact: every manifest signature must arrive from the archive stream for the range, or the range
+  stays unpublished and replays whole. V6 ordering takes `transaction_slot_index` from the
+  archive and keeps `getBlock` as a sampled cross-check (`archiveOrderingSample`, default 2 % of
+  multi-transaction slots) instead of one call per slot.
+- **Same rows.** Archive ranges fill the same tables. `tx_b64` is the wire re-serialized by the
+  SDK, `meta_json` is the RPC JSON shape produced from `TransactionStatusMeta` through the SDK's
+  `UiTransactionStatusMeta`, `provider` is `old-faithful`, `raw_rpc_json` records the epoch and
+  in-block index, `rpc_pages` stays empty, and `slot_order.block_signature_count` is the block's
+  executed transaction count. A transaction seen from both sources at a lane boundary may differ
+  in `meta_json` text and receive one decoder revision.
+- **Chunking.** Ranges of `archiveChunkSlots` (default 10,000) stream in reverse with
+  Jetstreamer's own parallelism; the range commits only when the stream has returned, so
+  publication stays contiguous and descending. The lane spends no compute units except the
+  manifest walk and the sampled cross-check.
+- **Build.** The lane is behind the `archive` feature because its dependency tree (agave 4.2
+  crates, RocksDB) needs clang and cmake and multiplies build time. The release binary for the
+  box is built with the feature; CI builds without it. Jetstreamer is pinned to a commit on its
+  `main` branch: the crates.io release fails on recent epochs and cannot decode v1 transactions.
+
+## Consequences
+
+The archive lags the tip by up to about two days plus publishing time, so the live tail and the
+gap lane remain RPC. Every epoch is downloaded whole (about 735 GB for epoch 1048) because the
+archive has no program filter; the box's network interface makes that minutes to an hour per
+epoch. The archive carries no account updates. Old Faithful does not state finality in its
+documentation; the blocks are the canonical chain as archived after the epoch closed, and the
+RPC manifest check guards completeness. The proof before cutover re-collects a range the RPC
+lane already published and compares every row.

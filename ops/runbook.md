@@ -20,12 +20,18 @@ Superseded inputs are removed after ten minutes when no local reader is using
 an old catalog and the replacement passes checksum/count verification.
 `status` counters describe the hot checkpoint; use `query` for historical totals.
 
+Historical collection below the last published Old Faithful epoch comes from the
+archive lane (ADR-0008) when `archiveBackfillEnabled` is true in `config/phoenix.json`.
+It needs no credential; it reads `files.old-faithful.net` and spends compute units
+only on the signature manifest and a sampled `getBlock` cross-check. Set
+`JETSTREAMER_THREADS` to bound its parallelism on a shared machine.
+
 For an existing large checkpoint, stop its writer and run:
 
 ```sh
-npm run collector -- maintain --all
-npm run collector -- repack
-npm run collector -- verify-storage
+solos-data collector maintain --all
+solos-data collector repack
+solos-data collector verify-storage
 ```
 
 Then restart the collector. `maintain --all` verifies archived contents before
@@ -34,7 +40,7 @@ closed checkpoint. Never run these offline commands while a writer is running.
 `maintain --all --legacy` optionally scans superseded files from older releases.
 This can take much longer and retains any file whose full contents do not match
 the latest archive. It is separate from routine cleanup and checkpoint rewrites.
-Use decoder `repack` and `verify-storage` with its writer stopped if needed.
+Use `solos-data decoder repack` and `verify-storage` with its writer stopped if needed.
 `validate-next-backfill` reports a blocked historical range;
 `repair-next-backfill` repairs ordering using already cached finalized blocks only.
 R2 is optional; cleanup preserves the whole archive locally.
@@ -42,19 +48,17 @@ Do not point two writers at the same checkpoint directory.
 
 ## Native Linux services
 
-The example units expect the checkout at `~/solos-data`. Edit their working directory
-if you use another location. They use a private Node.js runtime installed by
-`ops/install-runtime.sh` (Linux x64). The Rust codec can be built with Docker.
+The example units expect the checkout at `~/solos-data` and the binary at
+`~/.local/share/solos-data/bin/solos-data`. Build the binary in Docker on the
+server (the archive lane needs clang and cmake, which the build image installs):
 
 ```sh
-sh ops/install-runtime.sh
-export PATH="$HOME/.local/share/solos-data/runtime/bin:$PATH"
-npm ci
-docker build -t solos-data:local .
-mkdir -p bin
-codec_container=$(docker create solos-data:local)
-docker cp "$codec_container":/app/bin/solos-data-phoenix-codec bin/
-docker rm "$codec_container"
+docker build --target build -t solos-data:build .
+container=$(docker create solos-data:build)
+mkdir -p ~/.local/share/solos-data/bin
+docker cp "$container":/build/target/release/solos-data ~/.local/share/solos-data/bin/solos-data
+docker rm "$container"
+~/.local/share/solos-data/bin/solos-data collector help
 ```
 
 Create `~/.config/solos-data/collector.env` in a text editor with these variable
@@ -86,9 +90,33 @@ If jobs must continue after logout, configure user lingering on the server.
 Read status without opening the writer's checkpoint:
 
 ```sh
-SOLOS_DATA_DIR=/path/to/phoenix_raw npm run collector -- status
-SOLOS_DATA_DECODED_DIR=/path/to/decoded/v1 npm run decoder -- status
+SOLOS_DATA_DIR=/path/to/phoenix_raw solos-data collector status
+SOLOS_DATA_DECODED_DIR=/path/to/decoded/v1 solos-data decoder status
 ```
+
+## Switch a running TypeScript deployment to the binary
+
+The Rust binary reuses the checkpoints and cursors as they are (ADR-0007). Install the
+binary and the new unit files, then:
+
+```sh
+systemctl --user stop solos-data-phoenix-decoder.service
+systemctl --user stop solos-data-phoenix.service
+backup=~/.local/share/solos-data/backup-$(date -u +%Y%m%dT%H%M%SZ)
+mkdir -p "$backup/raw" "$backup/decoded"
+cp ~/.local/share/solos-data/phoenix_raw/{checkpoint.duckdb,catalog.json,status.json} "$backup/raw/"
+cp ~/.local/share/solos-data/phoenix_raw/checkpoint.duckdb.wal "$backup/raw/" 2>/dev/null || true
+cp ~/.local/share/solos-data/phoenix_decoded/v1/{checkpoint.duckdb,catalog.json,status.json} "$backup/decoded/"
+cp ~/.local/share/solos-data/phoenix_decoded/v1/checkpoint.duckdb.wal "$backup/decoded/" 2>/dev/null || true
+systemctl --user daemon-reload
+systemctl --user start solos-data-phoenix.service
+systemctl --user start solos-data-phoenix-decoder.service
+journalctl --user -u solos-data-phoenix.service -f
+```
+
+Watch for the first `backfill_chunk`, `tail_chunk` and `decoded_batch` events and compare
+`query` row counts with the numbers from before the stop. Rollback is the reverse `ExecStart`
+swap in the unit files; keep the Node runtime for a week.
 
 ## Move the data
 
@@ -96,7 +124,7 @@ Stop both writers, copy both data roots and the private credential file, then
 point the new services at those paths. Before restarting a moved raw collector:
 
 ```sh
-SOLOS_DATA_DIR=/path/to/new/raw npm run collector -- relocate
+SOLOS_DATA_DIR=/path/to/new/raw solos-data collector relocate
 ```
 
 Decoded catalogs use relative paths and need no rebase. Restart with the same
@@ -104,6 +132,7 @@ codec/schema version. [Table details](../docs/decoded-tables.md) cover read-only
 
 ## Verify changes
 
-With Node.js and Rust installed, run `npm run verify`. Tests are offline and need
-no credentials. On a Linux host with only the extracted codec, run `npm run check`
-and `SOLOS_DATA_CODEC="$PWD/bin/solos-data-phoenix-codec" npm test`.
+With Rust 1.96 installed, run `cargo test --workspace`. Tests are offline and need no
+credentials. The archive lane compiles with `cargo build --features archive -p solos-data`,
+which needs clang and cmake. Until the TypeScript sources are removed, `npm run verify`
+still runs their suite.

@@ -1,11 +1,16 @@
 //! Command-line surface. Arguments are parsed the way the TypeScript entry points parsed them:
 //! a positional command, `--flag value` pairs anywhere, and JSON on stdout.
 
+use crate::collector::config::{Config, load_config, provider_url};
+use crate::collector::limiter::Limiter;
+use crate::collector::rpc::Provider;
+use crate::db::Db;
 use crate::decoder::service::{DecoderConfig, run_decoder, stop_flag};
-use crate::jsonout::{Obj, now, safe_error};
+use crate::jsonout::{Obj, log, now, safe_error};
 use crate::store::{Store, StoreError};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Run the CLI and return the process exit code.
 #[must_use]
@@ -13,34 +18,13 @@ pub fn main(args: &[String]) -> i32 {
     let group = args.first().map(String::as_str).unwrap_or("help");
     match group {
         "decoder" => decoder(&args[1..]),
+        "collector" => collector(&args[1..]),
         "dev" => dev(&args[1..]),
-        "collector" => {
-            eprintln!(
-                "{}",
-                Obj::new()
-                    .with("at", now())
-                    .with("event", "fatal")
-                    .with(
-                        "error",
-                        "the collector is not in this binary yet; run the TypeScript collector"
-                    )
-                    .to_json()
-            );
-            1
-        }
         _ => {
             println!(
                 "{}",
                 Obj::new()
-                    .with(
-                        "groups",
-                        Value::Array(
-                            ["collector", "decoder", "dev"]
-                                .iter()
-                                .map(|g| Value::String((*g).into()))
-                                .collect()
-                        )
-                    )
+                    .with("groups", json!(["collector", "decoder", "dev"]))
                     .to_json()
             );
             0
@@ -57,6 +41,13 @@ pub fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
+fn has(args: &[String], name: &str) -> bool {
+    args.iter().any(|a| a == name)
+}
+
+// ---------------------------------------------------------------------------------------------
+// decoder
+
 fn decoder(args: &[String]) -> i32 {
     let command = args.first().map(String::as_str).unwrap_or("help");
     if command == "help" || command == "--help" {
@@ -65,7 +56,7 @@ fn decoder(args: &[String]) -> i32 {
             Obj::new()
                 .with(
                     "commands",
-                    serde_json::json!([
+                    json!([
                         "once",
                         "watch",
                         "status",
@@ -175,6 +166,345 @@ fn decoder_command(command: &str, args: &[String]) -> Result<(), StoreError> {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// collector
+
+const COLLECTOR_COMMANDS: [(&str, &str); 16] = [
+    (
+        "run",
+        "Supervised finalized-only collector (tail + backfill)",
+    ),
+    ("probe", "Bounded live sizing; isolated in dataDir/probe"),
+    (
+        "capabilities",
+        "Probe Alchemy extensions and oldest indexed program transactions",
+    ),
+    (
+        "status",
+        "Read supervisor status snapshot without opening the live writer",
+    ),
+    (
+        "catalog",
+        "Read published file/coverage catalog while collection runs",
+    ),
+    (
+        "query",
+        "Query published Parquet data while collection runs: --sql SELECT ... or --sql-file path",
+    ),
+    (
+        "verify-storage",
+        "Offline hash/count verification; stop the service first",
+    ),
+    (
+        "maintain",
+        "Offline compaction/verified checkpoint trimming/GC; --all drains checkpoint copies; --legacy also scans old files; stop writer first",
+    ),
+    (
+        "repair-next-backfill",
+        "Offline ordering repair using finalized cached blocks only; stop writer first",
+    ),
+    (
+        "validate-next-backfill",
+        "Offline validation report for the pending historical chunk; stop writer first",
+    ),
+    (
+        "storage-stats",
+        "Offline checkpoint allocation and table sizes; stop writer first",
+    ),
+    (
+        "repack",
+        "Offline verified atomic checkpoint rewrite to reclaim space; stop writer first",
+    ),
+    (
+        "relocate",
+        "Offline rebase and verify raw file registrations after moving the data root; stop the service first",
+    ),
+    (
+        "benchmark-decoder",
+        "Offline published-file resume benchmark: --mode legacy|bounded",
+    ),
+    (
+        "benchmark-ordering",
+        "Offline checkpoint benchmark with rolled-back writes: --mode legacy|bounded; stop writer first",
+    ),
+    (
+        "benchmark-ingest",
+        "Offline duplicate-page insert with rolled-back writes; stop writer first",
+    ),
+];
+
+fn collector(args: &[String]) -> i32 {
+    let command = args.first().map(String::as_str).unwrap_or("help");
+    if command == "help" || command == "--help" {
+        let mut commands = Obj::new();
+        for (name, text) in COLLECTOR_COMMANDS {
+            commands.set(name, text);
+        }
+        println!(
+            "{}",
+            Obj::new()
+                .with_obj("commands", commands)
+                .with(
+                    "config",
+                    "--config path or SOLOS_DATA_CONFIG; credentials: SOLANA_RPC_URL only"
+                )
+                .to_json()
+        );
+        return 0;
+    }
+    match collector_command(command, args) {
+        Ok(()) => 0,
+        Err(error) => {
+            log(
+                "fatal",
+                Obj::new().with("error", safe_error(&error.to_string())),
+            );
+            1
+        }
+    }
+}
+
+/// A provider that refuses every call; `repair-next-backfill` must use cached blocks only.
+struct NoRpc;
+
+impl crate::collector::rpc::Rpc for NoRpc {
+    fn call<'a>(
+        &'a self,
+        method: &'a str,
+        _params: Value,
+        _lane: crate::collector::config::Lane,
+    ) -> crate::collector::rpc::RpcFuture<'a> {
+        Box::pin(async move {
+            Err(crate::collector::rpc::RpcFailure {
+                method: format!(
+                    "{method}: missing finalized block cache; resume collector to fetch"
+                ),
+                code: -1,
+                throttled: false,
+            })
+        })
+    }
+
+    fn provider_name(&self) -> &str {
+        "none"
+    }
+}
+
+fn collector_command(command: &str, args: &[String]) -> Result<(), StoreError> {
+    let config_path = flag(args, "--config")
+        .map(str::to_owned)
+        .or_else(|| std::env::var("SOLOS_DATA_CONFIG").ok());
+    let mut config: Config = load_config(config_path.as_deref())?;
+    let mode = flag(args, "--mode").unwrap_or("bounded");
+    if command.starts_with("benchmark-") && !["legacy", "bounded"].contains(&mode) {
+        return Err(StoreError::Check("invalid benchmark mode".into()));
+    }
+    if command == "benchmark-decoder" {
+        println!(
+            "{}",
+            crate::collector::diagnostics::benchmark_decoder(&config.data_dir, mode)?.to_json()
+        );
+        return Ok(());
+    }
+    if command == "status" || command == "catalog" {
+        print!(
+            "{}",
+            std::fs::read_to_string(config.data_dir.join(format!("{command}.json")))?
+        );
+        return Ok(());
+    }
+    if command == "query" {
+        let sql = match (flag(args, "--sql-file"), flag(args, "--sql")) {
+            (Some(file), _) => std::fs::read_to_string(file)?,
+            (None, Some(sql)) => sql.to_owned(),
+            (None, None) => {
+                return Err(StoreError::Check(
+                    "query requires --sql or --sql-file".into(),
+                ));
+            }
+        };
+        println!(
+            "{}",
+            crate::collector::reader::query_dataset(&config.data_dir, &sql)?.to_json()
+        );
+        return Ok(());
+    }
+    if command == "probe" {
+        config.data_dir = config.data_dir.join("probe");
+    }
+    if command == "repack" {
+        println!(
+            "{}",
+            crate::repack::repack_checkpoint(&config.data_dir)?.to_json()
+        );
+        return Ok(());
+    }
+    if !COLLECTOR_COMMANDS.iter().any(|(name, _)| *name == command) {
+        return Err(StoreError::Check("Unknown command".into()));
+    }
+    let mut store = Store::open(&config.data_dir, crate::collector::schema::SCHEMA)?;
+    let result = offline_or_live(command, args, &mut store, config, mode);
+    store.close()?;
+    result
+}
+
+/// Offline commands run on the store directly; live commands move it to the writer thread.
+fn offline_or_live(
+    command: &str,
+    args: &[String],
+    store: &mut Store,
+    config: Config,
+    mode: &str,
+) -> Result<(), StoreError> {
+    let outcome: Result<(), StoreError> = (|| {
+        match command {
+            "benchmark-ordering" => println!(
+                "{}",
+                crate::collector::diagnostics::benchmark_ordering(store, mode)?.to_json()
+            ),
+            "benchmark-ingest" => println!(
+                "{}",
+                crate::collector::diagnostics::benchmark_ingest(store, mode)?.to_json()
+            ),
+            "validate-next-backfill" | "repair-next-backfill" => {
+                let progress = store
+                    .get("backfill")?
+                    .ok_or_else(|| StoreError::Check("no backfill cursor".into()))?;
+                let next = progress.get("next").and_then(Value::as_i64).unwrap_or(0);
+                let (from, to) = (next - config.backfill_chunk_slots + 1, next);
+                if command == "repair-next-backfill" {
+                    let store_moved = std::mem::replace(
+                        store,
+                        Store::open(&config.data_dir.join(".placeholder"), "")?,
+                    );
+                    let (db, thread) = Db::spawn(store_moved);
+                    let runtime = tokio::runtime::Runtime::new()?;
+                    let repair = runtime.block_on(crate::collector::ordering::order_range(
+                        Arc::new(NoRpc),
+                        &db,
+                        crate::collector::config::Lane::Backfill,
+                        from,
+                        to,
+                        256,
+                    ));
+                    *store = thread.join(db);
+                    let _ = std::fs::remove_dir_all(config.data_dir.join(".placeholder"));
+                    repair?;
+                }
+                let report = crate::collector::validation::validate_range(store, from, to)?;
+                let anomalies = store.rows(
+                    "SELECT s.slot,count(*) AS n,count(t.tx_index) AS indexed,
+        count(DISTINCT t.tx_index) AS distinct_index,count(*) FILTER(WHERE t.single_in_slot) AS singles,
+        count(*) FILTER(WHERE t.single_in_slot IS NULL) AS unknown,min(t.slot) AS transaction_slot,
+        count(*) FILTER(WHERE t.slot IS DISTINCT FROM s.slot) AS slot_mismatch
+        FROM signatures s LEFT JOIN transactions t USING(signature) WHERE s.slot BETWEEN ? AND ?
+        GROUP BY s.slot HAVING (n>1 AND (indexed<>n OR distinct_index<>n OR singles>0)) OR (n=1 AND singles<>1) LIMIT 10",
+                    &[&from, &to],
+                )?;
+                let mut out = report;
+                out.set_rows("anomalies", anomalies);
+                println!("{}", out.to_json());
+            }
+            "storage-stats" => println!(
+                "{}",
+                crate::collector::diagnostics::storage_stats(store)?.to_json()
+            ),
+            "verify-storage" => println!(
+                "{}",
+                crate::collector::writer::verify_files(store)?.to_json()
+            ),
+            "maintain" => println!(
+                "{}",
+                crate::collector::maintenance::maintain(
+                    store,
+                    &config,
+                    has(args, "--all"),
+                    has(args, "--legacy")
+                )?
+                .to_json()
+            ),
+            "relocate" => println!(
+                "{}",
+                crate::collector::maintenance::relocate(store)?.to_json()
+            ),
+            "capabilities" | "probe" | "run" => {
+                let limiter = Arc::new(Limiter::new(
+                    config.cu_per_second * config.utilization,
+                    config.tail_share,
+                    config.concurrency.clone(),
+                ));
+                let provider = Arc::new(Provider::new(provider_url()?, config.clone(), limiter));
+                let runtime = tokio::runtime::Runtime::new()?;
+                if command == "capabilities" {
+                    let rpc: Arc<dyn crate::collector::rpc::Rpc> = provider.clone();
+                    let report =
+                        runtime.block_on(crate::collector::probe::capabilities(rpc, &config))?;
+                    println!("{}", report.to_json());
+                    return Ok(());
+                }
+                let store_moved = std::mem::replace(
+                    store,
+                    Store::open(&config.data_dir.join(".placeholder"), "")?,
+                );
+                let (db, thread) = Db::spawn(store_moved);
+                let outcome = if command == "probe" {
+                    let rpc: Arc<dyn crate::collector::rpc::Rpc> = provider.clone();
+                    runtime
+                        .block_on(crate::collector::probe::probe(rpc, &db, &config))
+                        .map(|report| println!("{}", report.to_json()))
+                } else {
+                    runtime.block_on(crate::collector::service::run(
+                        provider,
+                        db.clone(),
+                        config.clone(),
+                    ))
+                };
+                *store = thread.join(db);
+                let _ = std::fs::remove_dir_all(config.data_dir.join(".placeholder"));
+                outcome?;
+            }
+            _ => return Err(StoreError::Check("Unknown command".into())),
+        }
+        Ok(())
+    })();
+    outcome
+}
+
+// ---------------------------------------------------------------------------------------------
+// dev
+
+/// Re-collect a published range through the archive lane and compare it with the raw archive.
+fn archive_check(args: &[String], from: i64, to: i64) -> Result<Obj, StoreError> {
+    let config_path = flag(args, "--config")
+        .map(str::to_owned)
+        .or_else(|| std::env::var("SOLOS_DATA_CONFIG").ok());
+    let mut config: Config = load_config(config_path.as_deref())?;
+    config.archive_backfill_enabled = true;
+    let limiter = Arc::new(Limiter::new(
+        config.cu_per_second * config.utilization,
+        config.tail_share,
+        config.concurrency.clone(),
+    ));
+    let provider = Arc::new(Provider::new(provider_url()?, config.clone(), limiter));
+    let runtime = tokio::runtime::Runtime::new()?;
+    let rpc: Arc<dyn crate::collector::rpc::Rpc> = provider.clone();
+    runtime.block_on(async {
+        let http = reqwest::Client::new();
+        let scratch = config
+            .data_dir
+            .join(format!(".archive-check-exchange-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&scratch, crate::collector::schema::SCHEMA)?;
+        let (db, thread) = Db::spawn(store);
+        let exchange =
+            crate::collector::exchange::refresh_exchange(rpc.as_ref(), &db, &config, &http).await;
+        let store = thread.join(db);
+        store.close()?;
+        let _ = std::fs::remove_dir_all(&scratch);
+        let exchange = exchange?;
+        crate::collector::archive::check_range(rpc, &config, &exchange.program_data, from, to).await
+    })
+}
+
 fn dev(args: &[String]) -> i32 {
     let command = args.first().map(String::as_str).unwrap_or("help");
     let result = match command {
@@ -193,13 +523,42 @@ fn dev(args: &[String]) -> i32 {
             };
             crate::dev::compare_decoded(&PathBuf::from(left), &PathBuf::from(right))
         }
+        "archive-check" => {
+            let (Some(from), Some(to)) = (
+                flag(args, "--from").and_then(|v| v.parse::<i64>().ok()),
+                flag(args, "--to").and_then(|v| v.parse::<i64>().ok()),
+            ) else {
+                eprintln!(
+                    "{}",
+                    Obj::new()
+                        .with("error", "archive-check requires --from and --to slots")
+                        .to_json()
+                );
+                return 1;
+            };
+            archive_check(args, from, to)
+        }
+        "crash-writer" => {
+            // Test fixture: commit one row, leave a transaction open, wait to be killed.
+            let Some(root) = flag(args, "--root") else {
+                return 1;
+            };
+            return match crate::dev::crash_writer(&PathBuf::from(root)) {
+                Ok(()) => 0,
+                Err(_) => 1,
+            };
+        }
         _ => {
             println!(
                 "{}",
                 Obj::new()
                     .with(
                         "commands",
-                        serde_json::json!(["compare-decoded --left <root> --right <root>"])
+                        json!([
+                            "compare-decoded --left <root> --right <root>",
+                            "archive-check --from <slot> --to <slot> [--config path]",
+                            "crash-writer --root <root> (test fixture)"
+                        ])
                     )
                     .to_json()
             );

@@ -8,6 +8,70 @@ use duckdb::{Config, Connection, ToSql, params_from_iter};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
+/// An owned SQL parameter that crosses the writer-thread channel.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Param {
+    /// SQL NULL.
+    Null,
+    /// 64-bit integer.
+    Int(i64),
+    /// Double.
+    Float(f64),
+    /// Text.
+    Text(String),
+    /// Boolean.
+    Bool(bool),
+}
+
+impl ToSql for Param {
+    fn to_sql(&self) -> duckdb::Result<duckdb::types::ToSqlOutput<'_>> {
+        use duckdb::types::{ToSqlOutput, Value as V};
+        Ok(match self {
+            Param::Null => ToSqlOutput::Owned(V::Null),
+            Param::Int(n) => ToSqlOutput::Owned(V::BigInt(*n)),
+            Param::Float(f) => ToSqlOutput::Owned(V::Double(*f)),
+            Param::Text(t) => ToSqlOutput::Owned(V::Text(t.clone())),
+            Param::Bool(b) => ToSqlOutput::Owned(V::Boolean(*b)),
+        })
+    }
+}
+
+impl From<i64> for Param {
+    fn from(value: i64) -> Self {
+        Param::Int(value)
+    }
+}
+impl From<i32> for Param {
+    fn from(value: i32) -> Self {
+        Param::Int(i64::from(value))
+    }
+}
+impl From<u64> for Param {
+    fn from(value: u64) -> Self {
+        Param::Int(i64::try_from(value).unwrap_or(i64::MAX))
+    }
+}
+impl From<f64> for Param {
+    fn from(value: f64) -> Self {
+        Param::Float(value)
+    }
+}
+impl From<bool> for Param {
+    fn from(value: bool) -> Self {
+        Param::Bool(value)
+    }
+}
+impl From<String> for Param {
+    fn from(value: String) -> Self {
+        Param::Text(value)
+    }
+}
+impl From<&str> for Param {
+    fn from(value: &str) -> Self {
+        Param::Text(value.to_owned())
+    }
+}
+
 /// Statement timing aggregate, keyed by `VERB:table` as in the TypeScript store.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Timing {

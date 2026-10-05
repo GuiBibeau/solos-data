@@ -25,7 +25,25 @@ hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 uuid = { version = "1", features = ["v4"] }
 signal-hook = "0.3"
-nix = { version = "0.30", features = ["signal"] }
+nix = { version = "0.30", features = ["signal", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json"] }
+futures-util = { version = "0.3", optional = true }
+jetstreamer-firehose = { git = "https://github.com/anza-xyz/jetstreamer", rev = "048d2cd", optional = true }
+solana-transaction-status = { version = "=4.2.2", optional = true }
+wincode = { version = "0.5", optional = true }
+# Pins that hold the agave graph on the 4.2 line Jetstreamer's lockfile uses (solana-transaction 4.1.6 / wincode 0.5).
+solana-accounts-db = { version = "=4.2.2", optional = true }
+solana-ledger = { version = "=4.2.2", optional = true }
+solana-runtime = { version = "=4.2.2", optional = true }
+solana-rpc = { version = "=4.2.2", optional = true }
+solana-geyser-plugin-manager = { version = "=4.2.2", optional = true }
+solana-storage-proto = { version = "=4.2.2", optional = true }
+
+[features]
+default = []
+# The Old Faithful archive lane through Jetstreamer (heavy build: agave crates and RocksDB).
+archive = ["dep:jetstreamer-firehose", "dep:solana-transaction-status", "dep:wincode", "dep:futures-util", "dep:solana-accounts-db", "dep:solana-ledger", "dep:solana-runtime", "dep:solana-rpc", "dep:solana-geyser-plugin-manager", "dep:solana-storage-proto"]
 
 [lints]
 workspace = true
