@@ -189,10 +189,13 @@ mod enabled {
                 jetstreamer_firehose::system::optimal_firehose_thread_count() as u64
             });
         let range = u64::try_from(from).unwrap_or(0)..u64::try_from(to + 1).unwrap_or(0);
+        // Rows commit per range, so stream direction is a throughput knob, not a correctness one.
+        let reverse =
+            std::env::var("SOLOS_DATA_ARCHIVE_REVERSE").is_ok_and(|v| v == "1" || v == "true");
         let outcome = firehose(
             threads,
             false,
-            true,
+            reverse,
             None,
             range,
             Some(on_block),
