@@ -170,6 +170,9 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
             let mut last_refresh = Instant::now();
             let mut last_maintenance = Instant::now();
             let mut error_streak = 0u64;
+            if !config.tail_enabled {
+                log("tail_lane_disabled", Obj::new());
+            }
             while !stopped.load(Ordering::Relaxed) {
                 let started = Instant::now();
                 let outcome: Result<(), StoreError> = async {
@@ -182,7 +185,9 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
                     }
                     let program_data = exchange.lock().expect("exchange").program_data.clone();
                     let rpc: Arc<dyn super::rpc::Rpc> = provider.clone();
-                    tail_cycle(rpc, &db, &config, &program_data).await?;
+                    if config.tail_enabled {
+                        tail_cycle(rpc, &db, &config, &program_data).await?;
+                    }
                     error_streak = 0;
                     if last_maintenance.elapsed()
                         > Duration::from_secs(config.maintenance_interval_seconds)

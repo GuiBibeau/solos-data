@@ -5,6 +5,7 @@
   "cuPerSecond": 10000,
   "utilization": 0.8,
   "tailShare": 0.85,
+  "tailEnabled": false,
   "concurrency": {
     "tail": 24,
     "backfill": 32

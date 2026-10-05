@@ -126,6 +126,14 @@ pub struct Config {
     /// Slots a routine retention pass may trim from the checkpoint (`maintain --all` is unbounded).
     #[serde(default = "d_retention_pass")]
     pub retention_slots_per_pass: i64,
+    /// Whether the live tail lane runs. Off, the collector only backfills, and the archive lane's
+    /// manifest check is the only steady compute-unit spend (ADR-0008).
+    #[serde(default = "d_true")]
+    pub tail_enabled: bool,
+}
+
+fn d_true() -> bool {
+    true
 }
 
 fn d_bulk_window() -> i64 {
@@ -271,6 +279,10 @@ mod tests {
         assert_eq!(config.archive_chunk_slots, 50_000);
         assert_eq!(config.retention_slots_per_pass, 100_000);
         assert_eq!(config.cu_weights["getBlock"], 40);
+        assert!(!config.tail_enabled, "the box runs archive-only");
+        let without: Config =
+            serde_json::from_str(&text.replace("\"tailEnabled\": false,", "")).unwrap();
+        assert!(without.tail_enabled, "the tail runs unless switched off");
         assert_eq!(
             url_parts("https://u:p@host.example:443/v2/key?x=1").unwrap(),
             ("https".into(), "host.example".into())
