@@ -63,6 +63,7 @@ records the missing checks, snapshots and reconstructed state.
 | `src/decode/` | Event extraction, decoded tables and readers |
 | `crates/phoenix-codec/` | Rust library and stdio binary around the official Phoenix event SDK |
 | `crates/solana-wire/` | Rust parser for legacy, v0 and v1 transaction envelopes |
+| `crates/solos-data/` | Rust `solos-data` binary: the decoder today (`decoder` group), the collector next; `dev compare-decoded` proves parity between two decoded roots |
 | `tests/` | Offline fixtures and interruption/restart tests |
 | `config/` | Rates, batch sizes and default data paths |
 | `ops/` | Linux services and installation notes |
