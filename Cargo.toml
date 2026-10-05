@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/phoenix-codec", "crates/solana-wire"]
+members = ["crates/phoenix-codec", "crates/solana-wire", "crates/solos-data"]
 
 [workspace.package]
 version = "0.1.0"
@@ -25,3 +25,7 @@ all = { level = "deny", priority = -1 }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# DuckDB is C++; compile it optimized even for debug builds so tests run at production speed.
+[profile.dev.package.libduckdb-sys]
+opt-level = 3
