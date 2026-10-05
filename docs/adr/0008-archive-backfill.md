@@ -69,6 +69,7 @@ TypeScript run of the previous day had averaged about 776 CU/s with two throttle
 At that ceiling the lane's manifest walk (over 1,000 pages per 50,000-slot range) starved the tail,
 whose share was 20 % and which cannot borrow the backfill's tokens; the watermark fell 85 minutes
 behind the finalized slot. The limiter is now configured at the measured ceiling, `tailShare` is
-0.65 and `archiveOrderingSample` 0.005. The lane is bound by the manifest walk, not by the archive:
-about 15 chain-hours per wall-hour at 300 CU/s, against about 30 while the tail starved. More
+0.85 and `archiveOrderingSample` 0.005: at the venue's current activity (about 55 transactions per
+slot, three times late September) the tail alone needs about 200 CU/s to stay current. The lane is bound by the manifest walk, not by the archive:
+about 7 chain-hours per wall-hour at 300 CU/s, against about 30 while the tail starved. More
 provider throughput, or a second provider for the tail, is the way to raise it.

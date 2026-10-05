@@ -88,7 +88,8 @@ free tier), and a configured rate above that ceiling produces bursts of 429s tha
 limiter far below the ceiling. Alchemy's costs match `cuWeights` (getBlock 40, getSignaturesForAddress
 40, getTransactionsForAddress 100). `tailShare` in `config/phoenix.json` is the fraction reserved for
 the live tail; the tail cannot borrow the backfill's share, so size it from the tail's cost (about
-48,000 CU per 1,000 slots at twenty transactions per slot, 180 CU/s at the chain's pace). The archive
+48,000 CU per 1,000 slots at twenty transactions per slot, 180 CU/s at the chain's pace; more
+when the venue is busier). The archive
 lane spends compute units only on the manifest walk (40 CU per 1,000 signatures) and the sampled
 ordering check (`archiveOrderingSample`). Check the ceiling with a short burst of
 `getSignaturesForAddress` pages: the first 429 arrives when the window is spent.
