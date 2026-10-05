@@ -268,7 +268,8 @@ mod tests {
         let text = std::fs::read_to_string(repository_config_path()).unwrap();
         let config: Config = serde_json::from_str(&text).unwrap();
         validate(&config).unwrap();
-        assert_eq!(config.archive_chunk_slots, 10_000);
+        assert_eq!(config.archive_chunk_slots, 50_000);
+        assert_eq!(config.retention_slots_per_pass, 100_000);
         assert_eq!(config.cu_weights["getBlock"], 40);
         assert_eq!(
             url_parts("https://u:p@host.example:443/v2/key?x=1").unwrap(),

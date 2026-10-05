@@ -30,6 +30,10 @@ of this change (see ADR-0008 for the archive lane that changes that bound).
   pinned to the one Jetstreamer locks so the workspace has one type graph.
 - **Codec.** `phoenix-rise-events 0.6.12` is linked into the decoder; the stdio codec binary stays
   only while the TypeScript decoder exists.
+- **One limiter deviation.** The additive recovery after a throttle steps every ten successful
+  requests instead of every hundred. Production showed a burst of provider throttles at every
+  start-up collapsing the rate to a few hundred CU/s, and at the lanes' request rate the old
+  pace never climbed back; the reduction, cooldown and window rules are unchanged.
 - **Known defect kept.** `fills.taker_side` compares the SDK's lowercase side against `Bid` and is
   therefore always `Bid`; the correction is a separate, data-affecting change.
 - **Concurrency.** One writer thread owns each checkpoint and executes closures sent by the
