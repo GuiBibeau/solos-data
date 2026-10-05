@@ -43,6 +43,9 @@ pub struct Limiter {
     pub state: Mutex<State>,
 }
 
+/// Successful requests per lane between additive recovery steps.
+pub const RECOVERY_SUCCESSES: u32 = 10;
+
 fn set_lane(lanes: &mut Lanes, lane: Lane, value: u32) {
     match lane {
         Lane::Tail => lanes.tail = value,
@@ -186,8 +189,11 @@ impl Limiter {
             s.cooldown_until = Some(Instant::now() + Duration::from_millis(retry_ms.max(1000)));
             set_lane(&mut s.successes, lane, 0);
         } else {
+            // Additive recovery every ten successes (the TypeScript limiter used a hundred): at the
+            // few requests per second the lanes make, the old pace never climbed back after a burst
+            // of throttles at start-up (ADR-0007).
             let successes = s.successes.get(lane) + 1;
-            if successes >= 100 {
+            if successes >= RECOVERY_SUCCESSES {
                 let window = (s.windows.get(lane) + 1).min(self.ceilings.get(lane));
                 set_lane(&mut s.windows, lane, window);
                 s.rate = (s.rate + 10.0).min(self.maximum_rate);
@@ -196,5 +202,38 @@ impl Limiter {
                 set_lane(&mut s.successes, lane, successes);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_climbs_ten_cu_per_ten_successes_up_to_the_ceiling() {
+        let limiter = Limiter::new(
+            4000.0,
+            0.2,
+            Lanes {
+                tail: 24,
+                backfill: 32,
+            },
+        );
+        limiter.state.lock().unwrap().active.backfill = 1;
+        limiter.release(Lane::Backfill, true, 1000);
+        assert!((limiter.rate() - 2800.0).abs() < 1e-9);
+        assert_eq!(limiter.windows().backfill, 16);
+        for _ in 0..RECOVERY_SUCCESSES {
+            limiter.state.lock().unwrap().active.backfill = 1;
+            limiter.release(Lane::Backfill, false, 0);
+        }
+        assert!((limiter.rate() - 2810.0).abs() < 1e-9);
+        assert_eq!(limiter.windows().backfill, 17);
+        for _ in 0..(RECOVERY_SUCCESSES * 200) {
+            limiter.state.lock().unwrap().active.backfill = 1;
+            limiter.release(Lane::Backfill, false, 0);
+        }
+        assert!((limiter.rate() - 4000.0).abs() < 1e-9);
+        assert_eq!(limiter.windows().backfill, 32);
     }
 }

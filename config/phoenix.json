@@ -40,6 +40,7 @@
   "probeTransactionLimit": 200,
   "probePageLimit": 20,
   "archiveBackfillEnabled": true,
-  "archiveChunkSlots": 10000,
-  "archiveOrderingSample": 0.02
+  "archiveChunkSlots": 50000,
+  "archiveOrderingSample": 0.02,
+  "retentionSlotsPerPass": 100000
 }
