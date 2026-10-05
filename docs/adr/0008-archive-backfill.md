@@ -45,3 +45,19 @@ epoch. The archive carries no account updates. Old Faithful does not state final
 documentation; the blocks are the canonical chain as archived after the epoch closed, and the
 RPC manifest check guards completeness. The proof before cutover re-collects a range the RPC
 lane already published and compares every row.
+
+## Production validation (2026-10-05)
+
+`dev archive-check` on slots 452,000,000 to 452,009,999, a range the RPC lane had published:
+338,521 transactions and 9,996 blocks from the archive, every row identical to the archive
+(signatures, block indexes, wire bytes, decisive meta fields). Streaming the range in reverse took
+371 s; streaming forward took 12 s for the neighbouring range 452,010,000 to 452,019,999 (285,714
+transactions, identical rows), so forward is the default. The mirror delivered 116 MB/s to one
+plain stream and 522 MB/s to eight, so the lane is not network-bound at this box.
+
+First live range after cutover (reverse, 450,217,137 to 450,227,136): 212,435 transactions, stream
+230 s, insert 69 s, manifest 36 s, validation 28 s, V1 and V6 passed, published with
+`source: archive`. With forward streaming the stream phase is seconds, so the manifest walk, the
+checkpoint insert and validation dominate a range; `archiveChunkSlots` moves from 10,000 to 50,000
+to amortize them. The reverse direction stays available through `SOLOS_DATA_ARCHIVE_REVERSE=1`.
+

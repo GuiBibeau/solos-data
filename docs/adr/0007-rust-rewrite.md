@@ -56,3 +56,22 @@ over two decoded roots, and by a shadow collector on a copy of the raw checkpoin
 for row with the live collector's files. Byte-level Parquet equality is not a goal: files are
 hashed at creation; rows are what the proofs compare. Nested objects embedded from DuckDB rows
 keep column order; JSON values nested inside them sort their keys.
+
+## Production validation (2026-10-05)
+
+Shadow proof: a Rust collector on a seeded scratch root re-collected slots 452,396,000 to
+452,400,999 over RPC at 1,000 CU/s and stopped cleanly on SIGTERM; its 45,810 transactions over
+2,966 slots matched the live archive in ordering, wire bytes, `meta` text and every column, and
+the signature manifests matched. Decoder proof: both decoders ran on the same raw file; all six
+tables were identical, as were `status.json`, `catalog.json` and query output.
+
+Cutover at 12:53 UTC: both services stopped, 190 GB of checkpoints, WAL, catalogs and status files
+backed up, unit files swapped, services started at 12:55. Pre-cutover state: watermark
+453,584,819, backfill cursor 450,228,136 after 2,945 chunks, 70,672,864 decoded transactions. The
+first live tail chunk published within four seconds of start; the decoder resumed with
+10,000-transaction batches. The TypeScript decoder had exited with status 1 on stop because it
+killed its codec child mid-batch; the batch had not reached its publish transaction and was
+replayed. One operational note: eleven provider throttles in the first minutes, inherited from
+parallel proof runs, left the limiter's additive recovery at 188 CU/s; a service restart resets
+the rate (done at 13:04).
+

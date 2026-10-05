@@ -24,7 +24,8 @@ Historical collection below the last published Old Faithful epoch comes from the
 archive lane (ADR-0008) when `archiveBackfillEnabled` is true in `config/phoenix.json`.
 It needs no credential; it reads `files.old-faithful.net` and spends compute units
 only on the signature manifest and a sampled `getBlock` cross-check. Set
-`JETSTREAMER_THREADS` to bound its parallelism on a shared machine.
+`JETSTREAMER_THREADS` to bound its parallelism on a shared machine. After a burst of provider
+throttles the limiter recovers slowly by design; restarting the collector resets its rate.
 
 For an existing large checkpoint, stop its writer and run:
 
