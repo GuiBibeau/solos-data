@@ -30,6 +30,10 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS published_ranges (
  slot_from BIGINT, slot_to BIGINT, PRIMARY KEY(slot_from, slot_to)
 );
+CREATE TABLE IF NOT EXISTS file_bounds(path VARCHAR PRIMARY KEY,slot_from BIGINT,slot_to BIGINT);
+CREATE TABLE IF NOT EXISTS retired_files(path VARCHAR PRIMARY KEY,replacement_path VARCHAR,retired_at VARCHAR);
+CREATE TABLE IF NOT EXISTS compaction_inputs(path VARCHAR,source_hash VARCHAR,row_count BIGINT);
+CREATE TABLE IF NOT EXISTS garbage_removed(path VARCHAR PRIMARY KEY,removed_at VARCHAR);
 INSERT OR IGNORE INTO published_ranges
  SELECT DISTINCT TRY_CAST(regexp_extract(path, '/([0-9]+)-([0-9]+)-[^/]+[.]parquet$', 1) AS BIGINT),
  TRY_CAST(regexp_extract(path, '/([0-9]+)-([0-9]+)-[^/]+[.]parquet$', 2) AS BIGINT)

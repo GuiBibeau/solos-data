@@ -13,8 +13,12 @@ services:
   decoder:
     image: solos-data:local
     build: .
+    depends_on: [collector]
+    # Reader leases use process IDs in a shared namespace.
+    pid: service:collector
     volumes:
       - ./data/phoenix_raw:/data/raw:ro
+      - ./data/phoenix_raw/.readers:/data/raw/.readers
       - ./data/phoenix_decoded:/data/decoded
     restart: unless-stopped
     stop_grace_period: 60s

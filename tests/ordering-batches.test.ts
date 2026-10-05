@@ -22,7 +22,7 @@ test('batched ordering preserves finalized indexes, bounded restart and cached r
     }
     await walkPage(new FixtureRpc([signatures]), f.store, 'manifest', makeWalk('program', 'backfill', 'batch', 0, 165));
     const failing = new FixtureRpc([], { ...blocks, 164: [] });
-    await assert.rejects(orderRange(failing, f.store, 'backfill', 100, 165), /missing/);
+    await assert.rejects(orderRange(failing, f.store, 'backfill', 100, 165,64), /missing/);
     assert.equal((await validateRange(f.store, 100, 163)).ok, true);
     assert.equal((await validateRange(f.store, 164, 165)).ok, false);
     // Cached block data must repair transactions whose ordering write was not retained.

@@ -8,7 +8,10 @@ import { Codec, type DecodedGroup } from './codec.ts';
 import { extractGroups } from './instructions.ts';
 import { emptyRows, normalize } from './normalize.ts';
 import { nextSource, sourceRows } from './source.ts';
-import { publish, recover } from './publish.ts';
+import { publish, recover,writeCatalog } from './publish.ts';
+import { withReadLease } from '../read-lease.ts';
+import { compactDecoded } from './compactor.ts';
+import { collectRetired } from '../garbage-collector.ts';
 
 export interface DecoderConfig { rawDir: string; dataDir: string; codecPath: string; batchSize: number; pollMs: number }
 export async function runDecoder(config: DecoderConfig, once = false) {
@@ -16,18 +19,23 @@ export async function runDecoder(config: DecoderConfig, once = false) {
   const codec = new Codec(config.codecPath);
   const verified = new Set<string>();
   let stopping = false;
+  let lastMaintenance=0;
   const stop = () => { stopping = true; };
   process.on('SIGTERM', stop); process.on('SIGINT', stop);
   try {
     await recover(store);
     while (!stopping) {
-      const source = await nextSource(store, config.rawDir);
+      const input=await withReadLease(config.rawDir,async()=>{
+        const source=await nextSource(store,config.rawDir);
+        return source ? {source,raw:await sourceRows(store,config.rawDir,source.file,source.offset,config.batchSize,verified)} : undefined;
+      });
+      const source=input?.source;
       if (!source) {
         await snapshot(store, { idle: true });
         if (once) break;
         await sleep(config.pollMs); continue;
       }
-      const raw = await sourceRows(store, config.rawDir, source.file, source.offset, config.batchSize, verified);
+      const raw=input!.raw;
       const rows = emptyRows();
       const seen: { signature: string; source_hash: string }[] = [];
       for (const tx of raw) {
@@ -56,6 +64,12 @@ export async function runDecoder(config: DecoderConfig, once = false) {
       }
       await publish(store, rows, { hash: source.file.sha256, path: source.file.path, offset: source.offset + raw.length,
         at:source.file.created_at, seen });
+      if(Date.now()-lastMaintenance>60000) {
+        const compaction=await compactDecoded(store);
+        const garbage=await collectRetired(store,store.root,600,writeCatalog);
+        await store.exec('CHECKPOINT');
+        log('decoded_maintenance',{...compaction,...garbage});lastMaintenance=Date.now();
+      }
       await snapshot(store, { idle: false, sourceCatalogAt: source.catalogAt, batchTransactions: rows.decoded_transactions.length,
         batchEvents: rows.events.length, batchFills: rows.fills.length,
         batchQuarantined: rows.decoded_transactions.filter(row => row.status === 'quarantined').length });

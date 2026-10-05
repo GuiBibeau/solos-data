@@ -28,7 +28,11 @@ from being mistaken for complete acceptance. Checkmarks require recorded evidenc
   event/fill sources; preserve corrected versions and reprocess quarantined payloads.
 - [ ] Validated state snapshots and forward replay for books/positions, market funding
   rates, and coverage-aware 10-minute features. Decoded events alone do not provide these.
-- [ ] Decoded partition compaction/retention and shared-server SQL serving if needed.
+- [x] Bounded decoded compaction, replacement verification, reader-aware input cleanup,
+  permanent raw archive with verified checkpoint trimming and checkpoint rewrites;
+  staging-memory and cleanup-fairness regression checks. Production counts/hashes
+  and storage results: [ADR 0006](../adr/0006-continuous-storage-retention.md).
+- [ ] Shared-server SQL serving if needed.
 - [ ] Complete M0: full recent day, JSON-RPC batch probe, same-slot until boundary,
   lookup-table/CPI independent samples, event-sequence decision D1, websocket deltas.
 - [ ] Size tail at >=2R from a representative day and the actual account CU/s limit.

@@ -54,3 +54,18 @@ test('live transaction ranges take priority over newly published history and leg
     assert.equal((await nextSource(store,root))!.file.sha256,'history');
   } finally { await store.close(); await rm(root,{recursive:true,force:true}); }
 });
+
+test('fully consumed compaction parents avoid decoding the same raw archive again',async()=>{
+  const root=await mkdtemp(join(tmpdir(),'decode-lineage-'));
+  const store=await Store.open(root,schema);
+  try {
+    await store.exec("INSERT INTO sources VALUES ('parent-a','old-a',10),('parent-b','old-b',20)");
+    await writeFile(join(root,'catalog.json'),JSON.stringify({at:'fixture',files:[
+      {path:'staging/100-200-merged.parquet',sha256:'merged',table_name:'transactions',row_count:30,created_at:'fixture',
+        parents:[{sha256:'parent-a',row_count:10},{sha256:'parent-b',row_count:20}]},
+      {path:'staging/50-99-pending.parquet',sha256:'pending',table_name:'transactions',row_count:1,created_at:'fixture'},
+    ]}));
+    assert.equal((await nextSource(store,root))!.file.sha256,'pending');
+    assert.equal((await store.rows("SELECT row_offset FROM sources WHERE source_hash='merged'"))[0].row_offset,'30');
+  } finally {await store.close();await rm(root,{recursive:true,force:true});}
+});

@@ -2,12 +2,16 @@ import { readFile } from 'node:fs/promises';
 import { resolve, join } from 'node:path';
 import { runDecoder } from './service.ts';
 import { queryDecoded } from './reader.ts';
+import { repackCheckpoint } from '../repack.ts';
+import { Store } from '../store.ts';
+import { schema } from './schema.ts';
+import { verifyDecoded } from './verify.ts';
 import { safeError } from '../service.ts';
 
 async function main() {
   const command = process.argv[2] ?? 'help';
   if (['help', '--help'].includes(command)) {
-    console.log(JSON.stringify({ commands: ['once', 'watch', 'status', 'query --sql SELECT ...'],
+    console.log(JSON.stringify({ commands: ['once', 'watch', 'status', 'query --sql SELECT ...', 'verify-storage (offline)', 'repack (offline)'],
       config: '--config config/decoded.json; no RPC credential required' })); return;
   }
   const index = process.argv.indexOf('--config');
@@ -23,6 +27,12 @@ async function main() {
     const sqlIndex = process.argv.indexOf('--sql');
     if (sqlIndex === -1) throw new Error('query requires --sql');
     console.log(JSON.stringify(await queryDecoded(config.dataDir, process.argv[sqlIndex + 1]))); return;
+  }
+  if(command==='repack') {console.log(JSON.stringify(await repackCheckpoint(config.dataDir)));return;}
+  if(command==='verify-storage') {
+    const store=await Store.open(config.dataDir,schema);
+    try {console.log(JSON.stringify(await verifyDecoded(store)));} finally {await store.close();}
+    return;
   }
   if (!['once', 'watch'].includes(command)) throw new Error('unknown decoder command');
   await runDecoder(config, command === 'once');

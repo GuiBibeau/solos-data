@@ -62,6 +62,8 @@ export async function publishRange(store: Store, root: string, from: number, to:
     try {
       for (const file of files) await connection.run('INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)',
         [file.path, file.table, file.epoch, file.count, file.hash, now(), 'active']);
+      for (const file of files) await connection.run('INSERT INTO file_bounds VALUES (?, ?, ?)',
+        [file.path,Math.max(from,file.epoch*432000),Math.min(to,(file.epoch+1)*432000-1)]);
       await connection.run('INSERT OR IGNORE INTO published_ranges VALUES (?, ?)', [from, to]);
       if (checkpoint) {
         await connection.run('INSERT OR REPLACE INTO kv VALUES (?, ?::JSON)', [checkpoint.key, json(checkpoint.value)]);

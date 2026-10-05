@@ -16,7 +16,7 @@ export async function publish(store: Store, rows: Rows, source: SourceProgress) 
   await store.exclusive(async connection => {
     const files: any[] = [];
     for (const table of tables) {
-      await connection.run(`DELETE FROM ${table}`);
+      await connection.run(`CREATE OR REPLACE TEMP TABLE ${table}(${definitions[table]})`);
       if (!rows[table].length) continue;
       await connection.run(`INSERT INTO ${table} SELECT unnest(json_transform(?::JSON, ?::JSON), recursive:=true)`,
         [JSON.stringify(rows[table]), JSON.stringify([Object.fromEntries(definitions[table].split(',').map(column => {
@@ -44,7 +44,7 @@ export async function publish(store: Store, rows: Rows, source: SourceProgress) 
       const seen = source.seen ?? rows.decoded_transactions;
       if (seen.length) {
         const keys = seen.map(row => sqlString(String(row.signature))).join(',');
-        await connection.run('DELETE FROM processed_batch');
+        await connection.run('CREATE OR REPLACE TEMP TABLE processed_batch(signature VARCHAR, source_hash VARCHAR, publication_at VARCHAR)');
         await connection.run(`INSERT INTO processed_batch SELECT value->>'signature', value->>'source_hash', ?
           FROM json_each(?::JSON)`, [source.at ?? '',JSON.stringify(seen)]);
         await connection.run(`UPDATE processed SET source_hash=b.source_hash, publication_at=b.publication_at
@@ -62,16 +62,18 @@ export async function publish(store: Store, rows: Rows, source: SourceProgress) 
 }
 
 export async function writeCatalog(store: Store) {
-  const files = await store.rows('SELECT * FROM files ORDER BY batch_id');
+  await store.exclusive(async connection=>{
+  const files = (await connection.runAndReadAll('SELECT * FROM files ORDER BY batch_id')).getRowObjectsJson();
   const catalog = { at: now(), schemaVersion: 1, decoderVersion: version, files,
     acceptance: 'decoded events; source range validation/sealing and state reconstruction pending' };
   const path = join(store.root, 'catalog.json');
   await writeFile(path + '.tmp', JSON.stringify(catalog) + '\n');
   await syncPath(path + '.tmp'); await rename(path + '.tmp', path); await syncPath(store.root);
+  });
 }
 
 export async function recover(store: Store) {
-  const files = new Set((await store.rows('SELECT path FROM files')).map(row => join(store.root, row.path)));
+  const files = new Set((await store.rows('SELECT path FROM files UNION SELECT path FROM retired_files')).map(row => join(store.root, row.path)));
   const walk = async (root: string) => {
     for (const item of await readdir(root, { withFileTypes: true })) {
       const path = join(root, item.name);

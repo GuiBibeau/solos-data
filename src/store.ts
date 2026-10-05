@@ -4,11 +4,13 @@ import { DuckDBInstance, type DuckDBConnection, type DuckDBValue } from '@duckdb
 import { json } from './config.ts';
 import { schema } from './schema.ts';
 import { requireStorageSpace } from './storage-space.ts';
+import { repackCheckpoint } from './repack.ts';
 
 export class Store {
   connection: DuckDBConnection;
   instance: DuckDBInstance;
   root = '';
+  ddl = schema;
   queue: Promise<unknown> = Promise.resolve();
   timings: Record<string, { calls:number; seconds:number; maxSeconds:number }> = {};
 
@@ -33,10 +35,10 @@ export class Store {
   static async open(dataDir: string, ddl = schema) {
     await mkdir(dataDir, { recursive: true });
     const memory = process.env.SOLOS_DATA_DB_MEMORY ?? '4GB';
-    const instance = await DuckDBInstance.create(join(dataDir, 'checkpoint.duckdb'), { threads: '4', memory_limit: memory,
+    const instance = await DuckDBInstance.create(join(dataDir, 'checkpoint.duckdb'), { threads: process.env.SOLOS_DATA_DB_THREADS??'4', memory_limit: memory,
       checkpoint_threshold:process.env.SOLOS_DATA_DB_CHECKPOINT ?? '256MB' });
     const store = new Store(instance, await instance.connect());
-    store.root = dataDir;
+    store.root = dataDir;store.ddl=ddl;
     await store.exec(ddl);
     return store;
   }
@@ -74,6 +76,20 @@ export class Store {
 
   async set(name: string, value: unknown) {
     await this.exec('INSERT OR REPLACE INTO kv VALUES (?, ?::JSON)', [name, json(value)]);
+  }
+
+  /** Queue all database users while the sole writer rewrites and reopens its checkpoint. */
+  async repack() {
+    return this.exclusive(async()=>{
+      await requireStorageSpace(this.root);
+      this.connection.closeSync();this.instance.closeSync();
+      try { return await repackCheckpoint(this.root); }
+      finally {
+        const next=await Store.open(this.root,this.ddl);
+        next.timings=this.timings;
+        this.connection=next.connection;this.instance=next.instance;
+      }
+    });
   }
 
   async close() {

@@ -15,6 +15,7 @@ export interface Config {
   bulkCommitPages: number;
   maxSupportedTransactionVersion: number;
   backfillChunkSlots: number;
+  checkpointHotSlots:number; maintenanceIntervalSeconds:number; garbageGraceSeconds:number;
 }
 
 export async function loadConfig(path = 'config/phoenix.json'): Promise<Config> {
@@ -23,15 +24,20 @@ export async function loadConfig(path = 'config/phoenix.json'): Promise<Config> 
   config.bulkFetchWindowSlots ??= 128;
   config.bulkFetchConcurrency ??= 8;
   config.bulkCommitPages ??= 10;
+  config.checkpointHotSlots ??= 10000;
+  config.maintenanceIntervalSeconds ??= 60;
+  config.garbageGraceSeconds ??= 600;
   config.dataDir = resolve(process.env.SOLOS_DATA_DIR ?? config.dataDir);
   if (process.env.SOLOS_DATA_CU_PER_SECOND) config.cuPerSecond = Number(process.env.SOLOS_DATA_CU_PER_SECOND);
   if (config.cuPerSecond <= 0 || !Number.isFinite(config.cuPerSecond)) throw new Error('Invalid CU/s');
   if (config.tailShare <= 0 || config.tailShare >= 1) throw new Error('Invalid tail share');
   if (config.utilization <= 0 || config.utilization > 1) throw new Error('Invalid utilization');
   for (const key of ['overlapSlots', 'maxSlotsPerChunk', 'backfillChunkSlots', 'fetchBatchSize', 'maxRetries',
-    'bulkFetchWindowSlots', 'bulkFetchConcurrency', 'bulkCommitPages'] as const) {
+    'bulkFetchWindowSlots', 'bulkFetchConcurrency', 'bulkCommitPages','checkpointHotSlots',
+    'maintenanceIntervalSeconds','garbageGraceSeconds'] as const) {
     if (!Number.isInteger(config[key]) || config[key] <= 0) throw new Error(`Invalid ${key}`);
   }
+  if(config.checkpointHotSlots<=config.overlapSlots+config.maxSlotsPerChunk) throw new Error('checkpoint hot slots must retain tail overlap and a full chunk');
   if (config.bulkCommitPages > 32) throw new Error('bulkCommitPages must be at most 32');
   return config;
 }

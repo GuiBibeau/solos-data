@@ -15,6 +15,7 @@ export async function status(store: Store, provider?: Provider) {
     (SELECT max(slot) FROM signatures) AS newest_slot`);
   return { at: now(), ...counts, H0: await store.get('H0'), watermark: await store.get('W'),
     backfill: await store.get('backfill'), walk: await store.get('walk/backfill'),
+    retention:await store.get('retention'),checkpointRepack:await store.get('checkpoint-repack'),maintenance:await store.get('maintenance'),checkpointCounts:counts,
     tailCycle: await store.get('tail-active'), tailHealth: await store.get('tail-health'),
     exchange: await store.get('exchange'), metrics: provider?.counters,
     storageTimings: store.timings,

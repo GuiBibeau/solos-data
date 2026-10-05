@@ -5,7 +5,7 @@ import { RpcFailure } from './rpc.ts';
 import type { Store } from './store.ts';
 import { tailCycle } from './pipeline.ts';
 import { backfill } from './history.ts';
-import { compact } from './compactor.ts';
+import { maintain } from './maintenance.ts';
 import { recoverFiles } from './writer.ts';
 import { writeStatus } from './status.ts';
 
@@ -28,7 +28,7 @@ export async function run(provider: Provider, store: Store, config: Config) {
   process.on('SIGTERM', stop);
   process.on('SIGINT', stop);
   let lastRefresh = Date.now();
-  let lastCompact = Date.now();
+  let lastMaintenance = Date.now();
   let errorStreak = 0;
   async function recordError(lane: string, error: unknown) {
     const detail = { lane, error: safeError(error), at: now() };
@@ -57,8 +57,8 @@ export async function run(provider: Provider, store: Store, config: Config) {
         }
         await tailCycle(provider, store, config, exchange.programData);
         errorStreak = 0;
-        if (started - lastCompact > config.compactionIntervalSeconds * 1000) {
-          await compact(store, config.dataDir); lastCompact = Date.now();
+        if (started - lastMaintenance > config.maintenanceIntervalSeconds * 1000) {
+          log('storage_maintenance',await maintain(store,config));lastMaintenance=Date.now();
         }
       } catch (error) { if (stopped) break; errorStreak++; await recordError('tail', error); }
       await store.set('tail-health', { errorStreak, cycleDurationSeconds: (Date.now() - started) / 1000 });

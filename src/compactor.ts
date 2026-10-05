@@ -4,13 +4,14 @@ import { randomUUID } from 'node:crypto';
 import { now } from './config.ts';
 import type { Store } from './store.ts';
 import { fileHash, sqlString, syncPath } from './writer.ts';
+import { writeCatalog } from './catalog.ts';
 
 /** Consolidates only registered revisions; the newest publication wins per signature. */
 export async function compact(store: Store, root: string) {
   const groups = await store.rows(`SELECT table_name, epoch FROM files WHERE status='active'
     GROUP BY table_name, epoch HAVING count(*)>=10`);
   for (const group of groups) await store.exclusive(async connection => {
-    const reader = await connection.runAndReadAll(`SELECT path, row_count FROM files
+    const reader = await connection.runAndReadAll(`SELECT path, row_count,sha256 FROM files
       WHERE status='active' AND table_name=? AND epoch=? ORDER BY created_at DESC, path DESC`,
       [group.table_name, Number(group.epoch)]);
     const paths: string[] = [];
@@ -37,18 +38,25 @@ export async function compact(store: Store, root: string) {
     await syncPath(path + '.tmp');
     await rename(path + '.tmp', path);
     await syncPath(directory);
-    const count = await connection.runAndReadAll(`SELECT count(*) AS n FROM read_parquet(${sqlString(path)})`);
+    const count = await connection.runAndReadAll(`SELECT count(*) AS n,min(slot) AS first,max(slot) AS last FROM read_parquet(${sqlString(path)})`);
     const expected = await connection.runAndReadAll(`SELECT count(*) AS n FROM (${query})`);
     const n = Number(count.getRowObjectsJson()[0].n);
     if (n !== Number(expected.getRowObjectsJson()[0].n)) throw new Error('V7: compaction mismatch');
     const hash = await fileHash(path);
     await connection.run('BEGIN');
     try {
-      for (const old of paths) await connection.run("UPDATE files SET status='superseded' WHERE path=?", [old]);
+      for (const old of paths) {
+        await connection.run("UPDATE files SET status='superseded' WHERE path=?", [old]);
+        await connection.run('INSERT INTO retired_files VALUES (?, ?, ?)',[old,path,now()]);
+        const input=reader.getRowObjectsJson().find(file=>file.path===old)!;
+        await connection.run('INSERT INTO compaction_inputs VALUES (?, ?, ?)',[path,String(input.sha256),Number(input.row_count)]);
+      }
       await connection.run('INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)',
         [path, group.table_name, Number(group.epoch), n, hash, now(), 'active']);
+      const bounds=count.getRowObjectsJson()[0];
+      await connection.run('INSERT INTO file_bounds VALUES (?, ?, ?)',[path,Number(bounds.first),Number(bounds.last)]);
       await connection.run('COMMIT');
     } catch (error) { await connection.run('ROLLBACK'); throw error; }
-    // Superseded files remain recoverable. Garbage collection is an explicit future operation.
   });
+  await writeCatalog(store,root);
 }

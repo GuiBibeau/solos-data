@@ -10,6 +10,34 @@ docker compose up -d
 
 `.env` holds the RPC URL and rate setting. Keep it out of Git and mode 0600.
 Data is stored under `data/`. Back up both raw and decoded directories.
+
+Cleanup runs every minute. Historical raw and decoded Parquet remain on disk.
+The checkpoint retains unpublished work and a recent 10,000-slot working set.
+The raw writer automatically rewrites a growing checkpoint after it exceeds
+both 16 GiB and twice its previous compact size. Database writes queue briefly
+during the verified rewrite; immutable Parquet remains queryable.
+Superseded inputs are removed after ten minutes when no local reader is using
+an old catalog and the replacement passes checksum/count verification.
+`status` counters describe the hot checkpoint; use `query` for historical totals.
+
+For an existing large checkpoint, stop its writer and run:
+
+```sh
+npm run collector -- maintain --all
+npm run collector -- repack
+npm run collector -- verify-storage
+```
+
+Then restart the collector. `maintain --all` verifies archived contents before
+trimming copies. `repack` verifies every table before atomically replacing the
+closed checkpoint. Never run these offline commands while a writer is running.
+`maintain --all --legacy` optionally scans superseded files from older releases.
+This can take much longer and retains any file whose full contents do not match
+the latest archive. It is separate from routine cleanup and checkpoint rewrites.
+Use decoder `repack` and `verify-storage` with its writer stopped if needed.
+`validate-next-backfill` reports a blocked historical range;
+`repair-next-backfill` repairs ordering using already cached finalized blocks only.
+R2 is optional; cleanup preserves the whole archive locally.
 Do not point two writers at the same checkpoint directory.
 
 ## Native Linux services
@@ -41,7 +69,8 @@ SOLOS_DATA_CU_PER_SECOND=1000
 Set `SOLOS_DATA_DIR` to the raw path used by the decoder unit. Its default is
 `~/.local/share/solos-data/phoenix_raw`. The unit memory limits are examples;
 adjust them for your server. DuckDB defaults to 4GB unless `SOLOS_DATA_DB_MEMORY`
-is set. Effective CU/s is the configured rate multiplied by utilization.
+is set. `SOLOS_DATA_QUERY_MEMORY` independently controls analytical query memory
+(default 4GB); increase it for full-history scans on a larger server. Effective CU/s is the configured rate multiplied by utilization.
 `SOLOS_DATA_DB_CHECKPOINT` defaults to `256MB`. It controls automatic checkpoint
 frequency; committed changes stay durable in the write-ahead log between checkpoints.
 

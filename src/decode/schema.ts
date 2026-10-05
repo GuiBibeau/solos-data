@@ -28,5 +28,7 @@ ALTER TABLE processed ADD COLUMN IF NOT EXISTS publication_at VARCHAR;
 CREATE TABLE IF NOT EXISTS sources(source_hash VARCHAR PRIMARY KEY, path VARCHAR, row_offset BIGINT);
 CREATE TABLE IF NOT EXISTS files(path VARCHAR PRIMARY KEY, table_name VARCHAR, row_count BIGINT,
   sha256 VARCHAR, batch_id BIGINT, created_at VARCHAR);
+CREATE TABLE IF NOT EXISTS retired_files(path VARCHAR PRIMARY KEY,replacement_path VARCHAR,retired_at VARCHAR);
+CREATE TABLE IF NOT EXISTS garbage_removed(path VARCHAR PRIMARY KEY,removed_at VARCHAR);
 CREATE TEMP TABLE processed_batch(signature VARCHAR, source_hash VARCHAR, publication_at VARCHAR);
 ${tables.map(table => `CREATE TEMP TABLE ${table}(${definitions[table]});`).join('\n')}`;

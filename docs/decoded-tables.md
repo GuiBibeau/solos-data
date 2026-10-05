@@ -10,6 +10,8 @@ Default decoded output: `data/phoenix_decoded/v1`.
 `catalog.json` registers relative file paths, SHA256 hashes, row counts and batch IDs.
 `checkpoint.duckdb` holds resume/dedupe metadata, not a second full analytical copy.
 Files are partitioned by table and Solana epoch, sorted by slot and signature.
+Small files are compacted every minute. Superseded inputs have a ten-minute
+reader-aware grace period; historical rows remain in their verified replacements.
 
 | Table | Contents |
 | --- | --- |
@@ -64,7 +66,9 @@ npm run decoder -- watch
 Portable deployment can use `docker compose build` and `docker compose up -d`.
 Provide SOLANA_RPC_URL through the shell or a private env file. It is required only
 for the collector; the decoder has no credential. Mount raw input read-only for the
-decoder. Do not run Compose and systemd collectors on the same checkpoint directory.
+decoder; its `.readers` subdirectory must be writable for cleanup leases. Compose
+shares the collector's PID namespace so abandoned reader leases can be recognized.
+Do not run Compose and systemd collectors on the same checkpoint directory.
 
 To move decoded data, gracefully stop its writer, copy the entire decoded root
 (including checkpoint, catalog and tables), and point SOLOS_DATA_DECODED_DIR at the
@@ -73,3 +77,7 @@ copy just catalog.json and registered Parquet files, and run `query` on that roo
 The catalog uses relative paths; no Alchemy credential is needed. Relocating the raw
 collector also requires rebasing its legacy absolute registrations before resuming;
 see the collector's offline `relocate` command.
+
+Decoder staging tables are recreated for each batch so temporary storage remains
+bounded. `SOLOS_DATA_QUERY_MEMORY` sets the native query working-memory limit
+(default 4GB). Stop the decoder before `repack` or `verify-storage`.

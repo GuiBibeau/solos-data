@@ -4,12 +4,17 @@ import { DuckDBInstance } from '@duckdb/node-api';
 import { sqlString } from '../writer.ts';
 import { definitions, tables } from './schema.ts';
 import { sourcePath } from './source.ts';
+import { withReadLease } from '../read-lease.ts';
 
 /** Read-only SQL over registered Parquet, with latest transaction revisions. */
 export async function queryDecoded(root: string, sql: string) {
+  return withReadLease(root,()=>readDecoded(root,sql));
+}
+
+async function readDecoded(root: string,sql:string) {
   if (!/^\s*(select|with)\b/i.test(sql) || sql.includes(';')) throw new Error('query accepts one SELECT or WITH statement');
   const catalog = JSON.parse(await readFile(join(root, 'catalog.json'), 'utf8'));
-  const instance = await DuckDBInstance.create(':memory:', { threads: '4', memory_limit: '4GB' });
+  const instance = await DuckDBInstance.create(':memory:', { threads: '4', memory_limit: process.env.SOLOS_DATA_QUERY_MEMORY??'4GB' });
   const connection = await instance.connect();
   try {
     for (const table of tables) {

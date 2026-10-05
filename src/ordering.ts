@@ -13,7 +13,7 @@ export function joinOrdering(slot: number, signatures: string[], block: string[]
   });
 }
 
-export async function orderRange(rpc: Rpc, store: Store, lane: Lane, from: number, to: number) {
+export async function orderRange(rpc: Rpc, store: Store, lane: Lane, from: number, to: number,batchSlots=256) {
   const slots = await store.rows(`SELECT slot, list(signature ORDER BY signature) AS signatures
     FROM signatures WHERE slot BETWEEN ? AND ? GROUP BY slot ORDER BY slot`, [from, to]);
   const cache = new Map<number, any[]>();
@@ -23,8 +23,8 @@ export async function orderRange(rpc: Rpc, store: Store, lane: Lane, from: numbe
     entries.push(item); cache.set(slot, entries);
   }
   // Bound memory and replay on failure; avoid one read/commit/fsync for every slot.
-  for (let offset = 0; offset < slots.length; offset += 64) {
-    const batch = slots.slice(offset, offset + 64);
+  for (let offset = 0; offset < slots.length; offset += batchSlots) {
+    const batch = slots.slice(offset, offset + batchSlots);
     const ordered: ReturnType<typeof joinOrdering> = [];
     const singles: number[] = [];
     await parallel(batch, 32, async row => {

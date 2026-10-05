@@ -20,6 +20,11 @@ export async function nextSource(store: Store, rawRoot: string) {
   const candidates = [];
   for (const file of catalog.files.filter(file => file.table_name === 'transactions' &&
     (progress.get(file.sha256) ?? 0) < Number(file.row_count))) {
+    // A merge adds no new payload when all immutable input sources were consumed.
+    if(file.parents?.length && file.parents.every(parent=>(progress.get(parent.sha256)??0)>=Number(parent.row_count))) {
+      await store.exec('INSERT OR REPLACE INTO sources VALUES (?, ?, ?)',[file.sha256,file.path,Number(file.row_count)]);
+      progress.set(file.sha256,Number(file.row_count));continue;
+    }
     candidates.push({ file,slot:await sourcePriority(store,rawRoot,file) });
   }
   const file = candidates.sort((a,b) => b.slot-a.slot || b.file.created_at.localeCompare(a.file.created_at)
