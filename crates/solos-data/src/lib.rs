@@ -3,6 +3,8 @@
 
 pub mod catalog;
 pub mod cli;
+pub mod collector;
+pub mod db;
 pub mod decoder;
 pub mod dev;
 pub mod fsutil;

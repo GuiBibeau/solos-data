@@ -5,11 +5,19 @@
   "cuPerSecond": 10000,
   "utilization": 0.8,
   "tailShare": 0.2,
-  "concurrency": { "tail": 24, "backfill": 32 },
+  "concurrency": {
+    "tail": 24,
+    "backfill": 32
+  },
   "cuWeights": {
-    "getGenesisHash": 10, "getSlot": 20, "getAccountInfo": 10,
-    "getSignaturesForAddress": 40, "getTransaction": 40, "getBlock": 40,
-    "getProgramAccountsV2": 20, "getTransactionsForAddress": 100
+    "getGenesisHash": 10,
+    "getSlot": 20,
+    "getAccountInfo": 10,
+    "getSignaturesForAddress": 40,
+    "getTransaction": 40,
+    "getBlock": 40,
+    "getProgramAccountsV2": 20,
+    "getTransactionsForAddress": 100
   },
   "tailIntervalSeconds": 30,
   "overlapSlots": 150,
@@ -30,5 +38,8 @@
   "garbageGraceSeconds": 600,
   "maxRetries": 6,
   "probeTransactionLimit": 200,
-  "probePageLimit": 20
+  "probePageLimit": 20,
+  "archiveBackfillEnabled": true,
+  "archiveChunkSlots": 10000,
+  "archiveOrderingSample": 0.02
 }

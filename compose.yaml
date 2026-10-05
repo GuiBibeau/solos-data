@@ -2,7 +2,7 @@ services:
   collector:
     image: solos-data:local
     build: .
-    command: [node, src/cli.ts, run]
+    command: [solos-data, collector, run]
     environment:
       SOLANA_RPC_URL: ${SOLANA_RPC_URL:?Load the RPC URL without printing it}
       SOLOS_DATA_CU_PER_SECOND: ${SOLOS_DATA_CU_PER_SECOND:-1000}
