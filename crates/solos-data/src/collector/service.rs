@@ -110,17 +110,28 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
             if !config.backfill_enabled {
                 return Ok::<(), StoreError>(());
             }
-            let tip: Arc<std::sync::Mutex<(Option<i64>, Option<Instant>)>> =
-                Arc::new(std::sync::Mutex::new((None, None)));
-            while !stopped.load(Ordering::Relaxed) {
-                let program_data = exchange.lock().expect("exchange").program_data.clone();
-                if config.archive_backfill_enabled {
-                    let refresh_due = tip
-                        .lock()
-                        .expect("tip")
-                        .1
-                        .is_none_or(|t| t.elapsed() > Duration::from_secs(600));
-                    if refresh_due {
+            let archive_enabled = config.archive_backfill_enabled && cfg!(feature = "archive");
+            if config.archive_backfill_enabled && !archive_enabled {
+                log("archive_lane_unavailable", Obj::new());
+            }
+            // The tip is probed in the background every ten minutes; a throttled probe keeps the
+            // last known value, which also survives restarts through the `archive-tip` record.
+            let known: Option<i64> = db
+                .get("archive-tip")
+                .await
+                .ok()
+                .flatten()
+                .and_then(|v| v.get("slot").and_then(Value::as_i64));
+            let tip: Arc<std::sync::Mutex<Option<i64>>> = Arc::new(std::sync::Mutex::new(known));
+            if archive_enabled {
+                let (tip, db, config, stopped) = (
+                    Arc::clone(&tip),
+                    db.clone(),
+                    config.clone(),
+                    Arc::clone(&stopped),
+                );
+                tokio::spawn(async move {
+                    while !stopped.load(Ordering::Relaxed) {
                         let hint = db
                             .get("W")
                             .await
@@ -128,17 +139,44 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
                             .flatten()
                             .and_then(|w| w.get("slot").and_then(Value::as_i64))
                             .map(|s| (s / 432_000) as u64);
-                        let value = super::archive::archive_tip(&config, hint).await;
-                        *tip.lock().expect("tip") = (value, Some(Instant::now()));
-                        log(
-                            "archive_tip",
-                            Obj::new().with("slot", value.map_or(Value::Null, Value::from)),
-                        );
+                        let probe = super::archive::probe_tip(&config, hint).await;
+                        let current = *tip.lock().expect("tip");
+                        let next = super::archive::apply_probe(probe, current);
+                        if probe == super::archive::TipProbe::Unknown {
+                            log(
+                                "archive_tip_unknown",
+                                Obj::new().with("kept", current.map_or(Value::Null, Value::from)),
+                            );
+                        } else if next != current || current.is_none() {
+                            log(
+                                "archive_tip",
+                                Obj::new().with("slot", next.map_or(Value::Null, Value::from)),
+                            );
+                        }
+                        *tip.lock().expect("tip") = next;
+                        if let Some(slot) = next {
+                            let _ = db
+                                .set("archive-tip", json!({ "slot": slot, "at": now() }))
+                                .await;
+                        }
+                        tokio::time::sleep(Duration::from_secs(600)).await;
                     }
-                }
-                let tip_now = tip.lock().expect("tip").0;
+                });
+            }
+            while !stopped.load(Ordering::Relaxed) {
+                let program_data = exchange.lock().expect("exchange").program_data.clone();
+                let tip_reader = Arc::clone(&tip);
                 let rpc: Arc<dyn super::rpc::Rpc> = provider.clone();
-                match backfill(rpc, &db, &config, &program_data, &move || tip_now).await {
+                match backfill(
+                    rpc,
+                    &db,
+                    &config,
+                    &program_data,
+                    &move || *tip_reader.lock().expect("tip"),
+                    archive_enabled,
+                )
+                .await
+                {
                     Ok(()) => return Ok(()),
                     Err(error) => {
                         if stopped.load(Ordering::Relaxed) {

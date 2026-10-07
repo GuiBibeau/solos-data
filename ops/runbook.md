@@ -117,6 +117,12 @@ lane spends compute units only on the manifest walk (40 CU per 1,000 signatures)
 ordering check (`archiveOrderingSample`). Check the ceiling with a short burst of
 `getSignaturesForAddress` pages: the first 429 arrives when the window is spent.
 
+The archive lane logs `archive_tip` when the mirror's newest epoch changes and
+`archive_tip_unknown` when the mirror does not answer; it then keeps the last known tip (stored
+as `archive-tip` in the checkpoint) and, if none is known, waits rather than backfilling over RPC.
+A run of `backfill_chunk` events with `source: rpc` below the archive tip means the archive lane
+is not being used; check the mirror and the `archive_tip` events.
+
 `tailEnabled: false` in `config/phoenix.json` runs the collector without the live tail: the archive
 lane backfills history (about 1.1 CU per slot for the manifest check, roughly 10M CU per wall-day
 at 280 CU/s) and the retention pass keeps running. The watermark stays put. Switching the tail back
