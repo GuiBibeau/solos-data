@@ -90,6 +90,16 @@ working set grows to tens of GB over a day. Halve `archiveChunkSlots` instead if
 small. `systemctl --user set-property <unit> MemoryMax=…` changes a running unit without a
 restart.
 
+The decoder is bound by its storage engine once the `processed` table holds hundreds of millions
+of rows: with DuckDB's defaults (4 GB buffer, 256 MB checkpoint threshold) it spent two thirds of
+its time in 45-second checkpoints and in the per-batch update of that table. The example unit sets
+`SOLOS_DATA_DB_MEMORY=96GB`, `SOLOS_DATA_DB_THREADS=16` and `SOLOS_DATA_DB_CHECKPOINT=48GB`; the
+checkpoint cost is fixed per call, so a large threshold amortizes it, at the price of a longer
+write-ahead log replay after a crash. Transactions in a batch decode in parallel on
+`SOLOS_DATA_DECODE_THREADS` threads (default: the machine's parallelism, at most 32); the
+published rows and the progress record are assembled in source order, so output is identical to
+the sequential decoder.
+
 
 Set `SOLOS_DATA_CU_PER_SECOND` to the provider account's real ceiling, not above it. Alchemy
 enforces compute units per second per account over a 10-second rolling window (300 CU/s on the

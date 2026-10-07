@@ -8,6 +8,9 @@ Type=simple
 WorkingDirectory=%h/solos-data
 Environment=SOLOS_DATA_RAW_DIR=%h/.local/share/solos-data/phoenix_raw
 Environment=SOLOS_DATA_DECODED_DIR=%h/.local/share/solos-data/phoenix_decoded/v1
+Environment=SOLOS_DATA_DB_MEMORY=96GB
+Environment=SOLOS_DATA_DB_CHECKPOINT=48GB
+Environment=SOLOS_DATA_DB_THREADS=16
 ExecStart=%h/.local/share/solos-data/bin/solos-data decoder watch
 Restart=always
 RestartSec=15
@@ -15,7 +18,7 @@ TimeoutStopSec=60
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
-MemoryMax=128G
+MemoryMax=256G
 TasksMax=128
 StandardOutput=journal
 StandardError=journal
