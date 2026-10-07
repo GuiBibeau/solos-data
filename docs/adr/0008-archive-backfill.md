@@ -78,3 +78,11 @@ Archive-only, 16:00 UTC: at that ceiling the live tail alone costs about 21M CU 
 chose to backfill first. `tailEnabled` (default true) switches the tail lane off; the follower loop
 keeps the exchange refresh and the maintenance pass. The archive lane then spends about 1.1 CU per
 slot, the whole nine-month history about 90M CU.
+
+Tip refresh, 2026-10-07: the lane had probed the archive tip once per process and treated a
+throttled mirror as "no archive", so after an out-of-memory restart at 02:27 UTC, while the mirror
+answered 429, the lane fell back to RPC chunks of 1,000 slots for twelve hours at forty times the
+compute units per slot and one fiftieth of the pace, without an error. The tip is now probed every
+ten minutes in the background; a probe that gets no answer keeps the last known tip (the mirror
+only adds epochs), the last tip survives restarts in the `archive-tip` record, and when no tip is
+known at all the lane waits and logs `archive_tip_unknown` instead of using RPC below the tip.

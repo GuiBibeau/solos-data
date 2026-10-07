@@ -269,10 +269,24 @@ pub async fn backfill(
     config: &Config,
     program_data: &str,
     archive_tip: &dyn Fn() -> Option<i64>,
+    wait_for_tip: bool,
 ) -> Result<(), StoreError> {
+    let mut waits = 0u32;
     loop {
-        let state =
-            backfill_step(Arc::clone(&rpc), db, config, program_data, archive_tip()).await?;
+        let tip = archive_tip();
+        if wait_for_tip && tip.is_none() {
+            // The archive lane is on but the mirror has not told us its tip yet: waiting costs
+            // nothing, while falling back to RPC below the tip costs forty times the compute
+            // units per slot (ADR-0008).
+            if waits.is_multiple_of(20) {
+                log("archive_tip_unknown", Obj::new().with("waitSeconds", 30));
+            }
+            waits += 1;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            continue;
+        }
+        waits = 0;
+        let state = backfill_step(Arc::clone(&rpc), db, config, program_data, tip).await?;
         if state.phase == "complete" {
             break;
         }

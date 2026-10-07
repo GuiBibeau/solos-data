@@ -29,14 +29,41 @@ pub async fn collect_range(
     ))
 }
 
-/// The newest slot the archive covers, or `None` when the lane is unavailable or disabled.
+/// Slots per epoch.
+pub const EPOCH_SLOTS: u64 = 432_000;
+
+/// Outcome of probing the mirror for the newest epoch it serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TipProbe {
+    /// The newest served epoch ends at this slot.
+    Found(i64),
+    /// No epoch exists at or below the hint within the probe window.
+    Missing,
+    /// The mirror did not answer (throttled, network error); nothing is known.
+    Unknown,
+    /// This binary has no archive lane.
+    Unavailable,
+}
+
+/// The tip to use after a probe: a throttled probe keeps the last known tip (the mirror only
+/// ever adds epochs), a definite answer replaces it, and an unavailable lane has none.
+#[must_use]
+pub fn apply_probe(probe: TipProbe, current: Option<i64>) -> Option<i64> {
+    match probe {
+        TipProbe::Found(slot) => Some(slot),
+        TipProbe::Missing | TipProbe::Unavailable => None,
+        TipProbe::Unknown => current,
+    }
+}
+
+/// Probe the archive tip; this binary has no archive lane.
 #[cfg(not(feature = "archive"))]
-pub async fn archive_tip(_config: &Config, _current_epoch_hint: Option<u64>) -> Option<i64> {
-    None
+pub async fn probe_tip(_config: &Config, _current_epoch_hint: Option<u64>) -> TipProbe {
+    TipProbe::Unavailable
 }
 
 #[cfg(feature = "archive")]
-pub use enabled::{archive_tip, check_range, collect_range};
+pub use enabled::{check_range, collect_range, probe_tip};
 
 /// Re-collect `[from, to]` from the archive into a scratch checkpoint and compare it with what
 /// the raw archive already published for the same slots.
@@ -70,22 +97,70 @@ mod enabled {
     use std::sync::{Arc, Mutex};
 
     /// Epoch length on mainnet.
-    const EPOCH_SLOTS: u64 = 432_000;
+    /// Base URL of the CAR mirror, honouring Jetstreamer's own overrides.
+    fn mirror_base() -> String {
+        std::env::var("JETSTREAMER_HTTP_BASE_URL")
+            .or_else(|_| std::env::var("JETSTREAMER_ARCHIVE_BASE"))
+            .unwrap_or_else(|_| "https://files.old-faithful.net".to_owned())
+    }
 
-    /// The last slot of the newest published epoch at or below `hint`, probing downward.
-    pub async fn archive_tip(config: &Config, current_epoch_hint: Option<u64>) -> Option<i64> {
-        if !config.archive_backfill_enabled {
-            return None;
-        }
-        let client = reqwest::Client::new();
-        let mut epoch = current_epoch_hint?;
-        for _ in 0..8 {
-            if jetstreamer_firehose::epochs::epoch_exists(epoch, &client).await {
-                return i64::try_from(epoch * EPOCH_SLOTS + EPOCH_SLOTS - 1).ok();
+    /// HEAD one epoch's CAR: `Some(true)` exists, `Some(false)` does not, `None` unknown after
+    /// three attempts (429, 5xx, network).
+    async fn epoch_present(client: &reqwest::Client, epoch: u64) -> Option<bool> {
+        let url = format!(
+            "{}/{epoch}/epoch-{epoch}.car",
+            mirror_base().trim_end_matches('/')
+        );
+        for attempt in 0..3u32 {
+            match client.head(&url).send().await {
+                Ok(response) if response.status().is_success() => return Some(true),
+                Ok(response) if response.status().as_u16() == 404 => return Some(false),
+                Ok(response)
+                    if response.status().is_client_error() && response.status().as_u16() != 429 =>
+                {
+                    return Some(false);
+                }
+                _ => {}
             }
-            epoch = epoch.checked_sub(1)?;
+            if attempt < 2 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
         }
         None
+    }
+
+    /// The newest slot the archive covers: the last slot of the newest epoch the mirror serves,
+    /// probed downward from the hint. A mirror that does not answer yields `Unknown`, never
+    /// `Missing`, so the caller keeps its last known tip (ADR-0008).
+    pub async fn probe_tip(config: &Config, current_epoch_hint: Option<u64>) -> super::TipProbe {
+        if !config.archive_backfill_enabled {
+            return super::TipProbe::Missing;
+        }
+        let Some(mut epoch) = current_epoch_hint else {
+            return super::TipProbe::Unknown;
+        };
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+        {
+            Ok(client) => client,
+            Err(_) => return super::TipProbe::Unknown,
+        };
+        for _ in 0..8 {
+            match epoch_present(&client, epoch).await {
+                Some(true) => {
+                    return i64::try_from(epoch * super::EPOCH_SLOTS + super::EPOCH_SLOTS - 1)
+                        .map_or(super::TipProbe::Unknown, super::TipProbe::Found);
+                }
+                Some(false) => {}
+                None => return super::TipProbe::Unknown,
+            }
+            let Some(previous) = epoch.checked_sub(1) else {
+                return super::TipProbe::Missing;
+            };
+            epoch = previous;
+        }
+        super::TipProbe::Missing
     }
 
     struct Collected {
@@ -147,7 +222,7 @@ mod enabled {
                     compute_units_consumed: meta.get("computeUnitsConsumed").cloned().unwrap_or(Value::Null),
                     tx_b64: STANDARD.encode(&wire),
                     meta_json: meta.to_string(),
-                    raw_rpc_json: json!({ "source": "old-faithful", "epoch": tx.slot / EPOCH_SLOTS, "transactionSlotIndex": tx.transaction_slot_index }).to_string(),
+                    raw_rpc_json: json!({ "source": "old-faithful", "epoch": tx.slot / super::EPOCH_SLOTS, "transactionSlotIndex": tx.transaction_slot_index }).to_string(),
                     mode: "backfill".into(),
                     provider: "old-faithful".into(),
                     fetched_at: now(),
@@ -486,5 +561,19 @@ mod enabled {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tip_tests {
+    use super::{TipProbe, apply_probe};
+
+    #[test]
+    fn a_throttled_probe_keeps_the_last_known_tip() {
+        assert_eq!(apply_probe(TipProbe::Unknown, Some(7)), Some(7));
+        assert_eq!(apply_probe(TipProbe::Unknown, None), None);
+        assert_eq!(apply_probe(TipProbe::Found(9), Some(7)), Some(9));
+        assert_eq!(apply_probe(TipProbe::Missing, Some(7)), None);
+        assert_eq!(apply_probe(TipProbe::Unavailable, Some(7)), None);
     }
 }
