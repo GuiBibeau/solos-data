@@ -99,6 +99,10 @@ write-ahead log replay after a crash. Transactions in a batch decode in parallel
 `SOLOS_DATA_DECODE_THREADS` threads (default: the machine's parallelism, at most 32); the
 published rows and the progress record are assembled in source order, so output is identical to
 the sequential decoder.
+The explicit checkpoint that used to follow every minute's compaction now runs every
+`checkpointIntervalSeconds` (`config/decoded.json`, default 900): on a large store each one costs
+45 to 60 seconds whatever the amount of change, and the write-ahead log keeps committed batches
+durable in between.
 
 
 Set `SOLOS_DATA_CU_PER_SECOND` to the provider account's real ceiling, not above it. Alchemy

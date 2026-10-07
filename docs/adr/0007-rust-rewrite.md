@@ -89,3 +89,8 @@ that table. The deployment now gives the engine a 96 GB buffer, 16 threads and a
 threshold, and the batch decodes transactions in parallel with order-preserving assembly, so the
 rows published are the same as the sequential loop's. The per-batch ordinal scan of a multi-million
 row source file is the next cost to remove if needed.
+The explicit `CHECKPOINT` after every minute's compaction, inherited from the TypeScript decoder,
+was the last large cost: eight calls of about 59 seconds in fifteen minutes with the engine
+threshold already at 48 GB. It now runs every `checkpointIntervalSeconds` (default 900); the
+compaction and garbage passes keep their one-minute cadence. This is the second deliberate
+deviation from the TypeScript behaviour, after the limiter's recovery pace.

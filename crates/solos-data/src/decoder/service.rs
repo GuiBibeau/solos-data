@@ -30,6 +30,9 @@ pub struct DecoderConfig {
     pub batch_size: u64,
     /// Idle poll interval, milliseconds.
     pub poll_ms: u64,
+    /// Seconds between explicit checkpoints of the decoded store (`checkpointIntervalSeconds`,
+    /// default 900). Compaction and garbage collection still run every minute.
+    pub checkpoint_interval_seconds: u64,
 }
 
 /// Run until stopped, or for one batch when `once`.
@@ -41,6 +44,7 @@ pub fn run_decoder(
     let mut store = Store::open(&config.data_dir, schema_static())?;
     let mut verified: HashSet<String> = HashSet::new();
     let mut last_maintenance = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+    let mut last_checkpoint = std::time::Instant::now();
     recover(&mut store)?;
     while !stopping.load(Ordering::Relaxed) {
         let input = with_read_lease(&config.raw_dir, || -> Result<_, StoreError> {
@@ -78,9 +82,18 @@ pub fn run_decoder(
             let compaction = compact_decoded(&mut store)?;
             let garbage =
                 collect_retired(&mut store, &config.data_dir.clone(), 600, &write_catalog)?;
-            store.exec_batch("CHECKPOINT")?;
+            // A checkpoint of a store whose `processed` table holds hundreds of millions of rows
+            // costs tens of seconds regardless of how much changed, so it runs on its own clock;
+            // durability is the write-ahead log's job in between (ADR-0007).
+            let checkpoint =
+                last_checkpoint.elapsed().as_secs() >= config.checkpoint_interval_seconds;
+            if checkpoint {
+                store.exec_batch("CHECKPOINT")?;
+                last_checkpoint = std::time::Instant::now();
+            }
             let mut fields = compaction;
             fields.extend(garbage);
+            fields.set("checkpoint", checkpoint);
             log("decoded_maintenance", fields);
             last_maintenance = std::time::Instant::now();
         }
