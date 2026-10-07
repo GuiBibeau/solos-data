@@ -82,6 +82,15 @@ adjust them for your server. DuckDB defaults to 4GB unless `SOLOS_DATA_DB_MEMORY
 is set. `SOLOS_DATA_QUERY_MEMORY` independently controls analytical query memory
 (default 4GB); increase it for full-history scans on a larger server. Effective CU/s is the configured rate multiplied by utilization.
 
+Size `MemoryMax` from the archive lane, not from the RPC lanes: the collector buffers a whole
+archive range before inserting it, about 25 KB of memory per transaction, so a 50,000-slot range
+on a busy day (2.8M transactions) peaks near 70 GB. A 64 GB limit was OOM-killed on such a range
+on 2026-10-07; the units now say 256 GB for the collector and 128 GB for the decoder, whose
+working set grows to tens of GB over a day. Halve `archiveChunkSlots` instead if the server is
+small. `systemctl --user set-property <unit> MemoryMax=…` changes a running unit without a
+restart.
+
+
 Set `SOLOS_DATA_CU_PER_SECOND` to the provider account's real ceiling, not above it. Alchemy
 enforces compute units per second per account over a 10-second rolling window (300 CU/s on the
 free tier), and a configured rate above that ceiling produces bursts of 429s that collapse the
