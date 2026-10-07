@@ -79,3 +79,13 @@ replayed. One operational note: eleven provider throttles in the first minutes, 
 parallel proof runs, left the limiter's additive recovery at 188 CU/s; a service restart resets
 the rate (done at 13:04).
 
+## Decoder throughput (2026-10-07)
+
+With the archive lane publishing eight to ten million transactions an hour, the decoder became the
+slower leg at 2.4 million an hour. Storage timings over 42 hours attributed two thirds of its wall
+time to DuckDB: 1,335 checkpoints of 45 seconds each (the 256 MB default threshold against a 75 GB
+checkpoint whose `processed` table held 220 million rows) and a 1.6-second per-batch update of
+that table. The deployment now gives the engine a 96 GB buffer, 16 threads and a 48 GB checkpoint
+threshold, and the batch decodes transactions in parallel with order-preserving assembly, so the
+rows published are the same as the sequential loop's. The per-batch ordinal scan of a multi-million
+row source file is the next cost to remove if needed.

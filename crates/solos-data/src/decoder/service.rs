@@ -65,51 +65,7 @@ pub fn run_decoder(
             std::thread::sleep(std::time::Duration::from_millis(config.poll_ms));
             continue;
         };
-        let mut rows = Rows::default();
-        let mut seen: Vec<(String, String)> = Vec::new();
-        for row in &raw {
-            let tx = &row.tx;
-            let hash = tx.content_hash();
-            if let Some(previous_at) = &row.previous_at
-                && !previous_at.is_empty()
-                && previous_at.as_str() > source.file.created_at.as_str()
-            {
-                continue;
-            }
-            seen.push((tx.signature.clone(), hash.clone()));
-            if row.previous_hash.as_deref() == Some(hash.as_str()) {
-                continue;
-            }
-            let decoded = match (&tx.tx_b64, &tx.meta_json, &tx.terminal_error) {
-                (Some(wire), Some(meta_text), None) => serde_json::from_str::<Value>(meta_text)
-                    .map_err(|e| e.to_string())
-                    .and_then(|meta| extract_groups(wire, &meta))
-                    .and_then(phoenix_codec::decode_all),
-                _ => Err("missing raw transaction or terminal fetch error".to_owned()),
-            }
-            .unwrap_or_else(|_| {
-                vec![quarantine(
-                    "extraction",
-                    "transaction instruction extraction failed",
-                    tx.tx_b64.as_deref().unwrap_or(""),
-                )]
-            });
-            let normalized = normalize(tx, &hash, &decoded, &source.file.sha256)
-                .or_else(|_| {
-                    normalize(
-                        tx,
-                        &hash,
-                        &[quarantine(
-                            "validation",
-                            "event context validation failed",
-                            tx.tx_b64.as_deref().unwrap_or(""),
-                        )],
-                        &source.file.sha256,
-                    )
-                })
-                .map_err(StoreError::Check)?;
-            rows.extend(normalized);
-        }
+        let (rows, seen) = decode_rows(&raw, &source.file.created_at, &source.file.sha256)?;
         let progress = SourceProgress {
             hash: source.file.sha256.clone(),
             path: source.file.path.clone(),
@@ -148,6 +104,115 @@ pub fn run_decoder(
         }
     }
     store.close()
+}
+
+/// Per-transaction result of the parallel phase, in source order.
+struct Outcome {
+    /// `(signature, content hash)` when the row counts as seen.
+    seen: Option<(String, String)>,
+    /// Normalized rows when the revision changed; `None` when unchanged or skipped.
+    rows: Option<Result<Rows, String>>,
+}
+
+/// Decode and normalize one source row; pure, so rows decode in parallel.
+fn decode_row(row: &super::source::SourceRow, created_at: &str, source_hash: &str) -> Outcome {
+    let tx = &row.tx;
+    let hash = tx.content_hash();
+    if let Some(previous_at) = &row.previous_at
+        && !previous_at.is_empty()
+        && previous_at.as_str() > created_at
+    {
+        return Outcome {
+            seen: None,
+            rows: None,
+        };
+    }
+    let seen = Some((tx.signature.clone(), hash.clone()));
+    if row.previous_hash.as_deref() == Some(hash.as_str()) {
+        return Outcome { seen, rows: None };
+    }
+    let decoded = match (&tx.tx_b64, &tx.meta_json, &tx.terminal_error) {
+        (Some(wire), Some(meta_text), None) => serde_json::from_str::<Value>(meta_text)
+            .map_err(|e| e.to_string())
+            .and_then(|meta| extract_groups(wire, &meta))
+            .and_then(phoenix_codec::decode_all),
+        _ => Err("missing raw transaction or terminal fetch error".to_owned()),
+    }
+    .unwrap_or_else(|_| {
+        vec![quarantine(
+            "extraction",
+            "transaction instruction extraction failed",
+            tx.tx_b64.as_deref().unwrap_or(""),
+        )]
+    });
+    let normalized = normalize(tx, &hash, &decoded, source_hash).or_else(|_| {
+        normalize(
+            tx,
+            &hash,
+            &[quarantine(
+                "validation",
+                "event context validation failed",
+                tx.tx_b64.as_deref().unwrap_or(""),
+            )],
+            source_hash,
+        )
+    });
+    Outcome {
+        seen,
+        rows: Some(normalized),
+    }
+}
+
+/// Decode threads: `SOLOS_DATA_DECODE_THREADS`, else the available parallelism, at most 32.
+fn decode_threads() -> usize {
+    std::env::var("SOLOS_DATA_DECODE_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1)
+                .min(32)
+        })
+}
+
+/// Decode a batch in parallel, then assemble `(rows, seen)` in source order so the published
+/// tables and the progress record are identical to the sequential loop.
+fn decode_rows(
+    raw: &[super::source::SourceRow],
+    created_at: &str,
+    source_hash: &str,
+) -> Result<(Rows, Vec<(String, String)>), StoreError> {
+    let threads = decode_threads().min(raw.len().max(1));
+    let chunk = raw.len().div_ceil(threads).max(1);
+    let outcomes: Vec<Outcome> = std::thread::scope(|scope| {
+        let handles: Vec<_> = raw
+            .chunks(chunk)
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .map(|row| decode_row(row, created_at, source_hash))
+                        .collect::<Vec<Outcome>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("decode thread"))
+            .collect()
+    });
+    let mut rows = Rows::default();
+    let mut seen = Vec::with_capacity(outcomes.len());
+    for outcome in outcomes {
+        if let Some(pair) = outcome.seen {
+            seen.push(pair);
+        }
+        if let Some(normalized) = outcome.rows {
+            rows.extend(normalized.map_err(StoreError::Check)?);
+        }
+    }
+    Ok((rows, seen))
 }
 
 fn snapshot(store: &mut Store, progress: Obj) -> Result<(), StoreError> {
