@@ -106,6 +106,15 @@ pub fn load_decoder_config(args: &[String]) -> Result<DecoderConfig, StoreError>
         .ok_or_else(|| StoreError::Check("dataDir is required".into()))?;
     let batch_size = config.get("batchSize").and_then(Value::as_i64).unwrap_or(0);
     let poll_ms = config.get("pollMs").and_then(Value::as_i64).unwrap_or(0);
+    let checkpoint_interval = config
+        .get("checkpointIntervalSeconds")
+        .and_then(Value::as_i64)
+        .unwrap_or(900);
+    if checkpoint_interval < 0 {
+        return Err(StoreError::Check(
+            "invalid checkpointIntervalSeconds".into(),
+        ));
+    }
     if !(1..=10_000).contains(&batch_size) {
         return Err(StoreError::Check("invalid batchSize".into()));
     }
@@ -125,6 +134,7 @@ pub fn load_decoder_config(args: &[String]) -> Result<DecoderConfig, StoreError>
         data_dir,
         batch_size: batch_size as u64,
         poll_ms: poll_ms as u64,
+        checkpoint_interval_seconds: checkpoint_interval as u64,
     })
 }
 

@@ -154,6 +154,7 @@ fn decoder_consumes_raw_publications_once_across_restarts_and_rebases_the_raw_ca
         data_dir: data_dir.clone(),
         batch_size: 100,
         poll_ms: 100,
+        checkpoint_interval_seconds: 0,
     };
     let stop = Arc::new(AtomicBool::new(false));
     run_decoder(&config, true, Arc::clone(&stop)).unwrap();

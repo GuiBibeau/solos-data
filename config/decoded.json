@@ -3,5 +3,6 @@
   "dataDir": "data/phoenix_decoded/v1",
   "codecPath": "bin/solos-data-phoenix-codec",
   "batchSize": 10000,
-  "pollMs": 2000
+  "pollMs": 2000,
+  "checkpointIntervalSeconds": 900
 }
