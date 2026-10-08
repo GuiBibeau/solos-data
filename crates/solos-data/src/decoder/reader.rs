@@ -9,12 +9,48 @@ use crate::store::{StoreError, memory_connection, query_rows, sql_string};
 use serde_json::Value;
 use std::path::Path;
 
+/// Slots per epoch; the publisher partitions every table into `epoch=<slot / 432000>` directories.
+pub const EPOCH_SLOTS: i64 = 432_000;
+
 /// Run one `SELECT` or `WITH` statement against a decoded root.
 pub fn query_decoded(root: &Path, sql: &str) -> Result<Obj, StoreError> {
-    with_read_lease(root, || read_decoded(root, sql))
+    query_decoded_slots(root, sql, None)
 }
 
-fn read_decoded(root: &Path, sql: &str) -> Result<Obj, StoreError> {
+/// The same, reading only the epoch partitions that cover `slots` (inclusive) when given. The
+/// latest-revision views join every table to the deduplicated `decoded_transactions`, so an
+/// unscoped query over hundreds of millions of transactions needs memory in proportion; every
+/// revision of a transaction shares its slot, so a slot range is exact.
+pub fn query_decoded_slots(
+    root: &Path,
+    sql: &str,
+    slots: Option<(i64, i64)>,
+) -> Result<Obj, StoreError> {
+    let epochs = match slots {
+        Some((from, to)) if from <= to => {
+            Some(from.div_euclid(EPOCH_SLOTS)..=to.div_euclid(EPOCH_SLOTS))
+        }
+        Some(_) => return Err(StoreError::Check("slot range must be from<=to".into())),
+        None => None,
+    };
+    with_read_lease(root, || read_decoded(root, sql, epochs.as_ref()))
+}
+
+/// The epoch a published path belongs to, when its directory says so.
+fn path_epoch(path: &str) -> Option<i64> {
+    let start = path.find("epoch=")? + "epoch=".len();
+    let digits: String = path[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    digits.parse().ok()
+}
+
+fn read_decoded(
+    root: &Path,
+    sql: &str,
+    epochs: Option<&std::ops::RangeInclusive<i64>>,
+) -> Result<Obj, StoreError> {
     let head = sql.trim_start().to_lowercase();
     let is_select = ["select", "with"].iter().any(|kw| {
         head.starts_with(kw)
@@ -29,11 +65,23 @@ fn read_decoded(root: &Path, sql: &str) -> Result<Obj, StoreError> {
         .map_err(|e| StoreError::Check(e.to_string()))?;
     let memory = std::env::var("SOLOS_DATA_QUERY_MEMORY").unwrap_or_else(|_| "4GB".into());
     let conn = memory_connection("4", &memory)?;
-    let files = catalog
+    let files: Vec<Value> = catalog
         .get("files")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|f| {
+            // A file outside the requested epochs is left out; one whose path carries no epoch
+            // (there are none today) stays in so a scoped query never silently loses rows.
+            epochs.is_none_or(|range| {
+                f.get("path")
+                    .and_then(Value::as_str)
+                    .and_then(path_epoch)
+                    .is_none_or(|epoch| range.contains(&epoch))
+            })
+        })
+        .collect();
     for table in TABLES {
         let registered: Vec<&Value> = files
             .iter()
@@ -91,6 +139,12 @@ fn read_decoded(root: &Path, sql: &str) -> Result<Obj, StoreError> {
         .with(
             "catalogAt",
             catalog.get("at").cloned().unwrap_or(Value::Null),
+        )
+        .with(
+            "epochs",
+            epochs.map_or(Value::Null, |range| {
+                Value::Array(vec![Value::from(*range.start()), Value::from(*range.end())])
+            }),
         )
         .with(
             "decoderVersion",

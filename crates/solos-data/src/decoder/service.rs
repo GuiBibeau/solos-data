@@ -19,6 +19,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// Wall time per maintenance pass during which compaction keeps starting merges.
+pub const COMPACTION_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
 /// Decoder settings from `config/decoded.json` and the environment.
 #[derive(Clone, Debug)]
 pub struct DecoderConfig {
@@ -79,7 +82,9 @@ pub fn run_decoder(
         };
         publish(&mut store, &rows, &progress)?;
         if last_maintenance.elapsed().as_secs() > 60 {
-            let compaction = compact_decoded(&mut store)?;
+            // Compaction starts merges for at most `COMPACTION_BUDGET` of each minute so the
+            // backlog drains without halving decode throughput; one merge may overrun it.
+            let compaction = compact_decoded(&mut store, COMPACTION_BUDGET)?;
             let garbage =
                 collect_retired(&mut store, &config.data_dir.clone(), 600, &write_catalog)?;
             // A checkpoint of a store whose `processed` table holds hundreds of millions of rows

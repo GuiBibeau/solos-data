@@ -109,3 +109,30 @@ across different historical activity, not a controlled benchmark or long-term SL
 Two automatic maintenance passes completed, live publication continued, and no
 collector errors or provider throttles occurred in the post-restart sample.
 The previously blocked partial range passed V1/V6 after the checkpoint rewrite.
+
+## Decoded compaction stall (2026-10-08)
+
+Three days after the Rust cutover the decoded root held 50,163 files, 42,252 of them `events`
+(1.17 billion rows, 632 new files an hour), and the decoder's catalog of 11 MB was rewritten after
+every batch. Compaction, ported unchanged from the TypeScript decoder, merged only the newest
+prefix of a `(table, epoch)` group and required 32 files inside 500,000 rows and 128 MiB. An
+`events` file from a 10,000-transaction batch holds 20,000 to 50,000 rows, so 32 of them never fit:
+the table had not compacted once since the cutover. Other tables stalled whenever an earlier
+merge's output of about 480,000 rows sat at the head of the prefix, and the files below it were out
+of reach for good. The maintenance log still reported two merges a minute, all on the small tables.
+
+The rule is now: walk a group newest first and grow a run while it stays inside 4,000,000 rows and
+512 MiB of compressed input; the file that would overflow the run closes it. A closed run merges
+with 32 files at the head of the group, where new batches keep landing and the wait bounds how
+often the growing head file is rewritten, or with two files anywhere below the head, where nothing
+new ever lands. Runs are contiguous in batch order and the merged file keeps the run's highest
+batch id, so the ADR-0005 rule still holds: no older row is promoted above an excluded newer
+revision. A pass visits the largest groups first and stops starting merges after 15 seconds, so
+the backlog drains over hours while decoding continues; `decoded_maintenance` reports `merges`,
+`mergedFiles` and `deferred`.
+
+The second cost surfaced by the same episode: `decoder query` builds every table as a view over all
+its files joined to the deduplicated `decoded_transactions`, so any query, even over the 627,000-row
+funding table, pays for the whole history and ran out of memory at 96 GB. The command now accepts
+`--slots <from>-<to>` and reads only the epoch partitions covering that range; every revision of a
+transaction shares its slot, so the scoped result equals the unscoped one for that range.
