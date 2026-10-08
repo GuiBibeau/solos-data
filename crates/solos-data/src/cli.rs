@@ -60,7 +60,7 @@ fn decoder(args: &[String]) -> i32 {
                         "once",
                         "watch",
                         "status",
-                        "query --sql SELECT ...",
+                        "query --sql SELECT ... [--slots <from>-<to>]",
                         "verify-storage (offline)",
                         "repack (offline)"
                     ])
@@ -138,6 +138,18 @@ pub fn load_decoder_config(args: &[String]) -> Result<DecoderConfig, StoreError>
     })
 }
 
+/// `--slots <from>-<to>`, inclusive, for a query scoped to the epochs covering that range.
+fn parse_slots(text: &str) -> Result<(i64, i64), StoreError> {
+    let invalid = || StoreError::Check("--slots expects <from>-<to>, both slots".into());
+    let (from, to) = text.split_once('-').ok_or_else(invalid)?;
+    let from = from.trim().parse::<i64>().map_err(|_| invalid())?;
+    let to = to.trim().parse::<i64>().map_err(|_| invalid())?;
+    if from < 0 || from > to {
+        return Err(invalid());
+    }
+    Ok((from, to))
+}
+
 fn decoder_command(command: &str, args: &[String]) -> Result<(), StoreError> {
     let config = load_decoder_config(args)?;
     match command {
@@ -151,9 +163,11 @@ fn decoder_command(command: &str, args: &[String]) -> Result<(), StoreError> {
         "query" => {
             let sql = flag(args, "--sql")
                 .ok_or_else(|| StoreError::Check("query requires --sql".into()))?;
+            let slots = flag(args, "--slots").map(parse_slots).transpose()?;
             println!(
                 "{}",
-                crate::decoder::reader::query_decoded(&config.data_dir, sql)?.to_json()
+                crate::decoder::reader::query_decoded_slots(&config.data_dir, sql, slots)?
+                    .to_json()
             );
             Ok(())
         }

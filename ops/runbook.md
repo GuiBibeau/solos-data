@@ -82,6 +82,15 @@ adjust them for your server. DuckDB defaults to 4GB unless `SOLOS_DATA_DB_MEMORY
 is set. `SOLOS_DATA_QUERY_MEMORY` independently controls analytical query memory
 (default 4GB); increase it for full-history scans on a larger server. Effective CU/s is the configured rate multiplied by utilization.
 
+Scope decoded queries to the slots you need: `solos-data decoder query --sql "..." --slots
+<from>-<to>` reads only the epoch partitions (432,000 slots each) covering the range, and the
+result names them under `epochs`. An unscoped query rebuilds the latest-revision views over every
+decoded transaction and needs memory in proportion (more than 96 GB at 441M transactions on
+2026-10-08); the 1.1 TB box runs one with `SOLOS_DATA_QUERY_MEMORY=400GB`. The decoder's
+`decoded_maintenance` line reports `merges`, `mergedFiles` and `deferred` (groups a pass had no
+time for); after the 2026-10-08 compaction change the file count under `tables/` should fall from
+tens of thousands to hundreds over a day and then stay there (ADR-0006).
+
 Size `MemoryMax` from the archive lane, not from the RPC lanes: the collector buffers a whole
 archive range before inserting it, about 25 KB of memory per transaction, so a 50,000-slot range
 on a busy day (2.8M transactions) peaks near 70 GB. A 64 GB limit was OOM-killed on such a range
