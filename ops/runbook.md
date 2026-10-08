@@ -195,5 +195,9 @@ codec/schema version. [Table details](../docs/decoded-tables.md) cover read-only
 
 With Rust 1.96 installed, run `cargo test --workspace`. Tests are offline and need no
 credentials. The archive lane compiles with `cargo build --features archive -p solos-data`,
-which needs clang and cmake. Until the TypeScript sources are removed, `npm run verify`
-still runs their suite.
+which needs clang and cmake. The `clang-sys` build script wants an unversioned `libclang.so`
+and `llvm-config`; a Debian box with only `libclang1-19` and `llvm-19-dev` builds with
+`ln -s /usr/lib/llvm-19/lib/libclang-19.so.19 ~/.local/lib/libclang.so` once, then
+`LIBCLANG_PATH=$HOME/.local/lib LLVM_CONFIG_PATH=/usr/bin/llvm-config-19 cargo build …`
+(installing `libclang-19-dev` provides the symlink instead). Until the TypeScript sources are
+removed, `npm run verify` still runs their suite.
