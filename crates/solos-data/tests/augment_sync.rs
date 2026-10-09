@@ -32,6 +32,7 @@ fn config_for(server: &Server, root: &std::path::Path) -> AugmentConfig {
     sources.binance.list_url = format!("{}/list", server.base);
     sources.binance.datasets = vec!["klines".into(), "metrics".into(), "fundingRate".into()];
     sources.hyperliquid.base_url = server.base.clone();
+    sources.hyperliquid.requests_per_second = 50.0;
     sources.deribit.base_url = server.base.clone();
     sources.deribit.resolutions = vec![3600];
     sources.deribit.currencies = vec!["BTC".into()];
@@ -313,12 +314,25 @@ fn checksum_mismatch_is_an_error_and_the_file_is_not_registered() {
         "SOLUSDT-metrics-2026-10-07.csv",
         &fixture("SOLUSDT-metrics-2026-10-07.csv"),
     );
-    server.serve_bytes(&format!("/files/{key}"), zip);
+    server.serve_bytes(&format!("/files/{key}"), zip.clone());
     server.serve_bytes(
         &format!("/files/{key}.CHECKSUM"),
         checksum_of(b"other", "x"),
     );
-    let keys = vec![key.clone(), format!("{key}.CHECKSUM")];
+    // The following day is fine, but must wait: fetching it would move the listing marker past
+    // the failed one.
+    let next = format!("{prefix}SOLUSDT-metrics-2026-10-08.zip");
+    server.serve_bytes(&format!("/files/{next}"), zip.clone());
+    server.serve_bytes(
+        &format!("/files/{next}.CHECKSUM"),
+        checksum_of(&zip, "SOLUSDT-metrics-2026-10-08.zip"),
+    );
+    let keys = vec![
+        key.clone(),
+        format!("{key}.CHECKSUM"),
+        next.clone(),
+        format!("{next}.CHECKSUM"),
+    ];
     server.route("/list", move |request| {
         let prefix = request.param("prefix").unwrap_or_default();
         Response::ok(listing_xml(&prefix, &keys, false, None))
@@ -337,6 +351,7 @@ fn checksum_mismatch_is_an_error_and_the_file_is_not_registered() {
             .join("tables/binance/metrics/SOLUSDT/2026-10-07.parquet")
             .exists()
     );
+    assert_eq!(server.hits_of(&format!("/files/{next}")), 0);
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -9816,6 +9816,7 @@ dependencies = [
  "bs58",
  "chrono",
  "duckdb",
+ "flate2",
  "futures-util",
  "hex",
  "jetstreamer-firehose",

@@ -9,7 +9,7 @@ use super::contexts::{self, ContextLane};
 use super::elfa::{self, ElfaLane};
 use super::http::Http;
 use super::ledger::{self, Lane};
-use super::series::{Ctx, Outcome};
+use super::series::{Ctx, Outcome, budget_bytes};
 use crate::db::Db;
 use crate::jsonout::{Obj, log, now};
 use crate::store::StoreError;
@@ -40,6 +40,10 @@ pub fn run_capture(config: &AugmentConfig, stop: Arc<AtomicBool>) -> Result<Obj,
     let recovered = ledger::recover(&mut store, &config.data_dir, Lane::Capture)?;
     let (db, thread) = Db::spawn(store);
     let http = Http::new(config.requests_per_second)?;
+    http.set_host_rate(
+        &config.sources.hyperliquid.base_url,
+        config.sources.hyperliquid.requests_per_second,
+    );
     let elfa_key = std::env::var("ELFA_API_KEY").ok().filter(|k| !k.is_empty());
     let elfa_cfg = &config.sources.elfa;
     if elfa_cfg.enabled && elfa_key.is_some() {
@@ -56,6 +60,7 @@ pub fn run_capture(config: &AugmentConfig, stop: Arc<AtomicBool>) -> Result<Obj,
         start,
         now_ms: 0,
         stop,
+        disk_budget_bytes: budget_bytes(config.disk_budget_gb),
     });
     let coins: Vec<(String, String)> = config
         .symbols

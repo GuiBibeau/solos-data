@@ -282,13 +282,18 @@ pub async fn sync(
     only_symbol: Option<&str>,
 ) -> Outcome {
     let mut outcome = Outcome::default();
-    let names: Vec<&String> = cfg.datasets.iter().chain(&cfg.large_datasets).collect();
-    for name in names {
+    let names: Vec<(&String, bool)> = cfg
+        .datasets
+        .iter()
+        .map(|n| (n, false))
+        .chain(cfg.large_datasets.iter().map(|n| (n, true)))
+        .collect();
+    for (name, large) in names {
         let Some(dataset) = dataset(name) else {
             continue;
         };
         for symbol in symbols {
-            if ctx.stopping() {
+            if ctx.stopping() || (large && !ctx.within_budget(name).await) {
                 return outcome;
             }
             let Some(venue) = symbol.binance.as_deref() else {
@@ -378,8 +383,11 @@ async fn sync_pair(
                 outcome.rows += rows;
             }
             Err(error) => {
+                // Later days would move the listing marker past this one; stop here and let
+                // the next run retry it.
                 log_error(dataset, venue, &label, &error.to_string());
                 outcome.errors += 1;
+                break;
             }
         }
     }
@@ -396,9 +404,18 @@ async fn fetch_item(
     label: &str,
 ) -> Result<u64, StoreError> {
     let url = format!("{}/{key}", cfg.files_url.trim_end_matches('/'));
-    let zip = ctx.http.get_bytes(&url, &[]).await?;
-    if cfg.verify_checksums {
-        let checksum = ctx.http.get_bytes(&format!("{url}.CHECKSUM"), &[]).await?;
+    // The zip and its checksum are two origin round trips of about 0.7 s each from the box;
+    // issued together (still spaced by the host limiter) they overlap instead of adding up.
+    let checksum_url = format!("{url}.CHECKSUM");
+    let (zip, checksum) = tokio::join!(ctx.http.get_bytes(&url, &[]), async {
+        if cfg.verify_checksums {
+            ctx.http.get_bytes(&checksum_url, &[]).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    });
+    let zip = zip?;
+    if let Some(checksum) = checksum? {
         let expected = parse_checksum(&String::from_utf8_lossy(&checksum.body))
             .ok_or_else(|| StoreError::Check("unreadable CHECKSUM".into()))?;
         if sha256_hex(&zip.body) != expected {

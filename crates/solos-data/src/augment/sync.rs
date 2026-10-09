@@ -7,7 +7,7 @@ use super::deribit::Dvol;
 use super::http::Http;
 use super::hyperliquid::FundingHistory;
 use super::ledger::{self, Lane};
-use super::series::{Ctx, Outcome, Series, sync_series};
+use super::series::{Ctx, Outcome, Series, budget_bytes, sync_series};
 use crate::db::Db;
 use crate::jsonout::{Obj, log, now};
 use crate::store::StoreError;
@@ -54,6 +54,10 @@ pub fn run_sync(
     }
     let (db, thread) = Db::spawn(store);
     let http = Http::new(config.requests_per_second)?;
+    http.set_host_rate(
+        &config.sources.hyperliquid.base_url,
+        config.sources.hyperliquid.requests_per_second,
+    );
     let ctx = Ctx {
         http,
         db: db.clone(),
@@ -62,6 +66,7 @@ pub fn run_sync(
         start,
         now_ms,
         stop,
+        disk_budget_bytes: budget_bytes(config.disk_budget_gb),
     };
     log(
         "augment_sync_start",
@@ -182,10 +187,18 @@ async fn run_hyperliquid(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> 
 
 async fn run_bybit(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option<Outcome> {
     let cfg = &config.sources.bybit;
-    if !cfg.enabled || !cfg.funding_history || !filter.allows("bybit") {
+    if !cfg.enabled || !filter.allows("bybit") {
         return None;
     }
     let mut outcome = Outcome::default();
+    if cfg.trades {
+        outcome.add(
+            &super::bybit::sync_trades(ctx, cfg, &config.symbols, filter.symbol.as_deref()).await,
+        );
+    }
+    if !cfg.funding_history {
+        return Some(outcome);
+    }
     for symbol in &config.symbols {
         let Some(venue) = symbol.bybit.as_deref() else {
             continue;

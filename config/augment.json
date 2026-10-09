@@ -2,6 +2,7 @@
   "dataDir": "data/augment",
   "startDate": "2026-01-01",
   "requestsPerSecond": 2.0,
+  "diskBudgetGb": 0,
   "sources": {
     "binance": {
       "enabled": true,
@@ -21,6 +22,7 @@
     "hyperliquid": {
       "enabled": true,
       "baseUrl": "https://api.hyperliquid.xyz",
+      "requestsPerSecond": 1.0,
       "fundingHistory": true,
       "candles": true,
       "candleIntervalSeconds": 1800,
