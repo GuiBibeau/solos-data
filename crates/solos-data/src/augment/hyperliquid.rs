@@ -148,27 +148,27 @@ pub fn context_rows(answer: &Value, coins: &[String], at_ms: i64) -> Vec<Value> 
             let mut row = ctx.clone();
             let object = row.as_object_mut()?;
             object.insert("coin".into(), Value::String(name.to_owned()));
-            object.insert("at".into(), Value::from(at_ms));
+            object.insert("captured_at".into(), Value::from(at_ms));
             Some(row)
         })
         .collect()
 }
 
-/// `SELECT` typing staged context rows.
+/// `SELECT` typing staged context rows (unordered; the writer orders by its key).
 #[must_use]
 pub fn contexts_select(staged: &Path, phoenix_case: &str) -> String {
     format!(
-        "SELECT at AS at_ms, make_timestamp(at * 1000) AS ts, coin AS symbol, {phoenix_case} AS phoenix_symbol,
+        "SELECT captured_at AS at_ms, make_timestamp(captured_at * 1000) AS ts, coin AS symbol, {phoenix_case} AS phoenix_symbol,
                 CAST(funding AS DOUBLE) AS funding, CAST(openInterest AS DOUBLE) AS open_interest,
                 CAST(markPx AS DOUBLE) AS mark_px, CAST(oraclePx AS DOUBLE) AS oracle_px, CAST(midPx AS DOUBLE) AS mid_px,
                 CAST(premium AS DOUBLE) AS premium, CAST(prevDayPx AS DOUBLE) AS prev_day_px,
                 CAST(dayNtlVlm AS DOUBLE) AS day_notional_volume, CAST(dayBaseVlm AS DOUBLE) AS day_base_volume,
                 impactPxs AS impact_pxs
-         FROM {} ORDER BY at, coin",
+         FROM {}",
         read_json_array(
             staged,
             &[
-                ("at", "BIGINT"), ("coin", "VARCHAR"), ("funding", "VARCHAR"), ("openInterest", "VARCHAR"),
+                ("captured_at", "BIGINT"), ("coin", "VARCHAR"), ("funding", "VARCHAR"), ("openInterest", "VARCHAR"),
                 ("markPx", "VARCHAR"), ("oraclePx", "VARCHAR"), ("midPx", "VARCHAR"), ("premium", "VARCHAR"),
                 ("prevDayPx", "VARCHAR"), ("dayNtlVlm", "VARCHAR"), ("dayBaseVlm", "VARCHAR"), ("impactPxs", "VARCHAR[]")
             ]
@@ -176,19 +176,41 @@ pub fn contexts_select(staged: &Path, phoenix_case: &str) -> String {
     )
 }
 
-/// `SELECT` typing staged candles.
+/// `SELECT` typing staged candles (unordered; the writer orders by its key). Rows are the
+/// API's candles with `t`/`T` renamed by [`candle_row`], since DuckDB column names are
+/// case-insensitive.
 #[must_use]
 pub fn candles_select(staged: &Path, constants: &str) -> String {
     format!(
-        "SELECT t AS open_time_ms, make_timestamp(t * 1000) AS ts, T AS close_time_ms, CAST(o AS DOUBLE) AS open,
-                CAST(h AS DOUBLE) AS high, CAST(l AS DOUBLE) AS low, CAST(c AS DOUBLE) AS close, CAST(v AS DOUBLE) AS volume,
-                n AS trades, {constants}
-         FROM {} ORDER BY t",
+        "SELECT open_time AS open_time_ms, make_timestamp(open_time * 1000) AS ts, close_time AS close_time_ms,
+                CAST(o AS DOUBLE) AS open, CAST(h AS DOUBLE) AS high, CAST(l AS DOUBLE) AS low, CAST(c AS DOUBLE) AS close,
+                CAST(v AS DOUBLE) AS volume, n AS trades, {constants}
+         FROM {}",
         read_json_array(
             staged,
-            &[("t", "BIGINT"), ("T", "BIGINT"), ("o", "VARCHAR"), ("h", "VARCHAR"), ("l", "VARCHAR"), ("c", "VARCHAR"), ("v", "VARCHAR"), ("n", "BIGINT")]
+            &[
+                ("open_time", "BIGINT"),
+                ("close_time", "BIGINT"),
+                ("o", "VARCHAR"),
+                ("h", "VARCHAR"),
+                ("l", "VARCHAR"),
+                ("c", "VARCHAR"),
+                ("v", "VARCHAR"),
+                ("n", "BIGINT")
+            ]
         )
     )
+}
+
+/// One API candle as a staged row: `(open_time, close_time)` and the candle's fields.
+#[must_use]
+pub fn candle_row(candle: &Value) -> Option<Value> {
+    Some(json!({
+        "open_time": candle.get("t")?.as_i64()?,
+        "close_time": candle.get("T")?.as_i64()?,
+        "o": candle.get("o"), "h": candle.get("h"), "l": candle.get("l"), "c": candle.get("c"),
+        "v": candle.get("v"), "n": candle.get("n"),
+    }))
 }
 
 /// A `CASE coin WHEN 'x' THEN 'X' ... END` mapping venue coins to Phoenix symbols.
@@ -244,7 +266,7 @@ mod tests {
         let rows = context_rows(&answer, &["SOL".into()], 5);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["coin"], "SOL");
-        assert_eq!(rows[0]["at"], 5);
+        assert_eq!(rows[0]["captured_at"], 5);
         assert_eq!(context_rows(&answer, &[], 5).len(), 2);
         assert_eq!(
             phoenix_case(&[("xyz:NVDA".into(), "NVDA".into())]),

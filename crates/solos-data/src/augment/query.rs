@@ -1,5 +1,5 @@
-//! Read-only SQL over the augment root: one view per (source, dataset) over the catalog's
-//! Parquet files in an independent in-memory DuckDB, so queries run while a sync or capture
+//! Read-only SQL over the augment root: one view per (source, dataset) over the files of both
+//! lanes' catalogs in an independent in-memory DuckDB, so queries run while a sync or capture
 //! writes.
 
 use crate::jsonout::Obj;
@@ -20,10 +20,22 @@ pub fn query_augment(root: &Path, sql: &str) -> Result<Obj, StoreError> {
             "query must be read-only (SELECT, WITH, DESCRIBE or SHOW)".into(),
         ));
     }
-    let text = std::fs::read_to_string(root.join("catalog.json"))?;
-    let catalog: Value =
-        serde_json::from_str(&text).map_err(|e| StoreError::Check(e.to_string()))?;
-    let views = view_paths(&catalog);
+    let mut views: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for lane in super::ledger::Lane::ALL {
+        let Ok(text) = std::fs::read_to_string(lane.catalog_path(root)) else {
+            continue;
+        };
+        let catalog: Value =
+            serde_json::from_str(&text).map_err(|e| StoreError::Check(e.to_string()))?;
+        for (view, paths) in view_paths(&catalog) {
+            views.entry(view).or_default().extend(paths);
+        }
+    }
+    if views.is_empty() {
+        return Err(StoreError::Check(
+            "no catalog under the augment root".into(),
+        ));
+    }
     let memory = std::env::var("SOLOS_DATA_QUERY_MEMORY").unwrap_or_else(|_| "4GB".into());
     let conn = memory_connection("4", &memory)?;
     for (view, paths) in &views {

@@ -43,6 +43,7 @@ pub struct Fetched {
 pub struct Http {
     client: reqwest::Client,
     interval: Duration,
+    host_intervals: Mutex<HashMap<String, Duration>>,
     next_slot: Mutex<HashMap<String, Instant>>,
     attempts: u32,
 }
@@ -59,20 +60,36 @@ impl Http {
         Ok(Http {
             client,
             interval: Duration::from_secs_f64(1.0 / requests_per_second.max(0.01)),
+            host_intervals: Mutex::new(HashMap::new()),
             next_slot: Mutex::new(HashMap::new()),
             attempts: 6,
         })
     }
 
+    /// A slower (or faster) pace for one host, from a URL on that host.
+    pub fn set_host_rate(&self, url: &str, requests_per_second: f64) {
+        self.host_intervals.lock().expect("host intervals").insert(
+            host_of(url).to_owned(),
+            Duration::from_secs_f64(1.0 / requests_per_second.max(0.01)),
+        );
+    }
+
     /// Wait for this host's next slot and claim the one after it.
     async fn acquire(&self, url: &str) {
         let host = host_of(url).to_owned();
+        let interval = self
+            .host_intervals
+            .lock()
+            .expect("host intervals")
+            .get(&host)
+            .copied()
+            .unwrap_or(self.interval);
         let wait = {
             let mut slots = self.next_slot.lock().expect("http slots");
             let now = Instant::now();
             let slot = slots.entry(host).or_insert(now);
             let at = (*slot).max(now);
-            *slot = at + self.interval;
+            *slot = at + interval;
             at.saturating_duration_since(now)
         };
         if !wait.is_zero() {

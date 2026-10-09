@@ -67,14 +67,26 @@ file, so an hourly run costs one listing per dataset and symbol plus the new day
 zip is compared with its published `.CHECKSUM` (SHA-256) before conversion; older dumps without a
 header line are detected by their first byte.
 
-Phase 2, `augment capture` (a later change set): Hyperliquid 1-minute candles (`candleSnapshot`
-returns about 5,000 candles, so they are captured every 30 minutes and deduplicated on open
-time) and `metaAndAssetCtxs` per dex every minute (open interest, funding, mark, oracle and mid
-prices); Elfa v3 events, calls, episodes and call-book bars hourly with a credit guard; Bybit
-funding history.
+Phase 2, `augment capture`, a second process with its own ledger (`capture/checkpoint.duckdb`,
+`catalog-capture.json`, `status-capture.json`, `staging-capture/`) writing distinct datasets into
+the same `tables/` tree; each lane's recovery only touches the dataset directories its own ledger
+knows:
+
+| Source | Dataset | Cadence | Files | Notes |
+|---|---|---|---|---|
+| Hyperliquid | `candles_1m` | every 30 min | day per coin | `candleSnapshot` serves about 5,000 candles; closed candles since the last stored open time are merged into the day's file on `open_time_ms` |
+| Hyperliquid | `asset_contexts` | every 1 min | day, all coins | `metaAndAssetCtxs` per dex (main, `xyz`, `flx`, …): funding, open interest, mark, oracle and mid prices, premium, day volumes; buffered in memory and merged every ten minutes on `(at_ms, symbol)`, so a crash loses at most ten minutes |
+| Elfa v3 | `events`, `calls`, `episodes`, `call_book` | every 1 h | day | from the last `to` with ascending cursors, 30 (bars: 200) per page, at most 200 pages a cycle; rows flattened with a `raw_json` column; episodes keep their newest observation |
+
+Bybit funding history (`/v5/market/funding/history`, 200 rows per page, newest first) is a paged
+history like Hyperliquid's and runs in `augment sync` as `bybit/funding`, month files.
+
+A day's file grows by a merge: the new rows and the existing file are unioned and deduplicated on
+the key with the new row winning, then written through the same durable path. Merged files are
+registered with `complete=false` until the day has passed.
 
 Phase 3, opt-in behind `largeDatasets` and `trades`: Binance `aggTrades` and `bookDepth`, Bybit
-tick trades. The column definitions are in place; the flags are off.
+tick trades. The Binance column definitions are in place; the flags are off.
 
 ## What is deliberately not fetched
 

@@ -24,8 +24,10 @@ pub struct Ctx {
     pub http: Http,
     /// The ledger's writer thread.
     pub db: Db,
-    /// Augment root.
+    /// Augment root (`tables/` lives here).
     pub root: PathBuf,
+    /// The lane this process runs as; names the ledger, staging and snapshots.
+    pub lane: super::ledger::Lane,
     /// First day stored.
     pub start: NaiveDate,
     /// The instant the run considers "now", milliseconds.
@@ -39,6 +41,12 @@ impl Ctx {
     #[must_use]
     pub fn stopping(&self) -> bool {
         self.stop.load(Ordering::Relaxed)
+    }
+
+    /// The lane's staging directory.
+    #[must_use]
+    pub fn staging(&self) -> PathBuf {
+        self.lane.staging_dir(&self.root)
     }
 }
 
@@ -192,7 +200,7 @@ async fn publish(
     key: &str,
     progress: Option<Value>,
 ) -> Result<u64, StoreError> {
-    let staged = stage_json(&ctx.root, rows)?;
+    let staged = stage_json(&ctx.staging(), rows)?;
     let target = Target {
         source: series.source().to_owned(),
         dataset: series.dataset().to_owned(),
@@ -204,10 +212,11 @@ async fn publish(
     let select = series.select(&staged, &target.constant_columns());
     let expected = i64::try_from(rows.len()).unwrap_or(i64::MAX);
     let key = key.to_owned();
+    let root = ctx.root.clone();
     let result = ctx
         .db
         .run(move |store| {
-            let record = write_parquet(store, &select, &target)?;
+            let record = write_parquet(store, &root, &select, &target)?;
             if record.row_count != expected {
                 return Err(StoreError::Check(format!(
                     "{} row count mismatch: {} written, {expected} fetched",

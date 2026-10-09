@@ -5,9 +5,14 @@
 //! cannot be fetched later.
 
 pub mod binance;
+pub mod bybit;
+pub mod candles;
+pub mod capture;
 pub mod config;
+pub mod contexts;
 pub mod defillama;
 pub mod deribit;
+pub mod elfa;
 pub mod http;
 pub mod hyperliquid;
 pub mod ledger;
