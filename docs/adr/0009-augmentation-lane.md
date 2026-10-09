@@ -115,3 +115,79 @@ ended, so a long backfill and the hourly catch-up are the same code path. Deribi
 history reaches back as far as its `continuation` chain goes and no further; the hourly series
 covers the whole year. DefiLlama returns its entire history on every call and is cut into months
 locally. A rerun never re-downloads a closed period; deleting the ledger re-downloads everything.
+
+## Production validation (2026-10-09)
+
+Deployed on the box from `main` at 7139fec (PR #15) at 04:18 UTC into
+`~/.local/share/solos-data/augment`, next to the raw and decoded roots; the collector and decoder
+services were not touched and kept publishing throughout (active since October 7 and 8). The
+quick sources were run first in the foreground, one `--source` at a time, then the timer was
+enabled and started the full run at 04:46:13 UTC. The capture lane (PR #16, 1067673) started at
+05:03:52 UTC.
+
+### Sync lane
+
+| Source | Files | Rows | Duration | Notes |
+|---|---|---|---|---|
+| DefiLlama `stablecoins` | 90 (9 series, 10 months) | 2,538 | 4 s | daily points 2026-01-01 to 2026-10-09; total 311.6 B USD on the last point |
+| Deribit `dvol_60s` | 374 | 535,021 | 478 s (both resolutions) | the 60-second history ends at 2026-04-06 04:17 UTC, 187 days back; 1,440 bars per full day, no gaps inside a day |
+| Deribit `dvol_3600s` | 20 | 13,498 | (same run) | 6,749 hourly bars per currency from 2026-01-01 00:00 to the run |
+| Hyperliquid `funding` | 778 (87 coins) | 511,302 | 1,057 s | zero duplicates on `(symbol, time_ms)`; 24 coins start after January 1 at their listing (`PONS` 2026-08-31, `xyz:MRNA` 2026-08-19, `xyz:SKHY` 2026-07-09, …) |
+| Binance `fundingRate` | 406 (47 symbols, 9 months) | 53,734 | 2 min | 93 rows a month at eight-hour funding; `HYPEUSDT` four-hour until the market ended in April; `RAYUSDT` has no monthly funding dump after 2025-06 although its daily dumps continue, so its funding comes from Hyperliquid and Bybit only |
+| Binance `klines` and the four other daily datasets | running | | | 1,440 rows a day; see the pace below |
+
+Zero `augment_series_error` in those runs. Hyperliquid answered 429 to 110 of the funding
+requests at two a second (every one succeeded on retry with the one-second backoff); the info API
+weighs most requests 20 against 1,200 a minute, so the source now has its own
+`requestsPerSecond` of 1 (PR #17). The timer's run re-synced the quick sources incrementally in
+seconds (only the open month of each series rewritten) before starting Binance.
+
+Pace: the Binance walk landed one daily file every 1.67 s (median; p10 1.23 s, p90 1.90 s) with
+the zip and its checksum fetched one after the other, each an origin round trip of about 0.7 s
+from the box, so the run was bound by latency rather than by the two-a-second spacing. Phase 1 is
+about 68,000 daily files, thirty hours at that pace; PR #17 issues the two requests together,
+which brings the walk to the spacing's one file a second. The timer starts the next run an hour
+after this one ends, and that run's listings start after the newest registered file of each
+dataset and symbol.
+
+### Capture lane
+
+First 18 minutes, zero errors:
+
+| Dataset | Files | Rows | Notes |
+|---|---|---|---|
+| Hyperliquid `candles_1m` | 435 (87 coins, 5 days) | 434,886 | 4,999 candles per coin from 2026-10-05 17:44 UTC, the API's window; zero duplicate open times; 22 throttles, all recovered |
+| Hyperliquid `asset_contexts` | 1 (day file, all coins) | 957 | first flush at 05:14:12 after ten minutes: 11 snapshots × 87 coins, zero duplicates on `(at_ms, symbol)` |
+| Elfa `call_book` | 31 | 726 | complete, hourly bars 2026-09-09 to the current hour |
+| Elfa `events` | 24 | 6,000 | 200 pages, 2026-09-03 to 2026-09-28 |
+| Elfa `calls` | 2 | 6,000 | 200 pages cover only 2026-09-09 to 2026-09-10: about 3,900 calls a day |
+| Elfa `episodes` | 2 | 6,000 | 200 pages, 2026-09-21 to 2026-09-22 |
+
+`credits.used` read 199 before and after the Elfa cycle, so the guard did not trip; no 429 at one
+request a second. The 200-pages-per-stream cap is 13 minutes of requests per cycle; with the
+resume rule of PR #17 the calls and episodes streams need about a day of hourly cycles to reach
+the present, after which an hour's increment is a few pages. Before that rule a capped stream
+restarted from `historyFrom` every hour: the merge on `id` kept the tables correct, the requests
+were wasted.
+
+The two lanes wrote 3,102 files, 2.9 million rows and 108 MB in the first hour, with the sync
+ledger, catalogs and status files included. `augment query` served every check above while both
+lanes were writing.
+
+### Redeploy with PR #17 (05:50 UTC)
+
+`main` at 500e158 was built and installed while both lanes ran, then only the two augment units
+were restarted (`systemctl --user restart`; note that a restart of the oneshot sync unit blocks
+the caller until the new run ends, so use `--no-block`). The sync run of 04:46 stopped at its
+next item with `stopped: true` after 2,479 files and zero errors; the capture lane flushed its
+buffers and exited (`augment_capture_done` after 2,819 s). Both restarted on the new binary
+within a second with `recovered: 0`: nothing on disk was unregistered. The new sync run re-walked
+the quick sources incrementally, added the Bybit `funding` month series (475 files for 50
+symbols, zero errors) and resumed the Binance klines after the newest registered day of each
+symbol at 1.23 s per file (median and p90), the pace of two requests per file against the host's
+two-a-second spacing; three throttles in six minutes, all recovered. The capture lane resumed the
+candles from each coin's last stored open time (86 files in its first cycle). Its first Elfa
+cycle had no progress to resume from, because the previous binary recorded none for a capped
+pull: it fetched the same 200 pages of events again, the merge on `id` left the 6,000 rows as
+they were, and this time the newest row was recorded as `lastTo`, so the following cycles move
+forward. The collector and decoder stayed active throughout, since October 7 and 8 respectively.
