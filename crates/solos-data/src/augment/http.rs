@@ -1,6 +1,8 @@
 //! The one HTTP client of the lane: a per-host request spacing (`requestsPerSecond`), bounded
 //! retries with exponential backoff on 429, 5xx and transport errors, `Retry-After` honoured,
-//! and error text that never carries a URL.
+//! and error text that never carries a URL. Ordinary requests carry a whole-request deadline;
+//! a server-sent event stream is opened on a second client without one, because that deadline
+//! also covers reading the body and would cut every long-lived stream at the same instant.
 
 use crate::jsonout::{Obj, log, safe_error};
 use serde_json::Value;
@@ -55,9 +57,14 @@ impl Fetched {
     }
 }
 
+/// Whole-request deadline of ordinary requests (head and body).
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+
 /// The shared client.
 pub struct Http {
     client: reqwest::Client,
+    stream_client: reqwest::Client,
+    request_timeout: Duration,
     interval: Duration,
     host_intervals: Mutex<HashMap<String, Duration>>,
     next_slot: Mutex<HashMap<String, Instant>>,
@@ -67,14 +74,23 @@ pub struct Http {
 impl Http {
     /// A client spacing requests to each host at `requests_per_second`.
     pub fn new(requests_per_second: f64) -> Result<Http, HttpError> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
-            .connect_timeout(Duration::from_secs(20))
-            .user_agent(USER_AGENT)
-            .build()
-            .map_err(|e| HttpError::Transport(safe_error(&e.to_string())))?;
+        Http::with_timeout(requests_per_second, REQUEST_TIMEOUT)
+    }
+
+    /// The same with another whole-request deadline (tests shorten it). It bounds every
+    /// ordinary request and the response head of a stream, never a stream's body.
+    pub fn with_timeout(requests_per_second: f64, timeout: Duration) -> Result<Http, HttpError> {
+        let build = |builder: reqwest::ClientBuilder| {
+            builder
+                .connect_timeout(Duration::from_secs(20))
+                .user_agent(USER_AGENT)
+                .build()
+                .map_err(|e| HttpError::Transport(safe_error(&e.to_string())))
+        };
         Ok(Http {
-            client,
+            client: build(reqwest::Client::builder().timeout(timeout))?,
+            stream_client: build(reqwest::Client::builder())?,
+            request_timeout: timeout,
             interval: Duration::from_secs_f64(1.0 / requests_per_second.max(0.01)),
             host_intervals: Mutex::new(HashMap::new()),
             next_slot: Mutex::new(HashMap::new()),
@@ -150,7 +166,8 @@ impl Http {
     }
 
     /// Open a GET whose body is read by the caller (a server-sent event stream): the same
-    /// spacing and retries up to the response head, then the response itself.
+    /// spacing and retries up to the response head, then the response itself. The head is
+    /// bounded by the request deadline; the body has no deadline, the caller bounds idleness.
     pub async fn open(
         &self,
         url: &str,
@@ -159,18 +176,20 @@ impl Http {
         let mut backoff = Duration::from_secs(1);
         for attempt in 1..=self.attempts {
             self.acquire(url).await;
-            let mut request = self.client.get(url);
+            let mut request = self.stream_client.get(url);
             for (name, value) in headers {
                 request = request.header(*name, *value);
             }
-            let (reason, retry_after) = match request.send().await {
-                Ok(response) => match classify(&response) {
-                    Ok(()) => return Ok(response),
-                    Err(Retry::Fatal(error)) => return Err(error),
-                    Err(Retry::Later(reason, retry_after)) => (reason, retry_after),
-                },
-                Err(e) => (safe_error(&e.to_string()), None),
-            };
+            let (reason, retry_after) =
+                match tokio::time::timeout(self.request_timeout, request.send()).await {
+                    Ok(Ok(response)) => match classify(&response) {
+                        Ok(()) => return Ok(response),
+                        Err(Retry::Fatal(error)) => return Err(error),
+                        Err(Retry::Later(reason, retry_after)) => (reason, retry_after),
+                    },
+                    Ok(Err(e)) => (safe_error(&e.to_string()), None),
+                    Err(_) => ("response head timed out".to_owned(), None),
+                };
             if attempt == self.attempts {
                 return Err(final_error(reason));
             }

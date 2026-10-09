@@ -6,6 +6,7 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 WorkingDirectory=%h/solos-data
+EnvironmentFile=-%h/.config/solos-data/augment.env
 Environment=SOLOS_DATA_AUGMENT_DIR=%h/.local/share/solos-data/augment
 Environment=SOLOS_DATA_DB_MEMORY=8GB
 ExecStart=%h/.local/share/solos-data/bin/solos-data augment sync --config config/augment.json

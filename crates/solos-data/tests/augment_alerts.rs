@@ -15,17 +15,26 @@ use solos_data::augment::ledger::{self, Lane};
 use solos_data::augment::series::Ctx;
 use solos_data::db::Db;
 use std::io::Write;
+use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// 2026-10-09T12:00:00Z.
 const NOW_MS: i64 = 1_791_547_200_000;
 
 fn ctx(server: &Server, root: &std::path::Path) -> (Arc<Ctx>, solos_data::db::DbThread) {
+    ctx_with(server, root, Http::new(50.0).unwrap())
+}
+
+fn ctx_with(
+    server: &Server,
+    root: &std::path::Path,
+    http: Http,
+) -> (Arc<Ctx>, solos_data::db::DbThread) {
     let mut store = ledger::open(root, Lane::Capture).unwrap();
     ledger::recover(&mut store, root, Lane::Capture).unwrap();
     let (db, thread) = Db::spawn(store);
-    let http = Http::new(50.0).unwrap();
     http.set_host_rate(&server.base, 50.0);
     (
         Arc::new(Ctx {
@@ -318,6 +327,111 @@ fn the_stream_records_notifications_with_receipt_and_handles_the_end() {
     let status = lane.status().to_value();
     assert_eq!(status["fired"], 3);
     assert_eq!(status["titles"], json!(["SOL funding"]));
+    let store = thread.join(ctx.db.clone());
+    store.close().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// One HTTP/1.1 chunk of a `Transfer-Encoding: chunked` body.
+fn chunk(stream: &mut TcpStream, bytes: &[u8]) {
+    let _ = write!(stream, "{:x}\r\n", bytes.len());
+    let _ = stream.write_all(bytes);
+    let _ = stream.write_all(b"\r\n");
+    let _ = stream.flush();
+}
+
+const SSE_HEAD: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n";
+
+/// The production failure: the client's whole-request deadline also bounded the stream body,
+/// so every connection died at that instant with `error decoding response body`. Here the
+/// deadline is one second and the first connection lives longer on keep-alives, delivers a
+/// notification whose `data:` spans two lines and two chunks, and then drops mid-event; the
+/// second sends CRLF frames and the `end` event; the third answers 410.
+#[test]
+fn the_stream_outlives_the_request_deadline_and_reconnects_without_errors() {
+    let server = Server::start();
+    let _fake = mount_auto(&server);
+    let connections = Arc::new(AtomicI64::new(0));
+    let seen = Arc::clone(&connections);
+    server.route_raw("/v2/auto/queries/stream", move |_, stream| {
+        match seen.fetch_add(1, Ordering::SeqCst) {
+            0 => {
+                let _ = stream.write_all(SSE_HEAD);
+                for _ in 0..6 {
+                    chunk(stream, b": keep-alive\n\n");
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                chunk(stream, b"id: evt-1\nevent: notification\ndata: {\"status\":\"triggered\",");
+                chunk(stream, b"\ndata: \"queryId\":\"q-1\",\"title\":\"Plan Triggered\"}\n\n");
+                // A partial frame, then the connection drops without the last chunk.
+                chunk(stream, b"id: evt-lost\nevent: notif");
+            }
+            1 => {
+                let _ = stream.write_all(SSE_HEAD);
+                chunk(stream, b": keep-alive\r\n\r\n");
+                chunk(stream, b"id: evt-2\r\nevent: notification\r\ndata: {\"status\":\"update\",\"queryId\":\"q-1\"}\r\n\r\n");
+                chunk(stream, b"event: end\r\ndata: {\"code\":\"USER_STREAM_CLOSED\"}\r\n\r\n");
+                let _ = stream.write_all(b"0\r\n\r\n");
+            }
+            _ => {
+                let _ = stream.write_all(b"HTTP/1.1 410 Gone\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        }
+        let _ = stream.flush();
+    });
+    let root = tempdir("solos-alerts");
+    let http = Http::with_timeout(50.0, Duration::from_secs(1)).unwrap();
+    http.set_host_rate(&server.base, 50.0);
+    let (ctx, thread) = ctx_with(&server, &root, http);
+    let cfg = ElfaAuto {
+        enabled: true,
+        alerts: vec![alert("SOL funding")],
+        ..ElfaAuto::default()
+    };
+    let lane = Arc::new(AutoLane::new(
+        &server.base,
+        "test-key",
+        cfg,
+        Arc::new(tokio::sync::Mutex::new(())),
+    ));
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime
+        .block_on(auto::reconcile(&ctx, &lane, NOW_MS))
+        .unwrap();
+    let stop = Arc::clone(&ctx.stop);
+    runtime.block_on(async {
+        let streaming = auto::stream_loop(&ctx, &lane);
+        let stopper = async {
+            while connections.load(Ordering::SeqCst) < 3 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            stop.store(true, Ordering::SeqCst);
+        };
+        tokio::join!(streaming, stopper);
+    });
+    let status = lane.status().to_value();
+    assert_eq!(
+        status["errors"], 0,
+        "expected closes are not errors: {status}"
+    );
+    assert_eq!(status["fired"], 2, "{status}");
+    assert_eq!(status["connections"], 2);
+    assert_eq!(status["reconnects"], 2, "the drop and the end event");
+    assert_eq!(status["streamConnected"], false);
+    assert!(root.join("tables/elfa/auto_events").is_dir());
+    catalog(&ctx);
+    let out = rows(
+        &root,
+        "SELECT event_id, query_title, status, title FROM elfa_auto_events ORDER BY event_id",
+    );
+    assert_eq!(out.len(), 2, "{out:?}");
+    assert_eq!(out[0]["event_id"], "evt-1");
+    assert_eq!(out[0]["query_title"], "SOL funding");
+    assert_eq!(out[0]["title"], "Plan Triggered");
+    assert_eq!(out[1]["event_id"], "evt-2");
+    assert_eq!(out[1]["status"], "update");
     let store = thread.join(ctx.db.clone());
     store.close().unwrap();
     let _ = std::fs::remove_dir_all(&root);

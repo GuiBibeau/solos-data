@@ -26,4 +26,5 @@ pub mod polymarket;
 pub mod query;
 pub mod sec;
 pub mod series;
+pub mod sse;
 pub mod sync;

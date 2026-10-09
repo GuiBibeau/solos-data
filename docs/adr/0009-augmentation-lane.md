@@ -142,12 +142,19 @@ key cannot store another issuer's filings: the lane compares the issuer's `ticke
 symbol and refuses the series when they differ.
 
 EDGAR's fair-access policy asks every automated client to declare itself in the User-Agent and
-answers `403 Undeclared Automated Tool` otherwise; the lane sends `sources.sec.userAgent`
-(`solos-data/1.0 (+https://github.com/GuiBibeau/solos-data)` by default), `Accept-Encoding:
-gzip`, inflates the body itself and keeps to four requests a second against the policy's ten.
-What the declaration must contain is the operator's decision and lives in the config, not in
-the code. `augment sec-map` reads `company_tickers.json` with the same header and reports or
-writes (`--write`) the CIK of every equity symbol.
+answers `403 Undeclared Automated Tool` otherwise; the lane sends `SEC_USER_AGENT`,
+`Accept-Encoding: gzip`, inflates the body itself and keeps to four requests a second against
+the policy's ten. The declaration must carry a contact email: in production (2026-10-09) the
+first default, `solos-data/1.0 (+https://github.com/GuiBibeau/solos-data)`, drew a `403` on every
+request (34 `augment_series_error` lines an hour), and the same request with an email in the
+User-Agent drew `200`. The contact is the operator's and is not in the code or the config: the
+operator adds `SEC_USER_AGENT=<name> <contact email>` to `~/.config/solos-data/augment.env`, which
+the sync unit reads. Without it, or without an `@` in it, the source is off: each sync logs one
+`augment_source_disabled` line (`reason` `SEC_USER_AGENT not set` or `SEC_USER_AGENT has no
+contact email`), sends no request to EDGAR, and `augment status` shows the source with
+`disabled: true` and the reason. `augment sec-map` reads `company_tickers.json` with the same
+header, refuses to run without it, and reports or writes (`--write`) the CIK of every equity
+symbol.
 
 Prediction markets are curated, not discovered: `polymarket.events` lists Gamma event ids
 (Fed decisions for the next three meetings, the September CPI prints, US recession by 2026 and
@@ -183,9 +190,18 @@ month's measured spend (`elfa/auto/spend`). Creation costs five credits ("baseli
 the only paid call besides the listing; `credits.used` is read before and after each
 reconciliation under a billing lock shared with the hourly v3 cycle, so the v3 credit guard
 never sees the Auto lane's spend as billing of the free reads. `creditBudgetPerMonth` (60) and
-`maxAlerts` (8) stop creation when reached (`elfa_auto_budget_reached`). The stream is
-reopened with exponential backoff; `410` means the account has no active query and the lane
-waits five minutes; a frame-less minute (keep-alives count) reopens it. Logs:
+`maxAlerts` (8) stop creation when reached (`elfa_auto_budget_reached`). The stream is read
+line by line (`text/event-stream`: comments and keep-alives dropped, multi-line `data:` joined,
+LF, CRLF or CR line ends, partial lines carried across chunks) on an HTTP client without a
+whole-request deadline: the first build shared the lane's client, whose 120-second deadline
+also covers the body, so every connection died at 120 s with `error decoding response body`
+(production, 2026-10-09). The response head is still bounded by that deadline. An `end` event,
+a server close, a dropped connection and a frame-less minute (keep-alives count) are
+reconnections, logged as `elfa_auto_stream_reconnect` with the reason and counted as
+`reconnects`, not errors; the wait doubles from one second to five minutes and falls back to
+one second after a connection that held a minute. `410` means the account has no active query
+and the lane waits five minutes. Errors are failures to open the stream and to record a
+notification. Logs:
 `elfa_auto_created` (with the answer's `x-elfa-credits`), `elfa_auto_renewed`,
 `elfa_auto_fired`, `elfa_auto_credits` (the measured delta per reconciliation).
 

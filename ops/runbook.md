@@ -164,8 +164,9 @@ Kalshi odds) into `SOLOS_DATA_AUGMENT_DIR` (default `dataDir`, `data/augment`) a
 idempotent: closed periods are fetched once, the open day or month is rewritten each run, and
 anything on disk the ledger does not know is removed at start. The timer runs it hourly, one run
 at a time; the first run backfills from `startDate` (2026-01-01) and takes about a day because
-of the two-requests-a-second spacing per host. No credential is needed; `augment.env` exists
-for `ELFA_API_KEY`, which only the capture lane reads.
+of the two-requests-a-second spacing per host. No credential is needed. Both augment units read
+`~/.config/solos-data/augment.env` (mode 0600): the capture lane for `ELFA_API_KEY`, the sync
+for `SEC_USER_AGENT`.
 
 ```sh
 cp ops/solos-data-augment.service ops/solos-data-augment.timer ~/.config/systemd/user/
@@ -188,9 +189,18 @@ check. Query views are named `<source>_<dataset>` (`binance_klines`, `hyperliqui
 `polymarket_prices`, `kalshi_candles_1h`, `phoenix_earnings_dates`).
 
 The exogenous sources (ADR-0009, "Exogenous triggers and alerts") run in the same sync. SEC
-EDGAR filings need the issuers' CIKs in the symbol map (`secCik`) and a declared User-Agent:
-EDGAR answers `403` to a client it considers undeclared, and `sources.sec.userAgent` is where
-the operator declares one. `augment sec-map` reports the CIK of every equity symbol from
+EDGAR filings need the issuers' CIKs in the symbol map (`secCik`) and a declared User-Agent
+with a contact email: EDGAR answers `403` to any User-Agent without one. The operator declares
+it in the environment, never in the config:
+
+```sh
+# in ~/.config/solos-data/augment.env (mode 0600); the next timer run picks it up
+SEC_USER_AGENT=<name> <contact email>
+```
+
+Without it (or without an `@` in it) each sync logs one `augment_source_disabled` line with
+`"source":"sec"` and the reason, sends nothing to EDGAR, and `augment status` shows
+`sources.sec.disabled: true` with the reason; `augment sec-map` refuses to run. `augment sec-map` reports the CIK of every equity symbol from
 EDGAR's `company_tickers.json`, `--write` stores them in the config, and the lane refuses a CIK
 whose EDGAR tickers do not include the symbol (`augment_series_error` with the issuer's name).
 Polymarket events and Kalshi series are curated lists in the config; add the next month's
@@ -231,7 +241,8 @@ merged into the day's file; a SIGTERM flushes them.
 The Auto alerts cost credits: five per creation, one per listing of the account's queries
 (once per reconciliation, so once an hour and once per restart). `elfa.auto.creditBudgetPerMonth`
 and `maxAlerts` cap what the lane may create; `status-capture.json` shows `elfaAuto`
-(active titles, created, renewed, fired, `creditsSpentMonth`, `streamConnected`) and
+(active titles, created, renewed, fired, `creditsSpentMonth`, `streamConnected`,
+`connections`, `reconnects`, `errors`) and
 `elfaEvents` (polls, requests, `requestsPerPoll`). To add an alert, append its definition to
 `elfa.auto.alerts` (conditions and repeat only; the lane adds the `notify` action and the
 expiry) and restart the capture unit; to retire one, remove it from the config and cancel it
@@ -240,6 +251,8 @@ spend against the key with `credits.used` before and after:
 
 ```sh
 journalctl --user -u solos-data-augment-capture.service -o cat | grep -E "elfa_auto_(created|renewed|fired|credits|budget_reached)"
+# Reconnections (end event, server close, drop, idle) are expected and are not errors:
+journalctl --user -u solos-data-augment-capture.service -o cat | grep -E "elfa_auto_stream_(reconnect|closed)|\"auto_events\".*augment_series_error"
 SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment query --sql \
   "SELECT ts, query_title, status, title FROM elfa_auto_events ORDER BY ts DESC LIMIT 20"
 SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment query --sql \

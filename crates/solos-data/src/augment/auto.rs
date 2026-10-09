@@ -12,6 +12,7 @@ use super::ledger::{get_progress, register, set_progress};
 use super::parquet::{Target, read_json_array, stage_json, write_merged};
 use super::periods::{Granularity, Period, date_of_ms};
 use super::series::Ctx;
+pub use super::sse::{SseFrame, SseParser};
 use crate::jsonout::{Obj, log, now, safe_error};
 use crate::store::StoreError;
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,8 @@ pub struct Counters {
     pub errors: AtomicU64,
     /// Stream connections opened.
     pub connections: AtomicU64,
+    /// Connections that ended without an error (end event, close, drop, idle) and were reopened.
+    pub reconnects: AtomicU64,
     /// Whether the stream is connected now.
     pub connected: AtomicBool,
     /// Credits spent this month, as measured.
@@ -121,6 +124,7 @@ impl AutoLane {
             .with("fired", c.fired.load(Ordering::Relaxed))
             .with("errors", c.errors.load(Ordering::Relaxed))
             .with("connections", c.connections.load(Ordering::Relaxed))
+            .with("reconnects", c.reconnects.load(Ordering::Relaxed))
             .with("streamConnected", c.connected.load(Ordering::Relaxed))
             .with("creditsSpentMonth", c.spent_month.load(Ordering::Relaxed))
             .with("creditBudgetPerMonth", self.cfg.credit_budget_per_month)
@@ -412,63 +416,68 @@ pub async fn reconcile_loop(ctx: &Ctx, lane: &AutoLane, interval_seconds: u64) {
     }
 }
 
-/// One server-sent event.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SseFrame {
-    /// `id:` line.
-    pub id: Option<String>,
-    /// `event:` line.
-    pub event: Option<String>,
-    /// `data:` lines joined by newlines.
-    pub data: String,
+/// How a stream connection ended when nothing went wrong on the lane's side.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// The server sent its `end` event.
+    Ended,
+    /// The body finished between events.
+    Closed,
+    /// The connection broke or closed mid-event (the reason, without URLs).
+    Dropped(String),
+    /// Nothing arrived, not even a keep-alive, for `idle_seconds`.
+    Idle,
+    /// The lane is stopping.
+    Stopped,
 }
 
-/// Take every complete frame (blank-line terminated) off the front of `buffer`.
-pub fn parse_sse(buffer: &mut Vec<u8>) -> Vec<SseFrame> {
-    let mut frames = Vec::new();
-    loop {
-        let text = String::from_utf8_lossy(buffer).into_owned();
-        let Some((end, skip)) = frame_end(&text) else {
-            return frames;
-        };
-        let mut frame = SseFrame::default();
-        let mut data: Vec<&str> = Vec::new();
-        for line in text[..end].split('\n') {
-            let line = line.trim_end_matches('\r');
-            let Some((field, value)) = line.split_once(':') else {
-                continue;
-            };
-            if field.is_empty() {
-                continue;
-            }
-            let value = value.strip_prefix(' ').unwrap_or(value);
-            match field {
-                "id" => frame.id = Some(value.to_owned()),
-                "event" => frame.event = Some(value.to_owned()),
-                "data" => data.push(value),
-                _ => {}
-            }
+impl StreamEnd {
+    fn reason(&self) -> String {
+        match self {
+            StreamEnd::Ended => "end event".into(),
+            StreamEnd::Closed => "server closed the stream".into(),
+            StreamEnd::Dropped(reason) => format!("disconnected: {reason}"),
+            StreamEnd::Idle => "idle, no keep-alive".into(),
+            StreamEnd::Stopped => "stopping".into(),
         }
-        frame.data = data.join("\n");
-        if frame.id.is_some() || frame.event.is_some() || !frame.data.is_empty() {
-            frames.push(frame);
-        }
-        buffer.drain(..end + skip);
     }
 }
 
-fn frame_end(text: &str) -> Option<(usize, usize)> {
-    let lf = text.find("\n\n").map(|i| (i, 2));
-    let crlf = text.find("\r\n\r\n").map(|i| (i, 4));
-    match (lf, crlf) {
-        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
-        (a, b) => a.or(b),
+/// Reconnection delays: doubling from one second to five minutes, back to one second after a
+/// connection that held for a minute (a stream the server keeps closing at once backs off).
+#[derive(Debug)]
+pub struct Backoff {
+    next: u64,
+}
+
+impl Default for Backoff {
+    fn default() -> Backoff {
+        Backoff { next: 1 }
     }
 }
 
-/// Hold the account-wide stream, reconnecting with backoff; `410` means no active query.
+impl Backoff {
+    /// The wait after a connection that lasted `held`.
+    pub fn after_connection(&mut self, held: Duration) -> u64 {
+        if held >= Duration::from_secs(60) {
+            self.next = 1;
+        }
+        self.after_failure()
+    }
+
+    /// The wait after a failed attempt.
+    pub fn after_failure(&mut self) -> u64 {
+        let wait = self.next;
+        self.next = (self.next * 2).min(300);
+        wait
+    }
+}
+
+/// Hold the account-wide stream and reconnect with backoff. A server close, an `end` event, a
+/// broken connection or an idle stream is a reconnection (`elfa_auto_stream_reconnect`), not an
+/// error; `410` means no active query; errors are failures to open or to record.
 pub async fn stream_loop(ctx: &Ctx, lane: &AutoLane) {
-    let mut backoff = Duration::from_secs(1);
+    let mut backoff = Backoff::default();
     while !ctx.stopping() {
         if lane.active().is_empty() {
             pause(ctx, 30).await;
@@ -478,66 +487,111 @@ pub async fn stream_loop(ctx: &Ctx, lane: &AutoLane) {
             .http
             .open(&lane.url("/v2/auto/queries/stream"), &headers(&lane.key))
             .await;
-        match opened {
+        let wait = match opened {
             Ok(response) => {
                 lane.counters.connections.fetch_add(1, Ordering::Relaxed);
                 lane.counters.connected.store(true, Ordering::Relaxed);
-                backoff = Duration::from_secs(1);
+                let started = std::time::Instant::now();
                 let outcome = read_stream(ctx, lane, response).await;
                 lane.counters.connected.store(false, Ordering::Relaxed);
+                let wait = backoff.after_connection(started.elapsed());
                 match outcome {
-                    Ok(()) => {
-                        log("elfa_auto_stream_ended", Obj::new());
-                        pause(ctx, 15).await;
+                    Ok(StreamEnd::Stopped) => break,
+                    Ok(end) => {
+                        lane.counters.reconnects.fetch_add(1, Ordering::Relaxed);
+                        log(
+                            "elfa_auto_stream_reconnect",
+                            Obj::new()
+                                .with("reason", end.reason())
+                                .with("connectedSeconds", started.elapsed().as_secs())
+                                .with("waitSeconds", wait),
+                        );
                     }
                     Err(error) => {
                         lane.counters.errors.fetch_add(1, Ordering::Relaxed);
                         log_error("stream", &error.to_string());
-                        pause(ctx, backoff.as_secs()).await;
-                        backoff = (backoff * 2).min(Duration::from_secs(300));
                     }
                 }
+                wait
             }
             Err(HttpError::Status(410)) => {
                 log(
                     "elfa_auto_stream_closed",
                     Obj::new().with("reason", "no active queries (410)"),
                 );
-                pause(ctx, 300).await;
+                300
             }
             Err(error) => {
                 lane.counters.errors.fetch_add(1, Ordering::Relaxed);
                 log_error("stream", &error.to_string());
-                pause(ctx, backoff.as_secs()).await;
-                backoff = (backoff * 2).min(Duration::from_secs(300));
+                backoff.after_failure()
+            }
+        };
+        pause(ctx, wait).await;
+    }
+}
+
+/// A body error with its causes (`error decoding response body: ...: connection reset`).
+fn describe(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    safe_error(&text)
+}
+
+/// The next body chunk, checking the stop flag every second; `Err` once the stream has been
+/// quiet for `idle`.
+async fn next_chunk<S>(ctx: &Ctx, body: &mut S, idle: Duration) -> Result<S::Item, StreamEnd>
+where
+    S: futures_util::Stream + Unpin,
+{
+    use futures_util::StreamExt;
+    let mut quiet = Duration::ZERO;
+    let slice = Duration::from_secs(1).min(idle);
+    loop {
+        if ctx.stopping() {
+            return Err(StreamEnd::Stopped);
+        }
+        match tokio::time::timeout(slice, body.next()).await {
+            Ok(Some(item)) => return Ok(item),
+            Ok(None) => return Err(StreamEnd::Closed),
+            Err(_) => {
+                quiet += slice;
+                if quiet >= idle {
+                    return Err(StreamEnd::Idle);
+                }
             }
         }
     }
 }
 
+/// Read one connection's events until it ends; record every notification as it arrives.
 async fn read_stream(
     ctx: &Ctx,
     lane: &AutoLane,
-    mut response: reqwest::Response,
-) -> Result<(), StoreError> {
-    let mut buffer: Vec<u8> = Vec::new();
+    response: reqwest::Response,
+) -> Result<StreamEnd, StoreError> {
+    let mut body = Box::pin(response.bytes_stream());
+    let mut parser = SseParser::new();
+    let idle = Duration::from_secs(lane.idle_seconds.max(1));
     loop {
-        if ctx.stopping() {
-            return Ok(());
-        }
-        let idle = Duration::from_secs(lane.idle_seconds.max(5));
-        let chunk = match tokio::time::timeout(idle, response.chunk()).await {
-            Ok(Ok(Some(bytes))) => bytes,
-            Ok(Ok(None)) => return Ok(()),
-            Ok(Err(error)) => return Err(StoreError::Check(safe_error(&error.to_string()))),
-            Err(_) => return Err(StoreError::Check("stream idle, reconnecting".into())),
+        let chunk = match next_chunk(ctx, &mut body, idle).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(error)) => return Ok(StreamEnd::Dropped(describe(&error))),
+            Err(StreamEnd::Closed) if parser.pending() => {
+                return Ok(StreamEnd::Dropped("closed mid-event".into()));
+            }
+            Err(end) => return Ok(end),
         };
-        buffer.extend_from_slice(&chunk);
-        for frame in parse_sse(&mut buffer) {
+        for frame in parser.push(&chunk) {
             match frame.event.as_deref() {
-                Some("end") => return Ok(()),
-                Some("error") => return Err(StoreError::Check(frame.data)),
-                Some("notification") | None if !frame.data.is_empty() => {
+                Some("end") => return Ok(StreamEnd::Ended),
+                Some("error") => return Err(StoreError::Check(safe_error(&frame.data))),
+                Some("notification" | "message") | None if !frame.data.is_empty() => {
                     record(ctx, lane, &frame, chrono::Utc::now().timestamp_millis()).await?;
                 }
                 _ => {}
@@ -673,14 +727,18 @@ mod tests {
         assert_eq!(body["query"]["expiresIn"], "720h");
         assert_eq!(expiry_ms("720h"), 720 * 3_600_000);
         assert_eq!(month_label(1_791_547_200_000), "2026-10");
-        let mut buffer = b"id: e1\r\nevent: notification\r\ndata: {\"queryId\":\"q\"}\r\n\r\n: keep-alive\n\nevent: end\ndata: {\"code\":\"USER_STREAM_CLOSED\"}\n\nid: partial".to_vec();
-        let frames = parse_sse(&mut buffer);
-        assert_eq!(frames.len(), 2);
-        assert_eq!(frames[0].id.as_deref(), Some("e1"));
-        assert_eq!(frames[0].event.as_deref(), Some("notification"));
-        assert_eq!(frames[0].data, "{\"queryId\":\"q\"}");
-        assert_eq!(frames[1].event.as_deref(), Some("end"));
-        assert_eq!(buffer, b"id: partial");
+        let frames = SseParser::new()
+            .push(b"id: e1\r\nevent: notification\r\ndata: {\"queryId\":\"q\"}\r\n\r\n");
+        assert_eq!(frames.len(), 1);
+        let mut backoff = Backoff::default();
+        assert_eq!(backoff.after_failure(), 1);
+        assert_eq!(backoff.after_connection(Duration::from_secs(5)), 2);
+        assert_eq!(backoff.after_connection(Duration::from_secs(5)), 4);
+        assert_eq!(backoff.after_connection(Duration::from_secs(90)), 1);
+        for _ in 0..12 {
+            backoff.after_failure();
+        }
+        assert_eq!(backoff.after_failure(), 300);
         let active = vec![ActiveQuery {
             id: "q".into(),
             title: "SOL funding".into(),
