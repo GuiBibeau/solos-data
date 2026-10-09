@@ -186,6 +186,13 @@ dataset, symbol and item that failed; the item is retried on the next run. `--so
 To re-download one series, delete its rows from `files` and its `progress` record in
 `checkpoint.duckdb` with no run active, or delete the whole root to start over.
 
+The large datasets (Binance `aggTrades` and `bookDepth` under `largeDatasets`, Bybit tick trades
+under `bybit.trades`) are off by default and stay off while `diskBudgetGb` is 0. Set the budget to
+the size the augment root may reach, in GB, and list the datasets; a run stops adding large files
+once the lane's registered bytes pass the budget (`augment_budget_reached`) and resumes where it
+left off when the budget is raised. SOLUSDT alone is about 17 MB of gzip ticks a day on Bybit;
+size the budget from `augment status`'s per-dataset bytes after a day.
+
 `solos-data augment capture --config config/augment.json` is the long-running lane for what
 cannot be fetched later: Hyperliquid 1-minute candles every thirty minutes, Hyperliquid asset
 contexts (funding, open interest, mark/oracle/mid prices) every minute, Elfa events, calls,

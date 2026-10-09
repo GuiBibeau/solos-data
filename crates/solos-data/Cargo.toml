@@ -42,6 +42,10 @@ solana-rpc = { version = "=4.2.2", optional = true }
 solana-geyser-plugin-manager = { version = "=4.2.2", optional = true }
 solana-storage-proto = { version = "=4.2.2", optional = true }
 
+[dev-dependencies]
+# Tests build gzip fixtures for the Bybit tick dumps; flate2 is already in the graph through zip.
+flate2 = "1"
+
 [features]
 default = []
 # The Old Faithful archive lane through Jetstreamer (heavy build: agave crates and RocksDB).

@@ -42,10 +42,11 @@ next to the raw and decoded roots, and keep them current from the same binary.
   `WTIOIL` is `xyz:CL`, the dexes' oil oracles differ and this is the `xyz` one), 50 a Bybit
   perpetual (`PUMP` is `PUMPFUNUSDT`, `RAY` `RAYDIUMUSDT`, `kSHIB` `SHIB1000USDT`, `GOLD`
   `XAUTUSDT`), all 94 an Elfa entity id. Tests never fetch the map.
-- **Politeness.** One HTTP client spaces requests per host at `requestsPerSecond` (2), retries
-  429, 5xx and transport errors six times with exponential backoff from one second, honours
-  `Retry-After`, and never logs a URL. Sources run concurrently within a run; each is bound by
-  its host's spacing.
+- **Politeness.** One HTTP client spaces requests per host at `requestsPerSecond` (2; Hyperliquid
+  has its own, 1, because its info API weighs most requests 20 against 1,200 a minute per
+  address and answered 429 at two a second), retries 429, 5xx and transport errors six times
+  with exponential backoff from one second, honours `Retry-After`, and never logs a URL. Sources
+  run concurrently within a run; each is bound by its host's spacing.
 - **Start.** Everything is stored from 2026-01-01, before the first Phoenix slot the collector
   reaches.
 
@@ -64,8 +65,11 @@ Phase 1, `augment sync`:
 
 Binance files are listed through the bucket's S3 index starting after the newest registered
 file, so an hourly run costs one listing per dataset and symbol plus the new day's files. Each
-zip is compared with its published `.CHECKSUM` (SHA-256) before conversion; older dumps without a
-header line are detected by their first byte.
+zip is compared with its published `.CHECKSUM` (SHA-256) before conversion; the zip and the
+checksum are requested together, since each is an origin round trip of about 0.7 s from the box
+and the lane is otherwise bound by latency rather than by its request spacing. Older dumps
+without a header line are detected by their first byte. A (dataset, symbol) walk stops at its
+first failed file so the next run's listing marker never moves past it.
 
 Phase 2, `augment capture`, a second process with its own ledger (`capture/checkpoint.duckdb`,
 `catalog-capture.json`, `status-capture.json`, `staging-capture/`) writing distinct datasets into
@@ -85,8 +89,15 @@ A day's file grows by a merge: the new rows and the existing file are unioned an
 the key with the new row winning, then written through the same durable path. Merged files are
 registered with `complete=false` until the day has passed.
 
-Phase 3, opt-in behind `largeDatasets` and `trades`: Binance `aggTrades` and `bookDepth`, Bybit
-tick trades. The Binance column definitions are in place; the flags are off.
+Phase 3, opt-in and bounded by `diskBudgetGb` (0, the default, keeps every large dataset off):
+Binance `aggTrades` and `bookDepth` daily zips through `largeDatasets`, and Bybit tick trades
+(`public.bybit.com/trading/<SYMBOL>/<SYMBOL><YYYY-MM-DD>.csv.gz`, one day per file, read as
+gzip CSV by DuckDB) through `trades: true`. Before each large file the lane sums the bytes its
+ledger has registered; past the budget it logs `augment_budget_reached` and skips the rest of the
+large datasets for that run, so a budget is a ceiling on the root, not a pace. Bybit publishes no
+machine-readable listing; the lane walks the days from its progress record to the day before
+yesterday and treats a 404 older than three days as "no trades that day" (the market was listed
+later) and a newer 404 as "not published yet".
 
 ## What is deliberately not fetched
 

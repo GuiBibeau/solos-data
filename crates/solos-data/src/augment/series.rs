@@ -34,6 +34,8 @@ pub struct Ctx {
     pub now_ms: i64,
     /// Set on SIGTERM; sources stop between items.
     pub stop: Arc<AtomicBool>,
+    /// Bytes the large datasets may bring the lane's files to; 0 disables them.
+    pub disk_budget_bytes: i64,
 }
 
 impl Ctx {
@@ -47,6 +49,33 @@ impl Ctx {
     #[must_use]
     pub fn staging(&self) -> PathBuf {
         self.lane.staging_dir(&self.root)
+    }
+
+    /// Whether a large dataset may add a file: the lane's registered bytes are under the budget.
+    /// Logs `augment_budget_reached` once per call that refuses.
+    pub async fn within_budget(&self, dataset: &str) -> bool {
+        if self.disk_budget_bytes <= 0 {
+            return false;
+        }
+        let used = self
+            .db
+            .run(|store| {
+                let rows = store.rows("SELECT coalesce(sum(bytes), 0) AS bytes FROM files", &[])?;
+                Ok(rows.first().and_then(|row| row.int("bytes")).unwrap_or(0))
+            })
+            .await
+            .unwrap_or(i64::MAX);
+        if used < self.disk_budget_bytes {
+            return true;
+        }
+        log(
+            "augment_budget_reached",
+            Obj::new()
+                .with("dataset", dataset)
+                .with("usedBytes", used)
+                .with("budgetBytes", self.disk_budget_bytes),
+        );
+        false
     }
 }
 
@@ -105,6 +134,15 @@ impl Outcome {
             .with("errors", self.errors)
             .with("skipped", self.skipped)
     }
+}
+
+/// `diskBudgetGb` as bytes.
+#[must_use]
+pub fn budget_bytes(gb: f64) -> i64 {
+    if gb <= 0.0 || !gb.is_finite() {
+        return 0;
+    }
+    (gb * 1e9).min(i64::MAX as f64) as i64
 }
 
 /// Progress key of a series.

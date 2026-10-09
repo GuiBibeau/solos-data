@@ -15,7 +15,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// Pages per stream per cycle; the rest waits for the next cycle.
+/// Pages per stream per cycle by default; the rest waits for the next cycle, which resumes from
+/// the newest row received.
 pub const MAX_PAGES: usize = 200;
 
 /// One Elfa stream.
@@ -100,6 +101,8 @@ pub struct ElfaLane {
     pub key: String,
     /// First instant to pull, seconds.
     pub start_s: i64,
+    /// Pages per stream per cycle.
+    pub max_pages: usize,
     disabled: AtomicBool,
 }
 
@@ -111,6 +114,7 @@ impl ElfaLane {
             base_url: base_url.trim_end_matches('/').to_owned(),
             key: key.to_owned(),
             start_s,
+            max_pages: MAX_PAGES,
             disabled: AtomicBool::new(false),
         }
     }
@@ -227,7 +231,7 @@ async fn pull_stream(
     let mut cursor: Option<String> = None;
     let mut pages = 0;
     let mut has_more = true;
-    while has_more && pages < MAX_PAGES {
+    while has_more && pages < lane.max_pages {
         let mut pairs: Vec<(&str, String)> = vec![
             ("from", from.to_string()),
             ("to", to.to_string()),
@@ -264,7 +268,18 @@ async fn pull_stream(
         }
         pages += 1;
     }
-    let complete_to = if has_more { None } else { Some(to) };
+    // Where the next cycle resumes: `to` when the pull finished, otherwise one second before the
+    // newest row received (rows sharing that second may be split across pages; the merge
+    // deduplicates on id).
+    let newest = rows
+        .iter()
+        .filter_map(|r| r.get(day_field(stream)).and_then(Value::as_i64))
+        .max();
+    let complete_to = match (has_more, newest) {
+        (false, _) => Some(to),
+        (true, Some(newest)) => Some((newest - 1).max(from)),
+        (true, None) => None,
+    };
     let by_day = group_by_day(rows);
     for (day, day_rows) in by_day {
         let count = write_day(

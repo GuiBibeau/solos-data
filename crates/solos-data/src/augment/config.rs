@@ -61,6 +61,10 @@ pub struct Hyperliquid {
     pub enabled: bool,
     /// API base.
     pub base_url: String,
+    /// Requests per second to this host: the info API weighs most requests 20 against a budget
+    /// of 1,200 a minute per address, so one a second.
+    #[serde(default = "d_hl_rps")]
+    pub requests_per_second: f64,
     /// Hourly funding history (sync).
     #[serde(default = "d_true")]
     pub funding_history: bool,
@@ -176,6 +180,9 @@ pub struct AugmentConfig {
     /// Requests per second per host.
     #[serde(default = "d_rps")]
     pub requests_per_second: f64,
+    /// Bytes the large datasets may bring the root to, in GB; 0 means no large dataset runs.
+    #[serde(default)]
+    pub disk_budget_gb: f64,
     /// Per-source settings.
     pub sources: Sources,
     /// The symbol map.
@@ -187,6 +194,9 @@ fn d_true() -> bool {
 }
 fn d_rps() -> f64 {
     2.0
+}
+fn d_hl_rps() -> f64 {
+    1.0
 }
 fn d_candle_interval() -> u64 {
     1800
@@ -240,6 +250,15 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
     }
     if !(config.requests_per_second > 0.0 && config.requests_per_second <= 50.0) {
         return Err(StoreError::Check("Invalid requestsPerSecond".into()));
+    }
+    if !(config.disk_budget_gb >= 0.0 && config.disk_budget_gb.is_finite()) {
+        return Err(StoreError::Check("Invalid diskBudgetGb".into()));
+    }
+    let hl_rps = config.sources.hyperliquid.requests_per_second;
+    if !(hl_rps > 0.0 && hl_rps <= 50.0) {
+        return Err(StoreError::Check(
+            "Invalid hyperliquid.requestsPerSecond".into(),
+        ));
     }
     if config.symbols.is_empty() {
         return Err(StoreError::Check("symbols must not be empty".into()));

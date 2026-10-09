@@ -36,6 +36,7 @@ fn ctx(server: &Server, root: &std::path::Path) -> (Ctx, solos_data::db::DbThrea
             start: solos_data::augment::periods::parse_date("2026-10-01").unwrap(),
             now_ms: NOW_MS,
             stop: Arc::new(AtomicBool::new(false)),
+            disk_budget_bytes: 0,
         },
         thread,
     )
@@ -224,7 +225,7 @@ fn elfa_pulls_streams_and_the_credit_guard_disables_the_lane() {
         assert_eq!(request.param("order").as_deref(), Some("asc"));
         if request.param("cursor").is_none() {
             let events: Vec<Value> = (0..30)
-                .map(|i| json!({ "id": format!("e{i}"), "firstSeenAt": from + i * 3600, "eventClass": "news", "primaryEntities": [{ "id": "a", "symbol": "SOL" }] }))
+                .map(|i| json!({ "id": format!("e{from}-{i}"), "firstSeenAt": from + i * 3600, "eventClass": "news", "primaryEntities": [{ "id": "a", "symbol": "SOL" }] }))
                 .filter(|e| e["firstSeenAt"].as_i64().unwrap() <= to)
                 .collect();
             Response::json(&json!({ "events": events, "nextCursor": "c2", "hasMore": true }))
@@ -243,12 +244,31 @@ fn elfa_pulls_streams_and_the_credit_guard_disables_the_lane() {
     });
     let root = tempdir("solos-capture");
     let (ctx, thread) = ctx(&server, &root);
-    let lane = ElfaLane::new(&server.base, "test-key", now_s - 40 * 86_400);
+    let mut lane = ElfaLane::new(&server.base, "test-key", now_s - 40 * 86_400);
+    // One page per cycle: the events pull cannot finish, so its progress must still move to
+    // the newest event received and the next cycle must resume there.
+    lane.max_pages = 1;
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let outcome = runtime.block_on(elfa::cycle(&ctx, &lane, now_s));
     assert_eq!(outcome.errors, 0);
     assert!(outcome.files >= 4);
     assert!(!lane.disabled());
+    let events_hits = server.hits_of("/v3/events");
+    let outcome = runtime.block_on(elfa::cycle(&ctx, &lane, now_s + 60));
+    assert_eq!(outcome.errors, 0);
+    let resumed: i64 = server
+        .hits()
+        .into_iter()
+        .filter(|h| h.path == "/v3/events")
+        .nth(events_hits)
+        .and_then(|h| h.param("from"))
+        .unwrap()
+        .parse()
+        .unwrap();
+    // The first page held events at from, from + 1 h, ... from + 29 h; the next cycle resumes
+    // one second before the newest, plus one.
+    assert_eq!(resumed, now_s - 30 * 86_400 + 29 * 3600);
+    lane.max_pages = elfa::MAX_PAGES;
     let first_from: i64 = server
         .hits()
         .iter()
@@ -270,7 +290,8 @@ fn elfa_pulls_streams_and_the_credit_guard_disables_the_lane() {
         &root,
         "SELECT count(*) AS n, count(DISTINCT id) AS ids FROM elfa_events",
     );
-    assert_eq!(events[0]["n"], "31");
+    // Two one-page cycles of thirty events each, all distinct.
+    assert_eq!(events[0]["n"], "60");
     assert_eq!(events[0]["n"], events[0]["ids"]);
     let episodes = rows(&root, "SELECT id, status, alpha_score FROM elfa_episodes");
     assert_eq!(episodes[0]["alpha_score"], 0.5);
@@ -292,7 +313,20 @@ fn elfa_pulls_streams_and_the_credit_guard_disables_the_lane() {
         .unwrap()
         .parse()
         .unwrap();
-    assert_eq!(second_from, now_s - 60 + 1);
+    // The second one-page cycle resumed at `resumed` and received events up to
+    // resumed + 29 h; this cycle starts one second before that, plus one.
+    assert_eq!(second_from, now_s - 30 * 86_400 + 58 * 3600);
+    let root_clone = root.clone();
+    ctx.db
+        .run_blocking(move |store| ledger::write_catalog(store, &root_clone, Lane::Capture))
+        .unwrap();
+    let events = rows(
+        &root,
+        "SELECT count(*) AS n, count(DISTINCT id) AS ids FROM elfa_events",
+    );
+    // Thirty more from the first page and the final `e-last` row of the second page.
+    assert_eq!(events[0]["n"], "91");
+    assert_eq!(events[0]["n"], events[0]["ids"]);
     let outcome = runtime.block_on(elfa::cycle(&ctx, &lane, now_s + 7200));
     assert_eq!(outcome.skipped, 1);
     let store = thread.join(ctx.db.clone());
@@ -353,5 +387,106 @@ fn bybit_funding_is_a_paged_month_series() {
         out[0]["n"],
         ((NOW_MS - 1_788_220_800_000) / (8 * 3_600_000) + 1).to_string()
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A gzip body.
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+#[test]
+fn bybit_trade_dumps_walk_days_under_the_disk_budget() {
+    let server = Server::start();
+    let csv = "timestamp,symbol,side,size,price,tickDirection,trdMatchID,grossValue,homeNotional,foreignNotional,RPI\n\
+1791331200.4902,SOLUSDT,Buy,0.5,120.640,ZeroMinusTick,430df55f-04cc-5b09-aff7-5051f01be39a,6.032e+09,0.5,60.32,0\n\
+1791331201.268,SOLUSDT,Sell,0.1,120.630,MinusTick,838ff3c1-17cc-5963-8a91-180b422a927a,1.2063e+09,0.1,12.063,0\n";
+    let legacy = "timestamp,symbol,side,size,price,tickDirection,trdMatchID,grossValue,homeNotional,foreignNotional\n\
+1791244800.1,SOLUSDT,Buy,1,100,PlusTick,id-1,1e+08,1,100\n";
+    // 10-04 has the legacy ten-column shape; 10-05 was never published and ended more than
+    // three days ago, so it counts as a day without trades; 10-06 to 10-08 (yesterday) exist;
+    // today is never asked for.
+    server.serve_bytes(
+        "/trading/SOLUSDT/SOLUSDT2026-10-04.csv.gz",
+        gzip(legacy.as_bytes()),
+    );
+    for day in ["2026-10-06", "2026-10-07", "2026-10-08"] {
+        server.serve_bytes(
+            &format!("/trading/SOLUSDT/SOLUSDT{day}.csv.gz"),
+            gzip(csv.as_bytes()),
+        );
+    }
+    let root = tempdir("solos-augment");
+    let mut config = load_augment_config(repository_config_path().to_str()).unwrap();
+    config.data_dir = root.clone();
+    config.start_date = "2026-10-04".into();
+    config.requests_per_second = 50.0;
+    config.disk_budget_gb = 1.0;
+    config.symbols.retain(|s| s.phoenix == "SOL");
+    config.sources.bybit.base_url = server.base.clone();
+    config.sources.bybit.files_url = server.base.clone();
+    config.sources.bybit.funding_history = false;
+    config.sources.bybit.trades = true;
+    let filter = solos_data::augment::sync::Filter {
+        source: Some("bybit".into()),
+        symbol: None,
+    };
+    let run = |config: &solos_data::augment::config::AugmentConfig| {
+        solos_data::augment::sync::run_sync(
+            config,
+            NOW_MS,
+            &filter,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap()
+        .to_value()
+    };
+    let status = run(&config);
+    assert_eq!(status["totals"]["errors"], 0, "{status}");
+    assert_eq!(status["sources"]["bybit"]["files"], 4);
+    assert_eq!(
+        server.hits_of("/trading/SOLUSDT/SOLUSDT2026-10-05.csv.gz"),
+        1
+    );
+    assert_eq!(
+        server.hits_of("/trading/SOLUSDT/SOLUSDT2026-10-09.csv.gz"),
+        0
+    );
+    let out = rows(
+        &root,
+        "SELECT count(*) AS n, count(rpi) AS with_rpi, min(ts)::VARCHAR AS first, max(price) AS px FROM bybit_trades",
+    );
+    assert_eq!(out[0]["n"], "7");
+    assert_eq!(out[0]["with_rpi"], "6");
+    assert_eq!(out[0]["first"], "2026-10-06 00:00:00.1");
+    assert_eq!(out[0]["px"], 120.64);
+    // Rerun: nothing new, the 404 for 10-05 is not retried, today is still not asked for.
+    let hits_before = server.hit_count();
+    let status = run(&config);
+    assert_eq!(status["sources"]["bybit"]["files"], 0);
+    let paths: Vec<String> = server
+        .hits()
+        .into_iter()
+        .skip(hits_before)
+        .map(|h| h.path)
+        .collect();
+    assert!(paths.is_empty(), "{paths:?}");
+    // A budget is a ceiling on the registered bytes: a fresh root admits the first file, then
+    // the lane stops adding large files; a zero budget keeps the large datasets off entirely.
+    config.disk_budget_gb = 0.000_001;
+    let mut fresh = config.clone();
+    fresh.data_dir = tempdir("solos-augment");
+    let status = run(&fresh);
+    assert_eq!(status["sources"]["bybit"]["files"], 1);
+    let _ = std::fs::remove_dir_all(&fresh.data_dir);
+    config.disk_budget_gb = 0.0;
+    let mut off = config.clone();
+    off.data_dir = tempdir("solos-augment");
+    let status = run(&off);
+    assert_eq!(status["sources"]["bybit"]["files"], 0);
+    let _ = std::fs::remove_dir_all(&off.data_dir);
     let _ = std::fs::remove_dir_all(&root);
 }
