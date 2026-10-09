@@ -2,7 +2,7 @@
   "dataDir": "data/augment",
   "startDate": "2026-01-01",
   "requestsPerSecond": 2.0,
-  "diskBudgetGb": 0,
+  "diskBudgetGb": 0.0,
   "sources": {
     "binance": {
       "enabled": true,
@@ -91,6 +91,101 @@
       "baseUrl": "https://api.elfa.ai",
       "intervalSeconds": 3600,
       "requestsPerMinute": 60
+    },
+    "sec": {
+      "enabled": true,
+      "baseUrl": "https://data.sec.gov",
+      "tickersUrl": "https://www.sec.gov/files/company_tickers.json",
+      "archiveUrl": "https://www.sec.gov/Archives/edgar/data",
+      "userAgent": "solos-data/1.0 (+https://github.com/GuiBibeau/solos-data)",
+      "requestsPerSecond": 4.0
+    },
+    "alternative": {
+      "enabled": true,
+      "baseUrl": "https://api.alternative.me"
+    },
+    "polymarket": {
+      "enabled": true,
+      "gammaUrl": "https://gamma-api.polymarket.com",
+      "clobUrl": "https://clob.polymarket.com",
+      "events": [
+        {
+          "id": "606422",
+          "slug": "fed-decision-in-october-20260617190323537"
+        },
+        {
+          "id": "770450",
+          "slug": "fed-decision-in-december-20260729232808632"
+        },
+        {
+          "id": "770451",
+          "slug": "fed-decision-in-january-20260729233815502"
+        },
+        {
+          "id": "1005013",
+          "slug": "september-inflation-us-annual"
+        },
+        {
+          "id": "1005022",
+          "slug": "core-cpi-yoy-september-2026"
+        },
+        {
+          "id": "1005015",
+          "slug": "core-cpi-mom-september-2026"
+        },
+        {
+          "id": "48802",
+          "slug": "us-recession-by-end-of-2026"
+        },
+        {
+          "id": "812474",
+          "slug": "us-recession-by-end-of-2027-20260807185409760"
+        },
+        {
+          "id": "89502",
+          "slug": "what-price-will-bitcoin-hit-before-2027"
+        },
+        {
+          "id": "89519",
+          "slug": "what-price-will-ethereum-hit-before-2027"
+        },
+        {
+          "id": "89525",
+          "slug": "what-price-will-solana-hit-before-2027"
+        },
+        {
+          "id": "1112205",
+          "slug": "what-price-will-bitcoin-hit-in-october-2026"
+        },
+        {
+          "id": "1112206",
+          "slug": "what-price-will-ethereum-hit-in-october-2026"
+        },
+        {
+          "id": "1112223",
+          "slug": "what-price-will-solana-hit-in-october-2026"
+        },
+        {
+          "id": "73040",
+          "slug": "us-national-bitcoin-reserve-before-2027"
+        }
+      ]
+    },
+    "kalshi": {
+      "enabled": true,
+      "baseUrl": "https://api.elections.kalshi.com/trade-api/v2",
+      "series": [
+        "KXFED",
+        "KXFEDDECISION",
+        "KXCPI",
+        "KXCPIYOY",
+        "KXRECSSNBER",
+        "KXU3"
+      ]
+    },
+    "phoenix": {
+      "enabled": true,
+      "marketsUrl": "https://perp-api.phoenix.trade/v1/view/exchange/markets"
     }
   },
   "symbols": [
@@ -102,7 +197,8 @@
       "binance": "SOLUSDT",
       "hyperliquid": "SOL",
       "bybit": "SOLUSDT",
-      "elfaEntityId": "837496d1-a391-4697-a202-99ee6bd7d6fe"
+      "elfaEntityId": "837496d1-a391-4697-a202-99ee6bd7d6fe",
+      "secCik": null
     },
     {
       "phoenix": "BTC",
@@ -112,7 +208,8 @@
       "binance": "BTCUSDT",
       "hyperliquid": "BTC",
       "bybit": "BTCUSDT",
-      "elfaEntityId": "360fd4a8-46e3-4713-8a91-3627b86029fc"
+      "elfaEntityId": "360fd4a8-46e3-4713-8a91-3627b86029fc",
+      "secCik": null
     },
     {
       "phoenix": "ETH",
@@ -122,7 +219,8 @@
       "binance": "ETHUSDT",
       "hyperliquid": "ETH",
       "bybit": "ETHUSDT",
-      "elfaEntityId": "7e735621-f411-49c0-b985-2dddc65ac570"
+      "elfaEntityId": "7e735621-f411-49c0-b985-2dddc65ac570",
+      "secCik": null
     },
     {
       "phoenix": "XRP",
@@ -132,7 +230,8 @@
       "binance": "XRPUSDT",
       "hyperliquid": "XRP",
       "bybit": "XRPUSDT",
-      "elfaEntityId": "c62a6173-4bbd-4ad3-ba5f-9bfa26b2908c"
+      "elfaEntityId": "c62a6173-4bbd-4ad3-ba5f-9bfa26b2908c",
+      "secCik": null
     },
     {
       "phoenix": "HYPE",
@@ -142,7 +241,8 @@
       "binance": "HYPEUSDT",
       "hyperliquid": "HYPE",
       "bybit": "HYPEUSDT",
-      "elfaEntityId": "944dcaf0-1b0a-44aa-bffc-11c1a80e1839"
+      "elfaEntityId": "944dcaf0-1b0a-44aa-bffc-11c1a80e1839",
+      "secCik": null
     },
     {
       "phoenix": "SKR",
@@ -152,7 +252,8 @@
       "binance": "SKRUSDT",
       "hyperliquid": "SKR",
       "bybit": "SKRUSDT",
-      "elfaEntityId": "bf549346-042d-4d4d-acd6-97a880d119d2"
+      "elfaEntityId": "bf549346-042d-4d4d-acd6-97a880d119d2",
+      "secCik": null
     },
     {
       "phoenix": "BNB",
@@ -162,7 +263,8 @@
       "binance": "BNBUSDT",
       "hyperliquid": "BNB",
       "bybit": "BNBUSDT",
-      "elfaEntityId": "1219aaf7-99e8-4517-9fe4-7cba6b2c7c3c"
+      "elfaEntityId": "1219aaf7-99e8-4517-9fe4-7cba6b2c7c3c",
+      "secCik": null
     },
     {
       "phoenix": "DOGE",
@@ -172,7 +274,8 @@
       "binance": "DOGEUSDT",
       "hyperliquid": "DOGE",
       "bybit": "DOGEUSDT",
-      "elfaEntityId": "7bc340d2-7cc2-4c7b-9f2b-ab649442a547"
+      "elfaEntityId": "7bc340d2-7cc2-4c7b-9f2b-ab649442a547",
+      "secCik": null
     },
     {
       "phoenix": "AAVE",
@@ -182,7 +285,8 @@
       "binance": "AAVEUSDT",
       "hyperliquid": "AAVE",
       "bybit": "AAVEUSDT",
-      "elfaEntityId": "9cbda5dd-7d25-4c0b-8dab-3764b6b87ace"
+      "elfaEntityId": "9cbda5dd-7d25-4c0b-8dab-3764b6b87ace",
+      "secCik": null
     },
     {
       "phoenix": "SUI",
@@ -192,7 +296,8 @@
       "binance": "SUIUSDT",
       "hyperliquid": "SUI",
       "bybit": "SUIUSDT",
-      "elfaEntityId": "6ab87b64-d4de-491e-ba78-b57af7988c00"
+      "elfaEntityId": "6ab87b64-d4de-491e-ba78-b57af7988c00",
+      "secCik": null
     },
     {
       "phoenix": "ZEC",
@@ -202,7 +307,8 @@
       "binance": "ZECUSDT",
       "hyperliquid": "ZEC",
       "bybit": "ZECUSDT",
-      "elfaEntityId": "b48179e1-5f7b-4c19-a4ca-1bc990bbacbc"
+      "elfaEntityId": "b48179e1-5f7b-4c19-a4ca-1bc990bbacbc",
+      "secCik": null
     },
     {
       "phoenix": "TAO",
@@ -212,7 +318,8 @@
       "binance": "TAOUSDT",
       "hyperliquid": "TAO",
       "bybit": "TAOUSDT",
-      "elfaEntityId": "550bddb6-b57a-4921-8503-65ae74fae912"
+      "elfaEntityId": "550bddb6-b57a-4921-8503-65ae74fae912",
+      "secCik": null
     },
     {
       "phoenix": "LIT",
@@ -222,7 +329,8 @@
       "binance": "LITUSDT",
       "hyperliquid": "LIT",
       "bybit": "LITUSDT",
-      "elfaEntityId": "e9a2399a-91e9-486a-99bb-694c9ff816c6"
+      "elfaEntityId": "e9a2399a-91e9-486a-99bb-694c9ff816c6",
+      "secCik": null
     },
     {
       "phoenix": "MON",
@@ -232,7 +340,8 @@
       "binance": "MONUSDT",
       "hyperliquid": "MON",
       "bybit": "MONUSDT",
-      "elfaEntityId": "b8965b15-ceb6-4e5b-9403-ed2db85d4e48"
+      "elfaEntityId": "b8965b15-ceb6-4e5b-9403-ed2db85d4e48",
+      "secCik": null
     },
     {
       "phoenix": "NEAR",
@@ -242,7 +351,8 @@
       "binance": "NEARUSDT",
       "hyperliquid": "NEAR",
       "bybit": "NEARUSDT",
-      "elfaEntityId": "5a158802-db76-4bd5-b962-9e0c512222ef"
+      "elfaEntityId": "5a158802-db76-4bd5-b962-9e0c512222ef",
+      "secCik": null
     },
     {
       "phoenix": "XPL",
@@ -252,7 +362,8 @@
       "binance": "XPLUSDT",
       "hyperliquid": "XPL",
       "bybit": "XPLUSDT",
-      "elfaEntityId": "e59383a9-7132-4fe7-a4bb-bdafe12410b3"
+      "elfaEntityId": "e59383a9-7132-4fe7-a4bb-bdafe12410b3",
+      "secCik": null
     },
     {
       "phoenix": "FARTCOIN",
@@ -262,7 +373,8 @@
       "binance": "FARTCOINUSDT",
       "hyperliquid": "FARTCOIN",
       "bybit": "FARTCOINUSDT",
-      "elfaEntityId": "59f3377b-e048-4f25-a854-8fca04918819"
+      "elfaEntityId": "59f3377b-e048-4f25-a854-8fca04918819",
+      "secCik": null
     },
     {
       "phoenix": "ENA",
@@ -272,7 +384,8 @@
       "binance": "ENAUSDT",
       "hyperliquid": "ENA",
       "bybit": "ENAUSDT",
-      "elfaEntityId": "7a3a92cf-94bd-4067-b21a-e1d2747ecb1c"
+      "elfaEntityId": "7a3a92cf-94bd-4067-b21a-e1d2747ecb1c",
+      "secCik": null
     },
     {
       "phoenix": "CHIP",
@@ -282,7 +395,8 @@
       "binance": "CHIPUSDT",
       "hyperliquid": "CHIP",
       "bybit": "CHIPUSDT",
-      "elfaEntityId": "9a7b6c0f-91c5-41a0-b446-fc35c40a0672"
+      "elfaEntityId": "9a7b6c0f-91c5-41a0-b446-fc35c40a0672",
+      "secCik": null
     },
     {
       "phoenix": "MEGA",
@@ -292,7 +406,8 @@
       "binance": "MEGAUSDT",
       "hyperliquid": "MEGA",
       "bybit": "MEGAUSDT",
-      "elfaEntityId": "a0a79d35-449e-4f90-b771-d2d0a07f34e3"
+      "elfaEntityId": "a0a79d35-449e-4f90-b771-d2d0a07f34e3",
+      "secCik": null
     },
     {
       "phoenix": "WTIOIL",
@@ -302,7 +417,8 @@
       "binance": null,
       "hyperliquid": "xyz:CL",
       "bybit": null,
-      "elfaEntityId": "f9ebc595-cebb-4ec7-bddc-f40604f8d73a"
+      "elfaEntityId": "f9ebc595-cebb-4ec7-bddc-f40604f8d73a",
+      "secCik": null
     },
     {
       "phoenix": "JTO",
@@ -312,7 +428,8 @@
       "binance": "JTOUSDT",
       "hyperliquid": "JTO",
       "bybit": "JTOUSDT",
-      "elfaEntityId": "963b377d-f2e6-4f99-8813-a915d47c2419"
+      "elfaEntityId": "963b377d-f2e6-4f99-8813-a915d47c2419",
+      "secCik": null
     },
     {
       "phoenix": "VVV",
@@ -322,7 +439,8 @@
       "binance": "VVVUSDT",
       "hyperliquid": "VVV",
       "bybit": "VVVUSDT",
-      "elfaEntityId": "be7acdf5-dd00-4409-8f15-6dc504130465"
+      "elfaEntityId": "be7acdf5-dd00-4409-8f15-6dc504130465",
+      "secCik": null
     },
     {
       "phoenix": "JUP",
@@ -332,7 +450,8 @@
       "binance": "JUPUSDT",
       "hyperliquid": "JUP",
       "bybit": "JUPUSDT",
-      "elfaEntityId": "721243d1-4fd8-4ef3-86a1-465ad5a9cc18"
+      "elfaEntityId": "721243d1-4fd8-4ef3-86a1-465ad5a9cc18",
+      "secCik": null
     },
     {
       "phoenix": "PUMP",
@@ -342,7 +461,8 @@
       "binance": "PUMPUSDT",
       "hyperliquid": "PUMP",
       "bybit": "PUMPFUNUSDT",
-      "elfaEntityId": "2a6acc95-e82e-4490-9aea-6a08ecb250b7"
+      "elfaEntityId": "2a6acc95-e82e-4490-9aea-6a08ecb250b7",
+      "secCik": null
     },
     {
       "phoenix": "MET",
@@ -352,7 +472,8 @@
       "binance": "METUSDT",
       "hyperliquid": "MET",
       "bybit": "METUSDT",
-      "elfaEntityId": "3697314e-3517-43f4-87ee-930220453a59"
+      "elfaEntityId": "3697314e-3517-43f4-87ee-930220453a59",
+      "secCik": null
     },
     {
       "phoenix": "WLD",
@@ -362,7 +483,8 @@
       "binance": "WLDUSDT",
       "hyperliquid": "WLD",
       "bybit": "WLDUSDT",
-      "elfaEntityId": "5b1bc876-8da8-4be7-864f-2b9e903a3e27"
+      "elfaEntityId": "5b1bc876-8da8-4be7-864f-2b9e903a3e27",
+      "secCik": null
     },
     {
       "phoenix": "ONDO",
@@ -372,7 +494,8 @@
       "binance": "ONDOUSDT",
       "hyperliquid": "ONDO",
       "bybit": "ONDOUSDT",
-      "elfaEntityId": "04d8071e-d9e6-4fc8-98ab-995c6b5b60f4"
+      "elfaEntityId": "04d8071e-d9e6-4fc8-98ab-995c6b5b60f4",
+      "secCik": null
     },
     {
       "phoenix": "RENDER",
@@ -382,7 +505,8 @@
       "binance": "RENDERUSDT",
       "hyperliquid": "RENDER",
       "bybit": "RENDERUSDT",
-      "elfaEntityId": "72c81c58-0723-4728-b417-13467a8306c8"
+      "elfaEntityId": "72c81c58-0723-4728-b417-13467a8306c8",
+      "secCik": null
     },
     {
       "phoenix": "VIRTUAL",
@@ -392,7 +516,8 @@
       "binance": "VIRTUALUSDT",
       "hyperliquid": "VIRTUAL",
       "bybit": "VIRTUALUSDT",
-      "elfaEntityId": "267f5408-31bc-4209-bf33-04f6bf13facd"
+      "elfaEntityId": "267f5408-31bc-4209-bf33-04f6bf13facd",
+      "secCik": null
     },
     {
       "phoenix": "MORPHO",
@@ -402,7 +527,8 @@
       "binance": "MORPHOUSDT",
       "hyperliquid": "MORPHO",
       "bybit": "MORPHOUSDT",
-      "elfaEntityId": "fa94cd48-e4ae-4534-a07e-66fba3f98273"
+      "elfaEntityId": "fa94cd48-e4ae-4534-a07e-66fba3f98273",
+      "secCik": null
     },
     {
       "phoenix": "FET",
@@ -412,7 +538,8 @@
       "binance": "FETUSDT",
       "hyperliquid": "FET",
       "bybit": null,
-      "elfaEntityId": "a8ca4d83-9fe8-4d67-8533-e0735e23412e"
+      "elfaEntityId": "a8ca4d83-9fe8-4d67-8533-e0735e23412e",
+      "secCik": null
     },
     {
       "phoenix": "ADA",
@@ -422,7 +549,8 @@
       "binance": "ADAUSDT",
       "hyperliquid": "ADA",
       "bybit": "ADAUSDT",
-      "elfaEntityId": "2193bdcb-b838-4b7d-8173-4ed7b1dd57a4"
+      "elfaEntityId": "2193bdcb-b838-4b7d-8173-4ed7b1dd57a4",
+      "secCik": null
     },
     {
       "phoenix": "XLM",
@@ -432,7 +560,8 @@
       "binance": "XLMUSDT",
       "hyperliquid": "XLM",
       "bybit": "XLMUSDT",
-      "elfaEntityId": "08ea23e7-ed33-4f9e-91a0-167bdced6fb9"
+      "elfaEntityId": "08ea23e7-ed33-4f9e-91a0-167bdced6fb9",
+      "secCik": null
     },
     {
       "phoenix": "TRX",
@@ -442,7 +571,8 @@
       "binance": "TRXUSDT",
       "hyperliquid": "TRX",
       "bybit": "TRXUSDT",
-      "elfaEntityId": "d5145ac3-0eef-408e-8153-368b98a5edf4"
+      "elfaEntityId": "d5145ac3-0eef-408e-8153-368b98a5edf4",
+      "secCik": null
     },
     {
       "phoenix": "NVDA",
@@ -452,7 +582,8 @@
       "binance": null,
       "hyperliquid": "xyz:NVDA",
       "bybit": null,
-      "elfaEntityId": "b66be494-62f6-4c86-bf8d-84841a074345"
+      "elfaEntityId": "b66be494-62f6-4c86-bf8d-84841a074345",
+      "secCik": "1045810"
     },
     {
       "phoenix": "AAPL",
@@ -462,7 +593,8 @@
       "binance": null,
       "hyperliquid": "xyz:AAPL",
       "bybit": null,
-      "elfaEntityId": "4094747e-4d5b-438f-9208-ad1a44cacf1d"
+      "elfaEntityId": "4094747e-4d5b-438f-9208-ad1a44cacf1d",
+      "secCik": "320193"
     },
     {
       "phoenix": "SPCX",
@@ -472,7 +604,8 @@
       "binance": null,
       "hyperliquid": "xyz:SPCX",
       "bybit": null,
-      "elfaEntityId": "42703feb-7611-4c9d-8062-b455bae2bcc5"
+      "elfaEntityId": "42703feb-7611-4c9d-8062-b455bae2bcc5",
+      "secCik": null
     },
     {
       "phoenix": "TSLA",
@@ -482,7 +615,8 @@
       "binance": null,
       "hyperliquid": "xyz:TSLA",
       "bybit": null,
-      "elfaEntityId": "d50f7660-69d8-4266-9535-3f04195e078f"
+      "elfaEntityId": "d50f7660-69d8-4266-9535-3f04195e078f",
+      "secCik": "1318605"
     },
     {
       "phoenix": "GOOGL",
@@ -492,7 +626,8 @@
       "binance": null,
       "hyperliquid": "xyz:GOOGL",
       "bybit": null,
-      "elfaEntityId": "b4fc0eb8-f461-4422-93ff-5338455cb483"
+      "elfaEntityId": "b4fc0eb8-f461-4422-93ff-5338455cb483",
+      "secCik": "1652044"
     },
     {
       "phoenix": "MU",
@@ -502,7 +637,8 @@
       "binance": null,
       "hyperliquid": "xyz:MU",
       "bybit": null,
-      "elfaEntityId": "9e3a043e-a2e5-463f-b3eb-e4edf4b380d5"
+      "elfaEntityId": "9e3a043e-a2e5-463f-b3eb-e4edf4b380d5",
+      "secCik": "723125"
     },
     {
       "phoenix": "AMD",
@@ -512,7 +648,8 @@
       "binance": null,
       "hyperliquid": "xyz:AMD",
       "bybit": null,
-      "elfaEntityId": "6b1df670-6483-4f9c-ab04-6f2fa0a1ef88"
+      "elfaEntityId": "6b1df670-6483-4f9c-ab04-6f2fa0a1ef88",
+      "secCik": "2488"
     },
     {
       "phoenix": "INTC",
@@ -522,7 +659,8 @@
       "binance": null,
       "hyperliquid": "xyz:INTC",
       "bybit": null,
-      "elfaEntityId": "74839d79-33cc-4f0b-98c0-07322b647de7"
+      "elfaEntityId": "74839d79-33cc-4f0b-98c0-07322b647de7",
+      "secCik": "50863"
     },
     {
       "phoenix": "CRWV",
@@ -532,7 +670,8 @@
       "binance": null,
       "hyperliquid": "xyz:CRWV",
       "bybit": null,
-      "elfaEntityId": "c789a4d6-ccfc-4851-82b2-1004da5c1caf"
+      "elfaEntityId": "c789a4d6-ccfc-4851-82b2-1004da5c1caf",
+      "secCik": "1769628"
     },
     {
       "phoenix": "MSFT",
@@ -542,7 +681,8 @@
       "binance": null,
       "hyperliquid": "xyz:MSFT",
       "bybit": null,
-      "elfaEntityId": "a70a67b9-da47-45ec-a37c-441a6caef365"
+      "elfaEntityId": "a70a67b9-da47-45ec-a37c-441a6caef365",
+      "secCik": "789019"
     },
     {
       "phoenix": "META",
@@ -552,7 +692,8 @@
       "binance": null,
       "hyperliquid": "xyz:META",
       "bybit": null,
-      "elfaEntityId": "895a34e5-64ba-44e6-8530-e99006a29966"
+      "elfaEntityId": "895a34e5-64ba-44e6-8530-e99006a29966",
+      "secCik": "1326801"
     },
     {
       "phoenix": "AMZN",
@@ -562,7 +703,8 @@
       "binance": null,
       "hyperliquid": "xyz:AMZN",
       "bybit": null,
-      "elfaEntityId": "bbb226d9-0da0-4292-a5e9-0f10bc8c70c7"
+      "elfaEntityId": "bbb226d9-0da0-4292-a5e9-0f10bc8c70c7",
+      "secCik": "1018724"
     },
     {
       "phoenix": "COIN",
@@ -572,7 +714,8 @@
       "binance": null,
       "hyperliquid": "xyz:COIN",
       "bybit": null,
-      "elfaEntityId": "407f1ed7-5cf9-415c-8f23-4d48ce2b5d37"
+      "elfaEntityId": "407f1ed7-5cf9-415c-8f23-4d48ce2b5d37",
+      "secCik": "1679788"
     },
     {
       "phoenix": "CRCL",
@@ -582,7 +725,8 @@
       "binance": null,
       "hyperliquid": "xyz:CRCL",
       "bybit": null,
-      "elfaEntityId": "ed966c3e-0deb-4ad9-af2d-9e48d647e15b"
+      "elfaEntityId": "ed966c3e-0deb-4ad9-af2d-9e48d647e15b",
+      "secCik": "1876042"
     },
     {
       "phoenix": "HOOD",
@@ -592,7 +736,8 @@
       "binance": null,
       "hyperliquid": "xyz:HOOD",
       "bybit": null,
-      "elfaEntityId": "f88ca8cd-d685-452e-9c3b-17cfa6cf91e5"
+      "elfaEntityId": "f88ca8cd-d685-452e-9c3b-17cfa6cf91e5",
+      "secCik": "1783879"
     },
     {
       "phoenix": "MSTR",
@@ -602,7 +747,8 @@
       "binance": null,
       "hyperliquid": "xyz:MSTR",
       "bybit": null,
-      "elfaEntityId": "3ade0b8d-7828-4558-a902-7b05671d2a7c"
+      "elfaEntityId": "3ade0b8d-7828-4558-a902-7b05671d2a7c",
+      "secCik": "1050446"
     },
     {
       "phoenix": "ANSEM",
@@ -612,7 +758,8 @@
       "binance": null,
       "hyperliquid": null,
       "bybit": null,
-      "elfaEntityId": "87191fcd-0993-428b-88b5-5a90bd43dbe4"
+      "elfaEntityId": "87191fcd-0993-428b-88b5-5a90bd43dbe4",
+      "secCik": null
     },
     {
       "phoenix": "SKHY",
@@ -622,7 +769,8 @@
       "binance": "SKHYUSDT",
       "hyperliquid": "xyz:SKHY",
       "bybit": "SKHYUSDT",
-      "elfaEntityId": "2dba1107-b46d-4dab-a62a-15d7a7cf3a11"
+      "elfaEntityId": "2dba1107-b46d-4dab-a62a-15d7a7cf3a11",
+      "secCik": null
     },
     {
       "phoenix": "TSM",
@@ -632,7 +780,8 @@
       "binance": null,
       "hyperliquid": "xyz:TSM",
       "bybit": null,
-      "elfaEntityId": "74e52bb6-9d95-4b87-9921-5aa035fa1e52"
+      "elfaEntityId": "74e52bb6-9d95-4b87-9921-5aa035fa1e52",
+      "secCik": "1046179"
     },
     {
       "phoenix": "ASML",
@@ -642,7 +791,8 @@
       "binance": null,
       "hyperliquid": "xyz:ASML",
       "bybit": null,
-      "elfaEntityId": "a3b948ea-3641-4cde-9266-cbcd56649f5c"
+      "elfaEntityId": "a3b948ea-3641-4cde-9266-cbcd56649f5c",
+      "secCik": "937966"
     },
     {
       "phoenix": "QCOM",
@@ -652,7 +802,8 @@
       "binance": null,
       "hyperliquid": "xyz:QCOM",
       "bybit": null,
-      "elfaEntityId": "a9c91dcd-3c17-4b03-b44f-bbeb00ee56eb"
+      "elfaEntityId": "a9c91dcd-3c17-4b03-b44f-bbeb00ee56eb",
+      "secCik": "804328"
     },
     {
       "phoenix": "ARM",
@@ -662,7 +813,8 @@
       "binance": null,
       "hyperliquid": "xyz:ARM",
       "bybit": null,
-      "elfaEntityId": "4f966495-e332-4b39-ba0a-6f28624e1a06"
+      "elfaEntityId": "4f966495-e332-4b39-ba0a-6f28624e1a06",
+      "secCik": "1973239"
     },
     {
       "phoenix": "CBRS",
@@ -672,7 +824,8 @@
       "binance": null,
       "hyperliquid": "xyz:CBRS",
       "bybit": null,
-      "elfaEntityId": "827fad38-4a57-450a-9343-df719083b117"
+      "elfaEntityId": "827fad38-4a57-450a-9343-df719083b117",
+      "secCik": null
     },
     {
       "phoenix": "AMAT",
@@ -682,7 +835,8 @@
       "binance": null,
       "hyperliquid": "xyz:AMAT",
       "bybit": null,
-      "elfaEntityId": "b19b2dd4-888e-4cfd-a3a5-405d70e68515"
+      "elfaEntityId": "b19b2dd4-888e-4cfd-a3a5-405d70e68515",
+      "secCik": "6951"
     },
     {
       "phoenix": "NBIS",
@@ -692,7 +846,8 @@
       "binance": null,
       "hyperliquid": "xyz:NBIS",
       "bybit": null,
-      "elfaEntityId": "0b71f3ab-7525-4022-aa2e-61e05e0f9c8a"
+      "elfaEntityId": "0b71f3ab-7525-4022-aa2e-61e05e0f9c8a",
+      "secCik": "1513845"
     },
     {
       "phoenix": "PLTR",
@@ -702,7 +857,8 @@
       "binance": null,
       "hyperliquid": "xyz:PLTR",
       "bybit": null,
-      "elfaEntityId": "5aa59c74-d3a6-4013-94b4-9b5bbffb89ce"
+      "elfaEntityId": "5aa59c74-d3a6-4013-94b4-9b5bbffb89ce",
+      "secCik": "1321655"
     },
     {
       "phoenix": "BABA",
@@ -712,7 +868,8 @@
       "binance": null,
       "hyperliquid": "xyz:BABA",
       "bybit": null,
-      "elfaEntityId": "2bddd640-54c3-41f3-aad0-d82e36f26c74"
+      "elfaEntityId": "2bddd640-54c3-41f3-aad0-d82e36f26c74",
+      "secCik": "1577552"
     },
     {
       "phoenix": "AVGO",
@@ -722,7 +879,8 @@
       "binance": null,
       "hyperliquid": "xyz:AVGO",
       "bybit": null,
-      "elfaEntityId": "50cdb5c8-4689-40ff-a8d6-d4ee628d0378"
+      "elfaEntityId": "50cdb5c8-4689-40ff-a8d6-d4ee628d0378",
+      "secCik": "1730168"
     },
     {
       "phoenix": "CRV",
@@ -732,7 +890,8 @@
       "binance": "CRVUSDT",
       "hyperliquid": "CRV",
       "bybit": "CRVUSDT",
-      "elfaEntityId": "545e05e8-8254-4c70-a70d-0124bc8897ea"
+      "elfaEntityId": "545e05e8-8254-4c70-a70d-0124bc8897ea",
+      "secCik": null
     },
     {
       "phoenix": "LINK",
@@ -742,7 +901,8 @@
       "binance": "LINKUSDT",
       "hyperliquid": "LINK",
       "bybit": "LINKUSDT",
-      "elfaEntityId": "f96a376e-1927-4850-8dc5-c64e5fc6599a"
+      "elfaEntityId": "f96a376e-1927-4850-8dc5-c64e5fc6599a",
+      "secCik": null
     },
     {
       "phoenix": "CRWD",
@@ -752,7 +912,8 @@
       "binance": null,
       "hyperliquid": "xyz:CRWD",
       "bybit": null,
-      "elfaEntityId": "81c7e9c1-7393-42ee-a2ba-0b31590ac7ae"
+      "elfaEntityId": "81c7e9c1-7393-42ee-a2ba-0b31590ac7ae",
+      "secCik": "1535527"
     },
     {
       "phoenix": "MRVL",
@@ -762,7 +923,8 @@
       "binance": null,
       "hyperliquid": "xyz:MRVL",
       "bybit": null,
-      "elfaEntityId": "9557f7e5-f4df-4886-953f-d5567ad74c03"
+      "elfaEntityId": "9557f7e5-f4df-4886-953f-d5567ad74c03",
+      "secCik": "1835632"
     },
     {
       "phoenix": "IREN",
@@ -772,7 +934,8 @@
       "binance": null,
       "hyperliquid": "xyz:IREN",
       "bybit": null,
-      "elfaEntityId": "5bd6e46e-e3b1-46e4-b281-e6f0f35cee11"
+      "elfaEntityId": "5bd6e46e-e3b1-46e4-b281-e6f0f35cee11",
+      "secCik": "1878848"
     },
     {
       "phoenix": "NET",
@@ -782,7 +945,8 @@
       "binance": null,
       "hyperliquid": "xyz:NET",
       "bybit": null,
-      "elfaEntityId": "fdba734d-ad55-4aeb-b506-e415434cc82a"
+      "elfaEntityId": "fdba734d-ad55-4aeb-b506-e415434cc82a",
+      "secCik": "1477333"
     },
     {
       "phoenix": "NFLX",
@@ -792,7 +956,8 @@
       "binance": null,
       "hyperliquid": "xyz:NFLX",
       "bybit": null,
-      "elfaEntityId": "ebc1d9bd-14e5-448f-8020-50b39b7a10c2"
+      "elfaEntityId": "ebc1d9bd-14e5-448f-8020-50b39b7a10c2",
+      "secCik": "1065280"
     },
     {
       "phoenix": "MRNA",
@@ -802,7 +967,8 @@
       "binance": null,
       "hyperliquid": "xyz:MRNA",
       "bybit": null,
-      "elfaEntityId": "b9431876-05fe-4de9-aec0-cdb0af0a9c8a"
+      "elfaEntityId": "b9431876-05fe-4de9-aec0-cdb0af0a9c8a",
+      "secCik": "1682852"
     },
     {
       "phoenix": "LLY",
@@ -812,7 +978,8 @@
       "binance": null,
       "hyperliquid": "xyz:LLY",
       "bybit": null,
-      "elfaEntityId": "ef7a1561-ea93-417a-b393-1d2918587473"
+      "elfaEntityId": "ef7a1561-ea93-417a-b393-1d2918587473",
+      "secCik": "59478"
     },
     {
       "phoenix": "DELL",
@@ -822,7 +989,8 @@
       "binance": null,
       "hyperliquid": "xyz:DELL",
       "bybit": null,
-      "elfaEntityId": "546baecb-8baf-4a24-a599-ae9137c4fc83"
+      "elfaEntityId": "546baecb-8baf-4a24-a599-ae9137c4fc83",
+      "secCik": "1571996"
     },
     {
       "phoenix": "ORCL",
@@ -832,7 +1000,8 @@
       "binance": null,
       "hyperliquid": "xyz:ORCL",
       "bybit": null,
-      "elfaEntityId": "e9c0a8c5-7942-42e1-9f49-5fab7d3be80f"
+      "elfaEntityId": "e9c0a8c5-7942-42e1-9f49-5fab7d3be80f",
+      "secCik": "1341439"
     },
     {
       "phoenix": "SPY",
@@ -842,7 +1011,8 @@
       "binance": null,
       "hyperliquid": null,
       "bybit": null,
-      "elfaEntityId": "11f3ef4f-aafc-4ecc-8154-53fb7db6338d"
+      "elfaEntityId": "11f3ef4f-aafc-4ecc-8154-53fb7db6338d",
+      "secCik": null
     },
     {
       "phoenix": "QQQ",
@@ -852,7 +1022,8 @@
       "binance": null,
       "hyperliquid": null,
       "bybit": null,
-      "elfaEntityId": "139c0f6e-984c-452e-b4d4-ff4ef1172f97"
+      "elfaEntityId": "139c0f6e-984c-452e-b4d4-ff4ef1172f97",
+      "secCik": null
     },
     {
       "phoenix": "PONS",
@@ -862,7 +1033,8 @@
       "binance": "PONSUSDT",
       "hyperliquid": "PONS",
       "bybit": "PONSUSDT",
-      "elfaEntityId": "1e177c5d-89ba-4b84-8bfa-25b131ab10b0"
+      "elfaEntityId": "1e177c5d-89ba-4b84-8bfa-25b131ab10b0",
+      "secCik": null
     },
     {
       "phoenix": "STONK",
@@ -872,7 +1044,8 @@
       "binance": null,
       "hyperliquid": null,
       "bybit": "STONKUSDT",
-      "elfaEntityId": "6de53059-e236-49ec-9260-b67654655f6c"
+      "elfaEntityId": "6de53059-e236-49ec-9260-b67654655f6c",
+      "secCik": null
     },
     {
       "phoenix": "UNI",
@@ -882,7 +1055,8 @@
       "binance": "UNIUSDT",
       "hyperliquid": "UNI",
       "bybit": "UNIUSDT",
-      "elfaEntityId": "6a0b88f8-f852-4798-b476-77a06cd3fe6e"
+      "elfaEntityId": "6a0b88f8-f852-4798-b476-77a06cd3fe6e",
+      "secCik": null
     },
     {
       "phoenix": "AVAX",
@@ -892,7 +1066,8 @@
       "binance": "AVAXUSDT",
       "hyperliquid": "AVAX",
       "bybit": "AVAXUSDT",
-      "elfaEntityId": "5380b7a1-45d2-4845-ae18-03a56473bb8c"
+      "elfaEntityId": "5380b7a1-45d2-4845-ae18-03a56473bb8c",
+      "secCik": null
     },
     {
       "phoenix": "ARB",
@@ -902,7 +1077,8 @@
       "binance": "ARBUSDT",
       "hyperliquid": "ARB",
       "bybit": "ARBUSDT",
-      "elfaEntityId": "165197e5-509b-47b4-a1c4-f7ab811685c6"
+      "elfaEntityId": "165197e5-509b-47b4-a1c4-f7ab811685c6",
+      "secCik": null
     },
     {
       "phoenix": "FIL",
@@ -912,7 +1088,8 @@
       "binance": "FILUSDT",
       "hyperliquid": "FIL",
       "bybit": "FILUSDT",
-      "elfaEntityId": "40a1931a-5c68-444e-a4d8-f63c539fa7a8"
+      "elfaEntityId": "40a1931a-5c68-444e-a4d8-f63c539fa7a8",
+      "secCik": null
     },
     {
       "phoenix": "LTC",
@@ -922,7 +1099,8 @@
       "binance": "LTCUSDT",
       "hyperliquid": "LTC",
       "bybit": "LTCUSDT",
-      "elfaEntityId": "e08779ec-7d0f-40d3-98dd-4229c11a4a14"
+      "elfaEntityId": "e08779ec-7d0f-40d3-98dd-4229c11a4a14",
+      "secCik": null
     },
     {
       "phoenix": "kBONK",
@@ -932,7 +1110,8 @@
       "binance": "1000BONKUSDT",
       "hyperliquid": "kBONK",
       "bybit": "1000BONKUSDT",
-      "elfaEntityId": "2206e4a7-3cd2-4601-9748-dd4a112c3309"
+      "elfaEntityId": "2206e4a7-3cd2-4601-9748-dd4a112c3309",
+      "secCik": null
     },
     {
       "phoenix": "kSHIB",
@@ -942,7 +1121,8 @@
       "binance": "1000SHIBUSDT",
       "hyperliquid": "kSHIB",
       "bybit": "SHIB1000USDT",
-      "elfaEntityId": "89778de1-2696-4d25-91d5-f25907515325"
+      "elfaEntityId": "89778de1-2696-4d25-91d5-f25907515325",
+      "secCik": null
     },
     {
       "phoenix": "kPEPE",
@@ -952,7 +1132,8 @@
       "binance": "1000PEPEUSDT",
       "hyperliquid": "kPEPE",
       "bybit": "1000PEPEUSDT",
-      "elfaEntityId": "4eb745b9-122f-46bc-9e3b-d5a0cb69310a"
+      "elfaEntityId": "4eb745b9-122f-46bc-9e3b-d5a0cb69310a",
+      "secCik": null
     },
     {
       "phoenix": "RAY",
@@ -962,7 +1143,8 @@
       "binance": "RAYUSDT",
       "hyperliquid": null,
       "bybit": "RAYDIUMUSDT",
-      "elfaEntityId": "f5b5e4a8-a5ca-4053-bc79-93730ae00c22"
+      "elfaEntityId": "f5b5e4a8-a5ca-4053-bc79-93730ae00c22",
+      "secCik": null
     },
     {
       "phoenix": "ZRO",
@@ -972,7 +1154,8 @@
       "binance": "ZROUSDT",
       "hyperliquid": "ZRO",
       "bybit": "ZROUSDT",
-      "elfaEntityId": "f0f3400a-2bcb-49e8-b09a-93d087d6e8bc"
+      "elfaEntityId": "f0f3400a-2bcb-49e8-b09a-93d087d6e8bc",
+      "secCik": null
     },
     {
       "phoenix": "OPEN",
@@ -982,7 +1165,8 @@
       "binance": null,
       "hyperliquid": null,
       "bybit": "OPENUSDT",
-      "elfaEntityId": "ad1f1574-5f8a-4afe-8c79-dd86bf79eb06"
+      "elfaEntityId": "ad1f1574-5f8a-4afe-8c79-dd86bf79eb06",
+      "secCik": "1801169"
     },
     {
       "phoenix": "GOLD",
@@ -992,7 +1176,8 @@
       "binance": null,
       "hyperliquid": "xyz:GOLD",
       "bybit": "XAUTUSDT",
-      "elfaEntityId": "5307f273-4b81-48ea-a044-0d39ebc09568"
+      "elfaEntityId": "5307f273-4b81-48ea-a044-0d39ebc09568",
+      "secCik": null
     },
     {
       "phoenix": "SNDK",
@@ -1002,7 +1187,8 @@
       "binance": null,
       "hyperliquid": "xyz:SNDK",
       "bybit": null,
-      "elfaEntityId": "fa76a130-2d40-4481-b385-bd2b6d723c17"
+      "elfaEntityId": "fa76a130-2d40-4481-b385-bd2b6d723c17",
+      "secCik": null
     },
     {
       "phoenix": "BP",
@@ -1012,7 +1198,8 @@
       "binance": null,
       "hyperliquid": null,
       "bybit": null,
-      "elfaEntityId": "9b96af5a-d0b5-4c5f-9d0f-687db4f2c0d6"
+      "elfaEntityId": "9b96af5a-d0b5-4c5f-9d0f-687db4f2c0d6",
+      "secCik": null
     },
     {
       "phoenix": "SILVER",
@@ -1022,7 +1209,8 @@
       "binance": null,
       "hyperliquid": "xyz:SILVER",
       "bybit": null,
-      "elfaEntityId": "62e3ddf8-0325-4228-8104-93171583a9d2"
+      "elfaEntityId": "62e3ddf8-0325-4228-8104-93171583a9d2",
+      "secCik": null
     },
     {
       "phoenix": "COPPER",
@@ -1032,7 +1220,8 @@
       "binance": null,
       "hyperliquid": "xyz:COPPER",
       "bybit": null,
-      "elfaEntityId": "1ba2890a-5b95-47ca-a8ac-bc49c1f14ba1"
+      "elfaEntityId": "1ba2890a-5b95-47ca-a8ac-bc49c1f14ba1",
+      "secCik": null
     }
   ]
 }

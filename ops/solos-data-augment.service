@@ -1,5 +1,5 @@
 [Unit]
-Description=solos-data augmentation sync: Binance dumps, Hyperliquid funding, Deribit DVOL, DefiLlama stablecoins
+Description=solos-data augmentation sync: Binance dumps, Hyperliquid and Bybit funding, Deribit DVOL, DefiLlama, SEC filings, Fear and Greed, Polymarket, Kalshi, Phoenix earnings dates
 After=network-online.target
 Wants=network-online.target
 

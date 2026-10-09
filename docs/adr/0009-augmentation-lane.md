@@ -116,6 +116,55 @@ history reaches back as far as its `continuation` chain goes and no further; the
 covers the whole year. DefiLlama returns its entire history on every call and is cut into months
 locally. A rerun never re-downloads a closed period; deleting the ledger re-downloads everything.
 
+## Exogenous triggers and alerts (2026-10-09)
+
+The venue model needs the events that move its markets from outside the order book: an
+issuer's filing, a macro print the prediction markets had already priced, a shift in crowd
+sentiment, a liquidation cascade elsewhere. The user chose to add them on October 9, 2026 as
+more sources of the same two lanes, and to record the moments they become known, since most of
+them cannot be fetched after the fact.
+
+### Sync lane
+
+| Source | Dataset | Cadence | Files | Notes |
+|---|---|---|---|---|
+| SEC EDGAR | `sec/filings` | per filing | month per issuer | `data.sec.gov/submissions/CIK##########.json` plus the `filings.files` continuations that reach the start date; rows carry the acceptance instant (`filed_at`), form, items, accession, primary document and its URL |
+| Phoenix | `phoenix/earnings_dates` | per sync | day, all markets | `metadata.earningsDates` of `perp-api.phoenix.trade/v1/view/exchange/markets`, merged on (symbol, date) so a moved date shows up as a new row |
+| alternative.me | `alternative/fear_greed` | 1 day | year | the whole index since 2018-02-01 from one call; the series overrides the lane's start date |
+| Polymarket | `polymarket/markets`, `polymarket/prices` | per sync, 1 h | day; month per market | the curated events in the config are expanded through Gamma (`/events/<id>`) into markets and outcome tokens; each token's CLOB `prices-history` at `fidelity=60` from the period's start (`startTs`; the API refuses a long `startTs`–`endTs` window) |
+| Kalshi | `kalshi/markets`, `kalshi/candles_1h` | per sync, 1 h | day; month per market | the curated series in the config are expanded through `/markets?series_ticker=…&min_close_ts=<start>` (both lanes of status, paged by cursor); hourly `candlesticks` per market with bid, ask and trade OHLC, volume and open interest. The public read endpoints need no key |
+
+The symbol map gained `secCik`: 34 of the 40 equity perps have an EDGAR issuer (TSM, ASML,
+BABA, NBIS and ARM file as foreign private issuers, 6-K and 20-F). SPY and QQQ are funds
+without issuer filings; SK hynix (SKHY) is not an SEC registrant; SpaceX (SPCX), Cerebras
+(CBRS) and Sandisk (SNDK) are left unmapped until `augment sec-map` confirms their keys. A wrong
+key cannot store another issuer's filings: the lane compares the issuer's `tickers` with the
+symbol and refuses the series when they differ.
+
+EDGAR's fair-access policy asks every automated client to declare itself in the User-Agent and
+answers `403 Undeclared Automated Tool` otherwise; the lane sends `sources.sec.userAgent`
+(`solos-data/1.0 (+https://github.com/GuiBibeau/solos-data)` by default), `Accept-Encoding:
+gzip`, inflates the body itself and keeps to four requests a second against the policy's ten.
+What the declaration must contain is the operator's decision and lives in the config, not in
+the code. `augment sec-map` reads `company_tickers.json` with the same header and reports or
+writes (`--write`) the CIK of every equity symbol.
+
+Prediction markets are curated, not discovered: `polymarket.events` lists Gamma event ids
+(Fed decisions for the next three meetings, the September CPI prints, US recession by 2026 and
+2027, the yearly and monthly BTC, ETH and SOL price ladders, a national Bitcoin reserve) and
+`kalshi.series` lists series tickers (`KXFED`, `KXFEDDECISION`, `KXCPI`, `KXCPIYOY`,
+`KXRECSSNBER`, `KXU3`). Monthly events expire; adding the next month's is a config change. A
+closed market whose last month is complete in the ledger is skipped (`skipped` in the status),
+so the hourly run only refetches the open month of live markets.
+
+### What cannot be fetched after the fact
+
+Polymarket's CLOB serves hourly history for the life of a token, Kalshi's candlesticks for the
+life of a market, EDGAR and alternative.me their whole archives; those backfill. Elfa's alert
+firings, cross-venue liquidation cascades (Elfa publishes decaying trailing-window snapshots,
+no archive) and raw mentions beyond the key's thirty-day `historyFrom` exist only while they
+happen; the capture lane records them as they arrive, with the instant of receipt.
+
 ## Production validation (2026-10-09)
 
 Deployed on the box from `main` at 7139fec (PR #15) at 04:18 UTC into

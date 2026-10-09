@@ -1,0 +1,33 @@
+[
+ {
+  "symbol": "MET",
+  "assetId": 29,
+  "marketStatus": "active",
+  "metadata": {
+   "earningsDates": [],
+   "name": "Meteora",
+   "coinGeckoId": "meteora"
+  },
+  "fundingIntervalSeconds": 3600
+ },
+ {
+  "symbol": "QCOM",
+  "assetId": 59,
+  "marketStatus": "active",
+  "metadata": {
+   "earningsDates": [
+    "2026-11-04T00:00:00Z"
+   ],
+   "name": "Qualcomm",
+   "coinGeckoId": null,
+   "calendar": {
+    "id": "us_equities_extended",
+    "description": "us_equities_extended",
+    "calendarUri": "https://phoenixcdn.trade/calendars/us_equities_extended.json",
+    "contentSha256": "8d308a62612513793d193699742ae06d90bb8ccda487f7f1e9f535f419c3768e",
+    "nextMarketTransitionUtc": "2026-10-10T00:00:00Z"
+   }
+  },
+  "fundingIntervalSeconds": 3600
+ }
+]

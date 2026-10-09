@@ -1,5 +1,5 @@
-//! Calendar periods for dated files and paged histories: one Parquet file covers one UTC day or
-//! one UTC month, named `YYYY-MM-DD` or `YYYY-MM`.
+//! Calendar periods for dated files and paged histories: one Parquet file covers one UTC day,
+//! one UTC month or one UTC year, named `YYYY-MM-DD`, `YYYY-MM` or `YYYY`.
 
 use chrono::{Datelike, NaiveDate};
 
@@ -10,6 +10,8 @@ pub enum Granularity {
     Day,
     /// One UTC month per file.
     Month,
+    /// One UTC year per file.
+    Year,
 }
 
 /// One day or one month, identified by its first day.
@@ -28,13 +30,21 @@ impl Period {
         let start = match granularity {
             Granularity::Day => date,
             Granularity::Month => date.with_day(1).unwrap_or(date),
+            Granularity::Year => NaiveDate::from_ymd_opt(date.year(), 1, 1).unwrap_or(date),
         };
         Period { granularity, start }
     }
 
-    /// Parse a label (`YYYY-MM-DD` or `YYYY-MM`); the shape decides the granularity.
+    /// Parse a label (`YYYY-MM-DD`, `YYYY-MM` or `YYYY`); the shape decides the granularity.
     #[must_use]
     pub fn parse(label: &str) -> Option<Period> {
+        if label.len() == 4 {
+            let date = NaiveDate::parse_from_str(&format!("{label}-01-01"), "%Y-%m-%d").ok()?;
+            return Some(Period {
+                granularity: Granularity::Year,
+                start: date,
+            });
+        }
         if label.len() == 7 {
             let date = NaiveDate::parse_from_str(&format!("{label}-01"), "%Y-%m-%d").ok()?;
             return Some(Period {
@@ -62,6 +72,9 @@ impl Period {
                 };
                 NaiveDate::from_ymd_opt(year, month, 1).unwrap_or(self.start)
             }
+            Granularity::Year => {
+                NaiveDate::from_ymd_opt(self.start.year() + 1, 1, 1).unwrap_or(self.start)
+            }
         };
         Period {
             granularity: self.granularity,
@@ -81,12 +94,13 @@ impl Period {
         ms_of(self.next().start)
     }
 
-    /// `YYYY-MM-DD` or `YYYY-MM`.
+    /// `YYYY-MM-DD`, `YYYY-MM` or `YYYY`.
     #[must_use]
     pub fn label(&self) -> String {
         match self.granularity {
             Granularity::Day => self.start.format("%Y-%m-%d").to_string(),
             Granularity::Month => self.start.format("%Y-%m").to_string(),
+            Granularity::Year => self.start.format("%Y").to_string(),
         }
     }
 
@@ -152,7 +166,16 @@ mod tests {
             Period::containing(parse_date("2026-03-17").unwrap(), Granularity::Month).label(),
             "2026-03"
         );
-        assert!(Period::parse("2026").is_none());
+        let year = Period::parse("2026").unwrap();
+        assert_eq!(year.granularity, Granularity::Year);
+        assert_eq!(year.label(), "2026");
+        assert_eq!(year.next().label(), "2027");
+        assert_eq!(year.end_ms(), Period::parse("2027-01").unwrap().start_ms());
+        assert_eq!(
+            Period::containing(parse_date("2026-03-17").unwrap(), Granularity::Year).label(),
+            "2026"
+        );
+        assert!(Period::parse("202").is_none());
         assert!(Period::parse("2026-13-01").is_none());
     }
 

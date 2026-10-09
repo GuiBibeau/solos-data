@@ -140,7 +140,7 @@ impl Dataset {
     pub fn prefix(&self, symbol: &str) -> String {
         let cadence = match self.granularity {
             Granularity::Day => "daily",
-            Granularity::Month => "monthly",
+            Granularity::Month | Granularity::Year => "monthly",
         };
         match self.interval {
             Some(interval) => format!(
@@ -269,7 +269,7 @@ pub fn label_before(dataset: &Dataset, start: chrono::NaiveDate) -> String {
     let period = super::periods::Period::containing(start, dataset.granularity);
     let previous = match dataset.granularity {
         Granularity::Day => start.pred_opt().unwrap_or(start),
-        Granularity::Month => period.start.pred_opt().unwrap_or(start),
+        Granularity::Month | Granularity::Year => period.start.pred_opt().unwrap_or(start),
     };
     super::periods::Period::containing(previous, dataset.granularity).label()
 }

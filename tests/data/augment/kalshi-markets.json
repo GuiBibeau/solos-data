@@ -1,0 +1,107 @@
+{
+ "cursor": "",
+ "markets": [
+  {
+   "can_close_early": true,
+   "close_time": "2028-01-26T18:59:00Z",
+   "created_time": "2025-10-02T21:53:09.691882Z",
+   "custom_strike": {
+    "Hike": ">25"
+   },
+   "event_ticker": "KXFEDDECISION-28JAN",
+   "exchange_index": 0,
+   "expected_expiration_time": "2028-01-26T19:05:00Z",
+   "expiration_time": "2028-04-26T19:01:00Z",
+   "expiration_value": "",
+   "last_price_dollars": "0.1000",
+   "latest_expiration_time": "2028-04-26T19:01:00Z",
+   "market_type": "binary",
+   "no_ask_dollars": "0.9100",
+   "no_bid_dollars": "0.8600",
+   "no_sub_title": "Hike >25bps",
+   "notional_value_dollars": "1.0000",
+   "open_interest_fp": "1215.31",
+   "open_time": "2025-10-06T14:00:00Z",
+   "previous_price_dollars": "0.1000",
+   "previous_yes_ask_dollars": "0.1900",
+   "previous_yes_bid_dollars": "0.1000",
+   "price_level_structure": "linear_cent",
+   "price_ranges": [
+    {
+     "end": "1.0000",
+     "start": "0.0000",
+     "step": "0.0100"
+    }
+   ],
+   "result": "",
+   "rules_primary": "If the Federal Reserve does a Hike of >25bps on January 26, 2028, then the market resolves to Yes.",
+   "rules_secondary": "This market is mutually exclusive. Therefore, if the Federal Reserve hikes by 50bps, the 50bps market will resolve to Yes and the 25bps market will resolve to No. Only one bucket, at maximum, can resolve to Yes. Note 4/28/25: For the markets beginning after the May meeting, if a scheduled FOMC meeting is canceled and does not occur on its scheduled date, then the strike for \"Fed maintains rate\" will resolve to Yes and all others will resolve to No.",
+   "settlement_bounds_type": "default",
+   "settlement_timer_seconds": 297,
+   "status": "active",
+   "strike_type": "custom",
+   "subtitle": "Hike >25bps",
+   "ticker": "KXFEDDECISION-28JAN-H26",
+   "title": "Will the Federal Reserve Hike rates by >25bps at their January 2028 meeting?",
+   "updated_time": "2026-04-09T14:07:31.692027Z",
+   "volume_24h_fp": "0.00",
+   "volume_fp": "2448.31",
+   "yes_ask_dollars": "0.1400",
+   "yes_ask_size_fp": "10.00",
+   "yes_bid_dollars": "0.0900",
+   "yes_bid_size_fp": "236.27",
+   "yes_sub_title": "Hike >25bps"
+  },
+  {
+   "can_close_early": true,
+   "close_time": "2028-01-26T18:59:00Z",
+   "created_time": "2025-10-02T21:53:09.691882Z",
+   "custom_strike": {
+    "Hike": "25"
+   },
+   "event_ticker": "KXFEDDECISION-28JAN",
+   "exchange_index": 0,
+   "expected_expiration_time": "2028-01-26T19:05:00Z",
+   "expiration_time": "2028-04-26T19:01:00Z",
+   "expiration_value": "",
+   "last_price_dollars": "0.0400",
+   "latest_expiration_time": "2028-04-26T19:01:00Z",
+   "market_type": "binary",
+   "no_ask_dollars": "0.9400",
+   "no_bid_dollars": "0.8600",
+   "no_sub_title": "Hike 25bps",
+   "notional_value_dollars": "1.0000",
+   "open_interest_fp": "147.00",
+   "open_time": "2025-10-06T14:00:00Z",
+   "previous_price_dollars": "0.0500",
+   "previous_yes_ask_dollars": "0.1300",
+   "previous_yes_bid_dollars": "0.0500",
+   "price_level_structure": "linear_cent",
+   "price_ranges": [
+    {
+     "end": "1.0000",
+     "start": "0.0000",
+     "step": "0.0100"
+    }
+   ],
+   "result": "",
+   "rules_primary": "If the Federal Reserve does a Hike of 25bps on January 26, 2028, then the market resolves to Yes.",
+   "rules_secondary": "This market is mutually exclusive. Therefore, if the Federal Reserve hikes by 50bps, the 50bps market will resolve to Yes and the 25bps market will resolve to No. Only one bucket, at maximum, can resolve to Yes. Note 4/28/25: For the markets beginning after the May meeting, if a scheduled FOMC meeting is canceled and does not occur on its scheduled date, then the strike for \"Fed maintains rate\" will resolve to Yes and all others will resolve to No.",
+   "settlement_bounds_type": "default",
+   "settlement_timer_seconds": 297,
+   "status": "active",
+   "strike_type": "custom",
+   "subtitle": "Hike 25bps",
+   "ticker": "KXFEDDECISION-28JAN-H25",
+   "title": "Will the Federal Reserve Hike rates by 25bps at their January 2028 meeting?",
+   "updated_time": "2026-04-09T14:07:31.543143Z",
+   "volume_24h_fp": "38.00",
+   "volume_fp": "637.70",
+   "yes_ask_dollars": "0.1400",
+   "yes_ask_size_fp": "10.00",
+   "yes_bid_dollars": "0.0600",
+   "yes_bid_size_fp": "33.00",
+   "yes_sub_title": "Hike 25bps"
+  }
+ ]
+}

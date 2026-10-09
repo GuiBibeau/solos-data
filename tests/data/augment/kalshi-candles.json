@@ -1,0 +1,73 @@
+{
+ "candlesticks": [
+  {
+   "end_period_ts": 1758078000,
+   "open_interest_fp": "1250.00",
+   "price": {
+    "open_dollars": "0.5200",
+    "high_dollars": "0.5600",
+    "low_dollars": "0.5100",
+    "close_dollars": "0.5500",
+    "mean_dollars": "0.5340",
+    "previous_dollars": "0.5200"
+   },
+   "volume_fp": "412.00",
+   "yes_ask": {
+    "close_dollars": "0.5600",
+    "high_dollars": "0.5700",
+    "low_dollars": "0.5300",
+    "open_dollars": "0.5300"
+   },
+   "yes_bid": {
+    "close_dollars": "0.5400",
+    "high_dollars": "0.5500",
+    "low_dollars": "0.5000",
+    "open_dollars": "0.5000"
+   }
+  },
+  {
+   "end_period_ts": 1758081600,
+   "open_interest_fp": "1300.00",
+   "price": {
+    "open_dollars": "0.5500",
+    "high_dollars": "0.5500",
+    "low_dollars": "0.5300",
+    "close_dollars": "0.5300",
+    "mean_dollars": "0.5410",
+    "previous_dollars": "0.5500"
+   },
+   "volume_fp": "88.00",
+   "yes_ask": {
+    "close_dollars": "0.5400",
+    "high_dollars": "0.5600",
+    "low_dollars": "0.5400",
+    "open_dollars": "0.5600"
+   },
+   "yes_bid": {
+    "close_dollars": "0.5200",
+    "high_dollars": "0.5400",
+    "low_dollars": "0.5200",
+    "open_dollars": "0.5400"
+   }
+  },
+  {
+   "end_period_ts": 1759276800,
+   "open_interest_fp": "0.00",
+   "price": {},
+   "volume_fp": "0.00",
+   "yes_ask": {
+    "close_dollars": "0.5700",
+    "high_dollars": "0.5700",
+    "low_dollars": "0.5700",
+    "open_dollars": "0.5700"
+   },
+   "yes_bid": {
+    "close_dollars": "0.4700",
+    "high_dollars": "0.4700",
+    "low_dollars": "0.4700",
+    "open_dollars": "0.4700"
+   }
+  }
+ ],
+ "ticker": "KXFEDDECISION-26SEP-H0"
+}

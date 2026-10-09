@@ -1,0 +1,32 @@
+{
+ "cik": "1045810",
+ "entityType": "operating",
+ "sic": "3674",
+ "name": "NVIDIA CORP",
+ "tickers": ["NVDA"],
+ "exchanges": ["Nasdaq"],
+ "fiscalYearEnd": "0131",
+ "stateOfIncorporation": "DE",
+ "filings": {
+  "recent": {
+   "accessionNumber": ["0001045810-26-000142", "0001045810-26-000131", "0001045810-26-000120"],
+   "filingDate": ["2026-10-02", "2026-09-15", "2026-08-27"],
+   "reportDate": ["2026-10-01", "", "2026-07-26"],
+   "acceptanceDateTime": ["2026-10-02T16:05:12.000Z", "2026-09-15T20:31:44.000Z", "2026-08-27T20:08:01.000Z"],
+   "act": ["34", "", "34"],
+   "form": ["8-K", "4", "10-Q"],
+   "fileNumber": ["000-23985", "000-23985", "000-23985"],
+   "filmNumber": ["261234567", "261234000", "261233999"],
+   "items": ["2.02,9.01", "", ""],
+   "size": [123456, 23456, 4567890],
+   "isXBRL": [1, 0, 1],
+   "isInlineXBRL": [1, 0, 1],
+   "primaryDocument": ["nvda-20261001.htm", "xslF345X05/wk-form4_1757968304.xml", "nvda-20260726.htm"],
+   "primaryDocDescription": ["8-K", "FORM 4", "10-Q"]
+  },
+  "files": [
+   {"name": "CIK0001045810-submissions-001.json", "filingCount": 2, "filingFrom": "2026-01-05", "filingTo": "2026-02-26"},
+   {"name": "CIK0001045810-submissions-002.json", "filingCount": 1, "filingFrom": "2025-11-01", "filingTo": "2025-12-20"}
+  ]
+ }
+}

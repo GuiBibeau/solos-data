@@ -130,24 +130,79 @@ async fn run_sources(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Vec<
             }
         })
     };
-    let (binance, hyperliquid, deribit, defillama, bybit) = tokio::join!(
+    let (binance, hyperliquid, deribit, defillama, bybit, exogenous) = tokio::join!(
         run_binance(ctx, config, filter),
         run_hyperliquid(ctx, config, filter),
         run_deribit(ctx, config, filter),
         run_defillama(ctx, config, filter),
         run_bybit(ctx, config, filter),
+        run_exogenous(ctx, config, filter),
     );
     catalog_writer.abort();
+    let (sec, alternative, polymarket, kalshi, phoenix) = exogenous;
     [
         ("binance", binance),
         ("hyperliquid", hyperliquid),
         ("deribit", deribit),
         ("defillama", defillama),
         ("bybit", bybit),
+        ("sec", sec),
+        ("alternative", alternative),
+        ("polymarket", polymarket),
+        ("kalshi", kalshi),
+        ("phoenix", phoenix),
     ]
     .into_iter()
     .filter_map(|(name, outcome)| outcome.map(|o| (name.to_owned(), o)))
     .collect()
+}
+
+type Five = (
+    Option<Outcome>,
+    Option<Outcome>,
+    Option<Outcome>,
+    Option<Outcome>,
+    Option<Outcome>,
+);
+
+/// The exogenous sources (ADR-0009, triggers and alerts): SEC filings, Fear and Greed, the
+/// prediction markets and Phoenix's earnings dates, each on its own host.
+async fn run_exogenous(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Five {
+    let symbol = filter.symbol.as_deref();
+    let s = &config.sources;
+    tokio::join!(
+        async {
+            (s.sec.enabled && filter.allows("sec"))
+                .then(|| super::sec::sync(ctx, config, symbol))?
+                .await
+                .into()
+        },
+        async {
+            if !s.alternative.enabled || !filter.allows("alternative") {
+                return None;
+            }
+            let series = super::alternative::FearGreed::new(&s.alternative.base_url);
+            Some(sync_series(ctx, &series).await)
+        },
+        async {
+            (s.polymarket.enabled && filter.allows("polymarket"))
+                .then(|| super::polymarket::sync(ctx, &s.polymarket, symbol))?
+                .await
+                .into()
+        },
+        async {
+            (s.kalshi.enabled && filter.allows("kalshi"))
+                .then(|| super::kalshi::sync(ctx, &s.kalshi, symbol))?
+                .await
+                .into()
+        },
+        async {
+            (s.phoenix.enabled && filter.allows("phoenix"))
+                .then(|| super::phoenix::sync(ctx, &s.phoenix, ctx.now_ms))?
+                .await
+                .into()
+        },
+    )
 }
 
 async fn run_binance(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option<Outcome> {

@@ -498,7 +498,7 @@ fn offline_or_live(
 // ---------------------------------------------------------------------------------------------
 // augment
 
-const AUGMENT_COMMANDS: [(&str, &str); 5] = [
+const AUGMENT_COMMANDS: [(&str, &str); 6] = [
     (
         "sync",
         "Backfill and catch up dated files and paged histories, then exit: [--source name] [--symbol SYM]",
@@ -509,6 +509,10 @@ const AUGMENT_COMMANDS: [(&str, &str); 5] = [
     ),
     ("status", "Read both lanes' status snapshots"),
     ("catalog", "Read the sync lane's file catalog"),
+    (
+        "sec-map",
+        "Look the equity symbols up in EDGAR's company_tickers.json and report their CIKs: [--write] stores them in the config",
+    ),
     (
         "query",
         "Read-only SQL over the catalogued files: --sql SELECT ... FROM <source>_<dataset>",
@@ -566,6 +570,14 @@ fn augment_command(command: &str, args: &[String]) -> Result<i32, StoreError> {
         "capture" => {
             let status = crate::augment::capture::run_capture(&config, stop_flag()?)?;
             println!("{}", status.to_json());
+            Ok(0)
+        }
+        "sec-map" => {
+            let path = flag(args, "--config").unwrap_or("config/augment.json");
+            let write = args.iter().any(|a| a == "--write");
+            let runtime = tokio::runtime::Runtime::new()?;
+            let report = runtime.block_on(crate::augment::sec::map_ciks(path, &config, write))?;
+            println!("{}", report.to_json());
             Ok(0)
         }
         "query" => {
