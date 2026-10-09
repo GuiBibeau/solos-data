@@ -8,8 +8,37 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request supersedes the run in flight; runs on main always finish so
+# their caches are saved.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # No debuginfo in CI builds: same code, same opt-levels, same tests. DuckDB's C++ is then
+  # compiled without -g, which is faster and makes its objects far smaller to cache. Local and
+  # release builds keep the Cargo.toml profiles.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+# Three jobs in parallel; the wall clock is the slowest one. `cargo clippy` (check, dev profile)
+# and `cargo test` (test profile) resolve different libduckdb-sys build-script units, so a shared
+# target/ would still compile DuckDB twice: each Rust job keeps its own cache instead.
 jobs:
-  verify:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: 1.96.0
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -17,15 +46,54 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: 1.96.0
-          components: rustfmt, clippy
+          components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # DuckDB's objects are already archived in libduckdb.a; drop them before the cache is saved.
+      # The build script reruns only when its inputs change, so nothing reads them again.
+      - name: Prune DuckDB objects before caching
+        run: find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo test --workspace --locked
+      # The npm suite runs on every push to main, and on a pull request that touches its inputs:
+      # the TypeScript sources and tests, their config, the npm manifests, and the codec it spawns.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: changes
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            npm:
+              - 'src/**'
+              - 'tests/**'
+              - 'config/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'tsconfig.json'
+              - 'crates/phoenix-codec/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '.github/workflows/ci.yml'
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        if: github.event_name != 'pull_request' || steps.changes.outputs.npm == 'true'
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
+      - if: github.event_name != 'pull_request' || steps.changes.outputs.npm == 'true'
+        run: npm ci
       # Type check, codec tests and release build, then the JavaScript suite (offline, no credentials).
-      - run: npm run verify
+      - if: github.event_name != 'pull_request' || steps.changes.outputs.npm == 'true'
+        run: npm run verify
+      - name: Prune DuckDB objects before caching
+        run: find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete

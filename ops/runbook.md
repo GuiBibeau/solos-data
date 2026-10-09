@@ -300,3 +300,24 @@ and `llvm-config`; a Debian box with only `libclang1-19` and `llvm-19-dev` build
 `LIBCLANG_PATH=$HOME/.local/lib LLVM_CONFIG_PATH=/usr/bin/llvm-config-19 cargo build …`
 (installing `libclang-19-dev` provides the symlink instead). Until the TypeScript sources are
 removed, `npm run verify` still runs their suite.
+
+## CI
+
+`.github/workflows/ci.yml` runs three jobs in parallel on GitHub-hosted runners: `fmt`
+(`cargo fmt --all --check`), `clippy` (`cargo clippy --workspace --all-targets --locked -- -D
+warnings`) and `test` (`cargo test --workspace --locked`, then `npm ci` and `npm run verify`).
+On a pull request the npm steps run only when the change touches `src/`, `tests/`, `config/`,
+the npm manifests, `tsconfig.json`, `crates/phoenix-codec/`, the Cargo manifests or the
+workflow; every push to `main` runs them. A newer push to a pull request cancels its run in
+flight.
+
+`clippy` and `test` each cache `~/.cargo` and `target/` with `Swatinem/rust-cache`, keyed on
+the job, the toolchain, the `CARGO_*` environment and `Cargo.lock` (a changed lockfile restores
+the newest older cache and rebuilds only what changed). The two cannot share one `target/`:
+check and test resolve different libduckdb-sys build-script units, so DuckDB would compile
+twice anyway. CI builds without debuginfo (`CARGO_PROFILE_DEV_DEBUG=0`), which compiles
+DuckDB's C++ without `-g`, and deletes DuckDB's `.o` files (already archived in
+`libduckdb.a`) before the cache is saved. To bust the caches, delete them with
+`gh cache delete --all -R GuiBibeau/solos-data`, or change the `CARGO_*` environment in the
+workflow. A cold run compiles DuckDB once in each Rust job and takes about 16 minutes (the
+caches are then about 0.5 GB and 0.3 GB); a warm run (full cache hit) takes about 4 minutes.
