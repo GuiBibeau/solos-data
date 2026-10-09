@@ -320,4 +320,4 @@ DuckDB's C++ without `-g`, and deletes DuckDB's `.o` files (already archived in
 `libduckdb.a`) before the cache is saved. To bust the caches, delete them with
 `gh cache delete --all -R GuiBibeau/solos-data`, or change the `CARGO_*` environment in the
 workflow. A cold run compiles DuckDB once in each Rust job and takes about 16 minutes (the
-caches are then about 0.5 GB and 0.3 GB); a warm run takes about 5 minutes.
+caches are then about 0.5 GB and 0.3 GB); a warm run (full cache hit) takes about 4 minutes.
