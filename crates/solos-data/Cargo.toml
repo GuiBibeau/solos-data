@@ -30,6 +30,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "json"] }
 # Binance public dumps are zip archives of one CSV; read-only use, deflate through flate2.
 zip = { version = "6", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+# EDGAR answers gzip when asked; the lane inflates the body itself. Tests build gzip fixtures
+# for the Bybit tick dumps with the same crate.
+flate2 = "1"
 futures-util = { version = "0.3", optional = true }
 jetstreamer-firehose = { git = "https://github.com/anza-xyz/jetstreamer", rev = "048d2cd", optional = true }
 solana-transaction-status = { version = "=4.2.2", optional = true }
@@ -41,10 +44,6 @@ solana-runtime = { version = "=4.2.2", optional = true }
 solana-rpc = { version = "=4.2.2", optional = true }
 solana-geyser-plugin-manager = { version = "=4.2.2", optional = true }
 solana-storage-proto = { version = "=4.2.2", optional = true }
-
-[dev-dependencies]
-# Tests build gzip fixtures for the Bybit tick dumps; flate2 is already in the graph through zip.
-flate2 = "1"
 
 [features]
 default = []

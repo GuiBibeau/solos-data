@@ -96,6 +96,11 @@ pub trait Series: Send + Sync {
     fn granularity(&self) -> Granularity;
     /// Publication lag: a period is closed once `now >= end + lag`.
     fn lag_ms(&self) -> i64;
+    /// First day the series stores; the lane's `startDate` unless the series reaches further
+    /// back (a full history that is cheap to keep).
+    fn start_date(&self, lane_start: NaiveDate) -> NaiveDate {
+        lane_start
+    }
     /// Every row with a timestamp in `[start_ms, end_ms)`, as JSON objects.
     fn fetch<'a>(&'a self, http: &'a Http, start_ms: i64, end_ms: i64) -> RowsFuture<'a>;
     /// The `SELECT` that types the rows staged as a JSON array at `staged`; `constants` is the
@@ -151,6 +156,29 @@ pub fn progress_key(source: &str, dataset: &str, symbol: &str) -> String {
     format!("{source}/{dataset}/{symbol}")
 }
 
+/// The label the series is complete through, from its progress record.
+pub async fn complete_through(ctx: &Ctx, series: &dyn Series) -> Option<String> {
+    let key = progress_key(series.source(), series.dataset(), series.symbol());
+    ctx.db
+        .run(move |store| get_progress(store, &key))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|p| {
+            p.get("completeThrough")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+/// Whether a series whose last row can be no later than `end_ms` has nothing left to fetch.
+pub async fn finished(ctx: &Ctx, series: &dyn Series, end_ms: i64) -> bool {
+    let last = Period::containing(super::periods::date_of_ms(end_ms), series.granularity());
+    complete_through(ctx, series)
+        .await
+        .is_some_and(|label| label >= last.label())
+}
+
 /// Walk the series' periods from its progress record to now.
 pub async fn sync_series(ctx: &Ctx, series: &dyn Series) -> Outcome {
     let mut outcome = Outcome::default();
@@ -174,7 +202,7 @@ pub async fn sync_series(ctx: &Ctx, series: &dyn Series) -> Outcome {
         .and_then(Value::as_str)
         .and_then(Period::parse)
         .map_or_else(
-            || Period::containing(ctx.start, series.granularity()),
+            || Period::containing(series.start_date(ctx.start), series.granularity()),
             Period::next,
         );
     for period in periods_through(first, ctx.now_ms) {

@@ -31,12 +31,28 @@ impl From<HttpError> for crate::store::StoreError {
     }
 }
 
+/// How the lane identifies itself to every host.
+pub const USER_AGENT: &str = "solos-data/1.0 (+https://github.com/GuiBibeau/solos-data)";
+
 /// A successful response.
 pub struct Fetched {
     /// Status code (2xx).
     pub status: u16,
     /// Body bytes.
     pub body: Vec<u8>,
+    /// Response headers, names lower-cased.
+    pub headers: Vec<(String, String)>,
+}
+
+impl Fetched {
+    /// One response header.
+    #[must_use]
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// The shared client.
@@ -54,7 +70,7 @@ impl Http {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(120))
             .connect_timeout(Duration::from_secs(20))
-            .user_agent("solos-data augment (+https://github.com/GuiBibeau/solos-data)")
+            .user_agent(USER_AGENT)
             .build()
             .map_err(|e| HttpError::Transport(safe_error(&e.to_string())))?;
         Ok(Http {
@@ -178,6 +194,11 @@ impl Http {
             .map_err(|e| Retry::Later(safe_error(&e.to_string()), None))?;
         let status = response.status().as_u16();
         if (200..300).contains(&status) {
+            let headers = response
+                .headers()
+                .iter()
+                .filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
+                .collect();
             let bytes = response
                 .bytes()
                 .await
@@ -185,6 +206,7 @@ impl Http {
             return Ok(Fetched {
                 status,
                 body: bytes.to_vec(),
+                headers,
             });
         }
         if status == 404 {

@@ -158,8 +158,9 @@ SOLOS_DATA_DECODED_DIR=/path/to/decoded/v1 solos-data decoder status
 ## Augmentation lane
 
 `solos-data augment sync --config config/augment.json` (ADR-0009) downloads the free exogenous
-data for the Phoenix markets (Binance USD-M dumps, Hyperliquid funding, Deribit DVOL, DefiLlama
-stablecoins) into `SOLOS_DATA_AUGMENT_DIR` (default `dataDir`, `data/augment`) and exits. It is
+data for the Phoenix markets (Binance USD-M dumps, Hyperliquid and Bybit funding, Deribit DVOL,
+DefiLlama stablecoins, SEC filings, Phoenix earnings dates, Fear and Greed, Polymarket and
+Kalshi odds) into `SOLOS_DATA_AUGMENT_DIR` (default `dataDir`, `data/augment`) and exits. It is
 idempotent: closed periods are fetched once, the open day or month is rewritten each run, and
 anything on disk the ledger does not know is removed at start. The timer runs it hourly, one run
 at a time; the first run backfills from `startDate` (2026-01-01) and takes about a day because
@@ -177,11 +178,30 @@ SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment quer
   "SELECT phoenix_symbol, count(*) AS rows, min(ts), max(ts) FROM binance_klines GROUP BY 1 ORDER BY 1"
 ```
 
-`status.json` has one entry per source (`files`, `rows`, `errors`) and one per dataset (files,
-symbols, rows, bytes, oldest and newest period). `augment_series_error` lines name the source,
-dataset, symbol and item that failed; the item is retried on the next run. `--source <name>` and
-`--symbol <SYM>` restrict a run for a check. Query views are named `<source>_<dataset>`
-(`binance_klines`, `hyperliquid_funding`, `deribit_dvol_60s`, `defillama_stablecoins`).
+`status.json` has one entry per source (`files`, `rows`, `errors`, `skipped`) and one per
+dataset (files, symbols, rows, bytes, oldest and newest period). `augment_series_error` lines
+name the source, dataset, symbol and item that failed; the item is retried on the next run.
+`--source <name>` (`binance`, `hyperliquid`, `deribit`, `defillama`, `bybit`, `sec`,
+`alternative`, `polymarket`, `kalshi`, `phoenix`) and `--symbol <SYM>` restrict a run for a
+check. Query views are named `<source>_<dataset>` (`binance_klines`, `hyperliquid_funding`,
+`deribit_dvol_60s`, `defillama_stablecoins`, `sec_filings`, `alternative_fear_greed`,
+`polymarket_prices`, `kalshi_candles_1h`, `phoenix_earnings_dates`).
+
+The exogenous sources (ADR-0009, "Exogenous triggers and alerts") run in the same sync. SEC
+EDGAR filings need the issuers' CIKs in the symbol map (`secCik`) and a declared User-Agent:
+EDGAR answers `403` to a client it considers undeclared, and `sources.sec.userAgent` is where
+the operator declares one. `augment sec-map` reports the CIK of every equity symbol from
+EDGAR's `company_tickers.json`, `--write` stores them in the config, and the lane refuses a CIK
+whose EDGAR tickers do not include the symbol (`augment_series_error` with the issuer's name).
+Polymarket events and Kalshi series are curated lists in the config; add the next month's
+events when the current ones close.
+
+```sh
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment sync --source sec --symbol NVDA
+solos-data augment sec-map            # report; add --write to store the CIKs in config/augment.json
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment query --sql \
+  "SELECT ticker, form, ts, url FROM sec_filings WHERE form IN ('8-K', '10-Q') ORDER BY ts DESC LIMIT 20"
+```
 
 To re-download one series, delete its rows from `files` and its `progress` record in
 `checkpoint.duckdb` with no run active, or delete the whole root to start over.

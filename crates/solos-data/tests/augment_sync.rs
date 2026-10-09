@@ -38,10 +38,15 @@ fn config_for(server: &Server, root: &std::path::Path) -> AugmentConfig {
     sources.deribit.currencies = vec!["BTC".into()];
     sources.defillama.base_url = server.base.clone();
     sources.defillama.stablecoins.truncate(1);
-    // Bybit has its own test; every other source points at the local server, so nothing here
-    // can reach the network.
+    // Bybit has its own test and the exogenous sources theirs; every other source points at
+    // the local server, so nothing here can reach the network.
     sources.bybit.enabled = false;
     sources.elfa.enabled = false;
+    sources.sec.enabled = false;
+    sources.alternative.enabled = false;
+    sources.polymarket.enabled = false;
+    sources.kalshi.enabled = false;
+    sources.phoenix.enabled = false;
     config.sources = sources;
     config
 }

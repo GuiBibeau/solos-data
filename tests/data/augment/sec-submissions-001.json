@@ -1,0 +1,16 @@
+{
+ "accessionNumber": ["0001045810-26-000031", "0001045810-26-000004"],
+ "filingDate": ["2026-02-26", "2026-01-05"],
+ "reportDate": ["2026-01-25", ""],
+ "acceptanceDateTime": ["2026-02-26T21:12:33.000Z", "2026-01-05T16:00:00.000Z"],
+ "act": ["34", ""],
+ "form": ["10-K", "SC 13G/A"],
+ "fileNumber": ["000-23985", "005-50913"],
+ "filmNumber": ["26660001", "26500002"],
+ "items": ["", ""],
+ "size": [9876543, 12345],
+ "isXBRL": [1, 0],
+ "isInlineXBRL": [1, 0],
+ "primaryDocument": ["nvda-20260125.htm", "schedule13ga.htm"],
+ "primaryDocDescription": ["10-K", "SC 13G/A"]
+}

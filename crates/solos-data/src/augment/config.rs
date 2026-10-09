@@ -31,6 +31,9 @@ pub struct Symbol {
     /// Elfa entity id.
     #[serde(default)]
     pub elfa_entity_id: Option<String>,
+    /// SEC EDGAR Central Index Key of the issuer (equities with filings).
+    #[serde(default)]
+    pub sec_cik: Option<String>,
 }
 
 /// Binance public dumps.
@@ -152,6 +155,84 @@ pub struct Elfa {
     pub requests_per_minute: u64,
 }
 
+/// SEC EDGAR: the submissions JSON of every mapped issuer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Sec {
+    /// Whether the source runs.
+    pub enabled: bool,
+    /// `data.sec.gov` base.
+    pub base_url: String,
+    /// `company_tickers.json`, for `augment sec-map`.
+    pub tickers_url: String,
+    /// Base of filing document URLs (`/Archives/edgar/data`).
+    pub archive_url: String,
+    /// The User-Agent EDGAR sees. EDGAR's fair-access policy asks automated tools to declare
+    /// a contact in it; the operator decides what to declare.
+    #[serde(default = "d_user_agent")]
+    pub user_agent: String,
+    /// Requests per second to EDGAR (its ceiling is ten).
+    #[serde(default = "d_sec_rps")]
+    pub requests_per_second: f64,
+}
+
+/// alternative.me Fear and Greed index.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Alternative {
+    /// Whether the source runs.
+    pub enabled: bool,
+    /// API base.
+    pub base_url: String,
+}
+
+/// One curated Polymarket event; its markets are resolved at run time.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PolymarketEvent {
+    /// Gamma event id.
+    pub id: String,
+    /// Event slug, for the reader.
+    pub slug: String,
+}
+
+/// Polymarket: Gamma for the catalogue, the CLOB for price history.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Polymarket {
+    /// Whether the source runs.
+    pub enabled: bool,
+    /// Gamma API base.
+    pub gamma_url: String,
+    /// CLOB API base.
+    pub clob_url: String,
+    /// The curated events.
+    #[serde(default)]
+    pub events: Vec<PolymarketEvent>,
+}
+
+/// Kalshi public read endpoints.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Kalshi {
+    /// Whether the source runs.
+    pub enabled: bool,
+    /// API base (`/trade-api/v2`).
+    pub base_url: String,
+    /// The curated series tickers.
+    #[serde(default)]
+    pub series: Vec<String>,
+}
+
+/// Phoenix's own market list, for the earnings dates.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Phoenix {
+    /// Whether the source runs.
+    pub enabled: bool,
+    /// The markets endpoint.
+    pub markets_url: String,
+}
+
 /// All sources.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Sources {
@@ -167,6 +248,16 @@ pub struct Sources {
     pub bybit: Bybit,
     /// Elfa.
     pub elfa: Elfa,
+    /// SEC EDGAR.
+    pub sec: Sec,
+    /// Fear and Greed.
+    pub alternative: Alternative,
+    /// Polymarket.
+    pub polymarket: Polymarket,
+    /// Kalshi.
+    pub kalshi: Kalshi,
+    /// Phoenix markets metadata.
+    pub phoenix: Phoenix,
 }
 
 /// `config/augment.json`.
@@ -210,6 +301,12 @@ fn d_elfa_interval() -> u64 {
 fn d_elfa_rpm() -> u64 {
     60
 }
+fn d_user_agent() -> String {
+    super::http::USER_AGENT.to_owned()
+}
+fn d_sec_rps() -> f64 {
+    4.0
+}
 
 /// Known Binance datasets and whether each is a large one.
 pub const BINANCE_DATASETS: [(&str, bool); 8] = [
@@ -238,6 +335,15 @@ pub fn load_augment_config(path: Option<&str>) -> Result<AugmentConfig, StoreErr
     Ok(config)
 }
 
+/// Rewrite a config file the way the repository keeps it: two-space JSON, struct field order,
+/// trailing newline. `augment sec-map --write` uses it, so the rewrite must be byte-stable.
+pub fn write_augment_config(path: &Path, config: &AugmentConfig) -> Result<(), StoreError> {
+    let text =
+        serde_json::to_string_pretty(config).map_err(|e| StoreError::Check(e.to_string()))?;
+    std::fs::write(path, format!("{text}\n"))?;
+    Ok(())
+}
+
 /// The repository's `config/augment.json`, for tests.
 #[must_use]
 pub fn repository_config_path() -> PathBuf {
@@ -260,6 +366,13 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
             "Invalid hyperliquid.requestsPerSecond".into(),
         ));
     }
+    let sec_rps = config.sources.sec.requests_per_second;
+    if !(sec_rps > 0.0 && sec_rps <= 10.0) {
+        return Err(StoreError::Check("Invalid sec.requestsPerSecond".into()));
+    }
+    if config.sources.sec.user_agent.trim().is_empty() {
+        return Err(StoreError::Check("sec.userAgent must not be empty".into()));
+    }
     if config.symbols.is_empty() {
         return Err(StoreError::Check("symbols must not be empty".into()));
     }
@@ -274,6 +387,14 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
         if !["crypto", "equity", "commodity"].contains(&symbol.kind.as_str()) {
             return Err(StoreError::Check(format!(
                 "invalid kind for {}",
+                symbol.phoenix
+            )));
+        }
+        if symbol.sec_cik.as_deref().is_some_and(|cik| {
+            cik.is_empty() || cik.len() > 10 || !cik.bytes().all(|b| b.is_ascii_digit())
+        }) {
+            return Err(StoreError::Check(format!(
+                "invalid secCik for {}",
                 symbol.phoenix
             )));
         }
@@ -300,6 +421,14 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
         &config.sources.bybit.base_url,
         &config.sources.bybit.files_url,
         &config.sources.elfa.base_url,
+        &config.sources.sec.base_url,
+        &config.sources.sec.tickers_url,
+        &config.sources.sec.archive_url,
+        &config.sources.alternative.base_url,
+        &config.sources.polymarket.gamma_url,
+        &config.sources.polymarket.clob_url,
+        &config.sources.kalshi.base_url,
+        &config.sources.phoenix.markets_url,
     ] {
         check_url(url)?;
     }
@@ -347,7 +476,36 @@ mod tests {
         assert!(nvda.binance.is_none());
         assert_eq!(nvda.hyperliquid.as_deref(), Some("xyz:NVDA"));
         assert!(config.symbols.iter().all(|s| s.elfa_entity_id.is_some()));
+        assert_eq!(nvda.sec_cik.as_deref(), Some("1045810"));
+        assert!(
+            config
+                .symbols
+                .iter()
+                .filter(|s| s.sec_cik.is_some())
+                .count()
+                >= 30
+        );
+        assert!(
+            config
+                .symbols
+                .iter()
+                .all(|s| s.sec_cik.is_none() || s.kind == "equity")
+        );
+        assert!(config.sources.polymarket.events.len() >= 10);
+        assert!(config.sources.kalshi.series.contains(&"KXFED".to_owned()));
         assert!(check_url("http://127.0.0.1:8080").is_ok());
         assert!(check_url("http://example.com").is_err());
+    }
+
+    #[test]
+    fn repository_config_round_trips_byte_for_byte() {
+        let path = repository_config_path();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let raw: AugmentConfig = serde_json::from_str(&text).unwrap();
+        let again = format!("{}\n", serde_json::to_string_pretty(&raw).unwrap());
+        assert_eq!(
+            again, text,
+            "config/augment.json must be the serializer's own output"
+        );
     }
 }
