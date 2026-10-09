@@ -215,8 +215,10 @@ size the budget from `augment status`'s per-dataset bytes after a day.
 
 `solos-data augment capture --config config/augment.json` is the long-running lane for what
 cannot be fetched later: Hyperliquid 1-minute candles every thirty minutes, Hyperliquid asset
-contexts (funding, open interest, mark/oracle/mid prices) every minute, Elfa events, calls,
-episodes and call-book bars every hour. It keeps its own ledger under `capture/` and its own
+contexts (funding, open interest, mark/oracle/mid prices) every minute, Elfa events every
+minute (`eventsIntervalSeconds`, two pages a poll), Elfa calls, episodes and call-book bars
+every hour, and the Elfa Auto alerts (`elfa.auto`): reconciled hourly, streamed continuously
+into `elfa/auto_events`. It keeps its own ledger under `capture/` and its own
 `catalog-capture.json` and `status-capture.json`, so it runs alongside the sync timer on the same
 root; `augment status` prints both and `augment query` sees both catalogs. Elfa needs
 `ELFA_API_KEY` in `~/.config/solos-data/augment.env` (mode 0600); without it the lane logs
@@ -225,6 +227,24 @@ undocumented: the lane reads `credits.used` before and after every cycle and, if
 `elfa_billing_started` and stops calling Elfa until the service restarts (the status shows
 `disabledByCreditGuard`). Asset contexts are buffered for up to ten minutes before they are
 merged into the day's file; a SIGTERM flushes them.
+
+The Auto alerts cost credits: five per creation, one per listing of the account's queries
+(once per reconciliation, so once an hour and once per restart). `elfa.auto.creditBudgetPerMonth`
+and `maxAlerts` cap what the lane may create; `status-capture.json` shows `elfaAuto`
+(active titles, created, renewed, fired, `creditsSpentMonth`, `streamConnected`) and
+`elfaEvents` (polls, requests, `requestsPerPoll`). To add an alert, append its definition to
+`elfa.auto.alerts` (conditions and repeat only; the lane adds the `notify` action and the
+expiry) and restart the capture unit; to retire one, remove it from the config and cancel it
+once with the Elfa API, since the lane never cancels an alert it did not renew. Check the
+spend against the key with `credits.used` before and after:
+
+```sh
+journalctl --user -u solos-data-augment-capture.service -o cat | grep -E "elfa_auto_(created|renewed|fired|credits|budget_reached)"
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment query --sql \
+  "SELECT ts, query_title, status, title FROM elfa_auto_events ORDER BY ts DESC LIMIT 20"
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment query --sql \
+  "SELECT quantile_cont((received_at_ms - first_seen_at * 1000) / 1000.0, [0.5, 0.9]) AS latency_s FROM elfa_events WHERE received_at_ms IS NOT NULL"
+```
 
 ```sh
 chmod 600 ~/.config/solos-data/augment.env

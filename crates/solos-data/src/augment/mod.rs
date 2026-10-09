@@ -5,6 +5,7 @@
 //! cannot be fetched later.
 
 pub mod alternative;
+pub mod auto;
 pub mod binance;
 pub mod bybit;
 pub mod candles;

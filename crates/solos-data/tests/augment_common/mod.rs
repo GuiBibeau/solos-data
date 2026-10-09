@@ -97,11 +97,14 @@ impl Response {
 }
 
 type Handler = Arc<dyn Fn(&Request) -> Response + Send + Sync>;
+/// A handler that writes the whole HTTP response itself (streams).
+type RawHandler = Arc<dyn Fn(&Request, &mut TcpStream) + Send + Sync>;
 
 /// The server.
 pub struct Server {
     pub base: String,
     routes: Arc<Mutex<HashMap<String, Handler>>>,
+    raw_routes: Arc<Mutex<HashMap<String, RawHandler>>>,
     hits: Arc<Mutex<Vec<Request>>>,
 }
 
@@ -110,20 +113,44 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let routes: Arc<Mutex<HashMap<String, Handler>>> = Arc::new(Mutex::new(HashMap::new()));
+        let raw_routes: Arc<Mutex<HashMap<String, RawHandler>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let hits: Arc<Mutex<Vec<Request>>> = Arc::new(Mutex::new(Vec::new()));
-        let (routes_thread, hits_thread) = (Arc::clone(&routes), Arc::clone(&hits));
+        let (routes_thread, raw_thread, hits_thread) = (
+            Arc::clone(&routes),
+            Arc::clone(&raw_routes),
+            Arc::clone(&hits),
+        );
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
-                let (routes, hits) = (Arc::clone(&routes_thread), Arc::clone(&hits_thread));
-                std::thread::spawn(move || serve(stream, &routes, &hits));
+                let (routes, raw, hits) = (
+                    Arc::clone(&routes_thread),
+                    Arc::clone(&raw_thread),
+                    Arc::clone(&hits_thread),
+                );
+                std::thread::spawn(move || serve(stream, &routes, &raw, &hits));
             }
         });
         Server {
             base: format!("http://127.0.0.1:{port}"),
             routes,
+            raw_routes,
             hits,
         }
+    }
+
+    /// Route a path to a handler that writes the response bytes itself, head included, and
+    /// may take its time: the connection closes when the handler returns.
+    pub fn route_raw(
+        &self,
+        path: &str,
+        handler: impl Fn(&Request, &mut TcpStream) + Send + Sync + 'static,
+    ) {
+        self.raw_routes
+            .lock()
+            .unwrap()
+            .insert(path.to_owned(), Arc::new(handler));
     }
 
     /// Route a path (without query) to a handler.
@@ -169,13 +196,20 @@ impl Server {
 fn serve(
     mut stream: TcpStream,
     routes: &Mutex<HashMap<String, Handler>>,
+    raw_routes: &Mutex<HashMap<String, RawHandler>>,
     hits: &Mutex<Vec<Request>>,
 ) {
     let Some(request) = read_request(&mut stream) else {
         return;
     };
-    let handler = routes.lock().unwrap().get(&request.path).cloned();
     hits.lock().unwrap().push(request.clone());
+    let raw = raw_routes.lock().unwrap().get(&request.path).cloned();
+    if let Some(raw) = raw {
+        raw(&request, &mut stream);
+        let _ = stream.flush();
+        return;
+    }
+    let handler = routes.lock().unwrap().get(&request.path).cloned();
     let response = match handler {
         Some(handler) => handler(&request),
         None => Response::status(404),

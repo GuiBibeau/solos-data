@@ -1,5 +1,5 @@
 [Unit]
-Description=solos-data augmentation capture: Hyperliquid candles and asset contexts, Elfa, Bybit funding
+Description=solos-data augmentation capture: Hyperliquid candles and asset contexts, Elfa events every minute, Elfa Auto alerts
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=0
