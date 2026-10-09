@@ -128,6 +128,16 @@ impl Http {
         serde_json::from_slice(&fetched.body).map_err(|e| HttpError::Decode(e.to_string()))
     }
 
+    /// POST a JSON body, keep the answer's bytes and headers.
+    pub async fn post(
+        &self,
+        url: &str,
+        body: &Value,
+        headers: &[(&str, &str)],
+    ) -> Result<Fetched, HttpError> {
+        self.send(url, headers, Some(body)).await
+    }
+
     /// POST a JSON body, parse a JSON answer.
     pub async fn post_json(
         &self,
@@ -137,6 +147,46 @@ impl Http {
     ) -> Result<Value, HttpError> {
         let fetched = self.send(url, headers, Some(body)).await?;
         serde_json::from_slice(&fetched.body).map_err(|e| HttpError::Decode(e.to_string()))
+    }
+
+    /// Open a GET whose body is read by the caller (a server-sent event stream): the same
+    /// spacing and retries up to the response head, then the response itself.
+    pub async fn open(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<reqwest::Response, HttpError> {
+        let mut backoff = Duration::from_secs(1);
+        for attempt in 1..=self.attempts {
+            self.acquire(url).await;
+            let mut request = self.client.get(url);
+            for (name, value) in headers {
+                request = request.header(*name, *value);
+            }
+            let (reason, retry_after) = match request.send().await {
+                Ok(response) => match classify(&response) {
+                    Ok(()) => return Ok(response),
+                    Err(Retry::Fatal(error)) => return Err(error),
+                    Err(Retry::Later(reason, retry_after)) => (reason, retry_after),
+                },
+                Err(e) => (safe_error(&e.to_string()), None),
+            };
+            if attempt == self.attempts {
+                return Err(final_error(reason));
+            }
+            let wait = retry_after.unwrap_or(backoff);
+            log(
+                "augment_http_retry",
+                Obj::new()
+                    .with("host", host_of(url))
+                    .with("attempt", attempt)
+                    .with("reason", reason)
+                    .with("waitSeconds", wait.as_secs()),
+            );
+            tokio::time::sleep(wait).await;
+            backoff = (backoff * 2).min(Duration::from_secs(60));
+        }
+        Err(HttpError::Transport("retries exhausted".into()))
     }
 
     async fn send(
@@ -154,10 +204,7 @@ impl Http {
                 Err(Retry::Later(reason, retry_after)) => (reason, retry_after),
             };
             if attempt == self.attempts {
-                return Err(match reason.strip_prefix("HTTP ") {
-                    Some(status) => HttpError::Status(status.parse().unwrap_or(0)),
-                    None => HttpError::Transport(reason),
-                });
+                return Err(final_error(reason));
             }
             let wait = retry_after.unwrap_or(backoff);
             log(
@@ -192,36 +239,50 @@ impl Http {
             .send()
             .await
             .map_err(|e| Retry::Later(safe_error(&e.to_string()), None))?;
+        classify(&response)?;
         let status = response.status().as_u16();
-        if (200..300).contains(&status) {
-            let headers = response
-                .headers()
-                .iter()
-                .filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
-                .collect();
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|e| Retry::Later(safe_error(&e.to_string()), None))?;
-            return Ok(Fetched {
-                status,
-                body: bytes.to_vec(),
-                headers,
-            });
-        }
-        if status == 404 {
-            return Err(Retry::Fatal(HttpError::NotFound));
-        }
-        if status == 429 || status >= 500 {
-            let retry_after = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.trim().parse::<u64>().ok())
-                .map(|s| Duration::from_secs(s.min(300)));
-            return Err(Retry::Later(format!("HTTP {status}"), retry_after));
-        }
-        Err(Retry::Fatal(HttpError::Status(status)))
+        let headers = response
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
+            .collect();
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Retry::Later(safe_error(&e.to_string()), None))?;
+        Ok(Fetched {
+            status,
+            body: bytes.to_vec(),
+            headers,
+        })
+    }
+}
+
+/// A response head: success, a final failure, or a reason to retry.
+fn classify(response: &reqwest::Response) -> Result<(), Retry> {
+    let status = response.status().as_u16();
+    if (200..300).contains(&status) {
+        return Ok(());
+    }
+    if status == 404 {
+        return Err(Retry::Fatal(HttpError::NotFound));
+    }
+    if status == 429 || status >= 500 {
+        let retry_after = response
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|s| Duration::from_secs(s.min(300)));
+        return Err(Retry::Later(format!("HTTP {status}"), retry_after));
+    }
+    Err(Retry::Fatal(HttpError::Status(status)))
+}
+
+fn final_error(reason: String) -> HttpError {
+    match reason.strip_prefix("HTTP ") {
+        Some(status) => HttpError::Status(status.parse().unwrap_or(0)),
+        None => HttpError::Transport(reason),
     }
 }
 

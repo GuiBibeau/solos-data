@@ -119,6 +119,8 @@ pub struct Outcome {
     pub errors: u64,
     /// Requests the series could skip because the periods were already closed.
     pub skipped: u64,
+    /// HTTP requests made, where the source counts them (Elfa's polls).
+    pub requests: u64,
 }
 
 impl Outcome {
@@ -128,6 +130,7 @@ impl Outcome {
         self.rows += other.rows;
         self.errors += other.errors;
         self.skipped += other.skipped;
+        self.requests += other.requests;
     }
 
     /// As a JSON object.

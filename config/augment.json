@@ -90,7 +90,193 @@
       "enabled": true,
       "baseUrl": "https://api.elfa.ai",
       "intervalSeconds": 3600,
-      "requestsPerMinute": 60
+      "requestsPerMinute": 60,
+      "eventsIntervalSeconds": 60,
+      "eventsPagesPerPoll": 2,
+      "auto": {
+        "enabled": true,
+        "maxAlerts": 8,
+        "creditBudgetPerMonth": 60,
+        "expiresIn": "720h",
+        "renewWithinHours": 48,
+        "alerts": [
+          {
+            "title": "BTC Hyperliquid liquidations above 2000k in 5m",
+            "description": "Total USD liquidated on BTC:HYPERLIQUID crosses above 2,000,000 in a trailing five-minute window (complete per-venue feed).",
+            "conditions": {
+              "AND": [
+                {
+                  "args": {
+                    "ticker": "BTC:HYPERLIQUID"
+                  },
+                  "method": "total_usd_5m",
+                  "operator": "crosses_above",
+                  "source": "liquidation",
+                  "value": 2000000
+                }
+              ]
+            },
+            "repeat": {
+              "cooldown": "15m",
+              "maxTriggers": 500
+            }
+          },
+          {
+            "title": "ETH Hyperliquid liquidations above 1000k in 5m",
+            "description": "Total USD liquidated on ETH:HYPERLIQUID crosses above 1,000,000 in a trailing five-minute window (complete per-venue feed).",
+            "conditions": {
+              "AND": [
+                {
+                  "args": {
+                    "ticker": "ETH:HYPERLIQUID"
+                  },
+                  "method": "total_usd_5m",
+                  "operator": "crosses_above",
+                  "source": "liquidation",
+                  "value": 1000000
+                }
+              ]
+            },
+            "repeat": {
+              "cooldown": "15m",
+              "maxTriggers": 500
+            }
+          },
+          {
+            "title": "SOL Hyperliquid liquidations above 500k in 5m",
+            "description": "Total USD liquidated on SOL:HYPERLIQUID crosses above 500,000 in a trailing five-minute window (complete per-venue feed).",
+            "conditions": {
+              "AND": [
+                {
+                  "args": {
+                    "ticker": "SOL:HYPERLIQUID"
+                  },
+                  "method": "total_usd_5m",
+                  "operator": "crosses_above",
+                  "source": "liquidation",
+                  "value": 500000
+                }
+              ]
+            },
+            "repeat": {
+              "cooldown": "15m",
+              "maxTriggers": 500
+            }
+          },
+          {
+            "title": "SOL Hyperliquid funding beyond +50% or -30% APR",
+            "description": "Annualized funding on SOL:HYPERLIQUID crosses above 50% (crowded longs) or below -30% (crowded shorts).",
+            "conditions": {
+              "OR": [
+                {
+                  "args": {
+                    "ticker": "SOL:HYPERLIQUID"
+                  },
+                  "method": "annualized_rate",
+                  "operator": "crosses_above",
+                  "source": "funding",
+                  "value": 50
+                },
+                {
+                  "args": {
+                    "ticker": "SOL:HYPERLIQUID"
+                  },
+                  "method": "annualized_rate",
+                  "operator": "crosses_below",
+                  "source": "funding",
+                  "value": -30
+                }
+              ]
+            },
+            "repeat": {
+              "cooldown": "1h",
+              "maxTriggers": 500
+            }
+          },
+          {
+            "title": "BTC Hyperliquid funding beyond +50% or -30% APR",
+            "description": "Annualized funding on BTC:HYPERLIQUID crosses above 50% (crowded longs) or below -30% (crowded shorts).",
+            "conditions": {
+              "OR": [
+                {
+                  "args": {
+                    "ticker": "BTC:HYPERLIQUID"
+                  },
+                  "method": "annualized_rate",
+                  "operator": "crosses_above",
+                  "source": "funding",
+                  "value": 50
+                },
+                {
+                  "args": {
+                    "ticker": "BTC:HYPERLIQUID"
+                  },
+                  "method": "annualized_rate",
+                  "operator": "crosses_below",
+                  "source": "funding",
+                  "value": -30
+                }
+              ]
+            },
+            "repeat": {
+              "cooldown": "1h",
+              "maxTriggers": 500
+            }
+          },
+          {
+            "title": "Solana network outage, halt or major exploit",
+            "description": "News reports that the Solana network halted or suffered an outage, or that a major Solana protocol was exploited.",
+            "conditions": {
+              "OR": [
+                {
+                  "args": {
+                    "minConfidence": 80,
+                    "text": "The Solana network halts or suffers an outage"
+                  },
+                  "source": "news"
+                },
+                {
+                  "args": {
+                    "minConfidence": 80,
+                    "text": "A major Solana protocol suffers an exploit or hack"
+                  },
+                  "source": "news"
+                }
+              ]
+            },
+            "repeat": {
+              "cooldown": "1h",
+              "maxTriggers": 100
+            }
+          },
+          {
+            "title": "Phoenix perps incident, exploit or delisting",
+            "description": "News reports an incident, exploit or market delisting at the Phoenix perpetuals exchange (Phoenix Trade).",
+            "conditions": {
+              "OR": [
+                {
+                  "args": {
+                    "minConfidence": 80,
+                    "text": "Phoenix Trade perpetuals exchange suffers an incident or exploit"
+                  },
+                  "source": "news"
+                },
+                {
+                  "args": {
+                    "minConfidence": 80,
+                    "text": "Phoenix Trade delists a perpetual market"
+                  },
+                  "source": "news"
+                }
+              ]
+            },
+            "repeat": {
+              "cooldown": "1h",
+              "maxTriggers": 100
+            }
+          }
+        ]
+      }
     },
     "sec": {
       "enabled": true,

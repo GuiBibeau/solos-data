@@ -1,7 +1,10 @@
 //! Elfa v3 (free today, undocumented): events, calls, call episodes and the crypto call-book
-//! bars, pulled hourly from the last `to` with ascending cursors into day files. A credit guard
-//! reads `credits.used` before and after every cycle; if it moved, the lane logs
-//! `elfa_billing_started` and disables itself for the rest of the process.
+//! bars, pulled from the last `to` with ascending cursors into day files; calls, episodes and
+//! bars hourly, events every minute (two pages at most, so the poll stays within two requests
+//! a minute of the key's sixty). Every row records the instant it was received. A credit guard
+//! reads `credits.used` before and after every hourly cycle under the billing lock shared with
+//! the Auto lane; if it moved, the lane logs `elfa_billing_started` and disables itself for
+//! the rest of the process.
 
 use super::http::{Http, with_query};
 use super::ledger::{get_progress, register};
@@ -13,7 +16,8 @@ use crate::store::StoreError;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Pages per stream per cycle by default; the rest waits for the next cycle, which resumes from
 /// the newest row received.
@@ -93,6 +97,23 @@ impl Stream {
     }
 }
 
+/// The mutual exclusion between the hourly cycle's credit guard and the Auto lane's paid
+/// calls: whoever holds it owns the movement of `credits.used` meanwhile.
+pub type Billing = Arc<tokio::sync::Mutex<()>>;
+
+/// Counters of the minute poll.
+#[derive(Default)]
+pub struct PollCounters {
+    /// Polls run.
+    pub polls: AtomicU64,
+    /// Requests those polls made.
+    pub requests: AtomicU64,
+    /// Rows received.
+    pub rows: AtomicU64,
+    /// Failed polls.
+    pub errors: AtomicU64,
+}
+
 /// The lane's settings and state.
 pub struct ElfaLane {
     /// API base.
@@ -101,8 +122,14 @@ pub struct ElfaLane {
     pub key: String,
     /// First instant to pull, seconds.
     pub start_s: i64,
-    /// Pages per stream per cycle.
+    /// Pages per stream per hourly cycle.
     pub max_pages: usize,
+    /// Pages per events poll; 0 keeps events in the hourly cycle.
+    pub events_pages: usize,
+    /// The billing lock.
+    pub billing: Billing,
+    /// The minute poll's counters.
+    pub poll: PollCounters,
     disabled: AtomicBool,
 }
 
@@ -115,6 +142,9 @@ impl ElfaLane {
             key: key.to_owned(),
             start_s,
             max_pages: MAX_PAGES,
+            events_pages: 0,
+            billing: Arc::new(tokio::sync::Mutex::new(())),
+            poll: PollCounters::default(),
             disabled: AtomicBool::new(false),
         }
     }
@@ -125,11 +155,18 @@ impl ElfaLane {
         self.disabled.load(Ordering::Relaxed)
     }
 
+    /// The streams the hourly cycle pulls: everything, or everything but the events when they
+    /// have their own poll.
+    #[must_use]
+    pub fn hourly_streams(&self) -> Vec<Stream> {
+        Stream::ALL
+            .into_iter()
+            .filter(|s| self.events_pages == 0 || *s != Stream::Events)
+            .collect()
+    }
+
     fn headers(&self) -> [(&str, &str); 2] {
-        [
-            ("x-elfa-api-key", self.key.as_str()),
-            ("accept", "application/json"),
-        ]
+        headers(&self.key)
     }
 
     async fn get(
@@ -144,23 +181,78 @@ impl ElfaLane {
 
     /// `credits.used` and `historyFrom` from `/v3/key-status`.
     pub async fn key_status(&self, http: &Http) -> Result<(i64, Option<i64>), StoreError> {
-        let status = self.get(http, "/v3/key-status", &[]).await?;
-        let used = status
-            .get("credits")
-            .and_then(|c| c.get("used"))
-            .and_then(Value::as_i64)
-            .ok_or_else(|| StoreError::Check("key-status has no credits.used".into()))?;
-        Ok((used, status.get("historyFrom").and_then(Value::as_i64)))
+        key_status(http, &self.base_url, &self.key).await
     }
 }
 
-/// One cycle: every stream from its last `to` up to `now_s`, under the credit guard.
+/// The headers every Elfa request carries.
+#[must_use]
+pub fn headers(key: &str) -> [(&str, &str); 2] {
+    [("x-elfa-api-key", key), ("accept", "application/json")]
+}
+
+/// `credits.used` and `historyFrom` from `/v3/key-status` (free).
+pub async fn key_status(
+    http: &Http,
+    base_url: &str,
+    key: &str,
+) -> Result<(i64, Option<i64>), StoreError> {
+    let status = http
+        .get_json(
+            &format!("{}/v3/key-status", base_url.trim_end_matches('/')),
+            &headers(key),
+        )
+        .await?;
+    let used = status
+        .get("credits")
+        .and_then(|c| c.get("used"))
+        .and_then(Value::as_i64)
+        .ok_or_else(|| StoreError::Check("key-status has no credits.used".into()))?;
+    Ok((used, status.get("historyFrom").and_then(Value::as_i64)))
+}
+
+/// One events poll: the next pages since the last `to`, free, outside the billing lock.
+pub async fn poll_events(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
+    let mut outcome = Outcome::default();
+    if lane.disabled() {
+        outcome.skipped += 1;
+        return outcome;
+    }
+    let result = pull_stream(ctx, lane, Stream::Events, None, now_s, lane.events_pages).await;
+    lane.poll.polls.fetch_add(1, Ordering::Relaxed);
+    match result {
+        Ok(result) => {
+            lane.poll
+                .requests
+                .fetch_add(result.requests, Ordering::Relaxed);
+            lane.poll.rows.fetch_add(result.rows, Ordering::Relaxed);
+            outcome.add(&result);
+        }
+        Err(error) => {
+            lane.poll.errors.fetch_add(1, Ordering::Relaxed);
+            outcome.errors += 1;
+            log_error(Stream::Events, "poll", &error.to_string());
+        }
+    }
+    log(
+        "elfa_events_poll",
+        Obj::new()
+            .with("requests", outcome.requests)
+            .with("rows", outcome.rows)
+            .with("errors", outcome.errors),
+    );
+    outcome
+}
+
+/// One hourly cycle: the hourly streams from their last `to` up to `now_s`, under the credit
+/// guard and the billing lock.
 pub async fn cycle(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
     let mut outcome = Outcome::default();
     if lane.disabled() {
         outcome.skipped += 1;
         return outcome;
     }
+    let _billing = lane.billing.lock().await;
     let (used_before, history_from) = match lane.key_status(&ctx.http).await {
         Ok(status) => status,
         Err(error) => {
@@ -169,11 +261,11 @@ pub async fn cycle(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
             return outcome;
         }
     };
-    for stream in Stream::ALL {
+    for stream in lane.hourly_streams() {
         if ctx.stopping() {
             break;
         }
-        match pull_stream(ctx, lane, stream, history_from, now_s).await {
+        match pull_stream(ctx, lane, stream, history_from, now_s, lane.max_pages).await {
             Ok(result) => outcome.add(&result),
             Err(error) => {
                 outcome.errors += 1;
@@ -213,6 +305,7 @@ async fn pull_stream(
     stream: Stream,
     history_from: Option<i64>,
     now_s: i64,
+    max_pages: usize,
 ) -> Result<Outcome, StoreError> {
     let key = progress_key(stream);
     let lookup = key.clone();
@@ -231,7 +324,8 @@ async fn pull_stream(
     let mut cursor: Option<String> = None;
     let mut pages = 0;
     let mut has_more = true;
-    while has_more && pages < lane.max_pages {
+    let received_at_ms = chrono::Utc::now().timestamp_millis();
+    while has_more && pages < max_pages {
         let mut pairs: Vec<(&str, String)> = vec![
             ("from", from.to_string()),
             ("to", to.to_string()),
@@ -254,7 +348,10 @@ async fn pull_stream(
                     stream.field()
                 ))
             })?;
-        rows.extend(page.iter().filter_map(|row| flatten(stream, row)));
+        rows.extend(
+            page.iter()
+                .filter_map(|row| flatten(stream, row, received_at_ms)),
+        );
         has_more = answer
             .get("hasMore")
             .and_then(Value::as_bool)
@@ -268,6 +365,7 @@ async fn pull_stream(
         }
         pages += 1;
     }
+    outcome.requests = pages as u64;
     // Where the next cycle resumes: `to` when the pull finished, otherwise one second before the
     // newest row received (rows sharing that second may be split across pages; the merge
     // deduplicates on id).
@@ -363,10 +461,20 @@ fn text(value: Option<&Value>) -> Value {
     }
 }
 
-/// A flat row for one stream item; `None` when the item has no id or time.
+/// A flat row for one stream item with the instant it was received; `None` when the item has
+/// no id or time.
 #[must_use]
-pub fn flatten(stream: Stream, row: &Value) -> Option<Value> {
+pub fn flatten(stream: Stream, row: &Value, received_at_ms: i64) -> Option<Value> {
     let raw = row.to_string();
+    let mut flat = flatten_fields(stream, row)?;
+    if let Some(object) = flat.as_object_mut() {
+        object.insert("raw_json".into(), Value::String(raw));
+        object.insert("received_at".into(), Value::from(received_at_ms));
+    }
+    Some(flat)
+}
+
+fn flatten_fields(stream: Stream, row: &Value) -> Option<Value> {
     Some(match stream {
         Stream::Events => {
             let entities = row.get("primaryEntities").and_then(Value::as_array);
@@ -391,7 +499,6 @@ pub fn flatten(stream: Stream, row: &Value) -> Option<Value> {
                 "origin_count": row.get("originCount"),
                 "primary_entity_ids": ids, "primary_symbols": symbols,
                 "impacts_json": text(row.get("impacts")), "cited_sources_json": text(row.get("citedSources")),
-                "raw_json": raw,
             })
         }
         Stream::Calls => json!({
@@ -400,7 +507,6 @@ pub fn flatten(stream: Stream, row: &Value) -> Option<Value> {
             "episode_id": row.get("episodeId"), "handle": row.get("handle"), "source": row.get("source"), "channel": row.get("channel"),
             "asset_id": row.get("asset").and_then(|a| a.get("id")), "asset_symbol": row.get("asset").and_then(|a| a.get("symbol")),
             "asset_name": row.get("asset").and_then(|a| a.get("name")), "call_action": row.get("callAction"),
-            "raw_json": raw,
         }),
         Stream::Episodes => json!({
             "id": row.get("id")?.as_str()?,
@@ -411,7 +517,6 @@ pub fn flatten(stream: Stream, row: &Value) -> Option<Value> {
             "direction": row.get("direction"), "horizon": row.get("horizon"), "status": row.get("status"),
             "entry_price": row.get("entryPrice"), "exit_price": row.get("exitPrice"), "close_reason": row.get("closeReason"),
             "alpha_score": row.get("track").and_then(|t| t.get("alphaScore")),
-            "raw_json": raw,
         }),
         Stream::CallBook => json!({
             "bar_at": seconds(row.get("barAt"))?,
@@ -420,7 +525,6 @@ pub fn flatten(stream: Stream, row: &Value) -> Option<Value> {
             "pulse24": row.get("pulse24"), "pulse24_long_share": row.get("pulse24LongShare"),
             "pulse6": row.get("pulse6"), "pulse6_long_share": row.get("pulse6LongShare"),
             "formula_version": row.get("formulaVersion"), "computed_at": seconds(row.get("computedAt")),
-            "raw_json": raw,
         }),
     })
 }
@@ -528,9 +632,11 @@ pub fn select(stream: Stream, staged: &Path, constants: &str) -> String {
             ("raw_json", "VARCHAR"),
         ],
     };
+    let mut typed: Vec<(&str, &str)> = columns.to_vec();
+    typed.push(("received_at", "BIGINT"));
     format!(
-        "SELECT *, make_timestamp({time} * 1000000) AS ts, {constants} FROM {}",
-        read_json_array(staged, columns)
+        "SELECT * EXCLUDE (received_at), received_at AS received_at_ms, make_timestamp({time} * 1000000) AS ts, {constants} FROM {}",
+        read_json_array(staged, &typed)
     )
 }
 
@@ -554,32 +660,49 @@ mod tests {
     fn flattens_each_stream() {
         let event = json!({ "id": "e1", "firstSeenAt": 1_791_500_000, "analyzedAt": 1_791_500_100_000_i64, "eventClass": "news",
             "primaryEntities": [{ "id": "a", "symbol": "SOL" }, { "id": "b", "symbol": null }], "impacts": [{ "x": 1 }] });
-        let row = flatten(Stream::Events, &event).unwrap();
+        let row = flatten(Stream::Events, &event, 77).unwrap();
         assert_eq!(row["analyzed_at"], 1_791_500_100);
+        assert_eq!(row["received_at"], 77);
+        assert!(
+            row["raw_json"]
+                .as_str()
+                .unwrap()
+                .contains("primaryEntities")
+        );
         assert_eq!(row["primary_entity_ids"], json!(["a", "b"]));
         assert_eq!(row["primary_symbols"], json!(["SOL"]));
         assert_eq!(row["impacts_json"], "[{\"x\":1}]");
-        assert!(flatten(Stream::Events, &json!({ "id": "x" })).is_none());
+        assert!(flatten(Stream::Events, &json!({ "id": "x" }), 0).is_none());
         let bar = flatten(
             Stream::CallBook,
             &json!({ "barAt": 1_791_500_000, "longShare": 0.6 }),
+            0,
         )
         .unwrap();
         assert_eq!(bar["bar_at"], 1_791_500_000);
         let call = flatten(
             Stream::Calls,
             &json!({ "id": "c", "occurredAt": 1, "asset": { "symbol": "BTC" } }),
+            0,
         )
         .unwrap();
         assert_eq!(call["asset_symbol"], "BTC");
         let episode = flatten(
             Stream::Episodes,
             &json!({ "id": "p", "openedAt": 5, "track": { "alphaScore": 0.2 } }),
+            0,
         )
         .unwrap();
         assert_eq!(episode["observed_at"], 5);
         assert_eq!(episode["alpha_score"], 0.2);
         assert_eq!(progress_key(Stream::CallBook), "elfa/call_book");
         assert_eq!(Stream::Episodes.path(), "/v3/calls/episodes");
+        let mut lane = ElfaLane::new("https://x", "k", 0);
+        assert_eq!(lane.hourly_streams().len(), 4);
+        lane.events_pages = 2;
+        assert_eq!(
+            lane.hourly_streams(),
+            [Stream::Calls, Stream::Episodes, Stream::CallBook]
+        );
     }
 }

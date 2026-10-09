@@ -157,6 +157,38 @@ Prediction markets are curated, not discovered: `polymarket.events` lists Gamma 
 closed market whose last month is complete in the ledger is skipped (`skipped` in the status),
 so the hourly run only refetches the open month of live markets.
 
+### Capture lane
+
+| Source | Dataset | Cadence | Files | Notes |
+|---|---|---|---|---|
+| Elfa v3 | `events` | every 60 s | day | incremental from the last `to` with `order=asc`, at most two pages (sixty events) a poll, so the poll costs at most two of the key's sixty requests a minute; every row of every Elfa stream now carries `received_at_ms`, the instant the lane received it, so publication latency against `first_seen_at` can be measured |
+| Elfa v3 | `calls`, `episodes`, `call_book` | every 1 h | day | unchanged, under the credit guard |
+| Elfa Auto | `auto_events` | as they fire | day | the notifications of the account's alerts from the server-sent event stream `GET /v2/auto/queries/stream`, one row per frame with `received_at_ms`, the outbox event id, query id and title, status, title, body, execution id, trigger time and the raw payload |
+
+The alerts are seven definitions in `elfa.auto.alerts`, `notify` action only (free to receive;
+no webhook, Telegram or LLM step): liquidation `total_usd_5m crosses_above` on
+`BTC:HYPERLIQUID` (2,000,000 USD), `ETH:HYPERLIQUID` (1,000,000) and `SOL:HYPERLIQUID`
+(500,000) with a fifteen-minute cooldown, funding `annualized_rate` on `SOL:HYPERLIQUID` and
+`BTC:HYPERLIQUID` crossing above 50 % or below −30 % (one alert per symbol, `OR`), and two
+`news.semantic` alerts at confidence 80 for a Solana outage, halt or major exploit and for a
+Phoenix perps incident, exploit or delisting, each split into atomic claims under `OR`. The
+thresholds are defaults, not calibrated from Phoenix's own liquidations: Phoenix's flow is an
+order of magnitude below Hyperliquid's and the alert watches Hyperliquid. All expire in
+`720h`, the API's ceiling.
+
+On start and then hourly the lane lists the account's queries (one credit), creates every
+missing title after a free `validate`, recreates any alert expiring within 48 hours and
+cancels the old one, and records what it holds in the ledger (`elfa/auto/queries`) with the
+month's measured spend (`elfa/auto/spend`). Creation costs five credits ("baseline") and is
+the only paid call besides the listing; `credits.used` is read before and after each
+reconciliation under a billing lock shared with the hourly v3 cycle, so the v3 credit guard
+never sees the Auto lane's spend as billing of the free reads. `creditBudgetPerMonth` (60) and
+`maxAlerts` (8) stop creation when reached (`elfa_auto_budget_reached`). The stream is
+reopened with exponential backoff; `410` means the account has no active query and the lane
+waits five minutes; a frame-less minute (keep-alives count) reopens it. Logs:
+`elfa_auto_created` (with the answer's `x-elfa-credits`), `elfa_auto_renewed`,
+`elfa_auto_fired`, `elfa_auto_credits` (the measured delta per reconciliation).
+
 ### What cannot be fetched after the fact
 
 Polymarket's CLOB serves hourly history for the life of a token, Kalshi's candlesticks for the

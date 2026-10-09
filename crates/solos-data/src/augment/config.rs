@@ -139,7 +139,60 @@ pub struct Bybit {
     pub trades: bool,
 }
 
-/// Elfa v3.
+/// One Elfa Auto alert definition: the EQL conditions and the repeat rule. The lane adds the
+/// `notify` action and the expiry; no other action type can be configured.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AlertDef {
+    /// Title, the idempotency key against the account's active queries.
+    pub title: String,
+    /// Description shown with the notification.
+    pub description: String,
+    /// EQL condition tree (`{"AND": [...]}` or `{"OR": [...]}`).
+    pub conditions: serde_json::Value,
+    /// `{"cooldown": "15m", "maxTriggers": 500}`; absent for a one-shot alert.
+    #[serde(default)]
+    pub repeat: Option<serde_json::Value>,
+}
+
+/// Elfa Auto: a small set of alerts whose firings are recorded as they arrive.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ElfaAuto {
+    /// Whether alerts are created and streamed.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Ceiling on alerts the lane may hold active.
+    #[serde(default = "d_max_alerts")]
+    pub max_alerts: usize,
+    /// Credits the lane may spend creating alerts in one calendar month.
+    #[serde(default = "d_credit_budget")]
+    pub credit_budget_per_month: i64,
+    /// `expiresIn` of every alert (`720h` is the API's maximum).
+    #[serde(default = "d_expires_in")]
+    pub expires_in: String,
+    /// An alert expiring within this many hours is recreated and the old one cancelled.
+    #[serde(default = "d_renew_hours")]
+    pub renew_within_hours: i64,
+    /// The alert definitions.
+    #[serde(default)]
+    pub alerts: Vec<AlertDef>,
+}
+
+impl Default for ElfaAuto {
+    fn default() -> Self {
+        ElfaAuto {
+            enabled: false,
+            max_alerts: d_max_alerts(),
+            credit_budget_per_month: d_credit_budget(),
+            expires_in: d_expires_in(),
+            renew_within_hours: d_renew_hours(),
+            alerts: Vec::new(),
+        }
+    }
+}
+
+/// Elfa v3 and Auto.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Elfa {
@@ -147,12 +200,22 @@ pub struct Elfa {
     pub enabled: bool,
     /// API base.
     pub base_url: String,
-    /// Seconds between capture cycles.
+    /// Seconds between capture cycles of the calls, episodes and call-book streams.
     #[serde(default = "d_elfa_interval")]
     pub interval_seconds: u64,
     /// The key's request allowance per minute.
     #[serde(default = "d_elfa_rpm")]
     pub requests_per_minute: u64,
+    /// Seconds between incremental pulls of the events stream; 0 keeps events in the hourly
+    /// cycle.
+    #[serde(default = "d_events_interval")]
+    pub events_interval_seconds: u64,
+    /// Pages one events pull may request (30 events each): the poll's request budget.
+    #[serde(default = "d_events_pages")]
+    pub events_pages_per_poll: usize,
+    /// Auto alerts.
+    #[serde(default)]
+    pub auto: ElfaAuto,
 }
 
 /// SEC EDGAR: the submissions JSON of every mapped issuer.
@@ -301,6 +364,24 @@ fn d_elfa_interval() -> u64 {
 fn d_elfa_rpm() -> u64 {
     60
 }
+fn d_events_interval() -> u64 {
+    60
+}
+fn d_events_pages() -> usize {
+    2
+}
+fn d_max_alerts() -> usize {
+    8
+}
+fn d_credit_budget() -> i64 {
+    60
+}
+fn d_expires_in() -> String {
+    "720h".into()
+}
+fn d_renew_hours() -> i64 {
+    48
+}
 fn d_user_agent() -> String {
     super::http::USER_AGENT.to_owned()
 }
@@ -372,6 +453,31 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
     }
     if config.sources.sec.user_agent.trim().is_empty() {
         return Err(StoreError::Check("sec.userAgent must not be empty".into()));
+    }
+    let auto = &config.sources.elfa.auto;
+    if auto.alerts.len() > auto.max_alerts {
+        return Err(StoreError::Check(format!(
+            "elfa.auto has {} alerts, more than maxAlerts {}",
+            auto.alerts.len(),
+            auto.max_alerts
+        )));
+    }
+    let mut titles = std::collections::HashSet::new();
+    for alert in &auto.alerts {
+        if alert.title.trim().is_empty() || !titles.insert(alert.title.as_str()) {
+            return Err(StoreError::Check(
+                "elfa.auto alert titles must be unique".into(),
+            ));
+        }
+        if !alert.conditions.is_object() {
+            return Err(StoreError::Check(format!(
+                "elfa.auto alert {} has no conditions",
+                alert.title
+            )));
+        }
+    }
+    if !auto.expires_in.ends_with('h') || auto.credit_budget_per_month < 0 {
+        return Err(StoreError::Check("invalid elfa.auto settings".into()));
     }
     if config.symbols.is_empty() {
         return Err(StoreError::Check("symbols must not be empty".into()));
@@ -492,6 +598,12 @@ mod tests {
                 .all(|s| s.sec_cik.is_none() || s.kind == "equity")
         );
         assert!(config.sources.polymarket.events.len() >= 10);
+        let auto = &config.sources.elfa.auto;
+        assert!(auto.enabled);
+        assert_eq!(auto.alerts.len(), 7);
+        assert!(auto.alerts.len() <= auto.max_alerts);
+        assert_eq!(auto.expires_in, "720h");
+        assert_eq!(config.sources.elfa.events_interval_seconds, 60);
         assert!(config.sources.kalshi.series.contains(&"KXFED".to_owned()));
         assert!(check_url("http://127.0.0.1:8080").is_ok());
         assert!(check_url("http://example.com").is_err());
