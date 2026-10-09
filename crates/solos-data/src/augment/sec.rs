@@ -1,14 +1,15 @@
 //! SEC EDGAR filings of the equity perps' issuers: the submissions JSON of each mapped CIK
 //! (`data.sec.gov/submissions/CIK##########.json`, with its continuation files when the recent
 //! window does not reach the start date) becomes one Parquet file per issuer and month. EDGAR
-//! wants a declared User-Agent, `Accept-Encoding: gzip` and at most ten requests a second.
+//! wants a declared User-Agent with a contact email (`SEC_USER_AGENT`; without one the source
+//! is off and says so once per run), `Accept-Encoding: gzip` and at most ten requests a second.
 
 use super::config::{AugmentConfig, Sec, Symbol};
 use super::http::Http;
 use super::parquet::read_json_array;
 use super::periods::Granularity;
 use super::series::{Ctx, Outcome, RowsFuture, Series, sync_series};
-use crate::jsonout::Obj;
+use crate::jsonout::{Obj, log};
 use crate::store::{StoreError, sql_string};
 use serde_json::{Value, json};
 use std::io::Read;
@@ -37,11 +38,11 @@ pub struct Filings {
 impl Filings {
     /// The series of one mapped symbol.
     #[must_use]
-    pub fn new(cfg: &Sec, symbol: &Symbol, cik: &str, since: &str) -> Filings {
+    pub fn new(cfg: &Sec, user_agent: &str, symbol: &Symbol, cik: &str, since: &str) -> Filings {
         Filings {
             base_url: cfg.base_url.trim_end_matches('/').to_owned(),
             archive_url: cfg.archive_url.trim_end_matches('/').to_owned(),
-            user_agent: cfg.user_agent.clone(),
+            user_agent: user_agent.to_owned(),
             ticker: symbol.phoenix.clone(),
             phoenix: symbol.phoenix.clone(),
             cik: cik.to_owned(),
@@ -241,9 +242,28 @@ impl Series for Filings {
     }
 }
 
-/// Sync every symbol with a CIK.
+/// The User-Agent to send, or the reason the source is off.
+fn user_agent(cfg: &Sec) -> Result<&str, &'static str> {
+    match (cfg.disabled_reason(), cfg.user_agent.as_deref()) {
+        (None, Some(agent)) => Ok(agent),
+        (reason, _) => Err(reason.unwrap_or("SEC_USER_AGENT not set")),
+    }
+}
+
+/// Sync every symbol with a CIK; without a usable `SEC_USER_AGENT`, one
+/// `augment_source_disabled` line and a disabled outcome instead of a 403 per issuer.
 pub async fn sync(ctx: &Ctx, config: &AugmentConfig, only_symbol: Option<&str>) -> Outcome {
     let cfg = &config.sources.sec;
+    let agent = match user_agent(cfg) {
+        Ok(agent) => agent,
+        Err(reason) => {
+            log(
+                "augment_source_disabled",
+                Obj::new().with("source", "sec").with("reason", reason),
+            );
+            return Outcome::disabled(reason);
+        }
+    };
     ctx.http
         .set_host_rate(&cfg.base_url, cfg.requests_per_second);
     let mut outcome = Outcome::default();
@@ -254,7 +274,7 @@ pub async fn sync(ctx: &Ctx, config: &AugmentConfig, only_symbol: Option<&str>) 
         if only_symbol.is_some_and(|s| s != symbol.phoenix) || ctx.stopping() {
             continue;
         }
-        let series = Filings::new(cfg, symbol, cik, &config.start_date);
+        let series = Filings::new(cfg, agent, symbol, cik, &config.start_date);
         outcome.add(&sync_series(ctx, &series).await);
     }
     outcome
@@ -268,14 +288,16 @@ pub async fn map_ciks(
     write: bool,
 ) -> Result<Obj, StoreError> {
     let cfg = &config.sources.sec;
+    let agent = user_agent(cfg).map_err(|reason| {
+        StoreError::Check(format!(
+            "{reason}: set SEC_USER_AGENT to \"<name> <contact email>\""
+        ))
+    })?;
     let http = Http::new(cfg.requests_per_second)?;
     let fetched = http
         .get_bytes(
             &cfg.tickers_url,
-            &[
-                ("user-agent", cfg.user_agent.as_str()),
-                ("accept-encoding", "gzip"),
-            ],
+            &[("user-agent", agent), ("accept-encoding", "gzip")],
         )
         .await?;
     let listing: Value = serde_json::from_slice(&inflate(fetched.body)?)

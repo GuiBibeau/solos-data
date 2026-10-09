@@ -230,13 +230,38 @@ pub struct Sec {
     pub tickers_url: String,
     /// Base of filing document URLs (`/Archives/edgar/data`).
     pub archive_url: String,
-    /// The User-Agent EDGAR sees. EDGAR's fair-access policy asks automated tools to declare
-    /// a contact in it; the operator decides what to declare.
-    #[serde(default = "d_user_agent")]
-    pub user_agent: String,
+    /// The User-Agent EDGAR sees, from `SEC_USER_AGENT` (never the config file). EDGAR's
+    /// fair-access policy answers `403` to a User-Agent without a contact email; the operator
+    /// declares `<name> <contact email>` in the environment, and without it the source is off.
+    #[serde(skip)]
+    pub user_agent: Option<String>,
     /// Requests per second to EDGAR (its ceiling is ten).
     #[serde(default = "d_sec_rps")]
     pub requests_per_second: f64,
+}
+
+/// The environment variable that carries EDGAR's User-Agent.
+pub const SEC_USER_AGENT_ENV: &str = "SEC_USER_AGENT";
+
+impl Sec {
+    /// Why the source cannot run with this User-Agent, if it cannot.
+    #[must_use]
+    pub fn disabled_reason(&self) -> Option<&'static str> {
+        match self.user_agent.as_deref() {
+            None => Some("SEC_USER_AGENT not set"),
+            Some(agent) if !agent.contains('@') => Some("SEC_USER_AGENT has no contact email"),
+            Some(_) => None,
+        }
+    }
+}
+
+/// `SEC_USER_AGENT`, trimmed, when set and not empty.
+#[must_use]
+pub fn sec_user_agent_from_env() -> Option<String> {
+    std::env::var(SEC_USER_AGENT_ENV)
+        .ok()
+        .map(|agent| agent.trim().to_owned())
+        .filter(|agent| !agent.is_empty())
 }
 
 /// alternative.me Fear and Greed index.
@@ -382,9 +407,6 @@ fn d_expires_in() -> String {
 fn d_renew_hours() -> i64 {
     48
 }
-fn d_user_agent() -> String {
-    super::http::USER_AGENT.to_owned()
-}
 fn d_sec_rps() -> f64 {
     4.0
 }
@@ -412,6 +434,7 @@ pub fn load_augment_config(path: Option<&str>) -> Result<AugmentConfig, StoreErr
         .map(PathBuf::from)
         .unwrap_or_else(|_| config.data_dir.clone());
     config.data_dir = crate::fsutil::resolve(&cwd, &data_dir);
+    config.sources.sec.user_agent = sec_user_agent_from_env();
     validate(&config)?;
     Ok(config)
 }
@@ -450,9 +473,6 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
     let sec_rps = config.sources.sec.requests_per_second;
     if !(sec_rps > 0.0 && sec_rps <= 10.0) {
         return Err(StoreError::Check("Invalid sec.requestsPerSecond".into()));
-    }
-    if config.sources.sec.user_agent.trim().is_empty() {
-        return Err(StoreError::Check("sec.userAgent must not be empty".into()));
     }
     let auto = &config.sources.elfa.auto;
     if auto.alerts.len() > auto.max_alerts {

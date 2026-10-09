@@ -14,6 +14,8 @@ use std::sync::atomic::AtomicBool;
 
 /// 2026-10-09T12:00:00Z.
 const NOW_MS: i64 = 1_791_547_200_000;
+/// What an operator puts in `SEC_USER_AGENT`.
+const SEC_AGENT: &str = "solos-data research ops@example.com";
 
 fn config_for(server: &Server, root: &std::path::Path, source: &str) -> AugmentConfig {
     let mut config = load_augment_config(repository_config_path().to_str()).unwrap();
@@ -45,6 +47,7 @@ fn config_for(server: &Server, root: &std::path::Path, source: &str) -> AugmentC
             s.sec.tickers_url = format!("{}/files/company_tickers.json", server.base);
             s.sec.archive_url = format!("{}/Archives/edgar/data", server.base);
             s.sec.requests_per_second = 10.0;
+            s.sec.user_agent = Some(SEC_AGENT.into());
         }
         "alternative" => {
             s.alternative.enabled = true;
@@ -101,10 +104,7 @@ fn sec_filings_are_month_files_per_issuer_behind_the_ticker_guard() {
     let server = Server::start();
     let doc = fixture("sec-submissions.json");
     server.route("/submissions/CIK0001045810.json", move |request| {
-        assert_eq!(
-            request.header("user-agent"),
-            Some("solos-data/1.0 (+https://github.com/GuiBibeau/solos-data)")
-        );
+        assert_eq!(request.header("user-agent"), Some(SEC_AGENT));
         assert_eq!(request.header("accept-encoding"), Some("gzip"));
         Response::ok(gzip(&doc)).with_header("Content-Encoding", "gzip")
     });
@@ -164,6 +164,48 @@ fn sec_filings_are_month_files_per_issuer_behind_the_ticker_guard() {
             .count(),
         1
     );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn sec_without_a_declared_contact_is_disabled_without_requests() {
+    let server = Server::start();
+    server.route("/submissions/CIK0001045810.json", |_| Response::status(403));
+    let root = tempdir("solos-augment");
+    let mut config = config_for(&server, &root, "sec");
+    for (agent, reason) in [
+        (None, "SEC_USER_AGENT not set"),
+        (
+            Some("solos-data/1.0 (+https://github.com/GuiBibeau/solos-data)"),
+            "SEC_USER_AGENT has no contact email",
+        ),
+    ] {
+        config.sources.sec.user_agent = agent.map(str::to_owned);
+        let status = run(&config, NOW_MS);
+        let sec = &status["sources"]["sec"];
+        assert_eq!(sec["disabled"], true, "{status}");
+        assert_eq!(sec["reason"], reason);
+        assert_eq!(sec["errors"], 0);
+        assert_eq!(sec["files"], 0);
+        let saved = solos_data::augment::ledger::read_statuses(&root).to_value();
+        assert_eq!(
+            saved.to_string().matches(reason).count(),
+            1,
+            "`augment status` shows the source as disabled: {saved}"
+        );
+    }
+    assert_eq!(server.hit_count(), 0, "no request reaches EDGAR");
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    config.sources.sec.user_agent = None;
+    let refused = runtime
+        .block_on(solos_data::augment::sec::map_ciks(
+            "unused.json",
+            &config,
+            false,
+        ))
+        .err()
+        .unwrap();
+    assert!(refused.to_string().contains("SEC_USER_AGENT"), "{refused}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

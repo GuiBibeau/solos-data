@@ -121,9 +121,20 @@ pub struct Outcome {
     pub skipped: u64,
     /// HTTP requests made, where the source counts them (Elfa's polls).
     pub requests: u64,
+    /// Why the source did not run (a missing credential), when it did not.
+    pub disabled: Option<String>,
 }
 
 impl Outcome {
+    /// The outcome of a source that is off for `reason`.
+    #[must_use]
+    pub fn disabled(reason: &str) -> Outcome {
+        Outcome {
+            disabled: Some(reason.to_owned()),
+            ..Outcome::default()
+        }
+    }
+
     /// Sum two outcomes.
     pub fn add(&mut self, other: &Outcome) {
         self.files += other.files;
@@ -136,11 +147,15 @@ impl Outcome {
     /// As a JSON object.
     #[must_use]
     pub fn to_obj(&self) -> Obj {
-        Obj::new()
+        let obj = Obj::new()
             .with("files", self.files)
             .with("rows", self.rows)
             .with("errors", self.errors)
-            .with("skipped", self.skipped)
+            .with("skipped", self.skipped);
+        match &self.disabled {
+            Some(reason) => obj.with("disabled", true).with("reason", reason.as_str()),
+            None => obj,
+        }
     }
 }
 

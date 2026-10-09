@@ -283,7 +283,6 @@
       "baseUrl": "https://data.sec.gov",
       "tickersUrl": "https://www.sec.gov/files/company_tickers.json",
       "archiveUrl": "https://www.sec.gov/Archives/edgar/data",
-      "userAgent": "solos-data/1.0 (+https://github.com/GuiBibeau/solos-data)",
       "requestsPerSecond": 4.0
     },
     "alternative": {
