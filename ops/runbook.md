@@ -186,6 +186,27 @@ dataset, symbol and item that failed; the item is retried on the next run. `--so
 To re-download one series, delete its rows from `files` and its `progress` record in
 `checkpoint.duckdb` with no run active, or delete the whole root to start over.
 
+`solos-data augment capture --config config/augment.json` is the long-running lane for what
+cannot be fetched later: Hyperliquid 1-minute candles every thirty minutes, Hyperliquid asset
+contexts (funding, open interest, mark/oracle/mid prices) every minute, Elfa events, calls,
+episodes and call-book bars every hour. It keeps its own ledger under `capture/` and its own
+`catalog-capture.json` and `status-capture.json`, so it runs alongside the sync timer on the same
+root; `augment status` prints both and `augment query` sees both catalogs. Elfa needs
+`ELFA_API_KEY` in `~/.config/solos-data/augment.env` (mode 0600); without it the lane logs
+`augment_elfa_skipped` and runs the Hyperliquid captures only. Elfa is free today and
+undocumented: the lane reads `credits.used` before and after every cycle and, if it moved, logs
+`elfa_billing_started` and stops calling Elfa until the service restarts (the status shows
+`disabledByCreditGuard`). Asset contexts are buffered for up to ten minutes before they are
+merged into the day's file; a SIGTERM flushes them.
+
+```sh
+chmod 600 ~/.config/solos-data/augment.env
+cp ops/solos-data-augment-capture.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now solos-data-augment-capture.service
+journalctl --user -u solos-data-augment-capture.service -o cat -f
+```
+
 ## Switch a running TypeScript deployment to the binary
 
 The Rust binary reuses the checkpoints and cursors as they are (ADR-0007). Install the

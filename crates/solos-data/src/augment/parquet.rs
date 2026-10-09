@@ -53,21 +53,21 @@ impl Target {
     }
 }
 
-/// A fresh path under `<root>/staging/` with the given extension.
+/// A fresh path in `staging` with the given extension.
 #[must_use]
-pub fn staging_path(root: &Path, extension: &str) -> PathBuf {
-    root.join("staging")
-        .join(format!("{}.{extension}", uuid::Uuid::new_v4()))
+pub fn staging_path(staging: &Path, extension: &str) -> PathBuf {
+    staging.join(format!("{}.{extension}", uuid::Uuid::new_v4()))
 }
 
-/// Run `COPY (<select>) TO <target>` durably and describe the result.
+/// Run `COPY (<select>) TO <target>` under `root` durably and describe the result.
 pub fn write_parquet(
     store: &mut Store,
+    root: &Path,
     select: &str,
     target: &Target,
 ) -> Result<FileRecord, StoreError> {
     let relative = target.relative_path();
-    let path = store.root.join(&relative);
+    let path = root.join(&relative);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -104,6 +104,31 @@ pub fn write_parquet(
     })
 }
 
+/// Write `select_new` merged into the target's existing file, when there is one: rows sharing
+/// `key` (one column or a comma-separated list) keep the new version, the result is ordered by
+/// `key`. The capture lane grows a day's file this way as rows arrive.
+pub fn write_merged(
+    store: &mut Store,
+    root: &Path,
+    select_new: &str,
+    key: &str,
+    target: &Target,
+) -> Result<FileRecord, StoreError> {
+    let existing = root.join(target.relative_path());
+    if !existing.is_file() {
+        return write_parquet(store, root, &format!("{select_new} ORDER BY {key}"), target);
+    }
+    let merged = format!(
+        "SELECT * EXCLUDE (_rank) FROM (
+           SELECT *, 1 AS _rank FROM ({select_new})
+           UNION ALL BY NAME
+           SELECT *, 2 AS _rank FROM read_parquet({})
+         ) QUALIFY row_number() OVER (PARTITION BY {key} ORDER BY _rank) = 1 ORDER BY {key}",
+        sql_string(&existing.to_string_lossy())
+    );
+    write_parquet(store, root, &merged, target)
+}
+
 /// `read_csv(...)` with explicit names and types; `header` says whether the first line is one.
 #[must_use]
 pub fn read_csv(path: &Path, columns: &[(&str, &str)], header: bool) -> String {
@@ -132,9 +157,9 @@ fn column_map(columns: &[(&str, &str)]) -> String {
     format!("{{{}}}", entries.join(", "))
 }
 
-/// Write a JSON array of rows to staging for `read_json_array`.
-pub fn stage_json(root: &Path, rows: &[serde_json::Value]) -> Result<PathBuf, StoreError> {
-    let path = staging_path(root, "json");
+/// Write a JSON array of rows to `staging` for `read_json_array`.
+pub fn stage_json(staging: &Path, rows: &[serde_json::Value]) -> Result<PathBuf, StoreError> {
+    let path = staging_path(staging, "json");
     let text = serde_json::to_vec(rows).map_err(|e| StoreError::Check(e.to_string()))?;
     std::fs::write(&path, text)?;
     Ok(path)

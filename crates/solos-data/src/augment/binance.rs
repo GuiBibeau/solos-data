@@ -407,7 +407,7 @@ async fn fetch_item(
     }
     let csv = unzip_single(&zip.body)?;
     let header = has_header(&csv);
-    let staged = staging_path(&ctx.root, "csv");
+    let staged = staging_path(&ctx.staging(), "csv");
     std::fs::write(&staged, &csv)?;
     let target = Target {
         source: "binance".into(),
@@ -423,10 +423,11 @@ async fn fetch_item(
         target.constant_columns(),
         read_csv(&staged, dataset.columns, header)
     );
+    let root = ctx.root.clone();
     let result = ctx
         .db
         .run(move |store| {
-            let record = write_parquet(store, &select, &target)?;
+            let record = write_parquet(store, &root, &select, &target)?;
             register(store, &record, None)?;
             Ok(record.row_count)
         })

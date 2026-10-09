@@ -498,13 +498,17 @@ fn offline_or_live(
 // ---------------------------------------------------------------------------------------------
 // augment
 
-const AUGMENT_COMMANDS: [(&str, &str); 4] = [
+const AUGMENT_COMMANDS: [(&str, &str); 5] = [
     (
         "sync",
         "Backfill and catch up dated files and paged histories, then exit: [--source name] [--symbol SYM]",
     ),
-    ("status", "Read the last run's status snapshot"),
-    ("catalog", "Read the file catalog"),
+    (
+        "capture",
+        "Long-running capture of streams that cannot be fetched later: Hyperliquid candles and asset contexts, Elfa",
+    ),
+    ("status", "Read both lanes' status snapshots"),
+    ("catalog", "Read the sync lane's file catalog"),
     (
         "query",
         "Read-only SQL over the catalogued files: --sql SELECT ... FROM <source>_<dataset>",
@@ -545,11 +549,23 @@ fn augment(args: &[String]) -> i32 {
 fn augment_command(command: &str, args: &[String]) -> Result<i32, StoreError> {
     let config = crate::augment::config::load_augment_config(flag(args, "--config"))?;
     match command {
-        "status" | "catalog" => {
+        "status" => {
+            println!(
+                "{}",
+                crate::augment::ledger::read_statuses(&config.data_dir).to_json()
+            );
+            Ok(0)
+        }
+        "catalog" => {
             print!(
                 "{}",
-                std::fs::read_to_string(config.data_dir.join(format!("{command}.json")))?
+                std::fs::read_to_string(config.data_dir.join("catalog.json"))?
             );
+            Ok(0)
+        }
+        "capture" => {
+            let status = crate::augment::capture::run_capture(&config, stop_flag()?)?;
+            println!("{}", status.to_json());
             Ok(0)
         }
         "query" => {

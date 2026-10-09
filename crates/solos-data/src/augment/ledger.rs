@@ -1,15 +1,17 @@
-//! The lane's checkpoint: a small DuckDB file that registers every published Parquet file with
-//! its row count and hash and keeps per-series progress, plus the `catalog.json` and
-//! `status.json` snapshots derived from it. Files are durable before they are registered; a
-//! rerun removes anything on disk that the ledger does not know.
+//! The lanes' checkpoints: a small DuckDB file per lane that registers every published Parquet
+//! file with its row count and hash and keeps per-series progress, plus the `catalog` and
+//! `status` snapshots derived from it. Files are durable before they are registered; a rerun
+//! removes anything in the lane's dataset directories that the ledger does not know. The sync
+//! and capture lanes run as separate processes, so each owns its ledger, staging directory and
+//! snapshots; they share the `tables/` tree through distinct datasets.
 
 use crate::fsutil::{write_atomic, write_durable};
 use crate::jsonout::{Obj, now};
 use crate::store::{Store, StoreError};
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-/// Schema of `checkpoint.duckdb` under the augment root.
+/// Schema of a lane's checkpoint.
 pub const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS files(
   path VARCHAR PRIMARY KEY, source VARCHAR, dataset VARCHAR, symbol VARCHAR, phoenix_symbol VARCHAR,
@@ -17,6 +19,67 @@ CREATE TABLE IF NOT EXISTS files(
 CREATE TABLE IF NOT EXISTS progress(key VARCHAR PRIMARY KEY, value JSON);
 CREATE TABLE IF NOT EXISTS kv(name VARCHAR PRIMARY KEY, value JSON);
 ";
+
+/// Which process owns the ledger.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lane {
+    /// `augment sync`: `checkpoint.duckdb`, `catalog.json`, `status.json`, `staging/`.
+    Sync,
+    /// `augment capture`: `capture.duckdb`, `catalog-capture.json`, `status-capture.json`,
+    /// `staging-capture/`.
+    Capture,
+}
+
+impl Lane {
+    /// Both lanes, sync first.
+    pub const ALL: [Lane; 2] = [Lane::Sync, Lane::Capture];
+
+    /// The lane's name in logs and status.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Lane::Sync => "sync",
+            Lane::Capture => "capture",
+        }
+    }
+
+    /// Directory the lane's checkpoint lives in (a subdirectory for the capture lane, so each
+    /// `Store` keeps its own `checkpoint.duckdb`).
+    #[must_use]
+    pub fn ledger_dir(self, root: &Path) -> PathBuf {
+        match self {
+            Lane::Sync => root.to_path_buf(),
+            Lane::Capture => root.join("capture"),
+        }
+    }
+
+    /// `catalog.json` or `catalog-capture.json`.
+    #[must_use]
+    pub fn catalog_path(self, root: &Path) -> PathBuf {
+        match self {
+            Lane::Sync => root.join("catalog.json"),
+            Lane::Capture => root.join("catalog-capture.json"),
+        }
+    }
+
+    /// `status.json` or `status-capture.json`.
+    #[must_use]
+    pub fn status_path(self, root: &Path) -> PathBuf {
+        match self {
+            Lane::Sync => root.join("status.json"),
+            Lane::Capture => root.join("status-capture.json"),
+        }
+    }
+
+    /// The lane's staging directory.
+    #[must_use]
+    pub fn staging_dir(self, root: &Path) -> PathBuf {
+        match self {
+            Lane::Sync => root.join("staging"),
+            Lane::Capture => root.join("staging-capture"),
+        }
+    }
+}
 
 /// One published file.
 #[derive(Clone, Debug)]
@@ -43,9 +106,11 @@ pub struct FileRecord {
     pub sha256: String,
 }
 
-/// Open (creating) the ledger under `root`.
-pub fn open(root: &Path) -> Result<Store, StoreError> {
-    Store::open(root, SCHEMA)
+/// Open (creating) a lane's ledger under `root`. The store's own root is the lane's ledger
+/// directory; files are published under `root/tables/`, which callers pass explicitly.
+pub fn open(root: &Path, lane: Lane) -> Result<Store, StoreError> {
+    std::fs::create_dir_all(root)?;
+    Store::open(&lane.ledger_dir(root), SCHEMA)
 }
 
 /// Register a file and, when given, advance a progress record, in one transaction.
@@ -119,8 +184,8 @@ pub fn complete_periods(
         .collect())
 }
 
-/// `catalog.json`: every registered file, ordered, durably written.
-pub fn write_catalog(store: &mut Store) -> Result<(), StoreError> {
+/// The lane's catalog: every registered file, ordered, durably written.
+pub fn write_catalog(store: &mut Store, root: &Path, lane: Lane) -> Result<(), StoreError> {
     let files = store.rows(
         "SELECT path, source, dataset, symbol, phoenix_symbol, period, complete, row_count, bytes, sha256, created_at
          FROM files ORDER BY source, dataset, symbol, period",
@@ -129,9 +194,10 @@ pub fn write_catalog(store: &mut Store) -> Result<(), StoreError> {
     let catalog = Obj::new()
         .with("at", now())
         .with("schemaVersion", 1)
+        .with("lane", lane.name())
         .with_rows("files", files);
     write_durable(
-        &store.root.join("catalog.json"),
+        &lane.catalog_path(root),
         format!("{}\n", catalog.to_json()).as_bytes(),
     )?;
     Ok(())
@@ -147,26 +213,47 @@ pub fn summary(store: &Store) -> Result<Vec<Obj>, StoreError> {
     )
 }
 
-/// `status.json`, written without fsync as the other lanes' snapshots are.
-pub fn write_status(root: &Path, status: &Obj) -> Result<(), StoreError> {
+/// The lane's status snapshot, written without fsync as the other lanes' snapshots are.
+pub fn write_status(root: &Path, lane: Lane, status: &Obj) -> Result<(), StoreError> {
     write_atomic(
-        &root.join("status.json"),
+        &lane.status_path(root),
         format!("{}\n", status.to_json()).as_bytes(),
     )?;
     Ok(())
 }
 
-/// Remove `.tmp` files, the staging directory's contents and unregistered Parquet under
-/// `tables/`, then rewrite the catalog. Returns the number of files removed.
-pub fn recover(store: &mut Store) -> Result<u64, StoreError> {
-    let registered: std::collections::HashSet<std::path::PathBuf> = store
-        .rows("SELECT path FROM files", &[])?
+/// Every lane's status that exists, keyed by lane name.
+pub fn read_statuses(root: &Path) -> Obj {
+    let mut out = Obj::new();
+    for lane in Lane::ALL {
+        if let Ok(text) = std::fs::read_to_string(lane.status_path(root))
+            && let Ok(value) = serde_json::from_str::<Value>(&text)
+        {
+            out.set(lane.name(), value);
+        }
+    }
+    out
+}
+
+/// Remove the lane's staging files, and `.tmp` files and unregistered Parquet in the dataset
+/// directories the ledger knows, then rewrite the catalog. Returns the number of files removed.
+/// Directories of datasets the ledger has never registered belong to the other lane or to a
+/// first run and are left alone.
+pub fn recover(store: &mut Store, root: &Path, lane: Lane) -> Result<u64, StoreError> {
+    let rows = store.rows("SELECT path FROM files", &[])?;
+    let registered: std::collections::HashSet<PathBuf> = rows
         .iter()
         .filter_map(|row| row.str("path"))
-        .map(|p| store.root.join(p))
+        .map(|p| root.join(p))
         .collect();
+    let mut dirs: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    for path in &registered {
+        if let Some(dataset_dir) = path.parent().and_then(Path::parent) {
+            dirs.insert(dataset_dir.to_path_buf());
+        }
+    }
     let mut removed = 0u64;
-    let staging = store.root.join("staging");
+    let staging = lane.staging_dir(root);
     if staging.is_dir() {
         for entry in std::fs::read_dir(&staging)? {
             let path = entry?.path();
@@ -177,18 +264,16 @@ pub fn recover(store: &mut Store) -> Result<u64, StoreError> {
         }
     }
     std::fs::create_dir_all(&staging)?;
-    let tables = store.root.join("tables");
-    if tables.is_dir() {
-        removed += walk(&tables, &registered)?;
+    for dir in dirs {
+        if dir.is_dir() {
+            removed += walk(&dir, &registered)?;
+        }
     }
-    write_catalog(store)?;
+    write_catalog(store, root, lane)?;
     Ok(removed)
 }
 
-fn walk(
-    dir: &Path,
-    registered: &std::collections::HashSet<std::path::PathBuf>,
-) -> std::io::Result<u64> {
+fn walk(dir: &Path, registered: &std::collections::HashSet<PathBuf>) -> std::io::Result<u64> {
     let mut removed = 0;
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();

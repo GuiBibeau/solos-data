@@ -6,7 +6,7 @@ use super::defillama::StablecoinChart;
 use super::deribit::Dvol;
 use super::http::Http;
 use super::hyperliquid::FundingHistory;
-use super::ledger;
+use super::ledger::{self, Lane};
 use super::series::{Ctx, Outcome, Series, sync_series};
 use crate::db::Db;
 use crate::jsonout::{Obj, log, now};
@@ -47,8 +47,8 @@ pub fn run_sync(
     let started_at = now();
     let start = super::periods::parse_date(&config.start_date)
         .ok_or_else(|| StoreError::Check("Invalid startDate".into()))?;
-    let mut store = ledger::open(&config.data_dir)?;
-    let recovered = ledger::recover(&mut store)?;
+    let mut store = ledger::open(&config.data_dir, Lane::Sync)?;
+    let recovered = ledger::recover(&mut store, &config.data_dir, Lane::Sync)?;
     if recovered > 0 {
         log("augment_recovered", Obj::new().with("removed", recovered));
     }
@@ -58,6 +58,7 @@ pub fn run_sync(
         http,
         db: db.clone(),
         root: config.data_dir.clone(),
+        lane: Lane::Sync,
         start,
         now_ms,
         stop,
@@ -78,8 +79,9 @@ pub fn run_sync(
         totals.add(outcome);
         per_source.set_obj(name, outcome.to_obj());
     }
-    let summary = db.run_blocking(|store| {
-        ledger::write_catalog(store)?;
+    let root = config.data_dir.clone();
+    let summary = db.run_blocking(move |store| {
+        ledger::write_catalog(store, &root, Lane::Sync)?;
         ledger::summary(store)
     })?;
     let status = Obj::new()
@@ -93,7 +95,7 @@ pub fn run_sync(
         .with_obj("sources", per_source)
         .with_obj("totals", totals.to_obj())
         .with_rows("datasets", summary);
-    ledger::write_status(&config.data_dir, &status)?;
+    ledger::write_status(&config.data_dir, Lane::Sync, &status)?;
     let store = thread.join(db);
     store.close()?;
     log(
@@ -110,20 +112,25 @@ pub fn run_sync(
 async fn run_sources(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Vec<(String, Outcome)> {
     let catalog_writer = {
         let db = ctx.db.clone();
+        let root = ctx.root.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                let _ = db.run(ledger::write_catalog).await;
+                let root = root.clone();
+                let _ = db
+                    .run(move |store| ledger::write_catalog(store, &root, Lane::Sync))
+                    .await;
             }
         })
     };
-    let (binance, hyperliquid, deribit, defillama) = tokio::join!(
+    let (binance, hyperliquid, deribit, defillama, bybit) = tokio::join!(
         run_binance(ctx, config, filter),
         run_hyperliquid(ctx, config, filter),
         run_deribit(ctx, config, filter),
         run_defillama(ctx, config, filter),
+        run_bybit(ctx, config, filter),
     );
     catalog_writer.abort();
     [
@@ -131,6 +138,7 @@ async fn run_sources(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Vec<
         ("hyperliquid", hyperliquid),
         ("deribit", deribit),
         ("defillama", defillama),
+        ("bybit", bybit),
     ]
     .into_iter()
     .filter_map(|(name, outcome)| outcome.map(|o| (name.to_owned(), o)))
@@ -165,6 +173,29 @@ async fn run_hyperliquid(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> 
         let series = FundingHistory {
             url: url.clone(),
             coin: coin.to_owned(),
+            phoenix: symbol.phoenix.clone(),
+        };
+        outcome.add(&sync_series(ctx, &series).await);
+    }
+    Some(outcome)
+}
+
+async fn run_bybit(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option<Outcome> {
+    let cfg = &config.sources.bybit;
+    if !cfg.enabled || !cfg.funding_history || !filter.allows("bybit") {
+        return None;
+    }
+    let mut outcome = Outcome::default();
+    for symbol in &config.symbols {
+        let Some(venue) = symbol.bybit.as_deref() else {
+            continue;
+        };
+        if !filter.symbol_allows(&symbol.phoenix, venue) || ctx.stopping() {
+            continue;
+        }
+        let series = super::bybit::FundingHistory {
+            base_url: cfg.base_url.clone(),
+            symbol: venue.to_owned(),
             phoenix: symbol.phoenix.clone(),
         };
         outcome.add(&sync_series(ctx, &series).await);
