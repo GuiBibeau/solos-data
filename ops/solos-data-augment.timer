@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the solos-data augmentation sync hourly, one run at a time
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1h
+AccuracySec=1min
+Persistent=true
+Unit=solos-data-augment.service
+
+[Install]
+WantedBy=timers.target
