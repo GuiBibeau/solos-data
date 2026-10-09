@@ -1,0 +1,26 @@
+[Unit]
+Description=solos-data augmentation capture: Hyperliquid candles and asset contexts, Elfa, Bybit funding
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/solos-data
+EnvironmentFile=-%h/.config/solos-data/augment.env
+Environment=SOLOS_DATA_AUGMENT_DIR=%h/.local/share/solos-data/augment
+Environment=SOLOS_DATA_DB_MEMORY=8GB
+ExecStart=%h/.local/share/solos-data/bin/solos-data augment capture --config config/augment.json
+Restart=always
+RestartSec=15
+TimeoutStopSec=60
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=32G
+TasksMax=256
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

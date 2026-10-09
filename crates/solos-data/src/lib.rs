@@ -1,6 +1,7 @@
 //! `solos-data`: the Phoenix perpetuals collector and decoder as one binary. This library holds
 //! everything the binary and the integration tests share.
 
+pub mod augment;
 pub mod catalog;
 pub mod cli;
 pub mod collector;

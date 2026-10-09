@@ -19,12 +19,13 @@ pub fn main(args: &[String]) -> i32 {
     match group {
         "decoder" => decoder(&args[1..]),
         "collector" => collector(&args[1..]),
+        "augment" => augment(&args[1..]),
         "dev" => dev(&args[1..]),
         _ => {
             println!(
                 "{}",
                 Obj::new()
-                    .with("groups", json!(["collector", "decoder", "dev"]))
+                    .with("groups", json!(["collector", "decoder", "augment", "dev"]))
                     .to_json()
             );
             0
@@ -492,6 +493,101 @@ fn offline_or_live(
         Ok(())
     })();
     outcome
+}
+
+// ---------------------------------------------------------------------------------------------
+// augment
+
+const AUGMENT_COMMANDS: [(&str, &str); 4] = [
+    (
+        "sync",
+        "Backfill and catch up dated files and paged histories, then exit: [--source name] [--symbol SYM]",
+    ),
+    ("status", "Read the last run's status snapshot"),
+    ("catalog", "Read the file catalog"),
+    (
+        "query",
+        "Read-only SQL over the catalogued files: --sql SELECT ... FROM <source>_<dataset>",
+    ),
+];
+
+fn augment(args: &[String]) -> i32 {
+    let command = args.first().map(String::as_str).unwrap_or("help");
+    if command == "help" || command == "--help" {
+        let mut commands = Obj::new();
+        for (name, text) in AUGMENT_COMMANDS {
+            commands.set(name, text);
+        }
+        println!(
+            "{}",
+            Obj::new()
+                .with_obj("commands", commands)
+                .with(
+                    "config",
+                    "--config config/augment.json; SOLOS_DATA_AUGMENT_DIR overrides dataDir; ELFA_API_KEY enables Elfa"
+                )
+                .to_json()
+        );
+        return 0;
+    }
+    match augment_command(command, args) {
+        Ok(code) => code,
+        Err(error) => {
+            log(
+                "augment_fatal",
+                Obj::new().with("error", safe_error(&error.to_string())),
+            );
+            1
+        }
+    }
+}
+
+fn augment_command(command: &str, args: &[String]) -> Result<i32, StoreError> {
+    let config = crate::augment::config::load_augment_config(flag(args, "--config"))?;
+    match command {
+        "status" | "catalog" => {
+            print!(
+                "{}",
+                std::fs::read_to_string(config.data_dir.join(format!("{command}.json")))?
+            );
+            Ok(0)
+        }
+        "query" => {
+            let sql = flag(args, "--sql")
+                .ok_or_else(|| StoreError::Check("query requires --sql".into()))?;
+            println!(
+                "{}",
+                crate::augment::query::query_augment(&config.data_dir, sql)?.to_json()
+            );
+            Ok(0)
+        }
+        "sync" => {
+            let filter = crate::augment::sync::Filter {
+                source: flag(args, "--source").map(str::to_owned),
+                symbol: flag(args, "--symbol").map(str::to_owned),
+            };
+            let status = crate::augment::sync::run_sync(
+                &config,
+                chrono::Utc::now().timestamp_millis(),
+                &filter,
+                stop_flag()?,
+            )?;
+            println!("{}", status.to_json());
+            let errors = status_errors(&status);
+            Ok(i32::from(errors > 0))
+        }
+        _ => Err(StoreError::Check("unknown augment command".into())),
+    }
+}
+
+/// `totals.errors` of a sync status.
+fn status_errors(status: &Obj) -> i64 {
+    status
+        .to_value()
+        .get("totals")
+        .and_then(|t| t.get("errors"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------------------------

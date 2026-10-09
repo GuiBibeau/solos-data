@@ -68,6 +68,8 @@ still pending. See the [remaining work](docs/issues/001-phoenix-acceptance.md).
 
 The collector and decoder are one Rust binary, `solos-data`. History below the last
 published Old Faithful epoch is replayed from the archive through Jetstreamer; the
-live tail follows RPC. For development, use Rust 1.96: `cargo test --workspace`.
+live tail follows RPC. The same binary's `augment` group collects free exogenous
+market data for the Phoenix markets (Binance futures dumps, Hyperliquid funding,
+Deribit DVOL, DefiLlama stablecoins) into Parquet next to the dataset (ADR-0009). For development, use Rust 1.96: `cargo test --workspace`.
 The code is [MIT licensed](LICENSE). This repo contains code and test fixtures;
 collected data is stored separately.

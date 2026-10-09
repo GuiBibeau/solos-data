@@ -155,6 +155,37 @@ SOLOS_DATA_DIR=/path/to/phoenix_raw solos-data collector status
 SOLOS_DATA_DECODED_DIR=/path/to/decoded/v1 solos-data decoder status
 ```
 
+## Augmentation lane
+
+`solos-data augment sync --config config/augment.json` (ADR-0009) downloads the free exogenous
+data for the Phoenix markets (Binance USD-M dumps, Hyperliquid funding, Deribit DVOL, DefiLlama
+stablecoins) into `SOLOS_DATA_AUGMENT_DIR` (default `dataDir`, `data/augment`) and exits. It is
+idempotent: closed periods are fetched once, the open day or month is rewritten each run, and
+anything on disk the ledger does not know is removed at start. The timer runs it hourly, one run
+at a time; the first run backfills from `startDate` (2026-01-01) and takes about a day because
+of the two-requests-a-second spacing per host. No credential is needed; `augment.env` exists
+for `ELFA_API_KEY`, which only the capture lane reads.
+
+```sh
+cp ops/solos-data-augment.service ops/solos-data-augment.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now solos-data-augment.timer
+systemctl --user list-timers solos-data-augment.timer
+journalctl --user -u solos-data-augment.service -o cat -f
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment status
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment query --sql \
+  "SELECT phoenix_symbol, count(*) AS rows, min(ts), max(ts) FROM binance_klines GROUP BY 1 ORDER BY 1"
+```
+
+`status.json` has one entry per source (`files`, `rows`, `errors`) and one per dataset (files,
+symbols, rows, bytes, oldest and newest period). `augment_series_error` lines name the source,
+dataset, symbol and item that failed; the item is retried on the next run. `--source <name>` and
+`--symbol <SYM>` restrict a run for a check. Query views are named `<source>_<dataset>`
+(`binance_klines`, `hyperliquid_funding`, `deribit_dvol_60s`, `defillama_stablecoins`).
+
+To re-download one series, delete its rows from `files` and its `progress` record in
+`checkpoint.duckdb` with no run active, or delete the whole root to start over.
+
 ## Switch a running TypeScript deployment to the binary
 
 The Rust binary reuses the checkpoints and cursors as they are (ADR-0007). Install the

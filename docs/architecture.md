@@ -41,6 +41,15 @@ strings. Funding rows describe settlements, not a market funding-rate time serie
 Each transaction has a content hash and decoder version. Corrections produce a new
 revision. SQL readers select the latest revision and exclude outdated event rows.
 
+## Augment with other venues
+
+`solos-data augment sync` runs hourly from a timer. It lists Binance's public futures
+dumps, downloads the day's zips, checks each against its published SHA-256 and converts
+the CSV to Parquet; it pages Hyperliquid funding, Deribit DVOL and DefiLlama stablecoin
+histories into one file per day or month. A small ledger records every file and how far
+each series is complete, so a rerun only fetches what is new. `augment capture` keeps
+the streams that cannot be fetched later (recent-only candles, asset contexts, Elfa).
+
 ## Read and move data
 
 `catalog.json` lists published files and their hashes. Query commands open those

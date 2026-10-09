@@ -1,0 +1,21 @@
+[Unit]
+Description=solos-data augmentation sync: Binance dumps, Hyperliquid funding, Deribit DVOL, DefiLlama stablecoins
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/solos-data
+EnvironmentFile=-%h/.config/solos-data/augment.env
+Environment=SOLOS_DATA_AUGMENT_DIR=%h/.local/share/solos-data/augment
+Environment=SOLOS_DATA_DB_MEMORY=8GB
+ExecStart=%h/.local/share/solos-data/bin/solos-data augment sync --config config/augment.json
+TimeoutStartSec=infinity
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=32G
+TasksMax=256
+StandardOutput=journal
+StandardError=journal
