@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the solos-data off-box backup daily at 02:00 UTC
+
+[Timer]
+OnCalendar=*-*-* 02:00:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+Unit=solos-data-backup.service
+
+[Install]
+WantedBy=timers.target
