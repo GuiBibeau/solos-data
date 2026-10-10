@@ -255,6 +255,37 @@ async fn load_records(ctx: &Ctx) -> Result<(Vec<ActiveQuery>, Option<i64>), Stor
         .await
 }
 
+/// What the listing says about each query: its scalar fields (ids, status, counters, times),
+/// without conditions or descriptions. It is where per-query execution counts would show.
+#[must_use]
+pub fn listing_summary(listing: &Value) -> Obj {
+    let queries: Vec<Value> = listing
+        .get("queries")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_object)
+        .map(|q| {
+            Value::Object(
+                q.iter()
+                    .filter(|(k, v)| {
+                        !matches!(k.as_str(), "description" | "query" | "conditions")
+                            && !v.is_object()
+                            && !v.is_array()
+                    })
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            )
+        })
+        .collect();
+    Obj::new()
+        .with(
+            "total",
+            listing.get("total").cloned().unwrap_or(Value::Null),
+        )
+        .with("queries", queries)
+}
+
 /// Reconcile the account with the configured alerts: list (one credit), create what is
 /// missing, renew what expires within the window, cancel the renewed, record the spend.
 pub async fn reconcile(ctx: &Ctx, lane: &AutoLane, now_ms: i64) -> Result<(), StoreError> {
@@ -270,6 +301,7 @@ pub async fn reconcile(ctx: &Ctx, lane: &AutoLane, now_ms: i64) -> Result<(), St
         .http
         .get_json(&lane.url("/v2/auto/queries?limit=100"), &headers(&lane.key))
         .await?;
+    log("elfa_auto_listing", listing_summary(&listing));
     let expiry = expiry_ms(&lane.cfg.expires_in);
     let mut active = active_from_listing(&listing, &records, expiry, now_ms);
     let mut spent = load_spend(ctx, now_ms).await?;

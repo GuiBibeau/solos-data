@@ -355,3 +355,40 @@ and nothing told which call cost what.
 The meter sees what the client's own requests declare. A charge the server makes on its own
 account, such as the evaluation of an alert, appears only in `credits.used`; the hourly cycle's
 `unattributed` figure is where it shows.
+
+### Measured on the box (2026-10-10, 08:30–08:55 UTC)
+
+The binary with the meter (PR #26) ran from 08:30 UTC; its first status after 25 minutes:
+
+| Endpoint | Calls | Credits per call (`x-elfa-credits`) |
+|---|---|---|
+| `/v3/events` (minute poll) | 25 | 0 |
+| `/v3/calls` | 9 | 0 |
+| `/v3/calls/episodes` (catch-up cycle) | 200 | 0 |
+| `/v3/market/crypto/call-book` | 1 | 0 |
+| `/v3/key-status` | 4 | 0 |
+| `/v2/auto/queries/stream` (open) | 2 | 0 |
+| `/v2/auto/queries` (listing) | 1 | 1 |
+
+Every answer carried the header (`noHeader` 0). The hourly cycle's 211 v3 requests moved
+`credits.used` by 0 (`elfa_cycle_credits`); the listing moved it by 1 (310 → 311). So v3 is
+still free and the per-endpoint guard can stay off them; the 03:26 trip (277 → 281) was not the
+v3 reads but something else on the key during the cycle.
+
+The only billed call of this client is the listing, which ran hourly and on every restart: 16
+credits between the alerts' creation (2026-10-09 16:01, 242 after the creations) and 08:26 the
+next morning (`elfa/auto/spend` 36 → 52). `credits.used` moved 68 over the same span (242 →
+310), so about 52 credits were spent on the key that no answer of this client declared: +4
+between 22:59 and 00:06, +4 during the 03:22 cycle, +12 between 03:26 and 04:26 with the v3
+lane already off, then +5, +4, +2 in the following hours and nothing from 07:26 to 08:33. The
+server charges an Auto alert's work after the fact and reports it only in `credits.used`
+(Elfa's pricing page: "charges that finalize after the response is flushed ... /v2/key-status
+remains the authoritative balance"); the two `news.semantic` alerts (semantic verification at
+confidence 80) are the likely payers, and another client of the same key would look the same.
+The cycle now logs `elfa_key_drift` at each start (the key's movement since the last cycle
+minus what the answers declared) and the status carries `unattributedCreditsSinceStart`; the
+listing logs each query's scalar fields (`elfa_auto_listing`) every twelve hours.
+
+The monthly cap counts what the answers declare. It cannot stop a charge the server makes for
+an active alert; that one ends only when the alert is cancelled or expires (the seven expire
+on 2026-11-08 and are renewed 48 hours before unless removed from the config).

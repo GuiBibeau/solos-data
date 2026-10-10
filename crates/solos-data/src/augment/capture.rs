@@ -365,6 +365,10 @@ fn write_status(
                 )
                 .with("laneDisabled", elfa.is_some_and(ElfaLane::disabled))
                 .with(
+                    "unattributedCreditsSinceStart",
+                    elfa.map_or(0, |l| l.drift().unattributed),
+                )
+                .with(
                     "billedEndpoints",
                     elfa.map(ElfaLane::billed_endpoints).unwrap_or_default(),
                 ),
