@@ -9,7 +9,8 @@ docker compose up -d
 ```
 
 `.env` holds the RPC URL and rate setting. Keep it out of Git and mode 0600.
-Data is stored under `data/`. Back up both raw and decoded directories.
+Data is stored under `data/`. Back up both raw and decoded directories (the native
+deployment's nightly off-box copy is under [Off-box backup](#off-box-backup)).
 
 Cleanup runs every minute. Historical raw and decoded Parquet remain on disk.
 The checkpoint retains unpublished work and a recent 10,000-slot working set.
@@ -310,6 +311,79 @@ and `transactionsProcessed`; `raw` has `statusAgeSeconds`, `catalogFiles` and
 `augment.capture` have their age and error totals (capture: since its `startedAt`); `disk` has
 `freeGb`. `nextChangedAt` and the capture error baseline come from the previous `health.json`,
 so deleting the file resets them (the first run cannot judge backfill movement).
+
+## Off-box backup
+
+A nightly `rclone copy` sends the raw Parquet the raw catalog lists, the augment root, `config/`
+and the `solos-*` user units to a private Cloudflare R2 bucket (ADR-0010). Not sent: decoded
+Parquet (regenerable from raw), DuckDB checkpoints, unlisted raw files, `.readers/`, staging,
+`*.env`, `~/research/`. It never deletes anything in the bucket: files the box retires stay
+there. Bucket layout: `phoenix_raw/`, `augment/`, `config/`, `systemd-user/`, and
+`catalogs/<UTC date>/{phoenix_raw,augment}/` (each night's catalogs).
+
+Install once (rclone goes to `~/.local/bin`, checked against the release's `SHA256SUMS`):
+
+```sh
+sh ops/backup/install-rclone.sh
+# The operator writes the bucket-scoped R2 token; never print the file.
+grep -oE '^[A-Z0-9_]+=' ~/.config/solos-data/backup.env   # R2_ACCOUNT_ID R2_BUCKET R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY
+cp ops/backup/solos-data-backup.service ops/backup/solos-data-backup.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now solos-data-backup.timer
+```
+
+The timer fires daily at 02:00 UTC (plus up to 30 minutes) and catches up after downtime. A run
+is idle-priority I/O and `nice 10`, eight transfers, 40 MiB/s from 06:00 to 22:00 UTC and
+unlimited at night (`SOLOS_BACKUP_BWLIMIT` overrides the rclone timetable). The first upload
+of about 790 GB takes hours; start it detached and watch the logs rather than an SSH session:
+
+```sh
+systemctl --user start --no-block solos-data-backup.service
+tail -f ~/.local/state/solos-data/backup/raw-files.log        # rclone stats every 10 minutes
+journalctl --user -u solos-data-backup.service -o cat | grep '"event":"backup"' | tail -3
+jq 'del(.steps)' ~/.local/share/solos-data/backup-status.json
+```
+
+`backup-status.json` has `state` (`running`, `ok`, `failed`), `files`, `bytes`,
+`durationSeconds`, `mbPerSecond`, `errors`, `failedSteps`, `rawCatalogUploaded`,
+`lastSuccessAt` and one entry per step. A raw file that compaction retires mid-run makes the run
+take a fresh catalog snapshot and copy again (three passes at most); if files are still missing
+the raw catalog is not uploaded and the run fails, leaving the previous catalog in the bucket.
+The health timer's `health_services` line carries the backup timer's state and
+`backupLastSuccessAt`. Without the credentials file the run fails with
+`{"event":"backup_credentials","state":"missing"}`.
+
+Tests and rehearsals take `SOLOS_BACKUP_DEST` (any rclone path, e.g. a local directory, which
+skips the credentials), `SOLOS_BACKUP_DRY_RUN=1`, `SOLOS_DATA_HOME`, `SOLOS_BACKUP_STATUS` and
+`SOLOS_BACKUP_LOG_DIR`, so a run against a scratch tree never touches the real status file.
+
+**Cost.** Infrequent Access: about $0.01 per GB-month (about $8 a month at 790 GB), a 30-day
+minimum per object, and retrieval billed per GB. Upload is a Class A request per object or part.
+A nightly run lists the bucket and uploads the day's new files only; it never downloads.
+
+**Restore rehearsal.** Downloads one raw table-epoch directory (at most
+`SOLOS_RESTORE_MAX_MB`, default 1024) and `SOLOS_RESTORE_AUGMENT_FILES` (default 20) random
+complete augment files into a temp directory, checks every SHA-256 against the bucket's
+catalogs and prints one `restore_check` line:
+
+```sh
+sh ops/backup/restore-check.sh
+```
+
+**Full restore.** The raw catalog holds the box's absolute paths: an object's key is its path
+with `$HOME/.local/share/solos-data/phoenix_raw/` replaced by `phoenix_raw/`. Augment catalog
+paths are relative to the augment root. To restore, load the credentials as `backup.sh` does
+(`. ops/backup/r2-env.sh` sets `$dest`), then copy down what is needed, for example
+`rclone copy "$dest/augment" /restore/augment` or the files one catalog lists with
+`--files-from-raw`. Use a dated catalog under `catalogs/` for an earlier state; the bucket also
+holds retired compaction inputs, so copy what a catalog lists rather than a whole prefix.
+Restored Parquet is readable directly; the collector cannot resume on it without a new
+checkpoint.
+
+**Rotate the token.** Create a new bucket-scoped token in the Cloudflare dashboard, run
+`~/.local/bin/solos-backup-credentials` on the box to overwrite `backup.env`, run
+`systemctl --user start --no-block solos-data-backup.service` and check that it ends `ok`, then
+revoke the old token.
 
 ## Switch a running TypeScript deployment to the binary
 

@@ -1,0 +1,18 @@
+[Unit]
+Description=solos-data off-box backup: raw Parquet, augment tables, config and units to Cloudflare R2 (ADR-0010)
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/solos-data
+ExecStart=/bin/sh %h/solos-data/ops/backup/backup.sh
+# backup.sh runs rclone under nice -n 10 and ionice -c3; these cover the script itself.
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+# The first full upload takes hours; later runs only add the day's new files.
+TimeoutStartSec=infinity
+StandardOutput=journal
+StandardError=journal
