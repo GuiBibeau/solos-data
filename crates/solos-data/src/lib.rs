@@ -10,6 +10,7 @@ pub mod decoder;
 pub mod dev;
 pub mod fsutil;
 pub mod gc;
+pub mod health;
 pub mod jsonout;
 pub mod lease;
 pub mod repack;
