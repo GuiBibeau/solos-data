@@ -313,3 +313,45 @@ page keeps its segment pending and the rows already paged are written. Rows merg
 the newest copy winning, so an episode paged again after its close replaces the open copy;
 episodes that close after the head has passed them are refreshed only when a segment pages them
 again.
+
+## Elfa credits: metered per endpoint, capped per month (2026-10-10)
+
+`credits.used` went from 199 on the morning of 2026-10-09 to 247 after the seven alerts were
+created and to 309 by 08:10 UTC on 2026-10-10, still rising after the credit guard had switched
+the v3 lane off at 03:26 (`elfa_billing_started`, 277 → 281). The guard read `credits.used`, a
+key-wide number, so anything billed on the key during an hourly cycle disabled every v3 read,
+and nothing told which call cost what.
+
+- **Every answer is metered.** Elfa answers carry `x-elfa-credits`, the credits that request
+  consumed. The lane's one HTTP client attributes every answer from the Elfa host to its
+  endpoint (the path, query dropped, UUID segments as `{id}`; never the key or the full URL)
+  and counts `calls`, `billedCalls`, `credits` and `noHeader` per endpoint. A billed answer
+  logs `elfa_credits` with the endpoint and the month's total; `status-capture.json` has
+  `elfaCredits` (`month`, `creditsSpentMonth`, `carriedIn`, `creditCapPerMonth`, `capReached`,
+  `endpoints`).
+- **A hard monthly cap over the whole client.** `elfa.creditCapPerMonth` (default 100) bounds
+  the credits the answers declare across v3 and Auto in a calendar month. At the cap the client
+  refuses every Elfa request before sending it (`HttpError::CreditCap`), the loops skip instead
+  of counting errors, and `elfa_credit_cap_reached` is logged once per month. The month's
+  totals are saved in the capture ledger (`elfa/credits`) with every status write (each minute
+  and at shutdown) and restored at start, so a restart does not reset the cap; a month without
+  a record starts from the Auto lane's measured spend (`elfa/auto/spend`), the only credits
+  counted before the meter existed. An Auto creation also needs room for its five credits.
+- **The v3 guard is per endpoint.** An answer whose header declares a credit disables that
+  endpoint until restart (`elfa_billing_started` with the endpoint; the page already paid for
+  is kept) and the other streams keep running; the status lists `billedEndpoints` and
+  `disabledByCreditGuard` is true when anything was disabled. The key-wide check remains only
+  as a fallback: when `credits.used` moved by more than the answers declared during an hourly
+  cycle *and* a v3 data answer carried no header, the movement may be the v3 reads themselves
+  and the whole lane stops (`laneDisabled`). With headers present the difference is logged as
+  `unattributed` in `elfa_cycle_credits` and disables nothing: it is spent elsewhere on the key.
+- **The Auto listing at most every twelve hours.** `GET /v2/auto/queries` costs a credit and
+  ran hourly and on every restart (24+ credits a day). The lane now lists when it never has,
+  when `elfa.auto.reconcileIntervalHours` (12) has passed since the last listing
+  (`elfa/auto/reconciledAt` in the ledger), when a configured title is not held or when a held
+  alert is due for renewal; otherwise it holds the alerts stored in the ledger
+  (`elfa_auto_held`), across restarts too. The hourly check reads only the ledger.
+
+The meter sees what the client's own requests declare. A charge the server makes on its own
+account, such as the evaluation of an alert, appears only in `credits.used`; the hourly cycle's
+`unattributed` figure is where it shows.

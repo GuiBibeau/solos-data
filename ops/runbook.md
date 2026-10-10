@@ -232,17 +232,33 @@ into `elfa/auto_events`. It keeps its own ledger under `capture/` and its own
 `catalog-capture.json` and `status-capture.json`, so it runs alongside the sync timer on the same
 root; `augment status` prints both and `augment query` sees both catalogs. Elfa needs
 `ELFA_API_KEY` in `~/.config/solos-data/augment.env` (mode 0600); without it the lane logs
-`augment_elfa_skipped` and runs the Hyperliquid captures only. Elfa is free today and
-undocumented: the lane reads `credits.used` before and after every cycle and, if it moved, logs
-`elfa_billing_started` and stops calling Elfa until the service restarts (the status shows
-`disabledByCreditGuard`). The credit guard watches the whole key: anything else spending on the
-same key during an hourly cycle trips it too. Episodes page newest first and resume their
+`augment_elfa_skipped` and runs the Hyperliquid captures only. Elfa v3 is
+undocumented: the credit guard disables any v3 endpoint whose answer declares a credit until
+the service restarts (the status shows `disabledByCreditGuard` and `billedEndpoints`); see
+the credit paragraph below. Episodes page newest first and resume their
 catch-up from a stored cursor (ADR-0009, "Episodes page newest first"); each cycle logs
 `elfa_episodes_cycle` with its requests, rows, `newestOpenedAt` and pending segments. Asset contexts are buffered for up to ten minutes before they are
 merged into the day's file; a SIGTERM flushes them.
 
+Every Elfa answer is metered per endpoint from its `x-elfa-credits` header and the whole client
+stops at `elfa.creditCapPerMonth` (default 100 credits a calendar month, v3 and Auto together;
+ADR-0009, "Elfa credits"). The month's total survives restarts (ledger key `elfa/credits`).
+The v3 guard is per endpoint: an answer that declares a credit disables that endpoint only
+(`elfa_billing_started` with `endpoint`; `elfa.billedEndpoints` in the status); the whole lane
+stops only when `credits.used` moved and a v3 answer carried no header (`elfa.laneDisabled`).
+`elfa_cycle_credits` logs each hourly cycle's `usedDelta`, `declared` and `unattributed`
+(credits spent on the key that no answer of this client declared).
+
+```sh
+python3 -c 'import json, os; s = json.load(open(os.path.expanduser("~/.local/share/solos-data/augment/status-capture.json"))); print(json.dumps(s["elfaCredits"], indent=1)); print(s["elfa"])'
+journalctl --user -u solos-data-augment-capture.service -o cat | grep -E '"event":"elfa_(credits|cycle_credits|billing_started|credit_cap_reached|credit_meter|auto_held)"' | tail -20
+```
+
+To raise the cap for the rest of a month, edit `creditCapPerMonth` and restart the capture unit.
+
 The Auto alerts cost credits: five per creation, one per listing of the account's queries
-(once per reconciliation, so once an hour and once per restart). `elfa.auto.creditBudgetPerMonth`
+(at most every `reconcileIntervalHours`, 12, or when an alert is missing or due for renewal;
+a restart in between holds the alerts stored in the ledger). `elfa.auto.creditBudgetPerMonth`
 and `maxAlerts` cap what the lane may create; `status-capture.json` shows `elfaAuto`
 (active titles, created, renewed, fired, `creditsSpentMonth`, `streamConnected`,
 `connections`, `reconnects`, `errors`) and
