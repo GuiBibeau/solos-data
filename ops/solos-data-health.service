@@ -1,0 +1,20 @@
+[Unit]
+Description=solos-data dataset health check: decoded files, decoder cadence, backfill progress, augment lanes, disk free
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/solos-data
+Environment=SOLOS_DATA_RAW_DIR=%h/.local/share/solos-data/phoenix_raw
+Environment=SOLOS_DATA_DECODED_DIR=%h/.local/share/solos-data/phoenix_decoded/v1
+Environment=SOLOS_DATA_AUGMENT_DIR=%h/.local/share/solos-data/augment
+Environment=SOLOS_DATA_HEALTH_FILE=%h/.local/share/solos-data/health.json
+ExecStart=%h/.local/share/solos-data/bin/solos-data health --config config/health.json
+# Service activity is not the binary's business: one JSON line with each unit's state.
+ExecStartPost=-/bin/sh %h/solos-data/ops/health-services.sh
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TimeoutStartSec=300
+Nice=10
+StandardOutput=journal
+StandardError=journal

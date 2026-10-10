@@ -1,0 +1,16 @@
+{
+  "thresholds": {
+    "decodedFilesWarn": 10000,
+    "decodedFilesCritical": 50000,
+    "decoderWindowMinutes": 30,
+    "decoderCriticalMinutes": 120,
+    "rawStatusWarnMinutes": 10,
+    "rawStatusCriticalMinutes": 60,
+    "backfillStallMinutes": 120,
+    "syncStatusWarnMinutes": 150,
+    "captureStatusWarnMinutes": 10,
+    "elfaCycleWarnMinutes": 150,
+    "diskFreeWarnGb": 500,
+    "diskFreeCriticalGb": 100
+  }
+}

@@ -21,11 +21,15 @@ pub fn main(args: &[String]) -> i32 {
         "collector" => collector(&args[1..]),
         "augment" => augment(&args[1..]),
         "dev" => dev(&args[1..]),
+        "health" => health(&args[1..]),
         _ => {
             println!(
                 "{}",
                 Obj::new()
-                    .with("groups", json!(["collector", "decoder", "augment", "dev"]))
+                    .with(
+                        "groups",
+                        json!(["collector", "decoder", "augment", "health", "dev"])
+                    )
                     .to_json()
             );
             0
@@ -44,6 +48,42 @@ pub fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn has(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+// ---------------------------------------------------------------------------------------------
+// health
+
+fn health(args: &[String]) -> i32 {
+    if args.first().is_some_and(|a| a == "help" || a == "--help") {
+        println!(
+            "{}",
+            Obj::new()
+                .with("commands", json!(["health [--json] [--config config/health.json]"]))
+                .with(
+                    "paths",
+                    "SOLOS_DATA_RAW_DIR, SOLOS_DATA_DECODED_DIR, SOLOS_DATA_AUGMENT_DIR (read), SOLOS_DATA_HEALTH_FILE (written)"
+                )
+                .to_json()
+        );
+        return 0;
+    }
+    let result = crate::health::load_thresholds(flag(args, "--config"))
+        .and_then(|t| crate::health::run(&crate::health::Paths::from_env(), &t));
+    match result {
+        Ok(health) => {
+            if has(args, "--json") {
+                println!("{health}");
+            }
+            0
+        }
+        Err(error) => {
+            log(
+                "health_fatal",
+                Obj::new().with("error", safe_error(&error.to_string())),
+            );
+            1
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -270,6 +270,47 @@ systemctl --user enable --now solos-data-augment-capture.service
 journalctl --user -u solos-data-augment-capture.service -o cat -f
 ```
 
+## Dataset health
+
+`solos-data health` reads the JSON snapshots the services already write (raw `status.json` and
+`catalog.json`, decoded `status.json` and `catalog.json`, the augment `status.json` and
+`status-capture.json`) and the free space of the data volume, writes `health.json` (path from
+`SOLOS_DATA_HEALTH_FILE`) and logs one `health` line with `level` (`ok`, `warn`, `critical`)
+and the `warn` and `critical` lists. It opens no DuckDB file and writes nothing under the raw or
+decoded roots. `--json` also prints the whole report. The thresholds are the `thresholds` block
+of `config/health.json`; a field left out keeps its default.
+
+| Check | Source | Warn | Critical |
+|---|---|---|---|
+| decoded files (compaction) | decoded `catalog.json` `files` | > 10,000 | > 50,000 |
+| decoder cadence | batch ids of non-compaction files created in the last 30 min | none while the raw catalog's `at` is newer than the newest batch | none for 120 min |
+| collector alive | raw `status.json` `at` | > 10 min old | > 60 min old |
+| backfill progress | raw `status.json` `backfill.next` against the previous `health.json` | unchanged for 120 min (not when `phase` is `complete`) | |
+| augment sync | `status.json` age and `sources.*.errors` | > 150 min old, or errors in the last run | |
+| augment capture | `status-capture.json` age and the lanes' `errors` | > 10 min old, errors grown since the previous check, the Elfa credit guard tripped, the last Elfa hourly cycle > 150 min ago | |
+| disk free | `statvfs` of the raw root's parent | < 500 GB | < 100 GB |
+
+The timer runs it every fifteen minutes; its `ExecStartPost` logs one `health_services` line
+with `systemctl --user is-active` of every solos-data unit (service activity is not the
+binary's business). There is no notification channel yet: read the file or the journal.
+
+```sh
+cp ops/solos-data-health.service ops/solos-data-health.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now solos-data-health.timer
+python3 -m json.tool ~/.local/share/solos-data/health.json | head -40
+python3 -c 'import json, os; h = json.load(open(os.path.expanduser("~/.local/share/solos-data/health.json"))); print(h["level"], h["warn"], h["critical"])'
+journalctl --user -u solos-data-health.service -o cat | grep -E '"event":"health(_services)?"' | tail -4
+```
+
+`level` is the worst finding; each `warn`/`critical` entry is a sentence naming the check and
+the measured value. `decoded` has `files`, `catalogBytes`, `batchesInWindow`, `newestBatchAt`
+and `transactionsProcessed`; `raw` has `statusAgeSeconds`, `catalogFiles` and
+`backfill.{next, phase, nextChangedAt, unchangedMinutes}`; `augment.sync` and
+`augment.capture` have their age and error totals (capture: since its `startedAt`); `disk` has
+`freeGb`. `nextChangedAt` and the capture error baseline come from the previous `health.json`,
+so deleting the file resets them (the first run cannot judge backfill movement).
+
 ## Switch a running TypeScript deployment to the binary
 
 The Rust binary reuses the checkpoints and cursors as they are (ADR-0007). Install the
