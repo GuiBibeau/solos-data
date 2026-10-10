@@ -288,3 +288,28 @@ cycle had no progress to resume from, because the previous binary recorded none 
 pull: it fetched the same 200 pages of events again, the merge on `id` left the 6,000 rows as
 they were, and this time the newest row was recorded as `lastTo`, so the following cycles move
 forward. The collector and decoder stayed active throughout, since October 7 and 8 respectively.
+
+## Episodes page newest first (2026-10-10)
+
+Five days after the capture lane started, `elfa/episodes` held 6,341 rows observed only from
+2026-09-21 to 2026-09-23 while `calls` had reached the present. `/v3/calls/episodes?from&to`
+answers every episode *active* in the window, not the ones opened in it, ordered by `openedAt`:
+with `order=asc` the first pages are always the tens of thousands of episodes opened months
+before `from` that are still open (the stored rows were opened from 2026-06-23 to 2026-07-04;
+3,952 still open). A 200-page cycle never got past them, and the resume rule of PR #17 moved
+`lastTo` to the newest `observedAt` of a capped pull, which stopped moving once it reached the
+day Elfa indexed that backlog. Every hourly cycle spent its 200 requests on the same pages.
+
+The episodes stream now pages with `order=desc` in resumable segments kept in the
+`elfa/episodes` progress record (`newestOpenedAt`, `pending: [{from, to, cursor, stopBelow}]`;
+the old `{lastTo}` record reads as a fresh start). Each cycle pulls the head first, newest
+`openedAt` first, until it reaches an episode opened more than an hour below the newest stored
+(`HEAD_OVERLAP_S`, for episodes Elfa indexes late), so the present is stored in the first cycle
+and new openings stay a page or two an hour. The rest of the 200-page budget goes to the pending
+segments, resumed from their cursors (Elfa's cursor encodes `openedAt|id`). The first head has
+no stop and drains the whole window from the start date: that is the one-off catch-up of the
+roughly 87,000 episodes active in the last thirty days, about fifteen hourly cycles. A failed
+page keeps its segment pending and the rows already paged are written. Rows merge on `id` with
+the newest copy winning, so an episode paged again after its close replaces the open copy;
+episodes that close after the head has passed them are refreshed only when a segment pages them
+again.
