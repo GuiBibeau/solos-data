@@ -2,10 +2,13 @@
 //! bars, pulled from the last `to` with ascending cursors into day files (episodes page newest
 //! first instead, see `episodes`); calls, episodes and
 //! bars hourly, events every minute (two pages at most, so the poll stays within two requests
-//! a minute of the key's sixty). Every row records the instant it was received. A credit guard
-//! reads `credits.used` before and after every hourly cycle under the billing lock shared with
-//! the Auto lane; if it moved, the lane logs `elfa_billing_started` and disables itself for
-//! the rest of the process.
+//! a minute of the key's sixty). Every row records the instant it was received. The credit
+//! guard is per endpoint: a v3 answer whose `x-elfa-credits` header declares a credit disables
+//! that endpoint for the rest of the process (`elfa_billing_started`), and the others keep
+//! running. Only when an answer carries no header at all does the hourly cycle fall back to the
+//! key-wide check (`credits.used` before and after, under the billing lock shared with the Auto
+//! lane) and disable the whole lane; with headers present a movement of `credits.used` that no
+//! answer declared is logged as unattributed (`elfa_cycle_credits`) and disables nothing.
 
 use super::http::{Http, with_query};
 use super::ledger::{get_progress, register};
@@ -15,10 +18,10 @@ use super::series::{Ctx, Outcome};
 use crate::jsonout::{Obj, log, now, safe_error};
 use crate::store::StoreError;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// Pages per stream per cycle by default; the rest waits for the next cycle, which resumes from
 /// the newest row received.
@@ -132,6 +135,7 @@ pub struct ElfaLane {
     /// The minute poll's counters.
     pub poll: PollCounters,
     disabled: AtomicBool,
+    billed: Mutex<BTreeSet<String>>,
 }
 
 impl ElfaLane {
@@ -147,13 +151,55 @@ impl ElfaLane {
             billing: Arc::new(tokio::sync::Mutex::new(())),
             poll: PollCounters::default(),
             disabled: AtomicBool::new(false),
+            billed: Mutex::new(BTreeSet::new()),
         }
     }
 
-    /// Whether the credit guard switched the lane off.
+    /// Whether the key-wide fallback guard switched the whole lane off.
     #[must_use]
     pub fn disabled(&self) -> bool {
         self.disabled.load(Ordering::Relaxed)
+    }
+
+    /// Whether a stream's endpoint may be called: neither it nor the lane was disabled.
+    #[must_use]
+    pub fn stream_enabled(&self, stream: Stream) -> bool {
+        !self.disabled() && !self.billed.lock().expect("billed").contains(stream.path())
+    }
+
+    /// The endpoints the guard disabled because an answer declared credits.
+    #[must_use]
+    pub fn billed_endpoints(&self) -> Vec<String> {
+        self.billed
+            .lock()
+            .expect("billed")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the guard switched anything off (the lane or one endpoint).
+    #[must_use]
+    pub fn guard_tripped(&self) -> bool {
+        self.disabled() || !self.billed.lock().expect("billed").is_empty()
+    }
+
+    /// Apply the per-endpoint guard to one answer's declared credits: anything above zero
+    /// disables the endpoint. Returns whether it did.
+    pub fn guard(&self, path: &str, credits: Option<i64>) -> bool {
+        let Some(credits) = credits.filter(|c| *c > 0) else {
+            return false;
+        };
+        if self.billed.lock().expect("billed").insert(path.to_owned()) {
+            log(
+                "elfa_billing_started",
+                Obj::new()
+                    .with("endpoint", path)
+                    .with("credits", credits)
+                    .with("action", "endpoint disabled until restart"),
+            );
+        }
+        true
     }
 
     /// The streams the hourly cycle pulls: everything, or everything but the events when they
@@ -170,14 +216,27 @@ impl ElfaLane {
         headers(&self.key)
     }
 
+    /// One v3 page. A disabled endpoint is refused; an answer that declares credits disables
+    /// its endpoint (the page already paid for is still returned).
     pub(super) async fn get(
         &self,
         http: &Http,
         path: &str,
         pairs: &[(&str, String)],
     ) -> Result<Value, StoreError> {
+        if self.disabled() || self.billed.lock().expect("billed").contains(path) {
+            return Err(StoreError::Check(format!(
+                "{path} disabled by the credit guard"
+            )));
+        }
         let url = with_query(&format!("{}{path}", self.base_url), pairs);
-        Ok(http.get_json(&url, &self.headers()).await?)
+        let fetched = http.get_bytes(&url, &self.headers()).await?;
+        let credits = fetched
+            .header("x-elfa-credits")
+            .and_then(|c| c.trim().parse::<f64>().ok())
+            .map(|c| c.ceil() as i64);
+        self.guard(path, credits);
+        serde_json::from_slice(&fetched.body).map_err(|e| StoreError::Check(e.to_string()))
     }
 
     /// `credits.used` and `historyFrom` from `/v3/key-status`.
@@ -215,7 +274,7 @@ pub async fn key_status(
 /// One events poll: the next pages since the last `to`, free, outside the billing lock.
 pub async fn poll_events(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
     let mut outcome = Outcome::default();
-    if lane.disabled() {
+    if !lane.stream_enabled(Stream::Events) || capped(ctx) {
         outcome.skipped += 1;
         return outcome;
     }
@@ -249,11 +308,12 @@ pub async fn poll_events(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
 /// guard and the billing lock.
 pub async fn cycle(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
     let mut outcome = Outcome::default();
-    if lane.disabled() {
+    if lane.disabled() || capped(ctx) {
         outcome.skipped += 1;
         return outcome;
     }
     let _billing = lane.billing.lock().await;
+    let metered_before = metered(ctx);
     let (used_before, history_from) = match lane.key_status(&ctx.http).await {
         Ok(status) => status,
         Err(error) => {
@@ -265,6 +325,10 @@ pub async fn cycle(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
     for stream in lane.hourly_streams() {
         if ctx.stopping() {
             break;
+        }
+        if !lane.stream_enabled(stream) {
+            outcome.skipped += 1;
+            continue;
         }
         let pulled = if stream == Stream::Episodes {
             let start_s = lane.start_s.max(history_from.unwrap_or(0));
@@ -281,23 +345,107 @@ pub async fn cycle(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
         }
     }
     match lane.key_status(&ctx.http).await {
-        Ok((used_after, _)) if used_after > used_before => {
-            lane.disabled.store(true, Ordering::Relaxed);
-            log(
-                "elfa_billing_started",
-                Obj::new()
-                    .with("usedBefore", used_before)
-                    .with("usedAfter", used_after)
-                    .with("action", "lane disabled until restart"),
-            );
+        Ok((used_after, _)) => {
+            let mut reading =
+                CycleCredits::between(metered_before, metered(ctx), used_before, used_after);
+            if ctx.http.meter().is_none() {
+                // Without a meter no header was read: every movement is the key-wide guard's.
+                reading.unheadered = reading.unheadered.max(1);
+            }
+            if reading.disables_lane() {
+                lane.disabled.store(true, Ordering::Relaxed);
+            }
+            reading.log(reading.disables_lane());
         }
-        Ok(_) => {}
         Err(error) => {
             outcome.errors += 1;
             log_error(Stream::Events, "key-status", &error.to_string());
         }
     }
     outcome
+}
+
+/// Whether the Elfa client's monthly credit cap is reached.
+#[must_use]
+pub fn capped(ctx: &Ctx) -> bool {
+    ctx.http
+        .meter()
+        .is_some_and(|m| !m.allows(0, chrono::Utc::now().timestamp_millis()))
+}
+
+/// The meter's month total and its count of answers without a header, for one cycle's reading.
+fn metered(ctx: &Ctx) -> (i64, u64) {
+    ctx.http.meter().map_or((0, 0), |m| {
+        let state = m.snapshot();
+        let no_header = state
+            .endpoints
+            .iter()
+            .filter(|(path, _)| path.starts_with("/v3/") && path.as_str() != "/v3/key-status")
+            .map(|(_, cost)| cost.no_header)
+            .sum();
+        (state.spent, no_header)
+    })
+}
+
+/// What one hourly cycle did to the key: `credits.used` moved by `used`, the answers declared
+/// `declared`, and `unheadered` v3 data answers carried no header.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CycleCredits {
+    /// Movement of `credits.used`.
+    pub used: i64,
+    /// Credits the answers declared.
+    pub declared: i64,
+    /// v3 data answers without `x-elfa-credits`.
+    pub unheadered: u64,
+}
+
+impl CycleCredits {
+    /// The reading from the meter's totals and `credits.used` before and after.
+    #[must_use]
+    pub fn between(
+        before: (i64, u64),
+        after: (i64, u64),
+        used_before: i64,
+        used_after: i64,
+    ) -> Self {
+        CycleCredits {
+            used: used_after - used_before,
+            declared: after.0 - before.0,
+            unheadered: after.1.saturating_sub(before.1),
+        }
+    }
+
+    /// `credits.used` moved by more than the answers declared.
+    #[must_use]
+    pub fn unattributed(&self) -> i64 {
+        (self.used - self.declared).max(0)
+    }
+
+    /// The key-wide fallback: the key moved by more than declared while some v3 answer carried
+    /// no header, so the movement may be the v3 reads themselves.
+    #[must_use]
+    pub fn disables_lane(&self) -> bool {
+        self.unattributed() > 0 && self.unheadered > 0
+    }
+
+    fn log(&self, disabled: bool) {
+        log(
+            "elfa_cycle_credits",
+            Obj::new()
+                .with("usedDelta", self.used)
+                .with("declared", self.declared)
+                .with("unattributed", self.unattributed())
+                .with("answersWithoutHeader", self.unheadered)
+                .with(
+                    "action",
+                    if disabled {
+                        "lane disabled until restart (answers without a header)"
+                    } else {
+                        "none"
+                    },
+                ),
+        );
+    }
 }
 
 /// Progress key of a stream.
@@ -711,5 +859,36 @@ mod tests {
             lane.hourly_streams(),
             [Stream::Calls, Stream::Episodes, Stream::CallBook]
         );
+    }
+
+    #[test]
+    fn the_guard_disables_one_billed_endpoint_and_keeps_the_others() {
+        let lane = ElfaLane::new("https://x", "k", 0);
+        assert!(!lane.guard(Stream::Events.path(), Some(0)));
+        assert!(!lane.guard(Stream::Events.path(), None));
+        assert!(!lane.guard_tripped());
+        assert!(lane.guard(Stream::Calls.path(), Some(1)));
+        assert!(!lane.stream_enabled(Stream::Calls));
+        assert!(lane.stream_enabled(Stream::Events));
+        assert!(lane.stream_enabled(Stream::Episodes));
+        assert!(lane.guard_tripped());
+        assert!(!lane.disabled(), "the lane as a whole keeps running");
+        assert_eq!(lane.billed_endpoints(), ["/v3/calls"]);
+    }
+
+    #[test]
+    fn cycle_readings_attribute_or_fall_back() {
+        // Headers present, the key moved by 4, the answers declared nothing: unattributed,
+        // spent elsewhere (an Auto evaluation, another client), nothing is disabled.
+        let r = CycleCredits::between((10, 0), (10, 0), 277, 281);
+        assert_eq!((r.unattributed(), r.disables_lane()), (4, false));
+        // Declared accounts for the movement.
+        let r = CycleCredits::between((10, 0), (12, 0), 100, 102);
+        assert_eq!((r.unattributed(), r.disables_lane()), (0, false));
+        // A v3 answer carried no header and the key moved: the key-wide fallback.
+        let r = CycleCredits::between((10, 3), (10, 5), 100, 101);
+        assert!(r.disables_lane());
+        // No header but no movement: nothing.
+        assert!(!CycleCredits::between((0, 0), (0, 9), 5, 5).disables_lane());
     }
 }

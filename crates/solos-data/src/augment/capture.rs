@@ -1,7 +1,9 @@
 //! `augment capture`: the long-running lane. Hyperliquid asset contexts every minute (flushed to
 //! the day's file every ten), Hyperliquid 1-minute candles every half hour, Elfa events every
 //! minute and the other Elfa streams every hour under the credit guard, the Elfa Auto alerts
-//! reconciled hourly and streamed continuously. Each loop runs on its own cadence; SIGTERM ends
+//! listed at most every `reconcileIntervalHours` and streamed continuously. Every Elfa answer
+//! is metered per endpoint and the whole client stops at `creditCapPerMonth` (the meter's month
+//! is saved in the ledger with every status write). Each loop runs on its own cadence; SIGTERM ends
 //! them at their next check, the buffers are flushed, and the catalog and status are written.
 
 use super::auto::{self, AutoLane};
@@ -11,6 +13,7 @@ use super::contexts::{self, ContextLane};
 use super::elfa::{self, ElfaLane};
 use super::http::Http;
 use super::ledger::{self, Lane};
+use super::meter::{CreditMeter, PROGRESS_CREDITS};
 use super::series::{Ctx, Outcome, budget_bytes};
 use crate::db::Db;
 use crate::jsonout::{Obj, log, now};
@@ -53,6 +56,11 @@ pub fn run_capture(config: &AugmentConfig, stop: Arc<AtomicBool>) -> Result<Obj,
             &elfa_cfg.base_url,
             elfa_cfg.requests_per_minute as f64 / 60.0,
         );
+        http.set_meter(Arc::new(restore_meter(
+            &db,
+            &elfa_cfg.base_url,
+            elfa_cfg.credit_cap_per_month,
+        )?));
     }
     let ctx = Arc::new(Ctx {
         http,
@@ -167,6 +175,35 @@ pub fn run_capture(config: &AugmentConfig, stop: Arc<AtomicBool>) -> Result<Obj,
     Ok(status)
 }
 
+/// The Elfa meter with the month's totals from the ledger; a month without a record starts
+/// from the Auto lane's measured spend, the only credits counted before the meter existed.
+fn restore_meter(db: &Db, base_url: &str, cap: i64) -> Result<CreditMeter, StoreError> {
+    let now_ms = now_ms();
+    let month = super::meter::month_of(now_ms);
+    let (saved, spend) = db.run_blocking(|store| {
+        Ok((
+            ledger::get_progress(store, PROGRESS_CREDITS)?,
+            ledger::get_progress(store, auto::PROGRESS_SPEND)?,
+        ))
+    })?;
+    let carried = spend
+        .filter(|v| v.get("month").and_then(serde_json::Value::as_str) == Some(month.as_str()))
+        .and_then(|v| v.get("credits").and_then(serde_json::Value::as_i64))
+        .unwrap_or(0);
+    let meter = CreditMeter::new(base_url, cap);
+    meter.restore(saved.as_ref(), carried, now_ms);
+    let state = meter.snapshot();
+    log(
+        "elfa_credit_meter",
+        Obj::new()
+            .with("month", state.month.as_str())
+            .with("creditsSpentMonth", state.spent)
+            .with("creditCapPerMonth", cap)
+            .with("carriedIn", state.carried),
+    );
+    Ok(meter)
+}
+
 /// Sleep `seconds`, waking early on stop.
 async fn pause(ctx: &Ctx, seconds: u64) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(seconds);
@@ -249,7 +286,7 @@ async fn events_loop(ctx: &Ctx, lane: Option<&ElfaLane>, interval: u64, totals: 
     let Some(lane) = lane.filter(|l| l.events_pages > 0 && interval > 0) else {
         return;
     };
-    while !ctx.stopping() && !lane.disabled() {
+    while !ctx.stopping() && lane.stream_enabled(elfa::Stream::Events) {
         let outcome = elfa::poll_events(ctx, lane, now_ms() / 1000).await;
         {
             let mut guard = totals.lock().expect("totals");
@@ -292,7 +329,16 @@ fn write_status(
     final_write: bool,
 ) -> Result<Obj, StoreError> {
     let root = ctx.root.clone();
+    let meter = ctx
+        .http
+        .meter()
+        .map(|m| serde_json::to_value(m.snapshot()))
+        .transpose()
+        .map_err(|e| StoreError::Check(e.to_string()))?;
     let summary = ctx.db.run_blocking(move |store| {
+        if let Some(meter) = &meter {
+            ledger::set_progress(store, PROGRESS_CREDITS, meter)?;
+        }
         ledger::write_catalog(store, &root, Lane::Capture)?;
         ledger::summary(store)
     })?;
@@ -309,10 +355,25 @@ fn write_status(
         )
         .with_obj(
             "elfa",
-            guard.elfa.to_obj().with("enabled", elfa.is_some()).with(
-                "disabledByCreditGuard",
-                elfa.is_some_and(ElfaLane::disabled),
-            ),
+            guard
+                .elfa
+                .to_obj()
+                .with("enabled", elfa.is_some())
+                .with(
+                    "disabledByCreditGuard",
+                    elfa.is_some_and(ElfaLane::guard_tripped),
+                )
+                .with("laneDisabled", elfa.is_some_and(ElfaLane::disabled))
+                .with(
+                    "billedEndpoints",
+                    elfa.map(ElfaLane::billed_endpoints).unwrap_or_default(),
+                ),
+        )
+        .with_obj(
+            "elfaCredits",
+            ctx.http
+                .meter()
+                .map_or_else(|| Obj::new().with("metered", false), |m| m.status()),
         )
         .with_obj("elfaEvents", elfa.map_or_else(Obj::new, poll_status))
         .with_obj(

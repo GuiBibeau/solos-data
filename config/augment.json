@@ -93,12 +93,14 @@
       "requestsPerMinute": 60,
       "eventsIntervalSeconds": 60,
       "eventsPagesPerPoll": 2,
+      "creditCapPerMonth": 100,
       "auto": {
         "enabled": true,
         "maxAlerts": 8,
         "creditBudgetPerMonth": 60,
         "expiresIn": "720h",
         "renewWithinHours": 48,
+        "reconcileIntervalHours": 12,
         "alerts": [
           {
             "title": "BTC Hyperliquid liquidations above 2000k in 5m",

@@ -4,10 +4,11 @@
 //! a server-sent event stream is opened on a second client without one, because that deadline
 //! also covers reading the body and would cut every long-lived stream at the same instant.
 
+use super::meter::CreditMeter;
 use crate::jsonout::{Obj, log, safe_error};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Why a request failed after its retries.
@@ -25,6 +26,9 @@ pub enum HttpError {
     /// The body was not what the caller expected.
     #[error("{0}")]
     Decode(String),
+    /// The host's monthly credit cap is reached; nothing was sent.
+    #[error("monthly credit cap reached")]
+    CreditCap,
 }
 
 impl From<HttpError> for crate::store::StoreError {
@@ -69,6 +73,7 @@ pub struct Http {
     host_intervals: Mutex<HashMap<String, Duration>>,
     next_slot: Mutex<HashMap<String, Instant>>,
     attempts: u32,
+    meter: OnceLock<Arc<CreditMeter>>,
 }
 
 impl Http {
@@ -95,6 +100,7 @@ impl Http {
             host_intervals: Mutex::new(HashMap::new()),
             next_slot: Mutex::new(HashMap::new()),
             attempts: 6,
+            meter: OnceLock::new(),
         })
     }
 
@@ -104,6 +110,38 @@ impl Http {
             host_of(url).to_owned(),
             Duration::from_secs_f64(1.0 / requests_per_second.max(0.01)),
         );
+    }
+
+    /// Meter one host's credits (`x-elfa-credits`) and refuse its requests past the cap.
+    pub fn set_meter(&self, meter: Arc<CreditMeter>) {
+        let _ = self.meter.set(meter);
+    }
+
+    /// The meter, if any.
+    #[must_use]
+    pub fn meter(&self) -> Option<&Arc<CreditMeter>> {
+        self.meter.get()
+    }
+
+    /// Refuse a request to the metered host once its cap is reached.
+    fn gate(&self, url: &str) -> Result<(), HttpError> {
+        match self.meter.get() {
+            Some(meter) if meter.covers(url) && !meter.allows(0, now_ms()) => {
+                Err(HttpError::CreditCap)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Attribute a response's declared credits to its endpoint.
+    fn meter_response(&self, url: &str, response: &reqwest::Response) {
+        if let Some(meter) = self.meter.get().filter(|m| m.covers(url)) {
+            let header = response
+                .headers()
+                .get("x-elfa-credits")
+                .and_then(|v| v.to_str().ok());
+            meter.record(url, header, now_ms());
+        }
     }
 
     /// Wait for this host's next slot and claim the one after it.
@@ -175,6 +213,7 @@ impl Http {
     ) -> Result<reqwest::Response, HttpError> {
         let mut backoff = Duration::from_secs(1);
         for attempt in 1..=self.attempts {
+            self.gate(url)?;
             self.acquire(url).await;
             let mut request = self.stream_client.get(url);
             for (name, value) in headers {
@@ -182,11 +221,14 @@ impl Http {
             }
             let (reason, retry_after) =
                 match tokio::time::timeout(self.request_timeout, request.send()).await {
-                    Ok(Ok(response)) => match classify(&response) {
-                        Ok(()) => return Ok(response),
-                        Err(Retry::Fatal(error)) => return Err(error),
-                        Err(Retry::Later(reason, retry_after)) => (reason, retry_after),
-                    },
+                    Ok(Ok(response)) => {
+                        self.meter_response(url, &response);
+                        match classify(&response) {
+                            Ok(()) => return Ok(response),
+                            Err(Retry::Fatal(error)) => return Err(error),
+                            Err(Retry::Later(reason, retry_after)) => (reason, retry_after),
+                        }
+                    }
                     Ok(Err(e)) => (safe_error(&e.to_string()), None),
                     Err(_) => ("response head timed out".to_owned(), None),
                 };
@@ -216,6 +258,7 @@ impl Http {
     ) -> Result<Fetched, HttpError> {
         let mut backoff = Duration::from_secs(1);
         for attempt in 1..=self.attempts {
+            self.gate(url)?;
             self.acquire(url).await;
             let (reason, retry_after) = match self.attempt(url, headers, body).await {
                 Ok(fetched) => return Ok(fetched),
@@ -258,6 +301,7 @@ impl Http {
             .send()
             .await
             .map_err(|e| Retry::Later(safe_error(&e.to_string()), None))?;
+        self.meter_response(url, &response);
         classify(&response)?;
         let status = response.status().as_u16();
         let headers = response
@@ -275,6 +319,10 @@ impl Http {
             headers,
         })
     }
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
 }
 
 /// A response head: success, a final failure, or a reason to retry.
