@@ -1,5 +1,6 @@
 //! Elfa v3 (free today, undocumented): events, calls, call episodes and the crypto call-book
-//! bars, pulled from the last `to` with ascending cursors into day files; calls, episodes and
+//! bars, pulled from the last `to` with ascending cursors into day files (episodes page newest
+//! first instead, see `episodes`); calls, episodes and
 //! bars hourly, events every minute (two pages at most, so the poll stays within two requests
 //! a minute of the key's sixty). Every row records the instant it was received. A credit guard
 //! reads `credits.used` before and after every hourly cycle under the billing lock shared with
@@ -169,7 +170,7 @@ impl ElfaLane {
         headers(&self.key)
     }
 
-    async fn get(
+    pub(super) async fn get(
         &self,
         http: &Http,
         path: &str,
@@ -265,7 +266,13 @@ pub async fn cycle(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
         if ctx.stopping() {
             break;
         }
-        match pull_stream(ctx, lane, stream, history_from, now_s, lane.max_pages).await {
+        let pulled = if stream == Stream::Episodes {
+            let start_s = lane.start_s.max(history_from.unwrap_or(0));
+            super::episodes::pull(ctx, lane, start_s, now_s, lane.max_pages).await
+        } else {
+            pull_stream(ctx, lane, stream, history_from, now_s, lane.max_pages).await
+        };
+        match pulled {
             Ok(result) => outcome.add(&result),
             Err(error) => {
                 outcome.errors += 1;
@@ -414,7 +421,7 @@ async fn pull_stream(
     Ok(outcome)
 }
 
-async fn write_day(
+pub(super) async fn write_day(
     ctx: &Ctx,
     stream: Stream,
     day: Period,
@@ -540,7 +547,7 @@ pub fn day_field(stream: Stream) -> &'static str {
     }
 }
 
-fn group_by_day(rows: Vec<Value>) -> BTreeMap<Period, Vec<Value>> {
+pub(super) fn group_by_day(rows: Vec<Value>) -> BTreeMap<Period, Vec<Value>> {
     let mut by_day: BTreeMap<Period, Vec<Value>> = BTreeMap::new();
     for row in rows {
         let field = row

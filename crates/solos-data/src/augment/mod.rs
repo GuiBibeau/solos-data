@@ -15,6 +15,7 @@ pub mod contexts;
 pub mod defillama;
 pub mod deribit;
 pub mod elfa;
+pub mod episodes;
 pub mod http;
 pub mod hyperliquid;
 pub mod kalshi;

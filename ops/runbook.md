@@ -235,7 +235,10 @@ root; `augment status` prints both and `augment query` sees both catalogs. Elfa 
 `augment_elfa_skipped` and runs the Hyperliquid captures only. Elfa is free today and
 undocumented: the lane reads `credits.used` before and after every cycle and, if it moved, logs
 `elfa_billing_started` and stops calling Elfa until the service restarts (the status shows
-`disabledByCreditGuard`). Asset contexts are buffered for up to ten minutes before they are
+`disabledByCreditGuard`). The credit guard watches the whole key: anything else spending on the
+same key during an hourly cycle trips it too. Episodes page newest first and resume their
+catch-up from a stored cursor (ADR-0009, "Episodes page newest first"); each cycle logs
+`elfa_episodes_cycle` with its requests, rows, `newestOpenedAt` and pending segments. Asset contexts are buffered for up to ten minutes before they are
 merged into the day's file; a SIGTERM flushes them.
 
 The Auto alerts cost credits: five per creation, one per listing of the account's queries
