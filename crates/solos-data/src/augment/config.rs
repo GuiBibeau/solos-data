@@ -174,6 +174,10 @@ pub struct ElfaAuto {
     /// An alert expiring within this many hours is recreated and the old one cancelled.
     #[serde(default = "d_renew_hours")]
     pub renew_within_hours: i64,
+    /// Hours between listings of the account's queries (one credit each); a restart within
+    /// the interval reuses the alerts stored in the ledger.
+    #[serde(default = "d_reconcile_hours")]
+    pub reconcile_interval_hours: i64,
     /// The alert definitions.
     #[serde(default)]
     pub alerts: Vec<AlertDef>,
@@ -187,6 +191,7 @@ impl Default for ElfaAuto {
             credit_budget_per_month: d_credit_budget(),
             expires_in: d_expires_in(),
             renew_within_hours: d_renew_hours(),
+            reconcile_interval_hours: d_reconcile_hours(),
             alerts: Vec::new(),
         }
     }
@@ -213,6 +218,10 @@ pub struct Elfa {
     /// Pages one events pull may request (30 events each): the poll's request budget.
     #[serde(default = "d_events_pages")]
     pub events_pages_per_poll: usize,
+    /// Hard monthly cap on the credits the whole Elfa client may spend (v3 and Auto), as the
+    /// answers' `x-elfa-credits` declare them; past it every Elfa request is refused.
+    #[serde(default = "d_elfa_credit_cap")]
+    pub credit_cap_per_month: i64,
     /// Auto alerts.
     #[serde(default)]
     pub auto: ElfaAuto,
@@ -407,6 +416,12 @@ fn d_expires_in() -> String {
 fn d_renew_hours() -> i64 {
     48
 }
+fn d_reconcile_hours() -> i64 {
+    12
+}
+fn d_elfa_credit_cap() -> i64 {
+    100
+}
 fn d_sec_rps() -> f64 {
     4.0
 }
@@ -496,7 +511,11 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
             )));
         }
     }
-    if !auto.expires_in.ends_with('h') || auto.credit_budget_per_month < 0 {
+    if !auto.expires_in.ends_with('h')
+        || auto.credit_budget_per_month < 0
+        || auto.reconcile_interval_hours < 1
+        || config.sources.elfa.credit_cap_per_month < 0
+    {
         return Err(StoreError::Check("invalid elfa.auto settings".into()));
     }
     if config.symbols.is_empty() {

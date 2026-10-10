@@ -195,6 +195,7 @@ fn alerts_are_created_once_renewed_near_expiry_and_bounded_by_the_budget() {
         credit_budget_per_month: 12,
         expires_in: "720h".into(),
         renew_within_hours: 48,
+        reconcile_interval_hours: 12,
         alerts: vec![alert("A"), alert("B"), alert("C")],
     };
     let billing = Arc::new(tokio::sync::Mutex::new(()));

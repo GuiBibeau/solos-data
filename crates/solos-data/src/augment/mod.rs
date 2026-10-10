@@ -20,6 +20,7 @@ pub mod http;
 pub mod hyperliquid;
 pub mod kalshi;
 pub mod ledger;
+pub mod meter;
 pub mod parquet;
 pub mod periods;
 pub mod phoenix;

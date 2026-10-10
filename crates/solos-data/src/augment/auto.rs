@@ -3,7 +3,9 @@
 //! and listens to on the account-wide server-sent event stream, appending every notification
 //! to the day's `auto_events` file with the instant it was received. Paid calls run under the
 //! billing lock shared with the v3 cycle and are measured through `credits.used`; a monthly
-//! credit budget and the alert ceiling bound the spend.
+//! credit budget and the alert ceiling bound the spend. The listing costs a credit, so the
+//! lane lists at most every `reconcileIntervalHours` (and when an alert is missing or due for
+//! renewal); in between, and across restarts, it holds the alerts stored in the ledger.
 
 use super::config::{AlertDef, ElfaAuto};
 use super::elfa::{Billing, headers, key_status};
@@ -26,6 +28,8 @@ use std::time::Duration;
 pub const PROGRESS_QUERIES: &str = "elfa/auto/queries";
 /// Progress key of the month's spend.
 pub const PROGRESS_SPEND: &str = "elfa/auto/spend";
+/// Progress key of the last listing's instant.
+pub const PROGRESS_RECONCILED: &str = "elfa/auto/reconciledAt";
 /// Credits one creation is expected to cost (the manifest's baseline).
 pub const CREATE_COST: i64 = 5;
 
@@ -217,6 +221,40 @@ pub fn active_from_listing(
         .collect()
 }
 
+/// Whether the account must be listed now: never listed, the interval passed, a configured
+/// alert is not held, or a held one is due for renewal. Otherwise the stored alerts stand.
+#[must_use]
+pub fn listing_due(
+    cfg: &ElfaAuto,
+    records: &[ActiveQuery],
+    reconciled_at_ms: Option<i64>,
+    now_ms: i64,
+) -> bool {
+    let Some(at) = reconciled_at_ms else {
+        return true;
+    };
+    let renew_ms = cfg.renew_within_hours * 3_600_000;
+    now_ms - at >= cfg.reconcile_interval_hours * 3_600_000
+        || cfg
+            .alerts
+            .iter()
+            .any(|def| !records.iter().any(|r| r.title == def.title))
+        || records.iter().any(|r| r.expires_at_ms - now_ms < renew_ms)
+}
+
+async fn load_records(ctx: &Ctx) -> Result<(Vec<ActiveQuery>, Option<i64>), StoreError> {
+    ctx.db
+        .run(|store| {
+            let records = get_progress(store, PROGRESS_QUERIES)?
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_default();
+            let at = get_progress(store, PROGRESS_RECONCILED)?
+                .and_then(|v| v.get("atMs").and_then(Value::as_i64));
+            Ok((records, at))
+        })
+        .await
+}
+
 /// Reconcile the account with the configured alerts: list (one credit), create what is
 /// missing, renew what expires within the window, cancel the renewed, record the spend.
 pub async fn reconcile(ctx: &Ctx, lane: &AutoLane, now_ms: i64) -> Result<(), StoreError> {
@@ -245,7 +283,12 @@ pub async fn reconcile(ctx: &Ctx, lane: &AutoLane, now_ms: i64) -> Result<(), St
         if existing.is_some() && !renewing {
             continue;
         }
-        if spent + CREATE_COST > lane.cfg.credit_budget_per_month
+        let meter_refuses = ctx
+            .http
+            .meter()
+            .is_some_and(|m| !m.allows(CREATE_COST, now_ms));
+        if meter_refuses
+            || spent + CREATE_COST > lane.cfg.credit_budget_per_month
             || (existing.is_none() && active.len() >= lane.cfg.max_alerts)
         {
             log(
@@ -292,10 +335,12 @@ pub async fn reconcile(ctx: &Ctx, lane: &AutoLane, now_ms: i64) -> Result<(), St
     lane.counters.spent_month.store(total, Ordering::Relaxed);
     let value = json!({ "month": month, "credits": total, "updatedAt": now() });
     let saved = serde_json::to_value(&active).map_err(|e| StoreError::Check(e.to_string()))?;
+    let reconciled = json!({ "atMs": now_ms, "at": now() });
     ctx.db
         .run(move |store| {
             store.transaction(|store| {
                 set_progress(store, PROGRESS_SPEND, &value)?;
+                set_progress(store, PROGRESS_RECONCILED, &reconciled)?;
                 set_progress(store, PROGRESS_QUERIES, &saved)
             })
         })
@@ -405,14 +450,46 @@ async fn cancel(ctx: &Ctx, lane: &AutoLane, query: &ActiveQuery) -> Result<(), S
     }
 }
 
-/// Reconcile now and then every `interval_seconds`.
-pub async fn reconcile_loop(ctx: &Ctx, lane: &AutoLane, interval_seconds: u64) {
+/// Check every `check_seconds` (free, from the ledger) whether a listing is due, and reconcile
+/// when it is; otherwise hold the stored alerts. Nothing is listed past the credit cap.
+pub async fn reconcile_loop(ctx: &Ctx, lane: &AutoLane, check_seconds: u64) {
+    let mut held_logged = false;
     while !ctx.stopping() {
-        if let Err(error) = reconcile(ctx, lane, chrono::Utc::now().timestamp_millis()).await {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let result = match load_records(ctx).await {
+            Ok((records, at))
+                if super::elfa::capped(ctx) || !listing_due(&lane.cfg, &records, at, now_ms) =>
+            {
+                if !held_logged {
+                    held_logged = true;
+                    log(
+                        "elfa_auto_held",
+                        Obj::new()
+                            .with("active", records.len())
+                            .with("reconciledAtMs", at)
+                            .with("reconcileIntervalHours", lane.cfg.reconcile_interval_hours)
+                            .with("capReached", super::elfa::capped(ctx)),
+                    );
+                }
+                if lane.active().is_empty() {
+                    *lane.active.lock().expect("active queries") = records;
+                    *lane.last_reconcile.lock().expect("reconcile") = at.and_then(|ms| {
+                        chrono::DateTime::from_timestamp_millis(ms).map(|d| d.to_rfc3339())
+                    });
+                }
+                Ok(())
+            }
+            Ok(_) => {
+                held_logged = false;
+                reconcile(ctx, lane, now_ms).await
+            }
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
             lane.counters.errors.fetch_add(1, Ordering::Relaxed);
             log_error("reconcile", &error.to_string());
         }
-        pause(ctx, interval_seconds.max(60)).await;
+        pause(ctx, check_seconds.max(60)).await;
     }
 }
 
@@ -479,7 +556,7 @@ impl Backoff {
 pub async fn stream_loop(ctx: &Ctx, lane: &AutoLane) {
     let mut backoff = Backoff::default();
     while !ctx.stopping() {
-        if lane.active().is_empty() {
+        if lane.active().is_empty() || super::elfa::capped(ctx) {
             pause(ctx, 30).await;
             continue;
         }
@@ -755,5 +832,47 @@ mod tests {
         let active = active_from_listing(&listing, &[], 3_600_000, 9);
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].expires_at_ms, 1_790_812_800_000 + 3_600_000);
+    }
+
+    #[test]
+    fn listing_is_due_only_when_needed() {
+        let def = |title: &str| AlertDef {
+            title: title.into(),
+            description: String::new(),
+            conditions: json!({ "AND": [] }),
+            repeat: None,
+        };
+        let cfg = ElfaAuto {
+            enabled: true,
+            alerts: vec![def("A"), def("B")],
+            ..ElfaAuto::default()
+        };
+        let hour = 3_600_000;
+        let now = 1_791_547_200_000;
+        let held = |title: &str, expires: i64| ActiveQuery {
+            id: title.to_lowercase(),
+            title: title.into(),
+            created_at_ms: 0,
+            expires_at_ms: expires,
+        };
+        let records = vec![held("A", now + 500 * hour), held("B", now + 500 * hour)];
+        assert!(listing_due(&cfg, &records, None, now), "never listed");
+        assert!(
+            !listing_due(&cfg, &records, Some(now - hour), now),
+            "listed an hour ago"
+        );
+        assert!(
+            listing_due(&cfg, &records, Some(now - 12 * hour), now),
+            "interval passed"
+        );
+        assert!(
+            listing_due(&cfg, &records[..1], Some(now - hour), now),
+            "B not held"
+        );
+        let expiring = vec![held("A", now + 500 * hour), held("B", now + 47 * hour)];
+        assert!(
+            listing_due(&cfg, &expiring, Some(now - hour), now),
+            "B due for renewal"
+        );
     }
 }

@@ -490,3 +490,114 @@ fn bybit_trade_dumps_walk_days_under_the_disk_budget() {
     let _ = std::fs::remove_dir_all(&off.data_dir);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// Fake v3 routes: `/v3/calls` declares one credit per answer, the rest zero; `credits.used`
+/// follows what was declared plus `extra` (a charge no answer declares).
+fn mount_metered_v3(server: &Server, extra: Arc<std::sync::atomic::AtomicI64>) {
+    use std::sync::atomic::Ordering::SeqCst;
+    let used = Arc::new(std::sync::atomic::AtomicI64::new(300));
+    let now_s = NOW_MS / 1000;
+    let (u1, u2) = (Arc::clone(&used), Arc::clone(&used));
+    server.route("/v3/key-status", move |_| {
+        let total = u1.load(SeqCst) + extra.load(SeqCst);
+        Response::json(&json!({ "credits": { "used": total }, "historyFrom": now_s - 86_400 }))
+            .with_header("x-elfa-credits", "0")
+    });
+    server.route("/v3/events", move |_| {
+        Response::json(&json!({ "events": [{ "id": "e1", "firstSeenAt": now_s - 100, "eventClass": "news" }], "hasMore": false }))
+            .with_header("x-elfa-credits", "0")
+    });
+    server.route("/v3/calls", move |_| {
+        u2.fetch_add(1, SeqCst);
+        Response::json(&json!({ "calls": [{ "id": "c1", "occurredAt": now_s - 100, "asset": { "symbol": "BTC" } }], "hasMore": false }))
+            .with_header("x-elfa-credits", "1")
+    });
+    server.route("/v3/calls/episodes", move |_| {
+        Response::json(&json!({ "episodes": [], "hasMore": false }))
+            .with_header("x-elfa-credits", "0")
+    });
+    server.route("/v3/market/crypto/call-book", move |_| {
+        Response::json(&json!({ "bars": [], "hasMore": false })).with_header("x-elfa-credits", "0")
+    });
+}
+
+#[test]
+fn elfa_credits_are_metered_per_endpoint_and_one_billed_endpoint_is_disabled_alone() {
+    use solos_data::augment::meter::CreditMeter;
+    let server = Server::start();
+    let extra = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    mount_metered_v3(&server, Arc::clone(&extra));
+    let root = tempdir("solos-capture");
+    let (ctx, thread) = ctx(&server, &root);
+    let meter = Arc::new(CreditMeter::new(&server.base, 100));
+    meter.restore(None, 51, NOW_MS);
+    ctx.http.set_meter(Arc::clone(&meter));
+    let now_s = NOW_MS / 1000;
+    let lane = ElfaLane::new(&server.base, "test-key", now_s - 86_400);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    // A charge nobody declared (an Auto evaluation) lands during the cycle: logged as
+    // unattributed, disables nothing.
+    extra.store(4, std::sync::atomic::Ordering::SeqCst);
+    let outcome = runtime.block_on(elfa::cycle(&ctx, &lane, now_s));
+    assert_eq!(outcome.errors, 0);
+    assert!(
+        !lane.disabled(),
+        "headers were present: no key-wide fallback"
+    );
+    assert!(!lane.stream_enabled(elfa::Stream::Calls));
+    assert!(lane.stream_enabled(elfa::Stream::Events));
+    assert_eq!(lane.billed_endpoints(), ["/v3/calls"]);
+    let state = meter.snapshot();
+    assert_eq!(state.spent, 52, "51 carried in plus the one declared");
+    assert_eq!(state.endpoints["/v3/calls"].credits, 1);
+    assert_eq!(state.endpoints["/v3/key-status"].calls, 2);
+    assert_eq!(state.endpoints["/v3/calls/episodes"].credits, 0);
+    // The next cycle skips the billed endpoint and keeps pulling the free ones.
+    let calls = server.hits_of("/v3/calls");
+    let books = server.hits_of("/v3/market/crypto/call-book");
+    let outcome = runtime.block_on(elfa::cycle(&ctx, &lane, now_s + 3600));
+    assert_eq!(outcome.errors, 0);
+    assert_eq!(server.hits_of("/v3/calls"), calls);
+    assert_eq!(server.hits_of("/v3/market/crypto/call-book"), books + 1);
+    let poll = runtime.block_on(elfa::poll_events(&ctx, &lane, now_s + 3600));
+    assert_eq!(poll.errors, 0);
+    let store = thread.join(ctx.db.clone());
+    store.close().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn the_monthly_cap_stops_every_elfa_request() {
+    use solos_data::augment::meter::CreditMeter;
+    let server = Server::start();
+    mount_metered_v3(&server, Arc::new(std::sync::atomic::AtomicI64::new(0)));
+    let root = tempdir("solos-capture");
+    let (ctx, thread) = ctx(&server, &root);
+    let meter = Arc::new(CreditMeter::new(&server.base, 100));
+    meter.restore(None, 100, NOW_MS);
+    ctx.http.set_meter(Arc::clone(&meter));
+    let now_s = NOW_MS / 1000;
+    let lane = ElfaLane::new(&server.base, "test-key", now_s - 86_400);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let outcome = runtime.block_on(elfa::cycle(&ctx, &lane, now_s));
+    let poll = runtime.block_on(elfa::poll_events(&ctx, &lane, now_s));
+    assert_eq!((outcome.errors, outcome.skipped), (0, 1));
+    assert_eq!((poll.errors, poll.skipped), (0, 1));
+    let direct = runtime.block_on(ctx.http.get_json(
+        &format!("{}/v3/key-status", server.base),
+        &[("x-elfa-api-key", "test-key")],
+    ));
+    assert!(matches!(
+        direct,
+        Err(solos_data::augment::http::HttpError::CreditCap)
+    ));
+    assert_eq!(server.hit_count(), 0, "nothing reached the server");
+    // The saved month survives a restart: a new meter restored from it refuses too.
+    let saved = serde_json::to_value(meter.snapshot()).unwrap();
+    let restarted = CreditMeter::new(&server.base, 100);
+    restarted.restore(Some(&saved), 0, NOW_MS);
+    assert!(!restarted.allows(0, NOW_MS));
+    let store = thread.join(ctx.db.clone());
+    store.close().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
