@@ -136,6 +136,18 @@ pub struct ElfaLane {
     pub poll: PollCounters,
     disabled: AtomicBool,
     billed: Mutex<BTreeSet<String>>,
+    drift: Mutex<Drift>,
+}
+
+/// The key's movement between hourly cycles that no answer of this client declared.
+#[derive(Clone, Debug, Default)]
+pub struct Drift {
+    /// `credits.used` and the meter's month total at the end of the last cycle.
+    pub last: Option<(i64, i64)>,
+    /// Unattributed credits since the process started.
+    pub unattributed: i64,
+    /// Hours (cycle gaps) in which some were seen.
+    pub gaps_with_spend: u64,
 }
 
 impl ElfaLane {
@@ -152,6 +164,7 @@ impl ElfaLane {
             poll: PollCounters::default(),
             disabled: AtomicBool::new(false),
             billed: Mutex::new(BTreeSet::new()),
+            drift: Mutex::new(Drift::default()),
         }
     }
 
@@ -176,6 +189,36 @@ impl ElfaLane {
             .iter()
             .cloned()
             .collect()
+    }
+
+    /// The unattributed movement of the key between cycles.
+    #[must_use]
+    pub fn drift(&self) -> Drift {
+        self.drift.lock().expect("drift").clone()
+    }
+
+    /// Record the key and the meter at a cycle's start (`start`) or end; at a start, log what
+    /// moved since the last end without being declared (`elfa_key_drift`).
+    pub fn observe(&self, used: i64, declared: i64, start: bool) -> Option<i64> {
+        let mut drift = self.drift.lock().expect("drift");
+        let previous = drift.last;
+        drift.last = Some((used, declared));
+        let (used_then, declared_then) = previous.filter(|_| start)?;
+        let moved = used - used_then;
+        let unattributed = (moved - (declared - declared_then)).max(0);
+        drift.unattributed += unattributed;
+        if unattributed > 0 {
+            drift.gaps_with_spend += 1;
+        }
+        log(
+            "elfa_key_drift",
+            Obj::new()
+                .with("usedDelta", moved)
+                .with("declared", declared - declared_then)
+                .with("unattributed", unattributed)
+                .with("unattributedSinceStart", drift.unattributed),
+        );
+        Some(unattributed)
     }
 
     /// Whether the guard switched anything off (the lane or one endpoint).
@@ -322,6 +365,7 @@ pub async fn cycle(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
             return outcome;
         }
     };
+    lane.observe(used_before, metered_before.0, true);
     for stream in lane.hourly_streams() {
         if ctx.stopping() {
             break;
@@ -352,6 +396,7 @@ pub async fn cycle(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
                 // Without a meter no header was read: every movement is the key-wide guard's.
                 reading.unheadered = reading.unheadered.max(1);
             }
+            lane.observe(used_after, metered(ctx).0, false);
             if reading.disables_lane() {
                 lane.disabled.store(true, Ordering::Relaxed);
             }
@@ -890,5 +935,18 @@ mod tests {
         assert!(r.disables_lane());
         // No header but no movement: nothing.
         assert!(!CycleCredits::between((0, 0), (0, 9), 5, 5).disables_lane());
+    }
+
+    #[test]
+    fn drift_between_cycles_is_the_undeclared_movement() {
+        let lane = ElfaLane::new("https://x", "k", 0);
+        assert_eq!(lane.observe(300, 50, true), None, "nothing to compare yet");
+        lane.observe(300, 50, false);
+        // An hour later the key moved by 6 and the answers declared 1 (a listing).
+        assert_eq!(lane.observe(306, 51, true), Some(5));
+        lane.observe(306, 51, false);
+        assert_eq!(lane.observe(306, 51, true), Some(0));
+        let drift = lane.drift();
+        assert_eq!((drift.unattributed, drift.gaps_with_spend), (5, 1));
     }
 }

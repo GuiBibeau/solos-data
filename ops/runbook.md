@@ -257,6 +257,17 @@ journalctl --user -u solos-data-augment-capture.service -o cat | grep -E '"event
 
 To raise the cap for the rest of a month, edit `creditCapPerMonth` and restart the capture unit.
 
+Measured per endpoint on 2026-10-10 (ADR-0009): every `/v3/*` endpoint (`events`, `calls`,
+`calls/episodes`, `market/crypto/call-book`, `key-status`) and the Auto stream declare 0
+credits; the Auto listing `/v2/auto/queries` declares 1; a creation declares 5. Credits that
+move `credits.used` without being declared show as `elfa_key_drift` (between hourly cycles)
+and `elfa.unattributedCreditsSinceStart` in the status: an alert's server-side work or another
+client of the same key. The cap does not stop them; cancelling the alert does.
+
+```sh
+journalctl --user -u solos-data-augment-capture.service -o cat | grep -E '"event":"elfa_(key_drift|auto_listing)"' | tail -12
+```
+
 The Auto alerts cost credits: five per creation, one per listing of the account's queries
 (at most every `reconcileIntervalHours`, 12, or when an alert is missing or due for renewal;
 a restart in between holds the alerts stored in the ledger). `elfa.auto.creditBudgetPerMonth`
