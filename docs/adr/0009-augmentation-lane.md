@@ -337,6 +337,10 @@ and nothing told which call cost what.
   and at shutdown) and restored at start, so a restart does not reset the cap; a month without
   a record starts from the Auto lane's measured spend (`elfa/auto/spend`), the only credits
   counted before the meter existed. An Auto creation also needs room for its five credits.
+  *2026-10-11:* the box config raises the cap to 1,000. The key is a deposit balance with no
+  reset (4,458 credits left), and the two news-semantic Auto alerts draw about 30 credits a day
+  server-side, which the cap counts but cannot stop; at 100 the capture lane would have shut
+  itself off after three days while the alerts kept billing.
 - **The v3 guard is per endpoint.** An answer whose header declares a credit disables that
   endpoint until restart (`elfa_billing_started` with the endpoint; the page already paid for
   is kept) and the other streams keep running; the status lists `billedEndpoints` and

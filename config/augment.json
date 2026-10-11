@@ -93,7 +93,7 @@
       "requestsPerMinute": 60,
       "eventsIntervalSeconds": 60,
       "eventsPagesPerPoll": 2,
-      "creditCapPerMonth": 100,
+      "creditCapPerMonth": 1000,
       "auto": {
         "enabled": true,
         "maxAlerts": 8,
