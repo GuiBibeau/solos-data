@@ -133,6 +133,13 @@ as `archive-tip` in the checkpoint) and, if none is known, waits rather than bac
 A run of `backfill_chunk` events with `source: rpc` below the archive tip means the archive lane
 is not being used; check the mirror and the `archive_tip` events.
 
+A `backfill_chunk` with `manifest: 0` while the matching `archive_range` reports transactions means
+the manifest walk ended early; since 2026-10-11 validation reports such rows as `unlisted` and
+refuses the range. `walk_reseeded` means the collector resumed an unconfirmed manifest walk from
+the oldest published transaction above the chunk; its `unverifiedFrom`..`unverifiedTo` slots were
+published without manifest rows and need re-validation (ADR-0008). `walk_cursor_unresolved` means
+the provider answered an empty page for a cursor and the walk continued from the row above it.
+
 `tailEnabled: false` in `config/phoenix.json` runs the collector without the live tail: the archive
 lane backfills history (about 1.1 CU per slot for the manifest check, roughly 10M CU per wall-day
 at 280 CU/s) and the retention pass keeps running. The watermark stays put. Switching the tail back

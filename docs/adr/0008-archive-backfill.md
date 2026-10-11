@@ -86,3 +86,28 @@ compute units per slot and one fiftieth of the pace, without an error. The tip i
 ten minutes in the background; a probe that gets no answer keeps the last known tip (the mirror
 only adds epochs), the last tip survives restarts in the `archive-tip` record, and when no tip is
 known at all the lane waits and logs `archive_tip_unknown` instead of using RPC below the tip.
+
+Manifest walk dead cursor, 2026-10-11: from 01:30 UTC the lane retried slots 427,113,137 to
+427,163,136 every ten minutes with `badSlots=2` (slots 427,120,310 and 427,131,354). The program's
+manifest walk had stored `done` at slot 428,785,356 on 2026-10-10 20:30 UTC because the provider
+answered `getSignaturesForAddress` with an empty page for `before=<the walk's cursor>`, every time
+(re-checked on 2026-10-11), while `before=<the row above it>` lists that cursor at position 34 of a
+full page and history continues below it. The walker read every empty page as the end of history.
+Below that slot the manifest held only ProgramData-walk rows, so V1 (every manifest signature
+arrived) and V6 (per manifest slot) passed vacuously: 33 ranges, slots 427,163,137 to 428,785,355,
+65,865,105 archive transactions, were published with no RPC manifest behind them. The stuck range
+failed only because it held two ProgramData-walk signatures in busy slots: the manifest saw one
+transaction in each slot, the archive saw the whole block (single_in_slot false, tx_index set).
+Retries were idempotent: no Parquet files or catalog entries since 01:23 UTC, the checkpoint kept
+2,155,092 distinct rows for the range; each retry re-streamed the epoch and spent its sampled
+`getBlock` cross-check.
+
+Changes: (1) V1 now runs in both directions: a transaction in the range whose signature is not in
+the manifest counts as `unlisted` and fails the range, so a short manifest can no longer pass.
+Before this incident every archive range had `unlisted` 0 (archive and manifest counts were equal
+for every earlier range). (2) A walk keeps a `fallback` cursor, the row above `before`; an empty
+page is confirmed from it, and a confirming page that lists rows below the cursor resumes the walk
+(`walk_cursor_unresolved`). (3) A stored walk that ended on an unconfirmed empty page above the
+chunk being collected is resumed from the oldest published transaction above the chunk
+(`walk_reseeded`); the slots it skips stay as published and are listed in the event. Open: the 33
+ranges above need a manifest re-walk and comparison before sealing; they stay unverified until then.

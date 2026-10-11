@@ -105,6 +105,76 @@ pub async fn manifest_through(
     Ok(walk)
 }
 
+/// Slots above a chunk searched for a published transaction to resume a walk from.
+const ANCHOR_WINDOW: i64 = 1_000;
+
+/// A walk that ended on an empty page it never confirmed, above the chunk being collected, while
+/// the published archive holds program transactions right above that chunk: the provider answered
+/// an empty page for a cursor it could not resolve (2026-10-11, ADR-0008). Resume the walk from
+/// the oldest published transaction above the chunk. Slots between that anchor and the old cursor
+/// were published without manifest rows and are logged for re-validation, not re-walked here.
+async fn reseed_unconfirmed_end(
+    db: &Db,
+    config: &Config,
+    key: &str,
+    from: i64,
+    to: i64,
+) -> Result<(), StoreError> {
+    let Some(value) = db.get(key).await? else {
+        return Ok(());
+    };
+    let mut walk: Walk =
+        serde_json::from_value(value).map_err(|e| StoreError::Check(e.to_string()))?;
+    let unconfirmed = walk.done && walk.fallback.is_none() && walk.until.is_none();
+    if !unconfirmed || walk.last_slot.is_none_or(|slot| slot <= from) {
+        return Ok(());
+    }
+    let rows = super::reader::range_rows(
+        &config.data_dir,
+        "transactions",
+        "signature, slot, tx_index",
+        to + 1,
+        to + ANCHOR_WINDOW,
+    )?;
+    let Some((signature, slot)) = anchor(&rows) else {
+        return Ok(());
+    };
+    log(
+        "walk_reseeded",
+        Obj::new()
+            .with("key", key)
+            .with("endedAtSlot", walk.last_slot)
+            .with("anchorSlot", slot)
+            .with("unverifiedFrom", to + 1)
+            .with("unverifiedTo", walk.last_slot.map(|s| s - 1)),
+    );
+    walk.done = false;
+    walk.before = Some(signature);
+    walk.last_slot = Some(slot);
+    walk.fallback = None;
+    db.set(
+        key,
+        serde_json::to_value(&walk).map_err(|e| StoreError::Check(e.to_string()))?,
+    )
+    .await
+}
+
+/// The oldest published row: lowest slot, then lowest index within the slot, so a walk resumed
+/// from it lists nothing that slot already published above the chunk.
+#[must_use]
+pub fn anchor(rows: &[Obj]) -> Option<(String, i64)> {
+    rows.iter()
+        .filter_map(|row| {
+            Some((
+                row.int("slot")?,
+                row.int("tx_index").unwrap_or(-1),
+                row.str("signature")?.to_owned(),
+            ))
+        })
+        .min()
+        .map(|(slot, _, signature)| (signature, slot))
+}
+
 /// Which lane collects `[from, to]`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -138,6 +208,9 @@ pub async fn backfill_step(
         config.backfill_chunk_slots
     };
     let mut from = (to - chunk + 1).max(0);
+    for key in ["walk/backfill", "walk/programdata"] {
+        reseed_unconfirmed_end(db, config, key, from, to).await?;
+    }
     let mut walks = Vec::new();
     for (key, address) in [
         ("walk/backfill", config.program_id.as_str()),
@@ -298,4 +371,32 @@ pub async fn backfill(
             .with("independentValidation", "pending"),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::anchor;
+    use crate::jsonout::Obj;
+
+    fn row(signature: &str, slot: i64, index: Option<i64>) -> Obj {
+        Obj::new()
+            .with("signature", signature)
+            .with("slot", slot)
+            .with("tx_index", index)
+    }
+
+    #[test]
+    fn the_anchor_is_the_oldest_published_row() {
+        let rows = [
+            row("later-slot", 427_163_138, Some(0)),
+            row("high-index", 427_163_137, Some(900)),
+            row("low-index", 427_163_137, Some(4)),
+        ];
+        assert_eq!(anchor(&rows), Some(("low-index".into(), 427_163_137)));
+        assert_eq!(
+            anchor(&[row("single", 427_163_140, None)]),
+            Some(("single".into(), 427_163_140))
+        );
+        assert_eq!(anchor(&[]), None);
+    }
 }

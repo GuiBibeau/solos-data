@@ -35,15 +35,31 @@ pub fn validate_range(store: &mut Store, from: i64, to: i64) -> Result<Obj, Stor
         .into_iter()
         .next()
         .unwrap_or_default();
+    // V1 in the other direction: every collected transaction must be listed in the manifest. The
+    // archive lane collects by account key, so a manifest walk that ended early leaves archive rows
+    // without manifest rows; without this check such a range passed V1 and V6 vacuously
+    // (2026-10-11, ADR-0008).
+    let unlisted = store
+        .rows(
+            "SELECT count(*) AS unlisted FROM transactions t WHERE t.slot BETWEEN ? AND ?
+    AND NOT EXISTS (SELECT 1 FROM signatures s WHERE s.slot BETWEEN ? AND ? AND s.signature=t.signature)",
+            &[&from, &to, &from, &to],
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .int("unlisted")
+        .unwrap_or(0);
     let missing = counts.int("missing").unwrap_or(0);
     let unordered = counts.int("unordered").unwrap_or(0);
     let bad = coverage.int("bad").unwrap_or(0);
-    let ok = missing == 0 && unordered == 0 && bad == 0;
+    let ok = missing == 0 && unlisted == 0 && unordered == 0 && bad == 0;
     Ok(Obj::new()
         .with("ok", ok)
-        .with("V1", missing == 0)
+        .with("V1", missing == 0 && unlisted == 0)
         .with("V6", bad == 0 && unordered == 0)
         .with("missing", missing)
+        .with("unlisted", unlisted)
         .with("unordered", unordered)
         .with("badOrderingSlots", bad)
         .with("from", from)
@@ -73,8 +89,9 @@ pub fn assert_publishable(report: &Obj) -> Result<(), StoreError> {
             .map_or("unknown".to_owned(), |v| v.to_string())
     };
     Err(StoreError::Check(format!(
-        "Range validation failed; watermark will not advance (missing={}, unordered={}, badSlots={})",
+        "Range validation failed; watermark will not advance (missing={}, unlisted={}, unordered={}, badSlots={})",
         show("missing"),
+        show("unlisted"),
         show("unordered"),
         show("badOrderingSlots")
     )))
@@ -92,5 +109,67 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("watermark"));
+    }
+
+    fn store() -> (Store, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("solos-validation-{}", uuid::Uuid::new_v4()));
+        let store = Store::open(&root, crate::collector::schema::SCHEMA).unwrap();
+        (store, root)
+    }
+
+    fn manifest(store: &mut Store, signature: &str, slot: i64) {
+        store
+            .exec(
+                "INSERT INTO signatures (signature, slot) VALUES (?, ?)",
+                &[&signature.to_owned(), &slot],
+            )
+            .unwrap();
+    }
+
+    fn collected(store: &mut Store, signature: &str, slot: i64, index: Option<i64>) {
+        let single = index.is_none();
+        store
+            .exec(
+                "INSERT INTO transactions (signature, slot, tx_b64, tx_index, single_in_slot) VALUES (?, ?, 'AA==', ?, ?)",
+                &[&signature.to_owned(), &slot, &index, &single],
+            )
+            .unwrap();
+    }
+
+    /// The 2026-10-11 stall: the program's manifest walk ended early, so the only manifest row in
+    /// a busy slot came from the ProgramData walk while the archive collected the whole slot.
+    #[test]
+    fn archive_rows_missing_from_the_manifest_fail_v1() {
+        let (mut store, root) = store();
+        manifest(&mut store, "programdata-touch", 427_120_310);
+        collected(&mut store, "programdata-touch", 427_120_310, Some(311));
+        collected(&mut store, "program-a", 427_120_310, Some(172));
+        collected(&mut store, "program-b", 427_120_310, Some(200));
+        // A slot with archive rows and no manifest at all: the case that used to pass vacuously.
+        collected(&mut store, "program-c", 427_120_400, None);
+        let report = validate_range(&mut store, 427_113_137, 427_163_136).unwrap();
+        assert_eq!(report.get("ok"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(report.get("V1"), Some(&serde_json::Value::Bool(false)));
+        assert_eq!(report.int("missing"), Some(0));
+        assert_eq!(report.int("unlisted"), Some(3));
+        assert_eq!(report.int("badOrderingSlots"), Some(1));
+        let error = assert_publishable(&report).unwrap_err().to_string();
+        assert!(error.contains("unlisted=3"), "{error}");
+        // With the complete manifest the same rows validate.
+        for (signature, slot) in [
+            ("program-a", 427_120_310),
+            ("program-b", 427_120_310),
+            ("program-c", 427_120_400),
+        ] {
+            manifest(&mut store, signature, slot);
+        }
+        let report = validate_range(&mut store, 427_113_137, 427_163_136).unwrap();
+        assert_eq!(
+            report.get("ok"),
+            Some(&serde_json::Value::Bool(true)),
+            "{report:?}"
+        );
+        drop(store);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
