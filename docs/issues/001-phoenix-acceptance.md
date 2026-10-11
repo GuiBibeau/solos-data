@@ -56,6 +56,9 @@ from being mistaken for complete acceptance. Checkmarks require recorded evidenc
 - [ ] Full 24-hour outage, five random SIGKILL tests across fetch/compaction/sealing,
   golden day hash, new-market and upgrade fixtures, seven-day p99 freshness evidence.
 - [ ] Optional V8 live-recorder reconciliation after locating the independent recorder.
+- [ ] Re-walk the program manifest for slots 427,163,137 to 428,785,355 and compare it with the
+  65,865,105 archive transactions published there on 2026-10-10/11 without manifest rows (a
+  provider cursor ended the walk early; ADR-0008). Hold sealing for those ranges until it passes.
 
 Keep validation evidence with changes. Do not include credentials, personal paths,
 private deployment details or unfiltered provider exceptions.
