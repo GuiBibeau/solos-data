@@ -373,6 +373,74 @@
     "phoenix": {
       "enabled": true,
       "marketsUrl": "https://perp-api.phoenix.trade/v1/view/exchange/markets"
+    },
+    "tardis": {
+      "enabled": true,
+      "datasetsUrl": "https://datasets.tardis.dev/v1",
+      "sampleStart": "2025-10-01",
+      "keyedStart": "2025-10-01",
+      "kinds": [
+        "crypto"
+      ],
+      "bookSymbols": [
+        "BTC",
+        "ETH",
+        "SOL"
+      ],
+      "budgetGb": 400.0,
+      "exchanges": [
+        {
+          "id": "binance-futures",
+          "symbolField": "binance",
+          "dataTypes": [
+            "trades",
+            "derivative_ticker",
+            "liquidations",
+            "book_snapshot_25"
+          ]
+        },
+        {
+          "id": "bybit",
+          "symbolField": "bybit",
+          "dataTypes": [
+            "trades",
+            "derivative_ticker",
+            "liquidations",
+            "book_snapshot_25"
+          ]
+        },
+        {
+          "id": "okex-swap",
+          "symbolField": "okx",
+          "dataTypes": [
+            "trades",
+            "derivative_ticker",
+            "liquidations",
+            "book_snapshot_25"
+          ]
+        },
+        {
+          "id": "hyperliquid",
+          "symbolField": "hyperliquid",
+          "dataTypes": [
+            "trades",
+            "derivative_ticker",
+            "book_snapshot_25"
+          ]
+        },
+        {
+          "id": "deribit",
+          "symbols": {
+            "BTC": "BTC-PERPETUAL",
+            "ETH": "ETH-PERPETUAL"
+          },
+          "dataTypes": [
+            "trades",
+            "derivative_ticker",
+            "liquidations"
+          ]
+        }
+      ]
     }
   },
   "symbols": [
@@ -384,6 +452,7 @@
       "binance": "SOLUSDT",
       "hyperliquid": "SOL",
       "bybit": "SOLUSDT",
+      "okx": "SOL-USDT-SWAP",
       "elfaEntityId": "837496d1-a391-4697-a202-99ee6bd7d6fe",
       "secCik": null
     },
@@ -395,6 +464,7 @@
       "binance": "BTCUSDT",
       "hyperliquid": "BTC",
       "bybit": "BTCUSDT",
+      "okx": "BTC-USDT-SWAP",
       "elfaEntityId": "360fd4a8-46e3-4713-8a91-3627b86029fc",
       "secCik": null
     },
@@ -406,6 +476,7 @@
       "binance": "ETHUSDT",
       "hyperliquid": "ETH",
       "bybit": "ETHUSDT",
+      "okx": "ETH-USDT-SWAP",
       "elfaEntityId": "7e735621-f411-49c0-b985-2dddc65ac570",
       "secCik": null
     },
@@ -417,6 +488,7 @@
       "binance": "XRPUSDT",
       "hyperliquid": "XRP",
       "bybit": "XRPUSDT",
+      "okx": "XRP-USDT-SWAP",
       "elfaEntityId": "c62a6173-4bbd-4ad3-ba5f-9bfa26b2908c",
       "secCik": null
     },
@@ -428,6 +500,7 @@
       "binance": "HYPEUSDT",
       "hyperliquid": "HYPE",
       "bybit": "HYPEUSDT",
+      "okx": "HYPE-USDT-SWAP",
       "elfaEntityId": "944dcaf0-1b0a-44aa-bffc-11c1a80e1839",
       "secCik": null
     },
@@ -450,6 +523,7 @@
       "binance": "BNBUSDT",
       "hyperliquid": "BNB",
       "bybit": "BNBUSDT",
+      "okx": "BNB-USDT-SWAP",
       "elfaEntityId": "1219aaf7-99e8-4517-9fe4-7cba6b2c7c3c",
       "secCik": null
     },
@@ -461,6 +535,7 @@
       "binance": "DOGEUSDT",
       "hyperliquid": "DOGE",
       "bybit": "DOGEUSDT",
+      "okx": "DOGE-USDT-SWAP",
       "elfaEntityId": "7bc340d2-7cc2-4c7b-9f2b-ab649442a547",
       "secCik": null
     },
@@ -472,6 +547,7 @@
       "binance": "AAVEUSDT",
       "hyperliquid": "AAVE",
       "bybit": "AAVEUSDT",
+      "okx": "AAVE-USDT-SWAP",
       "elfaEntityId": "9cbda5dd-7d25-4c0b-8dab-3764b6b87ace",
       "secCik": null
     },
@@ -483,6 +559,7 @@
       "binance": "SUIUSDT",
       "hyperliquid": "SUI",
       "bybit": "SUIUSDT",
+      "okx": "SUI-USDT-SWAP",
       "elfaEntityId": "6ab87b64-d4de-491e-ba78-b57af7988c00",
       "secCik": null
     },
@@ -494,6 +571,7 @@
       "binance": "ZECUSDT",
       "hyperliquid": "ZEC",
       "bybit": "ZECUSDT",
+      "okx": "ZEC-USDT-SWAP",
       "elfaEntityId": "b48179e1-5f7b-4c19-a4ca-1bc990bbacbc",
       "secCik": null
     },
@@ -505,6 +583,7 @@
       "binance": "TAOUSDT",
       "hyperliquid": "TAO",
       "bybit": "TAOUSDT",
+      "okx": "TAO-USDT-SWAP",
       "elfaEntityId": "550bddb6-b57a-4921-8503-65ae74fae912",
       "secCik": null
     },
@@ -516,6 +595,7 @@
       "binance": "LITUSDT",
       "hyperliquid": "LIT",
       "bybit": "LITUSDT",
+      "okx": "LIT-USDT-SWAP",
       "elfaEntityId": "e9a2399a-91e9-486a-99bb-694c9ff816c6",
       "secCik": null
     },
@@ -527,6 +607,7 @@
       "binance": "MONUSDT",
       "hyperliquid": "MON",
       "bybit": "MONUSDT",
+      "okx": "MON-USDT-SWAP",
       "elfaEntityId": "b8965b15-ceb6-4e5b-9403-ed2db85d4e48",
       "secCik": null
     },
@@ -538,6 +619,7 @@
       "binance": "NEARUSDT",
       "hyperliquid": "NEAR",
       "bybit": "NEARUSDT",
+      "okx": "NEAR-USDT-SWAP",
       "elfaEntityId": "5a158802-db76-4bd5-b962-9e0c512222ef",
       "secCik": null
     },
@@ -549,6 +631,7 @@
       "binance": "XPLUSDT",
       "hyperliquid": "XPL",
       "bybit": "XPLUSDT",
+      "okx": "XPL-USDT-SWAP",
       "elfaEntityId": "e59383a9-7132-4fe7-a4bb-bdafe12410b3",
       "secCik": null
     },
@@ -560,6 +643,7 @@
       "binance": "FARTCOINUSDT",
       "hyperliquid": "FARTCOIN",
       "bybit": "FARTCOINUSDT",
+      "okx": "FARTCOIN-USDT-SWAP",
       "elfaEntityId": "59f3377b-e048-4f25-a854-8fca04918819",
       "secCik": null
     },
@@ -571,6 +655,7 @@
       "binance": "ENAUSDT",
       "hyperliquid": "ENA",
       "bybit": "ENAUSDT",
+      "okx": "ENA-USDT-SWAP",
       "elfaEntityId": "7a3a92cf-94bd-4067-b21a-e1d2747ecb1c",
       "secCik": null
     },
@@ -582,6 +667,7 @@
       "binance": "CHIPUSDT",
       "hyperliquid": "CHIP",
       "bybit": "CHIPUSDT",
+      "okx": "CHIP-USDT-SWAP",
       "elfaEntityId": "9a7b6c0f-91c5-41a0-b446-fc35c40a0672",
       "secCik": null
     },
@@ -593,6 +679,7 @@
       "binance": "MEGAUSDT",
       "hyperliquid": "MEGA",
       "bybit": "MEGAUSDT",
+      "okx": "MEGA-USDT-SWAP",
       "elfaEntityId": "a0a79d35-449e-4f90-b771-d2d0a07f34e3",
       "secCik": null
     },
@@ -615,6 +702,7 @@
       "binance": "JTOUSDT",
       "hyperliquid": "JTO",
       "bybit": "JTOUSDT",
+      "okx": "JTO-USDT-SWAP",
       "elfaEntityId": "963b377d-f2e6-4f99-8813-a915d47c2419",
       "secCik": null
     },
@@ -626,6 +714,7 @@
       "binance": "VVVUSDT",
       "hyperliquid": "VVV",
       "bybit": "VVVUSDT",
+      "okx": "VVV-USDT-SWAP",
       "elfaEntityId": "be7acdf5-dd00-4409-8f15-6dc504130465",
       "secCik": null
     },
@@ -637,6 +726,7 @@
       "binance": "JUPUSDT",
       "hyperliquid": "JUP",
       "bybit": "JUPUSDT",
+      "okx": "JUP-USDT-SWAP",
       "elfaEntityId": "721243d1-4fd8-4ef3-86a1-465ad5a9cc18",
       "secCik": null
     },
@@ -648,6 +738,7 @@
       "binance": "PUMPUSDT",
       "hyperliquid": "PUMP",
       "bybit": "PUMPFUNUSDT",
+      "okx": "PUMP-USDT-SWAP",
       "elfaEntityId": "2a6acc95-e82e-4490-9aea-6a08ecb250b7",
       "secCik": null
     },
@@ -659,6 +750,7 @@
       "binance": "METUSDT",
       "hyperliquid": "MET",
       "bybit": "METUSDT",
+      "okx": "MET-USDT-SWAP",
       "elfaEntityId": "3697314e-3517-43f4-87ee-930220453a59",
       "secCik": null
     },
@@ -670,6 +762,7 @@
       "binance": "WLDUSDT",
       "hyperliquid": "WLD",
       "bybit": "WLDUSDT",
+      "okx": "WLD-USDT-SWAP",
       "elfaEntityId": "5b1bc876-8da8-4be7-864f-2b9e903a3e27",
       "secCik": null
     },
@@ -681,6 +774,7 @@
       "binance": "ONDOUSDT",
       "hyperliquid": "ONDO",
       "bybit": "ONDOUSDT",
+      "okx": "ONDO-USDT-SWAP",
       "elfaEntityId": "04d8071e-d9e6-4fc8-98ab-995c6b5b60f4",
       "secCik": null
     },
@@ -692,6 +786,7 @@
       "binance": "RENDERUSDT",
       "hyperliquid": "RENDER",
       "bybit": "RENDERUSDT",
+      "okx": "RENDER-USDT-SWAP",
       "elfaEntityId": "72c81c58-0723-4728-b417-13467a8306c8",
       "secCik": null
     },
@@ -703,6 +798,7 @@
       "binance": "VIRTUALUSDT",
       "hyperliquid": "VIRTUAL",
       "bybit": "VIRTUALUSDT",
+      "okx": "VIRTUAL-USDT-SWAP",
       "elfaEntityId": "267f5408-31bc-4209-bf33-04f6bf13facd",
       "secCik": null
     },
@@ -714,6 +810,7 @@
       "binance": "MORPHOUSDT",
       "hyperliquid": "MORPHO",
       "bybit": "MORPHOUSDT",
+      "okx": "MORPHO-USDT-SWAP",
       "elfaEntityId": "fa94cd48-e4ae-4534-a07e-66fba3f98273",
       "secCik": null
     },
@@ -725,6 +822,7 @@
       "binance": "FETUSDT",
       "hyperliquid": "FET",
       "bybit": null,
+      "okx": "FET-USDT-SWAP",
       "elfaEntityId": "a8ca4d83-9fe8-4d67-8533-e0735e23412e",
       "secCik": null
     },
@@ -736,6 +834,7 @@
       "binance": "ADAUSDT",
       "hyperliquid": "ADA",
       "bybit": "ADAUSDT",
+      "okx": "ADA-USDT-SWAP",
       "elfaEntityId": "2193bdcb-b838-4b7d-8173-4ed7b1dd57a4",
       "secCik": null
     },
@@ -747,6 +846,7 @@
       "binance": "XLMUSDT",
       "hyperliquid": "XLM",
       "bybit": "XLMUSDT",
+      "okx": "XLM-USDT-SWAP",
       "elfaEntityId": "08ea23e7-ed33-4f9e-91a0-167bdced6fb9",
       "secCik": null
     },
@@ -758,6 +858,7 @@
       "binance": "TRXUSDT",
       "hyperliquid": "TRX",
       "bybit": "TRXUSDT",
+      "okx": "TRX-USDT-SWAP",
       "elfaEntityId": "d5145ac3-0eef-408e-8153-368b98a5edf4",
       "secCik": null
     },
@@ -1077,6 +1178,7 @@
       "binance": "CRVUSDT",
       "hyperliquid": "CRV",
       "bybit": "CRVUSDT",
+      "okx": "CRV-USDT-SWAP",
       "elfaEntityId": "545e05e8-8254-4c70-a70d-0124bc8897ea",
       "secCik": null
     },
@@ -1088,6 +1190,7 @@
       "binance": "LINKUSDT",
       "hyperliquid": "LINK",
       "bybit": "LINKUSDT",
+      "okx": "LINK-USDT-SWAP",
       "elfaEntityId": "f96a376e-1927-4850-8dc5-c64e5fc6599a",
       "secCik": null
     },
@@ -1220,6 +1323,7 @@
       "binance": "PONSUSDT",
       "hyperliquid": "PONS",
       "bybit": "PONSUSDT",
+      "okx": "PONS-USDT-SWAP",
       "elfaEntityId": "1e177c5d-89ba-4b84-8bfa-25b131ab10b0",
       "secCik": null
     },
@@ -1242,6 +1346,7 @@
       "binance": "UNIUSDT",
       "hyperliquid": "UNI",
       "bybit": "UNIUSDT",
+      "okx": "UNI-USDT-SWAP",
       "elfaEntityId": "6a0b88f8-f852-4798-b476-77a06cd3fe6e",
       "secCik": null
     },
@@ -1253,6 +1358,7 @@
       "binance": "AVAXUSDT",
       "hyperliquid": "AVAX",
       "bybit": "AVAXUSDT",
+      "okx": "AVAX-USDT-SWAP",
       "elfaEntityId": "5380b7a1-45d2-4845-ae18-03a56473bb8c",
       "secCik": null
     },
@@ -1264,6 +1370,7 @@
       "binance": "ARBUSDT",
       "hyperliquid": "ARB",
       "bybit": "ARBUSDT",
+      "okx": "ARB-USDT-SWAP",
       "elfaEntityId": "165197e5-509b-47b4-a1c4-f7ab811685c6",
       "secCik": null
     },
@@ -1275,6 +1382,7 @@
       "binance": "FILUSDT",
       "hyperliquid": "FIL",
       "bybit": "FILUSDT",
+      "okx": "FIL-USDT-SWAP",
       "elfaEntityId": "40a1931a-5c68-444e-a4d8-f63c539fa7a8",
       "secCik": null
     },
@@ -1286,6 +1394,7 @@
       "binance": "LTCUSDT",
       "hyperliquid": "LTC",
       "bybit": "LTCUSDT",
+      "okx": "LTC-USDT-SWAP",
       "elfaEntityId": "e08779ec-7d0f-40d3-98dd-4229c11a4a14",
       "secCik": null
     },
@@ -1297,6 +1406,7 @@
       "binance": "1000BONKUSDT",
       "hyperliquid": "kBONK",
       "bybit": "1000BONKUSDT",
+      "okx": "BONK-USDT-SWAP",
       "elfaEntityId": "2206e4a7-3cd2-4601-9748-dd4a112c3309",
       "secCik": null
     },
@@ -1308,6 +1418,7 @@
       "binance": "1000SHIBUSDT",
       "hyperliquid": "kSHIB",
       "bybit": "SHIB1000USDT",
+      "okx": "SHIB-USDT-SWAP",
       "elfaEntityId": "89778de1-2696-4d25-91d5-f25907515325",
       "secCik": null
     },
@@ -1319,6 +1430,7 @@
       "binance": "1000PEPEUSDT",
       "hyperliquid": "kPEPE",
       "bybit": "1000PEPEUSDT",
+      "okx": "PEPE-USDT-SWAP",
       "elfaEntityId": "4eb745b9-122f-46bc-9e3b-d5a0cb69310a",
       "secCik": null
     },
@@ -1330,6 +1442,7 @@
       "binance": "RAYUSDT",
       "hyperliquid": null,
       "bybit": "RAYDIUMUSDT",
+      "okx": "RAY-USDT-SWAP",
       "elfaEntityId": "f5b5e4a8-a5ca-4053-bc79-93730ae00c22",
       "secCik": null
     },
@@ -1341,6 +1454,7 @@
       "binance": "ZROUSDT",
       "hyperliquid": "ZRO",
       "bybit": "ZROUSDT",
+      "okx": "ZRO-USDT-SWAP",
       "elfaEntityId": "f0f3400a-2bcb-49e8-b09a-93d087d6e8bc",
       "secCik": null
     },

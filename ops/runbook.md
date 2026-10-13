@@ -252,6 +252,27 @@ once the lane's registered bytes pass the budget (`augment_budget_reached`) and 
 left off when the budget is raised. SOLUSDT alone is about 17 MB of gzip ticks a day on Bybit;
 size the budget from `augment status`'s per-dataset bytes after a day.
 
+Tardis.dev (`sources.tardis`, ADR-0009 "Tardis.dev") downloads the free first-of-month CSV
+samples for the Phoenix crypto markets on Binance USD-M, Bybit, OKX swaps, Hyperliquid and
+Deribit (trades, derivative ticker, liquidations; thinned book snapshots for BTC, ETH and SOL)
+into `tables/tardis/`. Anonymous downloads hit a transfer limit after a few hundred MB to a few
+GB a day: the run logs `augment_tardis_quota`, `augment status` shows the note, and the next
+runs resume when it resets, so the 13 sample days take several days. Every other day needs a
+paid key. Put it in `augment.env` without it touching the terminal or the history, then check:
+
+```sh
+~/.local/bin/solos-tardis-key           # hidden input; backs up augment.env, prints only the key length
+systemctl --user start --no-block solos-data-augment.service
+journalctl --user -u solos-data-augment.service -o cat | grep -E '"event":"augment_tardis_(mode|quota)"' | tail -3
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment query --sql \
+  "SELECT symbol, count(*) AS days FROM (SELECT DISTINCT symbol, CAST(ts AS DATE) FROM tardis_binance_futures_trades) GROUP BY 1 ORDER BY 1"
+```
+
+Set `sources.tardis.keyedStart` to the first day the plan's history covers (a quarterly plan
+reaches 12 months back) and `budgetGb` to what the root may hold. The licence keeps these files on
+the box: the R2 backup skips `tables/tardis/`, and no Tardis-derived data goes to Modal, GitHub or
+another provider without written terms (ADR-0009).
+
 `solos-data augment capture --config config/augment.json` is the long-running lane for what
 cannot be fetched later: Hyperliquid 1-minute candles every thirty minutes, Hyperliquid asset
 contexts (funding, open interest, mark/oracle/mid prices) every minute, Elfa events every

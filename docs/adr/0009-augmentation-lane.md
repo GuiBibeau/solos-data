@@ -102,7 +102,8 @@ later) and a newer 404 as "not published yet".
 ## What is deliberately not fetched
 
 Pyth Benchmarks and Hermes answer 401 without a key. The Hyperliquid S3 archive is
-requester-pays. Tardis and Yellowstone are paid. Binance `bookTicker` dumps stopped in April
+requester-pays. Yellowstone is paid. Tardis.dev is paid except for the first day of each
+month; see "Tardis.dev: free samples now, any day with a key (2026-10-13)". Binance `bookTicker` dumps stopped in April
 2024. Elfa is free today and undocumented; the capture lane reads `credits.used` before and after
 every cycle and disables itself for the rest of the process if it moves, logging
 `elfa_billing_started`. The lane is skipped when `ELFA_API_KEY` is unset.
@@ -396,3 +397,80 @@ listing logs each query's scalar fields (`elfa_auto_listing`) every twelve hours
 The monthly cap counts what the answers declare. It cannot stop a charge the server makes for
 an active alert; that one ends only when the alert is cancelled or expires (the seven expire
 on 2026-11-08 and are renewed 48 hours before unless removed from the config).
+
+## Tardis.dev: free samples now, any day with a key (2026-10-13)
+
+"What is deliberately not fetched" listed Tardis.dev as paid. Two things changed that: the
+world-model work (regimes repository, ADR-0014) is data-starved on Phoenix alone, and the plan is
+to pretrain on large CEX/DEX perp venues and fine-tune on Phoenix; and Tardis.dev serves **the
+first day of every month without a key**, which is enough to test whether its data helps before
+anyone pays for it. The source `tardis` downloads those samples now and every other day only when
+`TARDIS_API_KEY` is set.
+
+**What it fetches.** Tardis.dev's normalized CSV datasets
+(`https://datasets.tardis.dev/v1/<exchange>/<dataType>/<YYYY>/<MM>/<DD>/<symbol>.csv.gz`, one
+gzip CSV per exchange, type, symbol and UTC day, exported around 06:00 UTC the next day;
+docs.tardis.dev/downloadable-csv-files/api) for the Phoenix crypto markets (`kinds`) on:
+
+| Exchange (`id`) | Symbols from | Data types |
+|---|---|---|
+| Binance USDⓈ-M (`binance-futures`) | `binance` | trades, derivative_ticker, liquidations, book_snapshot_25 |
+| Bybit (`bybit`) | `bybit` | the same |
+| OKX swaps (`okex-swap`) | `okx` (new symbol-map field, `<BASE>-USDT-SWAP`; 46 markets) | the same |
+| Hyperliquid (`hyperliquid`) | `hyperliquid` | trades, derivative_ticker, book_snapshot_25 (no liquidations dataset) |
+| Deribit (`deribit`) | explicit `BTC-PERPETUAL`, `ETH-PERPETUAL` | trades, derivative_ticker, liquidations |
+
+`derivative_ticker` carries funding, predicted funding, open interest, mark, index and last
+price. Order books only for `bookSymbols` (BTC, ETH, SOL): `book_snapshot_25` is thinned to the
+last snapshot of each second of local time, ten levels a side plus the 25-level amount and
+notional totals per side (BTCUSDT on Binance is 90 MB of gzip a day before thinning, about 9 MB of
+Parquet after). `incremental_book_L2` is not fetched: it is 4.4 TB a year of gzip for these
+markets, two thirds of everything, and the thinned snapshots answer the depth and imbalance
+questions the models ask.
+
+**Layout.** One Parquet day per file at
+`tables/tardis/<exchange>_<dataType>/<SYMBOL>/<YYYY-MM-DD>.parquet` (dataset
+`binance_futures_trades`, view `tardis_binance_futures_trades`), with `time_us` (exchange time),
+`local_time_us` (Tardis's receive time), `ts`, the typed columns, `exchange`, `symbol` and
+`phoenix_symbol`. Amounts are as the exchange reports them (OKX in contracts).
+
+**Walk.** The days wanted are every first of the month from `sampleStart` (2025-10-01) and, with
+a key, every day from `keyedStart` (2025-10-01; set it to what the plan's history reaches), from
+the newest down, **day by day across all series**, so whatever a run fetches is whole
+cross-sections. A day is asked for from 08:00 UTC the next day. A 400 or 404 for a day more than
+three days old is a day before the symbol's listing and is remembered in the series' progress
+record (`absent`); a younger one is asked again. An empty gzip is a day without rows and becomes
+an empty file. Without a key no request carries a credential and keyed days are skipped; with
+one, only non-sample days send `Authorization: Bearer`, and keyed files stop at `budgetGb` (400)
+of registered Tardis files. A 401/403 before any keyed day has been served in the run stops keyed
+requests for the run (the key or plan is wrong, whatever the ledger already holds); after one has
+been served it stops that series' older keyed days (the plan's history does not reach
+`keyedStart`); both count as errors. `augment status` shows the source's
+`note` (samples only; transfer limit).
+
+**Transfer limit.** Anonymous downloads share a transfer limit per client: past it, every request
+gets `429` with `{"code":277,"message":"This account has reached its data transfer limit."}` and
+a `Retry-After` of about a day (84,291 s measured from the Mac after about 0.3 GB of samples and
+1,063 aborted size probes). The HTTP client used to cap `Retry-After` at 300 s and retry six
+times, half an hour per request; it now fails a request at once when the host asks for more than
+300 s (every source), and the Tardis walk stops the run at the first 429 without counting an
+error, so the hourly timer resumes the backfill when the limit resets. The full sample backfill
+(13 days, about 2 GB of gzip a day for these markets) therefore spreads over several days.
+
+**Licence.** Tardis.dev's terms (docs.tardis.dev/legal/terms-of-service) cover sample data too.
+Permitted use is internal research; raw data may not be redistributed (only derived aggregates of
+10 minutes or more, clause 9.2). Clause 9.5 allows task-specific quantitative models for internal
+research but not training or fine-tuning "general-purpose AI models, foundation models" without
+a separate written agreement, and requires written terms, enforceable by Tardis.dev, with any
+external service provider before its data or derived data is disclosed to it. So the nightly R2
+backup excludes `tables/tardis/` and uploads catalogs without its rows (a restored root lists only
+files it holds; the restore check skips them too); Tardis-derived
+data must not go to Modal, GitHub or any other provider, and pretraining or fine-tuning Chronos-2
+on it needs Tardis.dev's written confirmation first.
+
+**Paid plans** (tardis.dev order form, 2026-10-13): CSV access needs only the Solo type. A
+quarterly subscription reaches 12 months back, monthly 4 months, yearly 4 years; price per month,
+billed by the interval: Perpetuals data plan $700 (Solo), $1,000 (Pro), $350 (Academic,
+quarterly or yearly only, eligibility checked); one exchange with all symbols $350 (Solo); selected
+instruments $50 each a month; minimum order $300. The key goes in `augment.env` with
+`~/.local/bin/solos-tardis-key` on the box (hidden input; prints only its length).

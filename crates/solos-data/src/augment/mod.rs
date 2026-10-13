@@ -30,3 +30,4 @@ pub mod sec;
 pub mod series;
 pub mod sse;
 pub mod sync;
+pub mod tardis;

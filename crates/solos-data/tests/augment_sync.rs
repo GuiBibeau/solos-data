@@ -47,6 +47,7 @@ fn config_for(server: &Server, root: &std::path::Path) -> AugmentConfig {
     sources.polymarket.enabled = false;
     sources.kalshi.enabled = false;
     sources.phoenix.enabled = false;
+    sources.tardis.enabled = false;
     config.sources = sources;
     config
 }

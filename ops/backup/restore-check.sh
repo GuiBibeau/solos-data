@@ -37,7 +37,7 @@ rc copy "$dest/phoenix_raw" "$work/raw" --files-from-raw "$work/raw-files.txt"
 for c in catalog.json catalog-capture.json; do
   rc copyto "$dest/augment/$c" "$work/augment-$c"
 done
-jq -s -r '.[].files[] | select(.complete) | "\(.sha256)  augment/\(.path)"' \
+jq -s -r '.[].files[] | select(.complete and .source != "tardis") | "\(.sha256)  augment/\(.path)"' \
   "$work/augment-catalog.json" "$work/augment-catalog-capture.json" | shuf -n "$augment_files" > "$work/augment-sums.txt"
 sed 's|^[0-9a-f]*  augment/||' "$work/augment-sums.txt" > "$work/augment-files.txt"
 rc copy "$dest/augment" "$work/augment" --files-from-raw "$work/augment-files.txt"

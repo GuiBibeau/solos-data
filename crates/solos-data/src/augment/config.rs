@@ -28,6 +28,9 @@ pub struct Symbol {
     /// Bybit linear perpetual symbol.
     #[serde(default)]
     pub bybit: Option<String>,
+    /// OKX USDT-margined perpetual swap (`SOL-USDT-SWAP`), as Tardis.dev's `okex-swap` names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub okx: Option<String>,
     /// Elfa entity id.
     #[serde(default)]
     pub elfa_entity_id: Option<String>,
@@ -137,6 +140,89 @@ pub struct Bybit {
     /// Tick trades dumps (large; opt-in).
     #[serde(default)]
     pub trades: bool,
+}
+
+/// One exchange of the Tardis.dev source: its id, where each Phoenix market's symbol comes
+/// from, and the data types fetched for it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TardisExchange {
+    /// Tardis.dev exchange id (`binance-futures`, `bybit`, `okex-swap`, `hyperliquid`, `deribit`).
+    pub id: String,
+    /// The symbol-map field that names the market on this exchange (`binance`, `bybit`, `okx`,
+    /// `hyperliquid`); absent when `symbols` lists them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_field: Option<String>,
+    /// Explicit Phoenix symbol to exchange symbol pairs (Deribit's `BTC-PERPETUAL`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub symbols: std::collections::BTreeMap<String, String>,
+    /// Data types fetched (`trades`, `derivative_ticker`, `liquidations`, `book_snapshot_25`).
+    pub data_types: Vec<String>,
+}
+
+/// The API key, kept out of `Debug` output and never serialized.
+#[derive(Clone, Default)]
+pub struct ApiKey(pub String);
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ApiKey(<{} chars>)", self.0.len())
+    }
+}
+
+/// Tardis.dev downloadable CSV datasets (ADR-0009, Tardis section): the free first-of-month
+/// samples always, every other day only with `TARDIS_API_KEY`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tardis {
+    /// Whether the source runs.
+    pub enabled: bool,
+    /// Base of the dataset URLs (`https://datasets.tardis.dev/v1`).
+    pub datasets_url: String,
+    /// First first-of-month sample day fetched without a key.
+    pub sample_start: String,
+    /// First day fetched with a key; the plan's history decides how far back it may reach.
+    pub keyed_start: String,
+    /// Symbol kinds covered (`crypto`).
+    pub kinds: Vec<String>,
+    /// Phoenix symbols whose order book snapshots are fetched; the others get no book type.
+    pub book_symbols: Vec<String>,
+    /// Size, in GB, the source's registered files may reach before keyed days stop.
+    pub budget_gb: f64,
+    /// The exchanges.
+    pub exchanges: Vec<TardisExchange>,
+    /// `TARDIS_API_KEY`, from the environment only.
+    #[serde(skip)]
+    pub api_key: Option<ApiKey>,
+}
+
+impl Default for Tardis {
+    fn default() -> Self {
+        Tardis {
+            enabled: false,
+            datasets_url: "https://datasets.tardis.dev/v1".into(),
+            sample_start: "2025-10-01".into(),
+            keyed_start: "2025-10-01".into(),
+            kinds: vec!["crypto".into()],
+            book_symbols: Vec::new(),
+            budget_gb: 0.0,
+            exchanges: Vec::new(),
+            api_key: None,
+        }
+    }
+}
+
+/// The variable `TARDIS_API_KEY` is read from (the augment units' `augment.env`).
+pub const TARDIS_API_KEY_ENV: &str = "TARDIS_API_KEY";
+
+/// `TARDIS_API_KEY`, trimmed, when set and not empty.
+#[must_use]
+pub fn tardis_key_from_env() -> Option<ApiKey> {
+    std::env::var(TARDIS_API_KEY_ENV)
+        .ok()
+        .map(|key| key.trim().to_owned())
+        .filter(|key| !key.is_empty())
+        .map(ApiKey)
 }
 
 /// One Elfa Auto alert definition: the EQL conditions and the repeat rule. The lane adds the
@@ -355,6 +441,9 @@ pub struct Sources {
     pub kalshi: Kalshi,
     /// Phoenix markets metadata.
     pub phoenix: Phoenix,
+    /// Tardis.dev datasets (off unless configured).
+    #[serde(default)]
+    pub tardis: Tardis,
 }
 
 /// `config/augment.json`.
@@ -450,6 +539,7 @@ pub fn load_augment_config(path: Option<&str>) -> Result<AugmentConfig, StoreErr
         .unwrap_or_else(|_| config.data_dir.clone());
     config.data_dir = crate::fsutil::resolve(&cwd, &data_dir);
     config.sources.sec.user_agent = sec_user_agent_from_env();
+    config.sources.tardis.api_key = tardis_key_from_env();
     validate(&config)?;
     Ok(config)
 }
@@ -574,10 +664,11 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
         &config.sources.polymarket.clob_url,
         &config.sources.kalshi.base_url,
         &config.sources.phoenix.markets_url,
+        &config.sources.tardis.datasets_url,
     ] {
         check_url(url)?;
     }
-    Ok(())
+    super::tardis::validate(&config.sources.tardis)
 }
 
 /// Source URLs are https, or http on the loopback address (tests).
