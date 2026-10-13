@@ -141,3 +141,15 @@ above its floor fails the range.
 Requests go through a limiter of their own (`--rps`, default 50 `getSignaturesForAddress` calls a
 second, which backs off on 429s like the collector's), so the running collector keeps its share.
 The command changes nothing in the raw root; a range that fails is repaired separately.
+
+Re-verification outcome, 2026-10-13: `collector reverify --from 427163137 --to 428813136` (the 33
+ranges in full, the top one to its published end) ran on the box from a separate binary built at
+9d6cc38 and 023452f, beside the running collector, at its default 50 requests a second. The walks took
+about 22 minutes for 67,187 program pages, plus one ProgramData page (41 ProgramData signatures
+from the tip, none inside the ranges). The first comparison then failed on a DuckDB cast in the
+ProgramData insert (fixed in #33); the rerun reused the finished walks and compared all 33 ranges in
+31 seconds. Every range passed: 67,168,228 manifest signatures and 67,168,228 published
+transactions, 0 missing, 0 unlisted, 0 slot mismatches, 0 unordered rows, 0 bad ordering slots,
+every walk past its floor, no unresolved cursor on the way. Each walk started from the oldest
+published transaction above its range and resolved it. The 33 ranges are verified against an
+independent manifest; nothing was changed in the raw root.
