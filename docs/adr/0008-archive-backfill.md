@@ -79,6 +79,13 @@ chose to backfill first. `tailEnabled` (default true) switches the tail lane off
 keeps the exchange refresh and the maintenance pass. The archive lane then spends about 1.1 CU per
 slot, the whole nine-month history about 90M CU.
 
+Live tail back on, 2026-10-13: the operator moved `SOLANA_RPC_URL` to a Helius plan. A read-only burst
+of `getSignaturesForAddress` pages (limit 1,000) ran at about 610 requests a second with no 429, against
+about 7 a second (300 CU/s) on the previous account, so the limiter is set to 8,000 CU/s
+(`SOLOS_DATA_CU_PER_SECOND`, about 200 such pages a second) and `tailEnabled` is true again. The tail
+resumes from its watermark (2026-10-05) over RPC and closes the gap at about 65k CU per 1,000 slots
+while the archive lane keeps its share. The previous `collector.env` is kept beside it for rollback.
+
 Tip refresh, 2026-10-07: the lane had probed the archive tip once per process and treated a
 throttled mirror as "no archive", so after an out-of-memory restart at 02:27 UTC, while the mirror
 answered 429, the lane fell back to RPC chunks of 1,000 slots for twelve hours at forty times the
