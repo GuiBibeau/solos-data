@@ -350,6 +350,25 @@ pub fn load_archive(
     Ok(digest)
 }
 
+/// Add the ProgramData walk's rows in `[from, to]` (a JSON array of `{signature, slot}`) to
+/// `manifest`, once per signature.
+pub fn add_programdata(
+    conn: &Connection,
+    programdata: &str,
+    from: i64,
+    to: i64,
+) -> Result<(), StoreError> {
+    conn.execute(
+        &format!(
+            "INSERT INTO manifest SELECT signature, slot FROM (
+  SELECT value->>'signature' AS signature, (value->>'slot')::BIGINT AS slot FROM json_each(?::JSON)) p
+  WHERE p.slot BETWEEN {from} AND {to} AND p.signature NOT IN (SELECT signature FROM manifest)"
+        ),
+        [programdata],
+    )?;
+    Ok(())
+}
+
 /// One range: manifest from its walked store plus the ProgramData rows, archive from the
 /// catalog, compared; full mismatch lists are written next to the store as CSV.
 fn compare_range(
@@ -367,14 +386,7 @@ fn compare_range(
 CREATE TABLE manifest AS SELECT signature, slot FROM walked.signatures WHERE slot BETWEEN {from} AND {to};
 DETACH walked;"
     ))?;
-    conn.execute(
-        &format!(
-            "INSERT INTO manifest SELECT value->>'signature', (value->>'slot')::BIGINT FROM json_each(?::JSON)
-  WHERE (value->>'slot')::BIGINT BETWEEN {from} AND {to}
-  AND value->>'signature' NOT IN (SELECT signature FROM manifest)"
-        ),
-        [programdata],
-    )?;
+    add_programdata(&conn, programdata, from, to)?;
     let digest = with_read_lease(raw, || load_archive(&conn, raw, from, to))?;
     let mut report = compare(&conn)?;
     report.set("archiveFiles", digest);
@@ -859,6 +871,37 @@ CREATE TABLE archive (signature VARCHAR, slot BIGINT, tx_index INTEGER, single_i
         // Nor is an end confirmed above the window, before the walk reached it.
         walk.oldest_slot = Some(250);
         assert!(!reached_floor(&walk));
+    }
+
+    /// The ProgramData rows as the run passes them: `Obj` rows from DuckDB, slots as strings.
+    #[test]
+    fn programdata_rows_join_the_manifest_once_and_only_in_the_window() {
+        let conn = conn();
+        rows(&conn, &[("shared", 150)], &[]);
+        let pd: Vec<Value> = [("shared", 150), ("pd-only", 160), ("outside", 250)]
+            .iter()
+            .map(|(s, slot)| {
+                Obj::new()
+                    .with("signature", *s)
+                    .with("slot", slot.to_string())
+                    .to_value()
+            })
+            .collect();
+        add_programdata(&conn, &Value::Array(pd).to_string(), 100, 199).unwrap();
+        let listed = query_rows(
+            &conn,
+            "SELECT signature FROM manifest ORDER BY signature",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .filter_map(|r| r.str("signature"))
+                .collect::<Vec<_>>(),
+            ["pd-only", "shared"]
+        );
+        add_programdata(&conn, "[]", 100, 199).unwrap();
     }
 
     /// Pages keyed by the `before` cursor; every other call fails.
