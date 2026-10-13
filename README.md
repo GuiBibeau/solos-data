@@ -10,7 +10,10 @@ now into older history. Each finished batch becomes available right away.
 Solana → raw transactions → decoded events → Parquet files → SQL
 ```
 
-![Phoenix perps data collection: sources, collection server, decoder, Parquet dataset with nightly off-site backup, research and models](docs/images/data-collection.jpg)
+![Phoenix perps data collection: sources, collection server, decoder, Parquet dataset, nightly off-site backup of raw and context data, research and models](docs/images/data-collection.jpg)
+
+The nightly backup copies the raw transactions and the context data, not the decoded
+tables; those are rebuilt from the raw files (ADR-0010).
 
 ## Tech stack
 
