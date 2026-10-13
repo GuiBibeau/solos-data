@@ -125,7 +125,8 @@ re-walks the manifest the backfill uses (the program and its ProgramData account
 ranges above can be checked without stopping the collector. It never opens the live checkpoint: each
 published range intersecting the request (from the `<from>-<to>-<id>.parquet` names of the
 catalog's transaction files; slots only compacted files hold become a range from the catalog's
-coverage, and an unpublished slot or an overlap is an error) gets its own DuckDB store under
+coverage, overlapping tail republications are split so each slot lands in one range, and an
+unpublished slot is an error) gets its own DuckDB store under
 `--out`, keyed by the compared window,
 and its walk starts from the oldest published transaction above the range, with the next oldest as
 the fallback cursor, so ranges walk in parallel and a cursor the provider cannot resolve is

@@ -47,8 +47,8 @@ const WALK_KEY: &str = "walk/reverify";
 /// The published ranges that intersect `[from, to]`, from the `<from>-<to>-<id>.parquet` names
 /// of the catalog's transaction files, sorted. Slots no ranged file names but the catalog's
 /// published `coverage` holds (their files were compacted into unranged ones) become a range of
-/// their own. Errors when a slot of `[from, to]` is not published at all or ranged files overlap,
-/// since the comparison would then miss or double-count slots.
+/// their own. Errors when a slot of `[from, to]` is not published at all, since the comparison
+/// would then miss it.
 pub fn published_ranges(
     files: &[Value],
     coverage: &[(i64, i64)],
@@ -67,13 +67,13 @@ pub fn published_ranges(
     let covered = |a: i64, b: i64| coverage.iter().any(|(x, y)| *x <= a && b <= *y);
     let mut ranges = Vec::new();
     let mut expected = from;
-    for (i, (a, b)) in named.iter().enumerate() {
-        if i > 0 && *a < expected {
-            return Err(StoreError::Check(format!(
-                "published ranges overlap at slot {a}"
-            )));
+    for (a, b) in named {
+        // Tail cycles republish `overlapSlots` below the watermark, so ranged files overlap;
+        // each slot goes to one range and the newest publication per signature wins anyway.
+        if b < expected {
+            continue;
         }
-        if *a > expected {
+        if a > expected {
             if !covered(expected, a - 1) {
                 return Err(StoreError::Check(format!(
                     "slots {expected} to {} are not published",
@@ -82,7 +82,15 @@ pub fn published_ranges(
             }
             ranges.push((expected, a - 1));
         }
-        ranges.push((*a, *b));
+        // The first range keeps its published start; later ones start after their predecessor.
+        ranges.push((
+            if ranges.is_empty() {
+                a
+            } else {
+                a.max(expected)
+            },
+            b,
+        ));
         expected = b + 1;
     }
     if expected <= to {
@@ -162,13 +170,19 @@ pub async fn walk_segment(rpc: &dyn Rpc, db: &Db, initial: Walk) -> Result<Walk,
 }
 
 /// Whether a finished walk listed everything down to its floor: its oldest row lies below the
-/// floor, or it ended on an empty page the fallback cursor confirmed (the address has no older
-/// history), or the provider listed nothing at all. A walk that ended on an unconfirmed empty page
-/// above the floor is the 2026-10-10 failure.
+/// floor; or it listed rows down into its window and then ended on an empty page the fallback
+/// cursor confirmed (the address has no older history); or, started from the tip, the provider
+/// listed nothing at all. A walk that ended on an unconfirmed empty page above the floor is the
+/// 2026-10-10 failure, and a start cursor whose own page and fallback page are both empty (a
+/// cursor the provider does not list for the address) never counts as a confirmed end.
 #[must_use]
 pub fn reached_floor(walk: &Walk) -> bool {
-    walk.oldest_slot.is_some_and(|slot| slot < walk.floor)
-        || (walk.done && (walk.fallback.is_some() || walk.before.is_none()))
+    let below = |bound: i64| walk.oldest_slot.is_some_and(|slot| slot < bound);
+    let confirmed_end = walk.done
+        && walk.fallback.is_some()
+        && walk.oldest_slot.is_some_and(|slot| slot <= walk.ceiling);
+    let empty_from_tip = walk.done && walk.before.is_none() && walk.oldest_slot.is_none();
+    below(walk.floor) || confirmed_end || empty_from_tip
 }
 
 /// Compare the `manifest(signature, slot)` and `archive(signature, slot, tx_index,
@@ -698,11 +712,17 @@ CREATE TABLE archive (signature VARCHAR, slot BIGINT, tx_index INTEGER, single_i
             file("/r/t/epoch=1/250-299-a.parquet"),
         ];
         assert!(error(&gap, &none, 100, 299).contains("200 to 249"));
+        // Tail republications overlap; every slot lands in exactly one range.
         let overlap = [
             file("/r/t/epoch=1/100-199-a.parquet"),
             file("/r/t/epoch=1/150-299-a.parquet"),
+            file("/r/t/epoch=1/160-180-a.parquet"),
+            file("/r/t/epoch=1/290-310-a.parquet"),
         ];
-        assert!(error(&overlap, &none, 100, 299).contains("overlap"));
+        assert_eq!(
+            published_ranges(&overlap, &none, 100, 305).unwrap(),
+            [(100, 199), (200, 299), (300, 310)]
+        );
         assert_eq!(
             catalog_coverage(&json!({"coverage": [{"from": 1, "to": "9"}]})),
             [(1, 9)]
@@ -749,6 +769,13 @@ CREATE TABLE archive (signature VARCHAR, slot BIGINT, tx_index INTEGER, single_i
         walk.fallback = Some("second".into());
         assert!(reached_floor(&walk));
         walk.done = false;
+        assert!(!reached_floor(&walk));
+        // A start cursor whose page and fallback page were both empty listed nothing: not an end.
+        walk.done = true;
+        walk.oldest_slot = None;
+        assert!(!reached_floor(&walk));
+        // Nor is an end confirmed above the window, before the walk reached it.
+        walk.oldest_slot = Some(250);
         assert!(!reached_floor(&walk));
     }
 
