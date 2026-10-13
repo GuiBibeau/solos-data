@@ -279,10 +279,15 @@ mod tests {
         assert_eq!(config.archive_chunk_slots, 50_000);
         assert_eq!(config.retention_slots_per_pass, 100_000);
         assert_eq!(config.cu_weights["getBlock"], 40);
-        assert!(!config.tail_enabled, "the box runs archive-only");
+        assert!(config.tail_enabled, "the box runs the live tail");
         let without: Config =
-            serde_json::from_str(&text.replace("\"tailEnabled\": false,", "")).unwrap();
+            serde_json::from_str(&text.replace("\"tailEnabled\": true,", "")).unwrap();
         assert!(without.tail_enabled, "the tail runs unless switched off");
+        let off: Config = serde_json::from_str(
+            &text.replace("\"tailEnabled\": true,", "\"tailEnabled\": false,"),
+        )
+        .unwrap();
+        assert!(!off.tail_enabled, "tailEnabled false switches the tail off");
         assert_eq!(
             url_parts("https://u:p@host.example:443/v2/key?x=1").unwrap(),
             ("https".into(), "host.example".into())
