@@ -442,9 +442,10 @@ three days old is a day before the symbol's listing and is remembered in the ser
 record (`absent`); a younger one is asked again. An empty gzip is a day without rows and becomes
 an empty file. Without a key no request carries a credential and keyed days are skipped; with
 one, only non-sample days send `Authorization: Bearer`, and keyed files stop at `budgetGb` (400)
-of registered Tardis files. A 401/403 on the newest keyed day stops keyed requests for the run
-(the key or plan is wrong); further back it stops that series' older keyed days (the plan's
-history does not reach `keyedStart`); both count as errors. `augment status` shows the source's
+of registered Tardis files. A 401/403 before any keyed day has been served in the run stops keyed
+requests for the run (the key or plan is wrong, whatever the ledger already holds); after one has
+been served it stops that series' older keyed days (the plan's history does not reach
+`keyedStart`); both count as errors. `augment status` shows the source's
 `note` (samples only; transfer limit).
 
 **Transfer limit.** Anonymous downloads share a transfer limit per client: past it, every request
@@ -462,7 +463,8 @@ Permitted use is internal research; raw data may not be redistributed (only deri
 research but not training or fine-tuning "general-purpose AI models, foundation models" without
 a separate written agreement, and requires written terms, enforceable by Tardis.dev, with any
 external service provider before its data or derived data is disclosed to it. So the nightly R2
-backup excludes `tables/tardis/` (and the restore check skips those catalog rows); Tardis-derived
+backup excludes `tables/tardis/` and uploads catalogs without its rows (a restored root lists only
+files it holds; the restore check skips them too); Tardis-derived
 data must not go to Modal, GitHub or any other provider, and pretraining or fine-tuning Chronos-2
 on it needs Tardis.dev's written confirmation first.
 

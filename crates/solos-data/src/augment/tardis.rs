@@ -373,8 +373,11 @@ pub fn gzip_is_empty(body: &[u8]) -> bool {
 #[derive(Default)]
 struct Run {
     outcome: Outcome,
-    /// The API refused the key on the newest keyed day; no other keyed day is asked for.
+    /// The API refused the key before any keyed day succeeded this run; no other keyed day is
+    /// asked for.
     keyed_refused: bool,
+    /// A keyed day was served this run, so the key works.
+    keyed_served: bool,
     /// The budget is spent; no other keyed day is asked for.
     budget_spent: bool,
     /// The host answered 429 with a long `Retry-After` (the transfer limit): the run stops.
@@ -403,7 +406,6 @@ pub async fn sync(ctx: &Ctx, cfg: &Tardis, symbols: &[Symbol], only: Option<&str
             .with("note", key.is_none().then_some(SAMPLES_ONLY)),
     );
     let days = wanted_days(cfg, key.is_some(), ctx.now_ms);
-    let newest_keyed = days.iter().copied().find(|d| !is_sample_day(*d));
     let mut run = Run::default();
     let mut walks = Vec::new();
     for item in items(cfg, symbols, only) {
@@ -420,7 +422,7 @@ pub async fn sync(ctx: &Ctx, cfg: &Tardis, symbols: &[Symbol], only: Option<&str
             if ctx.stopping() || run.quota_reached {
                 break 'days;
             }
-            if let Err(error) = sync_day(ctx, cfg, key, walk, day, newest_keyed, &mut run).await {
+            if let Err(error) = sync_day(ctx, cfg, key, walk, day, &mut run).await {
                 run.outcome.errors += 1;
                 walk.failed = true;
                 log_error(&walk.item, "write", &error.to_string());
@@ -472,7 +474,6 @@ async fn sync_day(
     key: Option<&ApiKey>,
     walk: &mut Walk,
     day: NaiveDate,
-    newest_keyed: Option<NaiveDate>,
     run: &mut Run,
 ) -> Result<(), StoreError> {
     let label = day.format("%Y-%m-%d").to_string();
@@ -504,6 +505,7 @@ async fn sync_day(
         Ok(fetched) => {
             let rows = write_day(ctx, &item, &label, &fetched.body).await?;
             walk.done.insert(label.clone());
+            run.keyed_served |= !sample;
             run.outcome.files += 1;
             run.outcome.rows += u64::try_from(rows).unwrap_or(0);
             log(
@@ -547,13 +549,15 @@ async fn sync_day(
                 log_error(&item, &label, &format!("HTTP {status}: sample day refused"));
                 return Ok(());
             }
-            // Refused on the newest keyed day: the key or the plan does not work, so no series
-            // asks again this run. Refused further back: the plan's history does not reach this
-            // day (keyedStart is too early); this series asks for no older keyed day.
+            // Refused before any keyed day was served this run (the first keyed request is the
+            // newest pending day, whatever the ledger already holds): the key or the plan does
+            // not work, so no series asks again this run. Refused after others were served: the
+            // plan's history does not reach this day (keyedStart is too early); this series asks
+            // for no older keyed day.
             walk.refused = true;
-            let what = if Some(day) == newest_keyed {
+            let what = if !run.keyed_served {
                 run.keyed_refused = true;
-                "key refused on the newest day; no keyed day is asked for again this run"
+                "key refused before any keyed day was served; no keyed day is asked for again this run"
             } else {
                 "key refused for this day: the plan's history does not reach keyedStart"
             };

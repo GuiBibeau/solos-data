@@ -352,3 +352,42 @@ fn the_transfer_limit_stops_the_run_without_waiting_or_an_error() {
     assert_eq!(last, path("trades", "2026-09-01"), "nothing after the 429");
     assert_eq!(server.hits_of(&last), 1, "the 429 is not retried");
 }
+
+#[test]
+fn a_key_refused_after_a_resume_stops_every_keyed_series() {
+    let server = Server::start();
+    mount(&server);
+    for day in ["2026-10-05", "2026-10-06"] {
+        let body = gzip(&trades_csv(SEP1_US));
+        server.route(&path("trades", day), move |request: &Request| {
+            if request.header("authorization") == Some(&format!("Bearer {KEY}")) {
+                Response::ok(body.clone())
+            } else {
+                Response::status(401)
+            }
+        });
+    }
+    let root = tempdir("solos-augment-tardis-resumed");
+    let mut config = config_for(&server, &root);
+    config.sources.tardis.api_key = Some(ApiKey(KEY.into()));
+    let first = run(&config);
+    assert_eq!(first["sources"]["tardis"]["files"], 5 + 2, "{first}");
+
+    // The newest keyed days are registered; the key is now wrong and keyedStart moved back,
+    // so the first keyed request of the run is an older day of the trades series.
+    config.sources.tardis.api_key = Some(ApiKey("expired".into()));
+    config.sources.tardis.keyed_start = "2026-10-05".into();
+    let before = server.hit_count();
+    let status = run(&config);
+    assert_eq!(status["sources"]["tardis"]["errors"], 1, "{status}");
+    let hits: Vec<String> = server.hits()[before..]
+        .iter()
+        .map(|r| r.path.clone())
+        .collect();
+    assert_eq!(
+        hits.iter().filter(|p| p.contains("/10/06/")).count(),
+        1,
+        "the refusal on the trades series stops the other series' keyed days: {hits:?}"
+    );
+    assert!(!hits.iter().any(|p| p.contains("/10/05/")), "{hits:?}");
+}
