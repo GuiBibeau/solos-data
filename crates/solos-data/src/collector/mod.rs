@@ -18,6 +18,7 @@ pub mod pipeline;
 pub mod probe;
 pub mod reader;
 pub mod retention;
+pub mod reverify;
 pub mod rpc;
 pub mod schema;
 pub mod service;

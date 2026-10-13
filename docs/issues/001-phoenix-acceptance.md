@@ -59,6 +59,8 @@ from being mistaken for complete acceptance. Checkmarks require recorded evidenc
 - [ ] Re-walk the program manifest for slots 427,163,137 to 428,785,355 and compare it with the
   65,865,105 archive transactions published there on 2026-10-10/11 without manifest rows (a
   provider cursor ended the walk early; ADR-0008). Hold sealing for those ranges until it passes.
+  `collector reverify` (2026-10-13) does the walk and comparison while the collector runs; the box
+  must record its outcome here before this item is checked.
 
 Keep validation evidence with changes. Do not include credentials, personal paths,
 private deployment details or unfiltered provider exceptions.

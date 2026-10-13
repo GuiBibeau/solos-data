@@ -234,7 +234,7 @@ fn decoder_command(command: &str, args: &[String]) -> Result<(), StoreError> {
 // ---------------------------------------------------------------------------------------------
 // collector
 
-const COLLECTOR_COMMANDS: [(&str, &str); 16] = [
+const COLLECTOR_COMMANDS: [(&str, &str); 17] = [
     (
         "run",
         "Supervised finalized-only collector (tail + backfill)",
@@ -283,6 +283,10 @@ const COLLECTOR_COMMANDS: [(&str, &str); 16] = [
     (
         "relocate",
         "Offline rebase and verify raw file registrations after moving the data root; stop the service first",
+    ),
+    (
+        "reverify",
+        "Re-walk the manifest over published ranges and compare it with the archive while collection runs: --from <slot> --to <slot> --out <dir> [--rps 50] [--parallel 32] [--memory 8GB] [--threads 4]",
     ),
     (
         "benchmark-decoder",
@@ -394,6 +398,9 @@ fn collector_command(command: &str, args: &[String]) -> Result<(), StoreError> {
         );
         return Ok(());
     }
+    if command == "reverify" {
+        return reverify(args, config);
+    }
     if command == "probe" {
         config.data_dir = config.data_dir.join("probe");
     }
@@ -411,6 +418,68 @@ fn collector_command(command: &str, args: &[String]) -> Result<(), StoreError> {
     let result = offline_or_live(command, args, &mut store, config, mode);
     store.close()?;
     result
+}
+
+/// `collector reverify`: its own limiter and output root; never opens the live checkpoint.
+fn reverify(args: &[String], mut config: Config) -> Result<(), StoreError> {
+    let number = |name: &str| flag(args, name).and_then(|v| v.parse::<i64>().ok());
+    let (Some(from), Some(to), Some(out)) = (number("--from"), number("--to"), flag(args, "--out"))
+    else {
+        return Err(StoreError::Check(
+            "reverify requires --from <slot> --to <slot> --out <dir>".into(),
+        ));
+    };
+    let rps = flag(args, "--rps").map_or(Ok(50.0), str::parse::<f64>);
+    let parallel = flag(args, "--parallel").map_or(Ok(32), str::parse::<usize>);
+    let (Ok(rps), Ok(parallel)) = (rps, parallel) else {
+        return Err(StoreError::Check("invalid --rps or --parallel".into()));
+    };
+    if from < 0 || from > to || !(1.0..=1_000.0).contains(&rps) || parallel == 0 {
+        return Err(StoreError::Check("invalid reverify range or limits".into()));
+    }
+    let options = crate::collector::reverify::Options {
+        from,
+        to,
+        out: PathBuf::from(out),
+        rps,
+        parallel,
+        memory: flag(args, "--memory").unwrap_or("8GB").to_owned(),
+        threads: flag(args, "--threads").unwrap_or("4").to_owned(),
+    };
+    // A limiter of its own: one getSignaturesForAddress weight per request, no tail share.
+    let weight = f64::from(
+        config
+            .cu_weights
+            .get("getSignaturesForAddress")
+            .copied()
+            .unwrap_or(40),
+    );
+    config.cu_per_second = rps * weight;
+    config.utilization = 1.0;
+    let limiter = Arc::new(Limiter::new(
+        config.cu_per_second,
+        0.0,
+        crate::collector::config::Lanes {
+            tail: 1,
+            backfill: u32::try_from(parallel).unwrap_or(u32::MAX),
+        },
+    ));
+    let provider = Arc::new(Provider::new(provider_url()?, config.clone(), limiter));
+    let rpc: Arc<dyn crate::collector::rpc::Rpc> = provider.clone();
+    let started = std::time::Instant::now();
+    let runtime = tokio::runtime::Runtime::new()?;
+    let mut report =
+        runtime.block_on(crate::collector::reverify::reverify(rpc, &config, &options))?;
+    report.set("durationSeconds", started.elapsed().as_secs_f64());
+    report.set_obj("requests", provider.counters());
+    println!("{}", report.to_json());
+    if report.get("ok") == Some(&Value::Bool(true)) {
+        Ok(())
+    } else {
+        Err(StoreError::Check(
+            "reverify found mismatches; nothing was changed (see the report)".into(),
+        ))
+    }
 }
 
 /// Offline commands run on the store directly; live commands move it to the writer thread.
