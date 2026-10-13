@@ -439,6 +439,10 @@ async fn verify_range(
         .join("ranges")
         .join(format!("{}-{}", window.0, window.1));
     let report_path = dir.join("report.json");
+    let pd_digest = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(programdata.as_bytes()))
+    };
     if let Ok(text) = std::fs::read_to_string(&report_path) {
         let value: Value =
             serde_json::from_str(&text).map_err(|e| StoreError::Check(e.to_string()))?;
@@ -446,12 +450,14 @@ async fn verify_range(
             range_files(&config.data_dir, "transactions", window.0, window.1)
                 .map(|files| files_digest(&files))
         })?;
-        if value.get("archiveFiles").and_then(Value::as_str) == Some(current.as_str()) {
+        let same = |key: &str, digest: &str| value.get(key).and_then(Value::as_str) == Some(digest);
+        if same("archiveFiles", &current) && same("programDataRows", &pd_digest) {
             return Ok(obj_of(value));
         }
-        // The catalog changed since this report: compare again (the finished walk is kept).
+        // The catalog or the ProgramData manifest changed since this report: compare again
+        // (the finished walk is kept).
         log(
-            "reverify_catalog_changed",
+            "reverify_inputs_changed",
             Obj::new().with("from", window.0).with("to", window.1),
         );
     }
@@ -496,6 +502,7 @@ async fn verify_range(
         .with("walkReachedFloor", reached)
         .with("startSlot", start.map(|(_, slot, _)| slot));
     report.set("ok", ok);
+    report.set("programDataRows", pd_digest);
     out.extend(report);
     out.set("verifiedAt", now());
     write_json(&report_path, &out)?;
