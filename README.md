@@ -10,6 +10,24 @@ now into older history. Each finished batch becomes available right away.
 Solana → raw transactions → decoded events → Parquet files → SQL
 ```
 
+![Phoenix perps data collection: sources, collection server, decoder, Parquet dataset with nightly off-site backup, research and models](docs/images/data-collection.jpg)
+
+## Tech stack
+
+| Layer | What we use |
+| --- | --- |
+| Language | Rust 1.96 (edition 2024), one binary: `solos-data` |
+| Runtime and HTTP | Tokio, reqwest (rustls, HTTP/2) |
+| Live data | Solana JSON-RPC |
+| History | Old Faithful archive, replayed through Jetstreamer |
+| Decoding | In-repo `phoenix-codec` and `solana-wire` crates |
+| Storage | Parquet with ZSTD, partitioned by epoch |
+| Queries | DuckDB 1.4.5 (bundled), SQL over the Parquet files |
+| Context data | Binance, Hyperliquid, Bybit, Deribit, DefiLlama, SEC EDGAR, Polymarket, Kalshi, Fear & Greed, Elfa |
+| Operations | systemd services and timers, a health check every 15 minutes, Docker Compose for local runs |
+| Backup | rclone to Cloudflare R2, nightly |
+| CI | GitHub Actions: fmt, clippy, tests |
+
 ## 1. Set up
 
 You need Docker and an Alchemy Solana mainnet RPC URL.
