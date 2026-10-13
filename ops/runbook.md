@@ -140,6 +140,27 @@ the oldest published transaction above the chunk; its `unverifiedFrom`..`unverif
 published without manifest rows and need re-validation (ADR-0008). `walk_cursor_unresolved` means
 the provider answered an empty page for a cursor and the walk continued from the row above it.
 
+Re-validate published ranges with the collector running (ADR-0008):
+
+```sh
+nice -n 10 env SOLOS_DATA_DB_MEMORY=1GB SOLOS_DATA_DB_THREADS=1 \
+  solos-data collector reverify --config config/phoenix.json \
+  --from 427163137 --to 428813136 --out ~/reverify/2026-10-13 --rps 50 --memory 32GB --threads 8
+```
+
+It needs `SOLANA_RPC_URL` (source `collector.env` in the same shell, never print it) and reads the
+raw root's catalog under a reader lease; it never opens the live checkpoint and writes only under
+`--out`, which must lie outside the raw root. Each published range gets a store under
+`--out/ranges/<from>-<to>/` (the slots it compares; the ProgramData walk is under
+`--out/programdata-<from>-<to>/`) (one DuckDB per range, hence the small `SOLOS_DATA_DB_*` values; `--memory`
+and `--threads` size the comparison connection), a `report.json` and, on a mismatch,
+`missing.csv`/`unlisted.csv`. An interrupted run resumes: walks continue from their stored cursor
+and ranges with a report are skipped while the published files and ProgramData rows behind it are unchanged (a changed
+catalog compares again; delete a range's directory to redo its walk). `--rps` caps its own
+requests (default 50/s, separate from the collector's limiter); `--parallel` bounds the ranges
+walked at once (default 32). It prints the summary, also written to `--out/report.json`, and exits
+1 when any range fails; it never rewrites published data.
+
 `tailEnabled: false` in `config/phoenix.json` runs the collector without the live tail: the archive
 lane backfills history (about 1.1 CU per slot for the manifest check, roughly 10M CU per wall-day
 at 280 CU/s) and the retention pass keeps running. The watermark stays put. Switching the tail back

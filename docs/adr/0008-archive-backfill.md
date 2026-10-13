@@ -118,3 +118,26 @@ page is confirmed from it, and a confirming page that lists rows below the curso
 chunk being collected is resumed from the oldest published transaction above the chunk
 (`walk_reseeded`); the slots it skips stay as published and are listed in the event. Open: the 33
 ranges above need a manifest re-walk and comparison before sealing; they stay unverified until then.
+
+Manifest re-verification, 2026-10-13: `collector reverify --from <slot> --to <slot> --out <dir>`
+re-walks the manifest the backfill uses (the program and its ProgramData account, through the same
+`walk_page`, fallback cursor included) and compares it with the published transactions, so the 33
+ranges above can be checked without stopping the collector. It never opens the live checkpoint: each
+published range intersecting the request (from the `<from>-<to>-<id>.parquet` names of the
+catalog's transaction files; slots only compacted files hold become a range from the catalog's
+coverage, overlapping tail republications are split so each slot lands in one range, and an
+unpublished slot is an error) gets its own DuckDB store under
+`--out`, keyed by the compared window,
+and its walk starts from the oldest published transaction above the range, with the next oldest as
+the fallback cursor, so ranges walk in parallel and a cursor the provider cannot resolve is
+confirmed like any other. The ProgramData walk runs once from the tip, and its signatures are never used as a
+program start cursor (the archive also keeps transactions that touch only ProgramData). The archive side is read
+from the catalog's Parquet under a reader lease, newest publication per signature, as `query` and
+the reseed anchor read it. Per range it reports manifest and archive counts, `missing` (listed, not
+published), `unlisted` (published, not listed), `slotMismatch`, and V6 (`unordered`,
+`badOrderingSlots`) exactly as range validation computes them, with samples inline and the full
+mismatch lists as CSV next to the range's store; a walk that ended on an unconfirmed empty page
+above its floor fails the range.
+Requests go through a limiter of their own (`--rps`, default 50 `getSignaturesForAddress` calls a
+second, which backs off on 429s like the collector's), so the running collector keeps its share.
+The command changes nothing in the raw root; a range that fails is repaired separately.

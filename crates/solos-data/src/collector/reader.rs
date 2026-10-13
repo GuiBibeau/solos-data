@@ -91,28 +91,7 @@ pub fn range_rows(
     to: i64,
 ) -> Result<Vec<Obj>, StoreError> {
     with_read_lease(root, || {
-        let catalog: Value =
-            serde_json::from_str(&std::fs::read_to_string(root.join("catalog.json"))?)
-                .map_err(|e| StoreError::Check(e.to_string()))?;
-        let epochs: std::collections::HashSet<i64> =
-            (from.div_euclid(432_000)..=to.div_euclid(432_000)).collect();
-        let files = catalog
-            .get("files")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let selected: Vec<&Value> = files
-            .iter()
-            .filter(|f| f.get("table_name").and_then(Value::as_str) == Some(table))
-            .filter(|f| {
-                let path = f.get("path").and_then(Value::as_str).unwrap_or("");
-                let in_epoch = epochs.iter().any(|e| path.contains(&format!("epoch={e}/")));
-                match path_range(path) {
-                    Some((a, b)) => in_epoch && a <= to && b >= from,
-                    None => in_epoch,
-                }
-            })
-            .collect();
+        let selected = range_files(root, table, from, to)?;
         if selected.is_empty() {
             return Ok(Vec::new());
         }
@@ -120,7 +99,7 @@ pub fn range_rows(
         let conn = memory_connection("4", &memory)?;
         conn.execute(
             "CREATE TABLE registrations AS SELECT value->>'path' AS path, value->>'created_at' AS created_at FROM json_each(?::JSON)",
-            [Value::Array(selected.iter().map(|f| (*f).clone()).collect()).to_string()],
+            [Value::Array(selected.clone()).to_string()],
         )?;
         let paths: Vec<String> = selected
             .iter()
@@ -138,8 +117,35 @@ pub fn range_rows(
     })
 }
 
+/// The catalog entries of `table` that can hold slots in `[from, to]`: ranged staging files
+/// whose name covers part of it and compacted files of the same epochs. The caller holds a
+/// reader lease while it reads them.
+pub fn range_files(root: &Path, table: &str, from: i64, to: i64) -> Result<Vec<Value>, StoreError> {
+    let catalog: Value = serde_json::from_str(&std::fs::read_to_string(root.join("catalog.json"))?)
+        .map_err(|e| StoreError::Check(e.to_string()))?;
+    let epochs: std::collections::HashSet<i64> =
+        (from.div_euclid(432_000)..=to.div_euclid(432_000)).collect();
+    let files = catalog
+        .get("files")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    Ok(files
+        .into_iter()
+        .filter(|f| f.get("table_name").and_then(Value::as_str) == Some(table))
+        .filter(|f| {
+            let path = f.get("path").and_then(Value::as_str).unwrap_or("");
+            let in_epoch = epochs.iter().any(|e| path.contains(&format!("epoch={e}/")));
+            match path_range(path) {
+                Some((a, b)) => in_epoch && a <= to && b >= from,
+                None => in_epoch,
+            }
+        })
+        .collect())
+}
+
 /// `<from>-<to>-<name>.parquet` → `(from, to)`.
-fn path_range(path: &str) -> Option<(i64, i64)> {
+pub fn path_range(path: &str) -> Option<(i64, i64)> {
     let name = path.rsplit('/').next()?;
     let stem = name.strip_suffix(".parquet")?;
     let mut parts = stem.splitn(3, '-');
