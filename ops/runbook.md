@@ -151,7 +151,8 @@ nice -n 10 env SOLOS_DATA_DB_MEMORY=1GB SOLOS_DATA_DB_THREADS=1 \
 It needs `SOLANA_RPC_URL` (source `collector.env` in the same shell, never print it) and reads the
 raw root's catalog under a reader lease; it never opens the live checkpoint and writes only under
 `--out`, which must lie outside the raw root. Each published range gets a store under
-`--out/ranges/<from>-<to>/` (one DuckDB per range, hence the small `SOLOS_DATA_DB_*` values; `--memory`
+`--out/ranges/<from>-<to>/` (the slots it compares; the ProgramData walk is under
+`--out/programdata-<from>-<to>/`) (one DuckDB per range, hence the small `SOLOS_DATA_DB_*` values; `--memory`
 and `--threads` size the comparison connection), a `report.json` and, on a mismatch,
 `missing.csv`/`unlisted.csv`. An interrupted run resumes: walks continue from their stored cursor
 and ranges with a report are skipped (delete a range's directory to redo it). `--rps` caps its own

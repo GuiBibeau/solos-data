@@ -45,43 +45,75 @@ const SAMPLE: i64 = 20;
 const WALK_KEY: &str = "walk/reverify";
 
 /// The published ranges that intersect `[from, to]`, from the `<from>-<to>-<id>.parquet` names
-/// of the catalog's transaction files, sorted. Errors when they leave a slot of `[from, to]`
-/// uncovered or overlap, since the comparison would then miss or double-count slots.
+/// of the catalog's transaction files, sorted. Slots no ranged file names but the catalog's
+/// published `coverage` holds (their files were compacted into unranged ones) become a range of
+/// their own. Errors when a slot of `[from, to]` is not published at all or ranged files overlap,
+/// since the comparison would then miss or double-count slots.
 pub fn published_ranges(
     files: &[Value],
+    coverage: &[(i64, i64)],
     from: i64,
     to: i64,
 ) -> Result<Vec<(i64, i64)>, StoreError> {
-    let mut ranges: Vec<(i64, i64)> = files
+    let mut named: Vec<(i64, i64)> = files
         .iter()
         .filter(|f| f.get("table_name").and_then(Value::as_str) == Some("transactions"))
         .filter_map(|f| f.get("path").and_then(Value::as_str))
         .filter_map(super::reader::path_range)
         .filter(|(a, b)| *a <= to && *b >= from)
         .collect();
-    ranges.sort_unstable();
-    ranges.dedup();
+    named.sort_unstable();
+    named.dedup();
+    let covered = |a: i64, b: i64| coverage.iter().any(|(x, y)| *x <= a && b <= *y);
+    let mut ranges = Vec::new();
     let mut expected = from;
-    for (i, (a, b)) in ranges.iter().enumerate() {
-        if *a > expected {
-            return Err(StoreError::Check(format!(
-                "published ranges leave slots {expected} to {} uncovered",
-                a - 1
-            )));
-        }
+    for (i, (a, b)) in named.iter().enumerate() {
         if i > 0 && *a < expected {
             return Err(StoreError::Check(format!(
                 "published ranges overlap at slot {a}"
             )));
         }
+        if *a > expected {
+            if !covered(expected, a - 1) {
+                return Err(StoreError::Check(format!(
+                    "slots {expected} to {} are not published",
+                    a - 1
+                )));
+            }
+            ranges.push((expected, a - 1));
+        }
+        ranges.push((*a, *b));
         expected = b + 1;
     }
     if expected <= to {
-        return Err(StoreError::Check(format!(
-            "published ranges leave slots {expected} to {to} uncovered"
-        )));
+        if !covered(expected, to) {
+            return Err(StoreError::Check(format!(
+                "slots {expected} to {to} are not published"
+            )));
+        }
+        ranges.push((expected, to));
     }
     Ok(ranges)
+}
+
+/// The catalog's published coverage as `(from, to)` pairs.
+#[must_use]
+pub fn catalog_coverage(catalog: &Value) -> Vec<(i64, i64)> {
+    let int = |v: &Value, k: &str| {
+        v.get(k).and_then(|x| {
+            x.as_i64()
+                .or_else(|| x.as_str().and_then(|s| s.parse().ok()))
+        })
+    };
+    catalog
+        .get("coverage")
+        .and_then(Value::as_array)
+        .map(|list| {
+            list.iter()
+                .filter_map(|c| Some((int(c, "from")?, int(c, "to")?)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The cursor a walk over a range starts from: the oldest published transaction above it (lowest
@@ -130,10 +162,13 @@ pub async fn walk_segment(rpc: &dyn Rpc, db: &Db, initial: Walk) -> Result<Walk,
 }
 
 /// Whether a finished walk listed everything down to its floor: its oldest row lies below the
-/// floor. A walk that ended on an empty page above the floor is the 2026-10-10 failure.
+/// floor, or it ended on an empty page the fallback cursor confirmed (the address has no older
+/// history), or the provider listed nothing at all. A walk that ended on an unconfirmed empty page
+/// above the floor is the 2026-10-10 failure.
 #[must_use]
 pub fn reached_floor(walk: &Walk) -> bool {
     walk.oldest_slot.is_some_and(|slot| slot < walk.floor)
+        || (walk.done && (walk.fallback.is_some() || walk.before.is_none()))
 }
 
 /// Compare the `manifest(signature, slot)` and `archive(signature, slot, tx_index,
@@ -353,7 +388,7 @@ async fn verify_range(
     let dir = options
         .out
         .join("ranges")
-        .join(format!("{}-{}", range.0, range.1));
+        .join(format!("{}-{}", window.0, window.1));
     let report_path = dir.join("report.json");
     if let Ok(text) = std::fs::read_to_string(&report_path) {
         let value: Value =
@@ -432,11 +467,21 @@ pub async fn reverify(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let ranges = published_ranges(&files, options.from, options.to)?;
+    let ranges = published_ranges(
+        &files,
+        &catalog_coverage(&catalog),
+        options.from,
+        options.to,
+    )?;
+    // Stores and reports are keyed by the compared window, so a later run over other bounds
+    // never reuses a walk or report that covered less.
+    let pd_dir = options
+        .out
+        .join(format!("programdata-{}-{}", options.from, options.to));
     let address = program_data(rpc.as_ref(), &config.program_id).await?;
     let pd_walk = walk_into(
         rpc.as_ref(),
-        &options.out.join("programdata"),
+        &pd_dir,
         make_walk(
             &address,
             Lane::Backfill,
@@ -446,7 +491,7 @@ pub async fn reverify(
         ),
     )
     .await?;
-    let pd_store = Store::open(&options.out.join("programdata"), super::schema::SCHEMA)?;
+    let pd_store = Store::open(&pd_dir, super::schema::SCHEMA)?;
     let pd_rows = pd_store.rows("SELECT signature, slot FROM signatures ORDER BY slot", &[])?;
     pd_store.close()?;
     let programdata =
@@ -625,34 +670,42 @@ CREATE TABLE archive (signature VARCHAR, slot BIGINT, tx_index INTEGER, single_i
             file("/r/staging/transactions/epoch=990/200-299-c.parquet"),
             file("/r/staging/transactions/epoch=989/100-199-a.parquet"),
             file("/r/staging/transactions/epoch=990/300-399-d.parquet"),
+            file("/r/open/compact-0f.parquet"),
             json!({"path": "/r/staging/signatures/epoch=989/0-99-x.parquet", "table_name": "signatures"}),
         ];
+        let none: [(i64, i64); 0] = [];
         assert_eq!(
-            published_ranges(&files, 150, 250).unwrap(),
+            published_ranges(&files, &none, 150, 250).unwrap(),
             [(100, 199), (200, 299)]
         );
-        assert_eq!(published_ranges(&files, 100, 399).unwrap().len(), 3);
-        assert!(
-            published_ranges(&files, 50, 250)
+        assert_eq!(published_ranges(&files, &none, 100, 399).unwrap().len(), 3);
+        let error = |files: &[Value], coverage: &[(i64, i64)], from, to| {
+            published_ranges(files, coverage, from, to)
                 .unwrap_err()
                 .to_string()
-                .contains("50 to 99")
+        };
+        assert!(error(&files, &none, 50, 250).contains("50 to 99"));
+        assert!(error(&files, &none, 100, 450).contains("400 to 450"));
+        // Slots whose ranged files were compacted away are published coverage: their own range.
+        let coverage = [(0, 420)];
+        assert_eq!(
+            published_ranges(&files, &coverage, 50, 410).unwrap(),
+            [(50, 99), (100, 199), (200, 299), (300, 399), (400, 410)]
         );
-        assert!(
-            published_ranges(&files, 100, 450)
-                .unwrap_err()
-                .to_string()
-                .contains("400 to 450")
-        );
+        assert!(error(&files, &coverage, 50, 450).contains("400 to 450"));
         let gap = [
             file("/r/t/epoch=1/100-199-a.parquet"),
             file("/r/t/epoch=1/250-299-a.parquet"),
         ];
-        assert!(
-            published_ranges(&gap, 100, 299)
-                .unwrap_err()
-                .to_string()
-                .contains("200 to 249")
+        assert!(error(&gap, &none, 100, 299).contains("200 to 249"));
+        let overlap = [
+            file("/r/t/epoch=1/100-199-a.parquet"),
+            file("/r/t/epoch=1/150-299-a.parquet"),
+        ];
+        assert!(error(&overlap, &none, 100, 299).contains("overlap"));
+        assert_eq!(
+            catalog_coverage(&json!({"coverage": [{"from": 1, "to": "9"}]})),
+            [(1, 9)]
         );
     }
 
@@ -681,11 +734,22 @@ CREATE TABLE archive (signature VARCHAR, slot BIGINT, tx_index INTEGER, single_i
     fn only_a_walk_below_its_floor_counts_as_complete() {
         let mut walk = make_walk("p", Lane::Backfill, "reverify", 100, 199);
         walk.done = true;
+        // A walk from the tip that listed nothing: the address has no history.
+        assert!(reached_floor(&walk));
+        // From a start cursor, an unconfirmed empty page is the 2026-10-10 failure.
+        walk.before = Some("anchor".into());
         assert!(!reached_floor(&walk));
         walk.oldest_slot = Some(100);
         assert!(!reached_floor(&walk));
         walk.oldest_slot = Some(99);
         assert!(reached_floor(&walk));
+        // An empty page confirmed from the fallback is the address's first signature.
+        walk.oldest_slot = Some(150);
+        assert!(!reached_floor(&walk));
+        walk.fallback = Some("second".into());
+        assert!(reached_floor(&walk));
+        walk.done = false;
+        assert!(!reached_floor(&walk));
     }
 
     /// Pages keyed by the `before` cursor; every other call fails.
