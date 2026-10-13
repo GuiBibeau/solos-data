@@ -130,7 +130,8 @@ unpublished slot is an error) gets its own DuckDB store under
 `--out`, keyed by the compared window,
 and its walk starts from the oldest published transaction above the range, with the next oldest as
 the fallback cursor, so ranges walk in parallel and a cursor the provider cannot resolve is
-confirmed like any other. The ProgramData walk runs once from the tip. The archive side is read
+confirmed like any other. The ProgramData walk runs once from the tip, and its signatures are never used as a
+program start cursor (the archive also keeps transactions that touch only ProgramData). The archive side is read
 from the catalog's Parquet under a reader lease, newest publication per signature, as `query` and
 the reseed anchor read it. Per range it reports manifest and archive counts, `missing` (listed, not
 published), `unlisted` (published, not listed), `slotMismatch`, and V6 (`unordered`,

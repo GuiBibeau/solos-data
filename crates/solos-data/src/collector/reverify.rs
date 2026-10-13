@@ -68,6 +68,9 @@ pub fn published_ranges(
     let mut ranges = Vec::new();
     let mut expected = from;
     for (a, b) in named {
+        if expected > to {
+            break;
+        }
         // Tail cycles republish `overlapSlots` below the watermark, so ranged files overlap;
         // each slot goes to one range and the newest publication per signature wins anyway.
         if b < expected {
@@ -127,10 +130,19 @@ pub fn catalog_coverage(catalog: &Value) -> Vec<(i64, i64)> {
 /// The cursor a walk over a range starts from: the oldest published transaction above it (lowest
 /// slot, then lowest index), with the next oldest as the fallback cursor, so a cursor the
 /// provider cannot resolve is confirmed from the row above it like any other walk (ADR-0008).
+/// Rows the ProgramData walk listed are skipped: the archive keeps transactions that touch only
+/// ProgramData, which the program's own listing cannot resolve as a cursor.
 #[must_use]
-pub fn start_cursor(rows: &[Obj]) -> Option<(String, i64, Option<String>)> {
+pub fn start_cursor(
+    rows: &[Obj],
+    programdata: &std::collections::HashSet<String>,
+) -> Option<(String, i64, Option<String>)> {
     let mut keyed: Vec<(i64, i64, String)> = rows
         .iter()
+        .filter(|row| {
+            row.str("signature")
+                .is_none_or(|s| !programdata.contains(s))
+        })
         .filter_map(|row| {
             Some((
                 row.int("slot")?,
@@ -417,6 +429,7 @@ async fn verify_range(
     config: &Config,
     options: &Options,
     programdata: Arc<String>,
+    programdata_signatures: Arc<std::collections::HashSet<String>>,
     compare_lock: Arc<tokio::sync::Mutex<()>>,
     range: (i64, i64),
 ) -> Result<Obj, StoreError> {
@@ -456,7 +469,7 @@ async fn verify_range(
         window.0,
         window.1,
     );
-    let start = start_cursor(&above);
+    let start = start_cursor(&above, &programdata_signatures);
     if let Some((signature, slot, fallback)) = &start {
         initial.before = Some(signature.clone());
         initial.last_slot = Some(*slot);
@@ -529,13 +542,9 @@ pub async fn reverify(
     let pd_walk = walk_into(
         rpc.as_ref(),
         &pd_dir,
-        make_walk(
-            &address,
-            Lane::Backfill,
-            "reverify",
-            options.from,
-            options.to,
-        ),
+        // No ceiling: ProgramData signatures above the request are what keeps the program walks'
+        // start cursors on program transactions.
+        make_walk(&address, Lane::Backfill, "reverify", options.from, i64::MAX),
     )
     .await?;
     let pd_store = Store::open(&pd_dir, super::schema::SCHEMA)?;
@@ -543,6 +552,19 @@ pub async fn reverify(
     pd_store.close()?;
     let programdata =
         Arc::new(Value::Array(pd_rows.iter().map(Obj::to_value).collect()).to_string());
+    let pd_signatures: Arc<std::collections::HashSet<String>> = Arc::new(
+        pd_rows
+            .iter()
+            .filter_map(|r| r.str("signature").map(str::to_owned))
+            .collect(),
+    );
+    let pd_in_window = pd_rows
+        .iter()
+        .filter(|r| {
+            r.int("slot")
+                .is_some_and(|s| (options.from..=options.to).contains(&s))
+        })
+        .count();
     let lock = Arc::new(tokio::sync::Mutex::new(()));
     let results: Vec<Result<Obj, StoreError>> = futures_util::stream::iter(ranges.clone())
         .map(|range| {
@@ -551,6 +573,7 @@ pub async fn reverify(
                 config,
                 options,
                 Arc::clone(&programdata),
+                Arc::clone(&pd_signatures),
                 Arc::clone(&lock),
                 range,
             )
@@ -586,7 +609,7 @@ pub async fn reverify(
         .with("walkPages", sum("walkPages"))
         .with(
             "programData",
-            json!({"rows": pd_rows.len(), "pages": pd_walk.pages, "walkReachedFloor": pd_reached}),
+            json!({"rows": pd_in_window, "rowsWalked": pd_rows.len(), "pages": pd_walk.pages, "walkReachedFloor": pd_reached}),
         )
         .with_rows("perRange", reports)
         .with("verifiedAt", now());
@@ -726,6 +749,15 @@ CREATE TABLE archive (signature VARCHAR, slot BIGINT, tx_index INTEGER, single_i
             [(100, 199), (200, 299)]
         );
         assert_eq!(published_ranges(&files, &none, 100, 399).unwrap().len(), 3);
+        // Nothing past the request, even when an overlapping range extends beyond it.
+        let tail = [
+            file("/r/t/epoch=1/100-199-a.parquet"),
+            file("/r/t/epoch=1/150-299-a.parquet"),
+        ];
+        assert_eq!(
+            published_ranges(&tail, &none, 160, 170).unwrap(),
+            [(100, 199)]
+        );
         let error = |files: &[Value], coverage: &[(i64, i64)], from, to| {
             published_ranges(files, coverage, from, to)
                 .unwrap_err()
@@ -775,12 +807,22 @@ CREATE TABLE archive (signature VARCHAR, slot BIGINT, tx_index INTEGER, single_i
             row("high", 200, Some(9)),
             row("low", 200, Some(3)),
         ];
+        let none = std::collections::HashSet::new();
         assert_eq!(
-            start_cursor(&rows),
+            start_cursor(&rows, &none),
             Some(("low".into(), 200, Some("high".into())))
         );
-        assert_eq!(start_cursor(&rows[..1]), Some(("later".into(), 201, None)));
-        assert_eq!(start_cursor(&[]), None);
+        assert_eq!(
+            start_cursor(&rows[..1], &none),
+            Some(("later".into(), 201, None))
+        );
+        assert_eq!(start_cursor(&[], &none), None);
+        // A ProgramData-only transaction is never a program cursor.
+        let pd = std::collections::HashSet::from(["low".to_owned()]);
+        assert_eq!(
+            start_cursor(&rows, &pd),
+            Some(("high".into(), 200, Some("later".into())))
+        );
     }
 
     #[test]
