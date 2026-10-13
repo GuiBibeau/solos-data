@@ -123,6 +123,8 @@ pub struct Outcome {
     pub requests: u64,
     /// Why the source did not run (a missing credential), when it did not.
     pub disabled: Option<String>,
+    /// How the source ran when it ran partly (Tardis.dev without a key: samples only).
+    pub note: Option<String>,
 }
 
 impl Outcome {
@@ -152,6 +154,10 @@ impl Outcome {
             .with("rows", self.rows)
             .with("errors", self.errors)
             .with("skipped", self.skipped);
+        let obj = match &self.note {
+            Some(note) => obj.with("note", note.as_str()),
+            None => obj,
+        };
         match &self.disabled {
             Some(reason) => obj.with("disabled", true).with("reason", reason.as_str()),
             None => obj,

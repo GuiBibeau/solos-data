@@ -37,6 +37,7 @@ fn config_for(server: &Server, root: &std::path::Path, source: &str) -> AugmentC
         &mut s.polymarket.enabled,
         &mut s.kalshi.enabled,
         &mut s.phoenix.enabled,
+        &mut s.tardis.enabled,
     ] {
         *enabled = false;
     }

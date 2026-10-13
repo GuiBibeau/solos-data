@@ -130,13 +130,14 @@ async fn run_sources(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Vec<
             }
         })
     };
-    let (binance, hyperliquid, deribit, defillama, bybit, exogenous) = tokio::join!(
+    let (binance, hyperliquid, deribit, defillama, bybit, exogenous, tardis) = tokio::join!(
         run_binance(ctx, config, filter),
         run_hyperliquid(ctx, config, filter),
         run_deribit(ctx, config, filter),
         run_defillama(ctx, config, filter),
         run_bybit(ctx, config, filter),
         run_exogenous(ctx, config, filter),
+        run_tardis(ctx, config, filter),
     );
     catalog_writer.abort();
     let (sec, alternative, polymarket, kalshi, phoenix) = exogenous;
@@ -151,6 +152,7 @@ async fn run_sources(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Vec<
         ("polymarket", polymarket),
         ("kalshi", kalshi),
         ("phoenix", phoenix),
+        ("tardis", tardis),
     ]
     .into_iter()
     .filter_map(|(name, outcome)| outcome.map(|o| (name.to_owned(), o)))
@@ -203,6 +205,14 @@ async fn run_exogenous(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Fi
                 .into()
         },
     )
+}
+
+async fn run_tardis(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option<Outcome> {
+    let cfg = &config.sources.tardis;
+    if !cfg.enabled || !filter.allows("tardis") {
+        return None;
+    }
+    Some(super::tardis::sync(ctx, cfg, &config.symbols, filter.symbol.as_deref()).await)
 }
 
 async fn run_binance(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option<Outcome> {

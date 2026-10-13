@@ -64,6 +64,9 @@ impl Fetched {
 /// Whole-request deadline of ordinary requests (head and body).
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The longest `Retry-After` the client waits out; a longer one fails the request at once.
+pub const MAX_RETRY_AFTER_SECONDS: u64 = 300;
+
 /// The shared client.
 pub struct Http {
     client: reqwest::Client,
@@ -335,12 +338,18 @@ fn classify(response: &reqwest::Response) -> Result<(), Retry> {
         return Err(Retry::Fatal(HttpError::NotFound));
     }
     if status == 429 || status >= 500 {
-        let retry_after = response
+        let seconds = response
             .headers()
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-            .map(|s| Duration::from_secs(s.min(300)));
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        // A host that asks for more than the longest wait is out of quota for hours (Tardis.dev
+        // answers 429 with a day-long Retry-After once the transfer limit is reached): retrying
+        // would only stall the run, so the request fails now and the caller decides.
+        if seconds.is_some_and(|s| s > MAX_RETRY_AFTER_SECONDS) {
+            return Err(Retry::Fatal(HttpError::Status(status)));
+        }
+        let retry_after = seconds.map(Duration::from_secs);
         return Err(Retry::Later(format!("HTTP {status}"), retry_after));
     }
     Err(Retry::Fatal(HttpError::Status(status)))

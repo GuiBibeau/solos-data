@@ -93,9 +93,11 @@ mkdir -p "$work/augment-meta"
 for f in catalog.json catalog-capture.json status.json status-capture.json; do
   if [ -f "$augment/$f" ]; then cp "$augment/$f" "$work/augment-meta/$f"; fi
 done
+# Tardis.dev files stay on the box: its licence (clause 9.5) requires written terms with any
+# external service provider before its data is disclosed to it (ADR-0009, Tardis.dev section).
 run_step augment-files 1 copy "$augment" "$dest/augment" --checksum --fast-list \
   --filter '- checkpoint.duckdb*' --filter '- /staging*/**' --filter '- *.tmp' \
-  --filter '- /catalog*.json' --filter '- /status*.json' || true
+  --filter '- /catalog*.json' --filter '- /status*.json' --filter '- /tables/tardis/**' || true
 
 run_step config 1 copy "$checkout/config" "$dest/config" --checksum --filter '- *.env' || true
 run_step units 1 copy "$units" "$dest/systemd-user" --checksum \
