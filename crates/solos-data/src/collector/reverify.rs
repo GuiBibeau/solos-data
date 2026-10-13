@@ -287,15 +287,36 @@ const MISSING: &str = "SELECT m.signature, m.slot FROM manifest m
 const UNLISTED: &str = "SELECT a.signature, a.slot, a.tx_index FROM archive a
   WHERE NOT EXISTS (SELECT 1 FROM manifest m WHERE m.signature=a.signature) ORDER BY a.slot, a.signature";
 
+/// A digest of the catalog entries a comparison read (path and content hash), so a stored report
+/// is reused only while the published files behind it are the same.
+#[must_use]
+pub fn files_digest(files: &[Value]) -> String {
+    use sha2::{Digest, Sha256};
+    let field = |f: &Value, k: &str| f.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+    let mut lines: Vec<String> = files
+        .iter()
+        .map(|f| format!("{}\t{}\n", field(f, "path"), field(f, "sha256")))
+        .collect();
+    lines.sort_unstable();
+    hex::encode(Sha256::digest(lines.concat().as_bytes()))
+}
+
 /// The newest publication per signature of the published transactions in `[from, to]`, into
-/// `archive`, read from the files `range_files` selects. Call it under a reader lease.
-pub fn load_archive(conn: &Connection, root: &Path, from: i64, to: i64) -> Result<(), StoreError> {
+/// `archive`, read from the files `range_files` selects; returns their [`files_digest`]. Call it
+/// under a reader lease.
+pub fn load_archive(
+    conn: &Connection,
+    root: &Path,
+    from: i64,
+    to: i64,
+) -> Result<String, StoreError> {
     let files = range_files(root, "transactions", from, to)?;
+    let digest = files_digest(&files);
     conn.execute_batch(
         "CREATE TABLE archive (signature VARCHAR, slot BIGINT, tx_index INTEGER, single_in_slot BOOLEAN)",
     )?;
     if files.is_empty() {
-        return Ok(());
+        return Ok(digest);
     }
     conn.execute(
         "CREATE TABLE registrations AS SELECT value->>'path' AS path, value->>'created_at' AS created_at FROM json_each(?::JSON)",
@@ -314,7 +335,7 @@ pub fn load_archive(conn: &Connection, root: &Path, from: i64, to: i64) -> Resul
   QUALIFY row_number() OVER (PARTITION BY p.signature ORDER BY p.created_at DESC, p.filename DESC)=1",
         paths.join(",")
     ))?;
-    Ok(())
+    Ok(digest)
 }
 
 /// One range: manifest from its walked store plus the ProgramData rows, archive from the
@@ -342,8 +363,9 @@ DETACH walked;"
         ),
         [programdata],
     )?;
-    with_read_lease(raw, || load_archive(&conn, raw, from, to))?;
-    let report = compare(&conn)?;
+    let digest = with_read_lease(raw, || load_archive(&conn, raw, from, to))?;
+    let mut report = compare(&conn)?;
+    report.set("archiveFiles", digest);
     for (name, sql, key) in [
         ("missing", MISSING, "missing"),
         ("unlisted", UNLISTED, "unlisted"),
@@ -407,7 +429,18 @@ async fn verify_range(
     if let Ok(text) = std::fs::read_to_string(&report_path) {
         let value: Value =
             serde_json::from_str(&text).map_err(|e| StoreError::Check(e.to_string()))?;
-        return Ok(obj_of(value));
+        let current = with_read_lease(&config.data_dir, || {
+            range_files(&config.data_dir, "transactions", window.0, window.1)
+                .map(|files| files_digest(&files))
+        })?;
+        if value.get("archiveFiles").and_then(Value::as_str) == Some(current.as_str()) {
+            return Ok(obj_of(value));
+        }
+        // The catalog changed since this report: compare again (the finished walk is kept).
+        log(
+            "reverify_catalog_changed",
+            Obj::new().with("from", window.0).with("to", window.1),
+        );
     }
     let above = super::reader::range_rows(
         &config.data_dir,
@@ -885,7 +918,17 @@ CREATE TABLE archive (signature VARCHAR, slot BIGINT, tx_index INTEGER, single_i
         std::fs::write(root.join("catalog.json"), catalog.to_string()).unwrap();
         let conn = conn();
         conn.execute_batch("DROP TABLE archive").unwrap();
-        load_archive(&conn, &root, 100, 199).unwrap();
+        let digest = load_archive(&conn, &root, 100, 199).unwrap();
+        assert_eq!(digest.len(), 64);
+        let files = range_files(&root, "transactions", 100, 199).unwrap();
+        assert_eq!(digest, files_digest(&files));
+        // Order does not matter; a changed content hash does.
+        let mut reversed = files.clone();
+        reversed.reverse();
+        assert_eq!(digest, files_digest(&reversed));
+        let mut changed = files.clone();
+        changed[0]["sha256"] = json!("other");
+        assert_ne!(digest, files_digest(&changed));
         rows(&conn, &[("a", 100), ("b", 100)], &[]);
         let report = compare(&conn).unwrap();
         assert_eq!(report.get("ok"), Some(&Value::Bool(true)), "{report:?}");

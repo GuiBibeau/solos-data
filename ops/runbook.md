@@ -155,7 +155,8 @@ raw root's catalog under a reader lease; it never opens the live checkpoint and 
 `--out/programdata-<from>-<to>/`) (one DuckDB per range, hence the small `SOLOS_DATA_DB_*` values; `--memory`
 and `--threads` size the comparison connection), a `report.json` and, on a mismatch,
 `missing.csv`/`unlisted.csv`. An interrupted run resumes: walks continue from their stored cursor
-and ranges with a report are skipped (delete a range's directory to redo it). `--rps` caps its own
+and ranges with a report are skipped while the published files behind it are unchanged (a changed
+catalog compares again; delete a range's directory to redo its walk). `--rps` caps its own
 requests (default 50/s, separate from the collector's limiter); `--parallel` bounds the ranges
 walked at once (default 32). It prints the summary, also written to `--out/report.json`, and exits
 1 when any range fails; it never rewrites published data.
