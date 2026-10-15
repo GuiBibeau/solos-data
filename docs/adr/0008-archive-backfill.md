@@ -153,3 +153,21 @@ transactions, 0 missing, 0 unlisted, 0 slot mismatches, 0 unordered rows, 0 bad 
 every walk past its floor, no unresolved cursor on the way. Each walk started from the oldest
 published transaction above its range and resolved it. The 33 ranges are verified against an
 independent manifest; nothing was changed in the raw root.
+
+Incident, 2026-10-14: with the live tail re-enabled on 2026-10-13 (catching up from 2026-10-05 on
+RPC) beside this lane, the collector's DuckDB reached its 32GB buffer limit at 07:22 UTC. A commit
+failed to roll back ("Failed to commit: Failed to rollback transaction. Cannot continue
+operation"), which leaves the connection unusable: from then on the archive lane failed every 30 s
+with `Out of Memory Error` and the tail with `Constraint Error: Duplicate key` on its
+`bulk/tail/<from>/<to>` progress record (already an `INSERT OR REPLACE`, so the duplicate comes
+from the poisoned index, not from the statement) and on a transaction signature. Nothing was
+published in either lane and nothing wrong was published; `backfill.next` stayed at 412113136.
+The process stayed active and its `status.json` fresh, so `solos-data health` warned only after
+its 120-minute backfill stall and never flagged the tail. The operator restarted the collector at
+02:51 UTC on 2026-10-15 with `SOLOS_DATA_DB_MEMORY=64GB` (a systemd drop-in; `ops/` now says 64GB),
+and both lanes resumed. Consequences: running the tail and this lane together needs the larger
+buffer; health now judges the tail watermark's advance (warn 15 min, critical 60 min) and each
+lane's run of consecutive errors with no chunk published (warn 3, critical 10, naming the lane and
+the error class), from a `lanes` object the collector writes to `status.json` (runbook, "Dataset
+health"). Recovering a poisoned connection without a restart is open
+(`docs/issues/002-poisoned-connection.md`).

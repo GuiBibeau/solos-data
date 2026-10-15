@@ -4,7 +4,8 @@
 //! space of the data volume, judged against the thresholds of `config/health.json`. The result
 //! is written to `health.json` (atomically) and summarized in one `health` log line with its
 //! `warn` and `critical` lists. Two checks need a previous observation (backfill movement and
-//! capture error growth); they read it from the previous `health.json`. Nothing under the raw
+//! capture error growth); they read it from the previous `health.json`. The collector lane checks
+//! (tail watermark staleness, per-lane error streaks) live in `health/lanes.rs`. Nothing under the raw
 //! or decoded roots is opened for writing and no DuckDB file is touched.
 
 use crate::fsutil::write_atomic;
@@ -15,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+mod lanes;
+pub use lanes::{error_class, lane_progress, progress_record};
 
 /// The thresholds; every field has a default, so the config file may name only some.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -34,6 +38,16 @@ pub struct Thresholds {
     pub raw_status_critical_minutes: i64,
     /// `backfill.next` unchanged for this long warns, minutes.
     pub backfill_stall_minutes: i64,
+    /// The tail watermark not advanced for this long warns while the tail is enabled, minutes.
+    pub tail_stale_warn_minutes: i64,
+    /// ... and for this long is critical, minutes.
+    pub tail_stale_critical_minutes: i64,
+    /// This many consecutive errors on a lane with no chunk published in between warns.
+    pub error_streak_warn: i64,
+    /// ... and this many is critical.
+    pub error_streak_critical: i64,
+    /// A streak counts only while its last error is younger than this, minutes.
+    pub error_streak_window_minutes: i64,
     /// The sync lane's `status.json` older than this warns, minutes (the timer runs hourly).
     pub sync_status_warn_minutes: i64,
     /// The capture lane's `status-capture.json` older than this warns, minutes (written every
@@ -57,6 +71,11 @@ impl Default for Thresholds {
             raw_status_warn_minutes: 10,
             raw_status_critical_minutes: 60,
             backfill_stall_minutes: 120,
+            tail_stale_warn_minutes: 15,
+            tail_stale_critical_minutes: 60,
+            error_streak_warn: 3,
+            error_streak_critical: 10,
+            error_streak_window_minutes: 30,
             sync_status_warn_minutes: 150,
             capture_status_warn_minutes: 10,
             elfa_cycle_warn_minutes: 150,
@@ -361,6 +380,8 @@ fn raw_section(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>, f: &mut Find
             "backfill.next unchanged for {unchanged_minutes} min"
         ));
     }
+    let tail = lanes::tail_section(status, t, now, f);
+    let streaks = lanes::streak_section(status, t, now, f);
     json!({
         "statusAgeSeconds": inputs.raw_status.age_s,
         "catalogFiles": at_path(inputs.raw_catalog.value.as_ref(), &["files"])
@@ -373,6 +394,8 @@ fn raw_section(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>, f: &mut Find
             "nextChangedAt": stamp(changed_at),
             "unchangedMinutes": unchanged_minutes,
         },
+        "tail": tail,
+        "errorStreaks": streaks,
     })
 }
 
@@ -513,11 +536,11 @@ pub fn run(paths: &Paths, t: &Thresholds) -> Result<Value, StoreError> {
 mod tests {
     use super::*;
 
-    fn at(text: &str) -> DateTime<Utc> {
+    pub(super) fn at(text: &str) -> DateTime<Utc> {
         parse_time(text).unwrap()
     }
 
-    fn snap(value: Value, age_s: i64) -> Snapshot {
+    pub(super) fn snap(value: Value, age_s: i64) -> Snapshot {
         Snapshot {
             bytes: value.to_string().len() as u64,
             value: Some(value),
@@ -529,7 +552,7 @@ mod tests {
         stamp(at(now) - chrono::Duration::minutes(minutes))
     }
 
-    fn healthy(now: &str) -> Inputs {
+    pub(super) fn healthy(now: &str) -> Inputs {
         let file = |batch: i64, created: &str| json!({ "path": format!("tables/events/epoch=1/b{batch}.parquet"), "batch_id": batch.to_string(), "created_at": created });
         Inputs {
             raw_status: snap(

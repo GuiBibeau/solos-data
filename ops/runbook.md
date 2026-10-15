@@ -363,6 +363,8 @@ of `config/health.json`; a field left out keeps its default.
 | decoder cadence | batch ids of non-compaction files created in the last 30 min | none while the raw catalog's `at` is newer than the newest batch | none for 120 min |
 | collector alive | raw `status.json` `at` | > 10 min old | > 60 min old |
 | backfill progress | raw `status.json` `backfill.next` against the previous `health.json` | unchanged for 120 min (not when `phase` is `complete`) | |
+| tail progress | raw `status.json` `watermark.completedAt` (written with every published tail chunk), only while the tail is enabled (`lanes.tail.enabled`) | not advanced for 15 min | not advanced for 60 min |
+| lane error streaks | raw `status.json` `lanes.{tail,backfill}`: consecutive `collector_error`s with no chunk published in between (the lane's progress marker unchanged), last error < 30 min old | 3 in a row | 10 in a row; the finding names the lane and the error class (`oom`, `constraint`, `rollback_failed`, `rpc`, `other`) |
 | augment sync | `status.json` age and `sources.*.errors` | > 150 min old, or errors in the last run | |
 | augment capture | `status-capture.json` age and the lanes' `errors` | > 10 min old, errors grown since the previous check, the Elfa credit guard tripped, the last Elfa hourly cycle > 150 min ago | |
 | disk free | `statvfs` of the raw root's parent | < 500 GB | < 100 GB |
@@ -387,6 +389,43 @@ and `transactionsProcessed`; `raw` has `statusAgeSeconds`, `catalogFiles` and
 `augment.capture` have their age and error totals (capture: since its `startedAt`); `disk` has
 `freeGb`. `nextChangedAt` and the capture error baseline come from the previous `health.json`,
 so deleting the file resets them (the first run cannot judge backfill movement).
+
+`raw.tail` has `watermarkSlot`, `watermarkAt`, `minutesSinceAdvance`, `headSlot` and `lagSlots`: a
+tail catching up (lag in the millions of slots after it was off for days) is fine as long as the
+watermark advances, so only the advance is judged. `raw.errorStreaks.<lane>` has the collector's
+`errorStreak`, the `current` count health judged (0 once the last error is older than the window
+or the lane published since), its `class`, `since` and `lastErrorAt`. The collector keeps the
+streaks in memory, not in DuckDB, so they are still counted when the database is what fails. A
+status from a collector older than this check has no `lanes`: the tail then falls back to
+`tailHealth.errorStreak` and `lastError`, and is judged only while a tail cycle is in flight or
+its streak is non-zero; the backfill streak needs the new collector.
+
+### 2026-10-14 incident: DuckDB out of memory with both lanes writing
+
+At 07:22 UTC on 2026-10-14 the collector's DuckDB reached its 32GB `SOLOS_DATA_DB_MEMORY` while
+the live tail (re-enabled on 2026-10-13, catching up from 2026-10-05) and the archive backfill
+wrote together. A commit then failed to roll back (`Failed to commit: Failed to rollback
+transaction. Cannot continue operation`), and from then on both lanes failed every 30 seconds: the
+backfill with `Out of Memory Error`, the tail with `Constraint Error: Duplicate key` on its
+`bulk/tail/<from>/<to>` progress record and on a transaction signature. The service stayed
+`active` and `status.json` stayed fresh, so health said `ok` until the backfill stall warned at
+120 min; the tail stall was never flagged. The two checks above now go critical within one timer
+run. The operator restarted the collector at 02:51 UTC on 2026-10-15 with the limit raised to
+64GB by a drop-in, which the unit in `ops/` now matches:
+
+```sh
+mkdir -p ~/.config/systemd/user/solos-data-phoenix.service.d
+printf '[Service]\nEnvironment=SOLOS_DATA_DB_MEMORY=64GB\n' \
+  > ~/.config/systemd/user/solos-data-phoenix.service.d/memory.conf
+systemctl --user daemon-reload
+systemctl --user cat solos-data-phoenix.service | grep DB_MEMORY   # the drop-in's line comes last and wins
+```
+
+A drop-in overrides the installed unit's `Environment=` line and survives copying a new unit from
+`ops/` over it; remove it once the installed unit says 64GB. The new value takes effect only on a
+restart, which needs the operator. A collector whose lanes both log `collector_error` every 30 s,
+`rollback_failed` then `constraint`, has a poisoned DuckDB connection: only a restart recovers it
+(`docs/issues/002-poisoned-connection.md`).
 
 ## Off-box backup
 
