@@ -394,7 +394,8 @@ so deleting the file resets them (the first run cannot judge backfill movement).
 tail catching up (lag in the millions of slots after it was off for days) is fine as long as the
 watermark advances, so only the advance is judged. `raw.errorStreaks.<lane>` has the collector's
 `errorStreak`, the `current` count health judged (0 once the last error is older than the window
-or the lane published since), its `class`, `since` and `lastErrorAt`. The collector keeps the
+or the lane published since: its progress marker moved, or its `watermark`/`backfill` record's
+`completedAt` is newer than the last error), its `class`, `since` and `lastErrorAt`. The collector keeps the
 streaks in memory, not in DuckDB, so they are still counted when the database is what fails. A
 status from a collector older than this check has no `lanes`: the tail then falls back to
 `tailHealth.errorStreak` and `lastError`, and is judged only while a tail cycle is in flight or

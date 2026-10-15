@@ -45,14 +45,25 @@ pub fn progress_record(lane: &str) -> &'static str {
     if lane == "tail" { "W" } else { "backfill" }
 }
 
-fn status_progress(status: &Value, lane: &str) -> Value {
+fn status_record<'a>(status: &'a Value, lane: &str) -> Option<&'a Value> {
     let field = if lane == "tail" {
         "watermark"
     } else {
         "backfill"
     };
-    status
-        .get(field)
+    status.get(field)
+}
+
+/// When the lane last published a chunk: its record's `completedAt`.
+fn published_at(status: &Value, lane: &str) -> Option<DateTime<Utc>> {
+    status_record(status, lane)
+        .and_then(|r| r.get("completedAt"))
+        .and_then(Value::as_str)
+        .and_then(parse_time)
+}
+
+fn status_progress(status: &Value, lane: &str) -> Value {
+    status_record(status, lane)
         .filter(|v| !v.is_null())
         .map_or(Value::Null, |record| lane_progress(lane, record))
 }
@@ -190,7 +201,12 @@ pub(super) fn streak_section(
         let Some(s) = streak(status, lane) else {
             continue;
         };
-        let moved = !s.progress.is_null() && status_progress(status, lane) != s.progress;
+        // A chunk published since the streak's last error ends it: the marker moved, or the lane's
+        // record was completed after that error. The second also covers an older collector,
+        // whose `tailHealth.errorStreak` is written only when a tail cycle ends, which during a
+        // catch-up is hours after the chunks resumed.
+        let moved = (!s.progress.is_null() && status_progress(status, lane) != s.progress)
+            || matches!((published_at(status, lane), s.last_at), (Some(p), Some(e)) if p > e);
         let recent = s
             .last_at
             .is_some_and(|at| (now - at).num_minutes() < t.error_streak_window_minutes);
@@ -322,6 +338,22 @@ mod tests {
             critical.contains("tail watermark not advanced for 1162 min"),
             "{critical}"
         );
+    }
+
+    #[test]
+    fn a_stale_streak_from_an_older_collector_is_ignored_once_chunks_publish() {
+        // The box at 03:09 on 2026-10-15, eighteen minutes after the restart: the tail publishes
+        // again, but the old collector's `tailHealth` still holds the streak from before.
+        let now = "2026-10-15T03:09:30Z";
+        let mut status = incident(now);
+        status.as_object_mut().unwrap().remove("lanes");
+        status["tailHealth"]["errorStreak"] = json!(1255);
+        status["lastError"] =
+            json!({ "lane": "tail", "error": OOM, "at": "2026-10-15T02:42:37.003Z" });
+        status["watermark"]["completedAt"] = json!("2026-10-15T03:08:11.192Z");
+        let health = judge(status, now);
+        assert_eq!(health["level"], "ok", "{health}");
+        assert_eq!(health["raw"]["errorStreaks"]["tail"]["progressMoved"], true);
     }
 
     #[test]
