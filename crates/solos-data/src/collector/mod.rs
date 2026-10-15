@@ -11,6 +11,7 @@ pub mod diagnostics;
 pub mod exchange;
 pub mod fetcher;
 pub mod history;
+pub mod lanes;
 pub mod limiter;
 pub mod maintenance;
 pub mod ordering;

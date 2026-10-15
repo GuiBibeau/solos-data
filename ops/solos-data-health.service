@@ -1,5 +1,5 @@
 [Unit]
-Description=solos-data dataset health check: decoded files, decoder cadence, backfill progress, augment lanes, disk free
+Description=solos-data dataset health check: decoded files, decoder cadence, backfill and tail progress, lane error streaks, augment lanes, disk free
 
 [Service]
 Type=oneshot

@@ -8,8 +8,12 @@ use crate::store::{Store, StoreError};
 use serde_json::Value;
 use std::path::Path;
 
-/// Build the status object.
-pub fn status(store: &mut Store, provider: Option<&Provider>) -> Result<Obj, StoreError> {
+/// Build the status object; `lanes` is the process's lane state (`Null` when there is none).
+pub fn status(
+    store: &mut Store,
+    provider: Option<&Provider>,
+    lanes: Value,
+) -> Result<Obj, StoreError> {
     let counts = store
         .rows(
             "SELECT
@@ -39,6 +43,7 @@ pub fn status(store: &mut Store, provider: Option<&Provider>) -> Result<Obj, Sto
     value.set_obj("checkpointCounts", counts);
     value.set("tailCycle", kv(store, "tail-active")?);
     value.set("tailHealth", kv(store, "tail-health")?);
+    value.set("lanes", lanes);
     value.set("exchange", kv(store, "exchange")?);
     match provider {
         Some(provider) => {
@@ -72,9 +77,10 @@ pub fn write_status(
     store: &mut Store,
     root: &Path,
     provider: Option<&Provider>,
+    lanes: Value,
 ) -> Result<(), StoreError> {
     write_catalog(store, root)?;
-    let body = status(store, provider)?;
+    let body = status(store, provider, lanes)?;
     write_atomic(
         &root.join("status.json"),
         format!("{}\n", body.to_json()).as_bytes(),

@@ -4,6 +4,7 @@
 use super::config::Config;
 use super::exchange::{Exchange, confirm_mainnet, refresh_exchange};
 use super::history::backfill;
+use super::lanes::Lanes;
 use super::maintenance::maintain;
 use super::pipeline::tail_cycle;
 use super::rpc::{Provider, Rpc};
@@ -25,7 +26,7 @@ fn rpc_code(message: &str) -> Option<i64> {
     rest[..end].parse().ok()
 }
 
-async fn record_error(db: &Db, provider: &Provider, lane: &str, error: &StoreError) {
+async fn record_error(db: &Db, provider: &Provider, lanes: &Lanes, lane: &str, error: &StoreError) {
     let detail = Obj::new()
         .with("lane", lane)
         .with("error", safe_error(&error.to_string()))
@@ -35,6 +36,14 @@ async fn record_error(db: &Db, provider: &Provider, lane: &str, error: &StoreErr
     let lane = lane.to_owned();
     let text = detail.str("error").unwrap_or("").to_owned();
     let at = detail.str("at").unwrap_or("").to_owned();
+    // Best effort: when the database is failing the marker is unreadable and the streak goes on.
+    let progress = db
+        .get(crate::health::progress_record(&lane))
+        .await
+        .ok()
+        .flatten()
+        .map(|record| crate::health::lane_progress(&lane, &record));
+    lanes.error(&lane, &text, &at, progress);
     let _ = db
         .run(move |store| {
             store.set("last-error", &value)?;
@@ -76,6 +85,7 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
         )
         .await?;
     }
+    let lanes = Arc::new(Lanes::new(config.tail_enabled, config.backfill_enabled));
     let stopped: Arc<AtomicBool> = Arc::clone(&provider.shutdown);
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stopped))?;
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stopped))?;
@@ -99,12 +109,13 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
     };
 
     let history = {
-        let (provider, db, config, exchange, stopped) = (
+        let (provider, db, config, exchange, stopped, lanes) = (
             Arc::clone(&provider),
             db.clone(),
             config.clone(),
             Arc::clone(&exchange),
             Arc::clone(&stopped),
+            Arc::clone(&lanes),
         );
         async move {
             if !config.backfill_enabled {
@@ -182,7 +193,7 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
                         if stopped.load(Ordering::Relaxed) {
                             return Ok(());
                         }
-                        record_error(&db, &provider, "backfill", &error).await;
+                        record_error(&db, &provider, &lanes, "backfill", &error).await;
                         if matches!(rpc_code(&error.to_string()), Some(401 | 403)) {
                             stopped.store(true, Ordering::Relaxed);
                             return Ok(());
@@ -196,13 +207,14 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
     };
 
     let follower = {
-        let (provider, db, config, exchange, stopped, http) = (
+        let (provider, db, config, exchange, stopped, http, lanes) = (
             Arc::clone(&provider),
             db.clone(),
             config.clone(),
             Arc::clone(&exchange),
             Arc::clone(&stopped),
             http.clone(),
+            Arc::clone(&lanes),
         );
         async move {
             let mut last_refresh = Instant::now();
@@ -225,6 +237,7 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
                     let rpc: Arc<dyn super::rpc::Rpc> = provider.clone();
                     if config.tail_enabled {
                         tail_cycle(rpc, &db, &config, &program_data).await?;
+                        lanes.success("tail", &now());
                     }
                     error_streak = 0;
                     if last_maintenance.elapsed()
@@ -245,7 +258,7 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
                         break;
                     }
                     error_streak += 1;
-                    record_error(&db, &provider, "tail", &error).await;
+                    record_error(&db, &provider, &lanes, "tail", &error).await;
                 }
                 let _ = db.set("tail-health", json!({ "errorStreak": error_streak, "cycleDurationSeconds": started.elapsed().as_secs_f64() })).await;
                 let delay = Duration::from_secs(config.tail_interval_seconds)
@@ -258,17 +271,19 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
     };
 
     let observer = {
-        let (provider, db, config, stopped) = (
+        let (provider, db, config, stopped, lanes) = (
             Arc::clone(&provider),
             db.clone(),
             config.clone(),
             Arc::clone(&stopped),
+            Arc::clone(&lanes),
         );
         async move {
             while !stopped.load(Ordering::Relaxed) {
                 let (provider2, root) = (Arc::clone(&provider), config.data_dir.clone());
+                let state = lanes.to_value();
                 let _ = db
-                    .run(move |store| write_status(store, &root, Some(provider2.as_ref())))
+                    .run(move |store| write_status(store, &root, Some(provider2.as_ref()), state))
                     .await;
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
@@ -280,7 +295,8 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
     history_result?;
     follower_result?;
     let (provider2, root) = (Arc::clone(&provider), config.data_dir.clone());
-    db.run(move |store| write_status(store, &root, Some(provider2.as_ref())))
+    let state = lanes.to_value();
+    db.run(move |store| write_status(store, &root, Some(provider2.as_ref()), state))
         .await?;
     log(
         "collector_stopped",
