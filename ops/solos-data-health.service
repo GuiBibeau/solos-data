@@ -7,6 +7,7 @@ WorkingDirectory=%h/solos-data
 Environment=SOLOS_DATA_RAW_DIR=%h/.local/share/solos-data/phoenix_raw
 Environment=SOLOS_DATA_DECODED_DIR=%h/.local/share/solos-data/phoenix_decoded/v1
 Environment=SOLOS_DATA_AUGMENT_DIR=%h/.local/share/solos-data/augment
+Environment=SOLOS_DATA_STATE_DIR=%h/.local/share/solos-data/phoenix_state
 Environment=SOLOS_DATA_HEALTH_FILE=%h/.local/share/solos-data/health.json
 ExecStart=%h/.local/share/solos-data/bin/solos-data health --config config/health.json
 # Service activity is not the binary's business: one JSON line with each unit's state.

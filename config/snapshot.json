@@ -13,6 +13,7 @@
     "spline_collection": 60,
     "perp_asset_map": 300,
     "global_trader_index": 60,
+    "active_trader_buffer": 60,
     "trader": 0
   },
   "rawBaselineSeconds": {

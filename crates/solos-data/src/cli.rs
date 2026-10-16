@@ -741,7 +741,7 @@ fn status_errors(status: &Obj) -> i64 {
 const SNAPSHOT_COMMANDS: [(&str, &str); 7] = [
     (
         "run",
-        "Long-running state snapshots: books, splines and the trader index every bookIntervalSeconds, the perp asset map every marketIntervalSeconds, every trader account every traderIntervalSeconds: [--duration-seconds N]",
+        "Long-running state snapshots: books, splines, the trader index and the active trader buffer every bookIntervalSeconds, the perp asset map every marketIntervalSeconds, every trader account every traderIntervalSeconds: [--duration-seconds N]",
     ),
     (
         "once",
@@ -755,7 +755,7 @@ const SNAPSHOT_COMMANDS: [(&str, &str); 7] = [
     ("catalog", "Read catalog.json"),
     (
         "query",
-        "Read-only SQL over the catalogued files: --sql SELECT ... FROM book_orders | book_snapshots | splines | market_state | traders | trader_positions | trader_index | raw_accounts",
+        "Read-only SQL over the catalogued files: --sql SELECT ... FROM book_orders | book_snapshots | splines | market_state | traders | trader_positions | trader_index | active_positions | raw_accounts",
     ),
     (
         "account",

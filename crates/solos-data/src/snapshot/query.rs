@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Run `sql` with a view per dataset (`raw_accounts`, `book_snapshots`, `book_orders`,
-/// `splines`, `market_state`, `trader_index`, `traders`, `trader_positions`).
+/// `splines`, `market_state`, `trader_index`, `traders`, `trader_positions`, `active_positions`).
 pub fn query_state(root: &Path, sql: &str) -> Result<Obj, StoreError> {
     let head = sql.trim_start().to_lowercase();
     if !["select", "with", "describe", "show", "summarize"]

@@ -3,15 +3,19 @@
 //! decimals, funding interval and period, open-interest cap, liquidation size and a recent
 //! open-interest and cumulative-funding snapshot; the order book headers and the perp asset map
 //! must agree with it. The trader index must hold exactly the trader accounts a program scan
-//! finds, with the same collateral, and resting orders' `trader_id`s must resolve through it.
+//! finds, and resting orders' `trader_id`s must resolve through it. The active trader buffer,
+//! read in the same call as each batch of order books, must carry every (trader, market) with
+//! resting orders, with the same best prices and resting lots the books show. Open interest is
+//! rebuilt from positions (the buffer for hot traders, trader accounts for the rest) and compared
+//! with the perp asset map.
 
-use super::decode::{self, TraderIndex};
+use super::decode::{self, ActivePosition, TraderIndex};
 use super::rpc::StateRpc;
 use super::service::Exchange;
 use crate::jsonout::Obj;
 use phoenix_rise_accounts::owned::{Orderbook, PerpAssetMapOwned, SplineCollection, Trader};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Default)]
 struct Checks {
@@ -38,6 +42,94 @@ fn num(v: Option<&Value>) -> Option<i128> {
         Value::String(s) => s.parse().ok(),
         _ => None,
     }
+}
+
+/// One trader's resting orders in one market, as the order book shows them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Resting {
+    /// Lowest ask in ticks (0 without asks).
+    pub best_ask_ticks: u64,
+    /// Highest bid in ticks (0 without bids).
+    pub best_bid_ticks: u64,
+    /// Non-reduce-only ask base lots.
+    pub ask_lots: u64,
+    /// Reduce-only ask base lots.
+    pub ask_reduce_only_lots: u64,
+    /// Non-reduce-only bid base lots.
+    pub bid_lots: u64,
+    /// Reduce-only bid base lots.
+    pub bid_reduce_only_lots: u64,
+}
+
+impl Resting {
+    /// The same summary as the active trader buffer holds it.
+    #[must_use]
+    pub fn of_active(p: &ActivePosition) -> Resting {
+        Resting {
+            best_ask_ticks: u64::from(p.best_ask_ticks),
+            best_bid_ticks: u64::from(p.best_bid_ticks),
+            ask_lots: u64::from(p.ask_lots),
+            ask_reduce_only_lots: u64::from(p.ask_reduce_only_lots),
+            bid_lots: u64::from(p.bid_lots),
+            bid_reduce_only_lots: u64::from(p.bid_reduce_only_lots),
+        }
+    }
+}
+
+/// Add a book's resting orders, per (trader id, asset id), to `into`.
+pub fn summarize_book(book: &Orderbook, into: &mut HashMap<(u32, u32), Resting>) {
+    for (ask, side) in [(true, &book.asks), (false, &book.bids)] {
+        for e in side {
+            let Some(trader) = e.order.trader_position_id.trader_id else {
+                continue;
+            };
+            let r = into
+                .entry((trader, e.order.trader_position_id.asset_id))
+                .or_default();
+            let price = e.order_id.price_in_ticks.as_inner();
+            let lots = e.order.num_base_lots_remaining;
+            match (ask, e.order.reduce_only) {
+                (true, false) => r.ask_lots += lots,
+                (true, true) => r.ask_reduce_only_lots += lots,
+                (false, false) => r.bid_lots += lots,
+                (false, true) => r.bid_reduce_only_lots += lots,
+            }
+            if ask && (r.best_ask_ticks == 0 || price < r.best_ask_ticks) {
+                r.best_ask_ticks = price;
+            }
+            if !ask && price > r.best_bid_ticks {
+                r.best_bid_ticks = price;
+            }
+        }
+    }
+}
+
+/// Compare the buffer with the books of `assets`: `(pairs compared, book pairs missing from the
+/// buffer, mismatches)`.
+#[must_use]
+pub fn compare_active(
+    positions: &[ActivePosition],
+    assets: &HashSet<u32>,
+    books: &HashMap<(u32, u32), Resting>,
+) -> (u64, u64, Vec<Value>) {
+    let mut compared = 0;
+    let mut mismatches = Vec::new();
+    let mut seen = HashSet::new();
+    for p in positions.iter().filter(|p| assets.contains(&p.asset_id)) {
+        compared += 1;
+        seen.insert((p.trader_id, p.asset_id));
+        let book = books
+            .get(&(p.trader_id, p.asset_id))
+            .copied()
+            .unwrap_or_default();
+        let buffer = Resting::of_active(p);
+        if book != buffer {
+            mismatches.push(json!({ "traderId": p.trader_id, "assetId": p.asset_id,
+                "book": format!("{book:?}"), "buffer": format!("{buffer:?}") }));
+        }
+    }
+    let missing = books.keys().filter(|k| !seen.contains(*k)).count() as u64;
+    (compared, missing, mismatches)
 }
 
 /// Validate a live read against the exchange view.
@@ -129,10 +221,13 @@ pub async fn validate(
     }
     let oi_equal = oi_gaps.iter().filter(|g| g["decoded"] == g["view"]).count();
     // Trader index and trader accounts.
-    let answer = rpc
-        .multiple(&exchange.index)
-        .await
-        .map_err(|e| e.to_string())?;
+    let keys: Vec<String> = exchange
+        .index
+        .iter()
+        .chain(&exchange.active)
+        .cloned()
+        .collect();
+    let answer = rpc.multiple(&keys).await.map_err(|e| e.to_string())?;
     let buffers: Vec<&[u8]> = answer
         .accounts
         .iter()
@@ -143,8 +238,22 @@ pub async fn validate(
         })
         .collect::<Result<_, _>>()?;
     let index_slot = answer.slot;
-    let index = TraderIndex::decode(buffers[0], &buffers[1..])?;
+    let (index_buffers, active_buffers) = buffers.split_at(exchange.index.len());
+    let index = TraderIndex::decode(index_buffers[0], &index_buffers[1..])?;
     let ids = index.ids();
+    let active = match active_buffers.split_first() {
+        Some((header, arenas)) => decode::decode_active(header, arenas)?,
+        None => Vec::new(),
+    };
+    // Open interest rebuilt from positions: hot traders from the buffer, the rest from accounts.
+    let mut longs: HashMap<u64, i128> = HashMap::new();
+    for p in &active {
+        if p.base_lot_position > 0 {
+            *longs.entry(u64::from(p.asset_id)).or_default() += i128::from(p.base_lot_position);
+        }
+    }
+    let active_traders: HashSet<u32> = active.iter().map(|p| p.trader_id).collect();
+    let mut hot_not_in_buffer = 0u64;
     let prefix = decode::trader_prefix();
     let mut cursor: Option<String> = None;
     let mut scanned: HashSet<String> = HashSet::new();
@@ -168,6 +277,20 @@ pub async fn validate(
             scanned.insert(account.pubkey.clone());
             let is_hot = t.state.flags & 1 != 0;
             hot += u64::from(is_hot);
+            let in_buffer = ids
+                .get(account.pubkey.as_str())
+                .is_some_and(|id| active_traders.contains(id));
+            if is_hot && !in_buffer {
+                hot_not_in_buffer += 1;
+            }
+            if !is_hot {
+                for (asset, p) in &t.positions.entries {
+                    let lots = p.base_lot_position.as_inner();
+                    if lots > 0 {
+                        *longs.entry(*asset).or_default() += i128::from(lots);
+                    }
+                }
+            }
             match ids
                 .get(account.pubkey.as_str())
                 .and_then(|id| index.by_id.get(id))
@@ -219,13 +342,24 @@ pub async fn validate(
     );
     // Order books and splines against the view and the index.
     let (mut orders, mut resolved, mut splines, mut spline_known) = (0u64, 0u64, 0u64, 0u64);
-    for chunk in exchange.markets.chunks(50) {
-        let keys: Vec<String> = chunk
+    let (mut active_compared, mut active_missing) = (0u64, 0u64);
+    let mut active_mismatches = Vec::new();
+    let per_call = ((100 - exchange.active.len()) / 2).max(1);
+    for chunk in exchange.markets.chunks(per_call) {
+        let mut keys: Vec<String> = chunk
             .iter()
             .flat_map(|m| [m.book.clone(), m.spline.clone()])
             .collect();
+        keys.extend(exchange.active.iter().cloned());
         let answer = rpc.multiple(&keys).await.map_err(|e| e.to_string())?;
-        for (market, pair) in chunk.iter().zip(answer.accounts.chunks(2)) {
+        let (pairs, buffer) = answer.accounts.split_at(chunk.len() * 2);
+        let buffer: Vec<&[u8]> = buffer
+            .iter()
+            .filter_map(|a| a.as_ref().map(|a| a.data.as_slice()))
+            .collect();
+        let mut resting = HashMap::new();
+        let mut assets = HashSet::new();
+        for (market, pair) in chunk.iter().zip(pairs.chunks(2)) {
             let Some(book) = pair[0].as_ref() else {
                 c.check(false, "order book exists", json!(market.symbol));
                 continue;
@@ -262,6 +396,8 @@ pub async fn validate(
                 "bids descend and asks ascend",
                 json!(market.symbol),
             );
+            summarize_book(&b, &mut resting);
+            assets.insert(b.header.asset_id);
             for e in b.bids.iter().chain(&b.asks) {
                 if let Some(id) = e.order.trader_position_id.trader_id {
                     orders += 1;
@@ -288,7 +424,43 @@ pub async fn validate(
                 }
             }
         }
+        if let Some((header, arenas)) = buffer.split_first() {
+            let same_slot = decode::decode_active(header, arenas)?;
+            let (compared, missing, mismatched) = compare_active(&same_slot, &assets, &resting);
+            active_compared += compared;
+            active_missing += missing;
+            active_mismatches.extend(mismatched);
+        }
     }
+    if !exchange.active.is_empty() {
+        c.check(
+            active_missing == 0,
+            "every (trader, market) with resting orders is in the active trader buffer",
+            json!(active_missing),
+        );
+        c.check(
+            active_mismatches.is_empty(),
+            "active trader buffer best prices and resting lots = order books",
+            json!({ "compared": active_compared, "mismatched": active_mismatches.len(),
+                "sample": active_mismatches.iter().take(5).collect::<Vec<_>>() }),
+        );
+        c.check(
+            hot_not_in_buffer == 0,
+            "every hot trader is in the active trader buffer",
+            json!(hot_not_in_buffer),
+        );
+    }
+    let mut oi_rebuilt = Vec::new();
+    for (symbol, m) in map.iter() {
+        let asset = u64::from(m.static_market_params.asset_id);
+        let rebuilt = longs.get(&asset).copied().unwrap_or(0);
+        let decoded = i128::from(m.open_interest_params.open_interest.as_inner());
+        oi_rebuilt.push(
+            json!({ "symbol": symbol, "mapOpenInterest": decoded.to_string(),
+            "fromPositions": rebuilt.to_string(), "equal": rebuilt == decoded }),
+        );
+    }
+    let oi_rebuilt_equal = oi_rebuilt.iter().filter(|g| g["equal"] == true).count();
     c.check(
         resolved == orders,
         "every resting order's trader_id is an index node",
@@ -327,6 +499,21 @@ pub async fn validate(
         .with("collateralDiffersFromIndex", collateral_diff)
         .with("restingOrdersWithTraderId", orders)
         .with("restingOrdersResolved", resolved)
+        .with("activeTraderBufferPositions", active.len())
+        .with("activeBufferPairsComparedToBooks", active_compared)
+        .with("hotTradersNotInActiveBuffer", hot_not_in_buffer)
+        .with("openInterestFromPositionsEqual", oi_rebuilt_equal)
+        .with("openInterestFromPositionsCompared", oi_rebuilt.len())
+        .with(
+            "openInterestFromPositionsSample",
+            Value::Array(
+                oi_rebuilt
+                    .into_iter()
+                    .filter(|g| g["equal"] != true)
+                    .take(10)
+                    .collect(),
+            ),
+        )
         .with("activeSplines", splines)
         .with("activeSplineTradersInIndex", spline_known))
 }

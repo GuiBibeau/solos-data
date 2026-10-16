@@ -3,7 +3,9 @@
 //! collections, the perp asset map and trader accounts. The global trader index, which maps the
 //! `trader_id` of a resting order to a trader account, has no decoder in that SDK; its layout is
 //! decoded here (a sokoban red-black tree of `Pubkey -> TraderState` nodes in multi-arena
-//! accounts) and checked live against the trader accounts (ADR-0011).
+//! accounts) and checked live against the trader accounts (ADR-0011). So is the active trader
+//! buffer, the same kind of tree keyed by (trader id, asset id), which holds hot traders' live
+//! positions and resting-order summaries.
 //!
 //! Every row is a JSON object staged as one NDJSON line; integers stay exact (u64 and i64 as
 //! JSON numbers, i128 as decimal strings).
@@ -62,6 +64,8 @@ pub fn kind_of(data: &[u8]) -> &'static str {
         Some(PhoenixAccount::Trader) => "trader",
         Some(PhoenixAccount::GlobalTraderIndexHeader) => "global_trader_index",
         Some(PhoenixAccount::GlobalTraderIndexArenaHeader) => "global_trader_index",
+        Some(PhoenixAccount::ActiveTraderBufferHeader) => "active_trader_buffer",
+        Some(PhoenixAccount::ActiveTraderBufferArenaHeader) => "active_trader_buffer",
         Some(_) => "other",
         None => "unknown",
     }
@@ -129,79 +133,123 @@ fn i64_at(data: &[u8], offset: usize) -> Option<i64> {
     ))
 }
 
+/// Superblock facts of a sokoban multi-arena red-black tree.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TreeInfo {
+    /// Allocated nodes.
+    pub size: u32,
+    /// Accounts the tree spans (header account included).
+    pub num_arenas: u16,
+    /// Nodes per arena.
+    pub nodes_per_arena: u32,
+}
+
+/// Live tree nodes: `(node pointer, node bytes)` in key order.
+pub type TreeNodes<'a> = Vec<(u32, &'a [u8])>;
+
+/// Walk a sokoban multi-arena red-black tree in key order: `| header (48) | superblock (32) |
+/// tree header (16) | nodes |` in the first account, `| arena header (32) | nodes |` in the
+/// others; a node is four u32 registers (left, right, parent, color) then key and value. Returns
+/// the superblock facts and `(node pointer, node bytes)` for every live node. Cycles, pointers out
+/// of range and a node count different from the superblock's are errors.
+pub fn walk_tree<'a>(
+    name: &str,
+    kind: &str,
+    header: &'a [u8],
+    arenas: &[&'a [u8]],
+    node_size: usize,
+) -> Result<(TreeInfo, TreeNodes<'a>), String> {
+    if kind_of(header) != kind {
+        return Err(format!("{name} discriminant mismatch"));
+    }
+    let sb = INDEX_HEADER;
+    let bad = || format!("{name} is truncated");
+    let info = TreeInfo {
+        size: u32_at(header, sb).ok_or_else(bad)?,
+        num_arenas: u16_at(header, sb + 4).ok_or_else(bad)?,
+        nodes_per_arena: u32_at(header, sb + 8).ok_or_else(bad)?,
+    };
+    let root = u32_at(header, sb + SUPERBLOCK).ok_or_else(bad)?;
+    let per_arena = info.nodes_per_arena;
+    if per_arena == 0 {
+        return Err(format!("{name} has no nodes per arena"));
+    }
+    if usize::from(info.num_arenas) > arenas.len() + 1 {
+        return Err(format!(
+            "{name} spans {} accounts, {} known",
+            info.num_arenas,
+            arenas.len() + 1
+        ));
+    }
+    let mut buffers: Vec<&[u8]> = vec![
+        header
+            .get(INDEX_HEADER + SUPERBLOCK + TREE_HEADER..)
+            .ok_or_else(bad)?,
+    ];
+    for arena in arenas {
+        buffers.push(arena.get(ARENA_HEADER..).ok_or_else(bad)?);
+    }
+    let node = |pointer: u32| -> Option<&'a [u8]> {
+        let page = pointer.checked_sub(1)?;
+        let arena = buffers.get((page / per_arena) as usize)?;
+        let start = (page % per_arena) as usize * node_size;
+        arena.get(start..start + node_size)
+    };
+    let mut out: TreeNodes<'a> = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut stack = Vec::new();
+    let mut current = root;
+    let limit = info.size as usize + 1;
+    while current != 0 || !stack.is_empty() {
+        while current != 0 {
+            if stack.len() > limit {
+                return Err(format!("{name} tree is cyclic"));
+            }
+            stack.push(current);
+            current = u32_at(node(current).ok_or_else(bad)?, 0).ok_or_else(bad)?;
+        }
+        let Some(pointer) = stack.pop() else { break };
+        let bytes = node(pointer).ok_or_else(bad)?;
+        if !visited.insert(pointer) || out.len() >= limit {
+            return Err(format!("{name} tree revisits a node"));
+        }
+        out.push((pointer, bytes));
+        current = u32_at(bytes, 4).ok_or_else(bad)?;
+    }
+    if out.len() != info.size as usize {
+        return Err(format!(
+            "{name} walk found {} of {} nodes",
+            out.len(),
+            info.size
+        ));
+    }
+    Ok((info, out))
+}
+
 impl TraderIndex {
     /// Decode the header account and its arena accounts (in the exchange view's order).
     pub fn decode(header: &[u8], arenas: &[&[u8]]) -> Result<TraderIndex, String> {
-        if kind_of(header) != "global_trader_index" {
-            return Err("global trader index discriminant mismatch".into());
+        let name = "global trader index";
+        let (info, nodes) = walk_tree(name, "global_trader_index", header, arenas, INDEX_NODE)?;
+        let bad = || format!("{name} node is truncated");
+        let mut by_id = BTreeMap::new();
+        for (pointer, bytes) in nodes {
+            by_id.insert(
+                pointer,
+                IndexEntry {
+                    trader_id: pointer,
+                    trader: bs58::encode(&bytes[16..48]).into_string(),
+                    collateral: i64_at(bytes, 48).ok_or_else(bad)?,
+                    flags: u32_at(bytes, 56).ok_or_else(bad)?,
+                },
+            );
         }
-        let sb = INDEX_HEADER;
-        let bad = || "global trader index is truncated".to_owned();
-        let size = u32_at(header, sb).ok_or_else(bad)?;
-        let num_arenas = u16_at(header, sb + 4).ok_or_else(bad)?;
-        let nodes_per_arena = u32_at(header, sb + 8).ok_or_else(bad)?;
-        let root = u32_at(header, sb + SUPERBLOCK).ok_or_else(bad)?;
-        if nodes_per_arena == 0 {
-            return Err("global trader index has no nodes per arena".into());
-        }
-        if usize::from(num_arenas) > arenas.len() + 1 {
-            return Err(format!(
-                "global trader index spans {num_arenas} accounts, {} known",
-                arenas.len() + 1
-            ));
-        }
-        let mut buffers: Vec<&[u8]> = vec![
-            header
-                .get(INDEX_HEADER + SUPERBLOCK + TREE_HEADER..)
-                .ok_or_else(bad)?,
-        ];
-        for arena in arenas {
-            buffers.push(arena.get(ARENA_HEADER..).ok_or_else(bad)?);
-        }
-        let node = |pointer: u32| -> Option<&[u8]> {
-            let page = pointer.checked_sub(1)?;
-            let arena = buffers.get((page / nodes_per_arena) as usize)?;
-            let start = (page % nodes_per_arena) as usize * INDEX_NODE;
-            arena.get(start..start + INDEX_NODE)
-        };
-        let mut index = TraderIndex {
-            by_id: BTreeMap::new(),
-            size,
-            num_arenas,
-            nodes_per_arena,
-        };
-        // In-order walk with an explicit stack, bounded by the allocated size.
-        let mut stack = Vec::new();
-        let mut current = root;
-        let limit = size as usize + 1;
-        while current != 0 || !stack.is_empty() {
-            while current != 0 {
-                if stack.len() > limit {
-                    return Err("global trader index tree is cyclic".into());
-                }
-                stack.push(current);
-                current = u32_at(node(current).ok_or_else(bad)?, 0).ok_or_else(bad)?;
-            }
-            let Some(pointer) = stack.pop() else { break };
-            let bytes = node(pointer).ok_or_else(bad)?;
-            let entry = IndexEntry {
-                trader_id: pointer,
-                trader: bs58::encode(&bytes[16..48]).into_string(),
-                collateral: i64_at(bytes, 48).ok_or_else(bad)?,
-                flags: u32_at(bytes, 56).ok_or_else(bad)?,
-            };
-            if index.by_id.insert(pointer, entry).is_some() || index.by_id.len() > limit {
-                return Err("global trader index tree revisits a node".into());
-            }
-            current = u32_at(bytes, 4).ok_or_else(bad)?;
-        }
-        if index.by_id.len() != size as usize {
-            return Err(format!(
-                "global trader index walk found {} of {size} traders",
-                index.by_id.len()
-            ));
-        }
-        Ok(index)
+        Ok(TraderIndex {
+            by_id,
+            size: info.size,
+            num_arenas: info.num_arenas,
+            nodes_per_arena: info.nodes_per_arena,
+        })
     }
 
     /// Trader address for a node pointer.
@@ -233,6 +281,131 @@ impl TraderIndex {
             })
             .collect()
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Active trader buffer
+
+/// Registers (16) + `TraderPositionId` key (trader_id u32, asset_id u32) + the position (base
+/// lots i64, virtual quote lots i64, cumulative funding snapshot i64, position sequence u8,
+/// accumulated funding i56; the trader account's 32-byte layout) + the order state: per side a
+/// u32 best price in ticks and a u32 reference, then per side u32 non-reduce-only and u32
+/// reduce-only resting base lots. The prices and lots match the order books exactly (checked by
+/// `snapshot validate` and the fixture test); the meaning of the two references is not known
+/// (they are not order counts) and they are kept as read (ADR-0011).
+const ACTIVE_NODE: usize = 16 + 8 + 32 + 32;
+
+/// One hot trader's live state in one market.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivePosition {
+    /// Trader index node pointer.
+    pub trader_id: u32,
+    /// Asset id.
+    pub asset_id: u32,
+    /// Signed base lots.
+    pub base_lot_position: i64,
+    /// Signed virtual quote lots.
+    pub virtual_quote_lot_position: i64,
+    /// Cumulative funding snapshot.
+    pub cumulative_funding_snapshot: i64,
+    /// Position sequence number.
+    pub position_sequence_number: u8,
+    /// Accumulated funding for the active position (i56).
+    pub accumulated_funding: i64,
+    /// The trader's best (lowest) resting ask in ticks; 0 without asks.
+    pub best_ask_ticks: u32,
+    /// Unidentified u32 next to the ask price.
+    pub ask_ref: u32,
+    /// The trader's best (highest) resting bid in ticks; 0 without bids.
+    pub best_bid_ticks: u32,
+    /// Unidentified u32 next to the bid price.
+    pub bid_ref: u32,
+    /// Resting non-reduce-only ask base lots.
+    pub ask_lots: u32,
+    /// Resting reduce-only ask base lots.
+    pub ask_reduce_only_lots: u32,
+    /// Resting non-reduce-only bid base lots.
+    pub bid_lots: u32,
+    /// Resting reduce-only bid base lots.
+    pub bid_reduce_only_lots: u32,
+}
+
+fn i56_at(data: &[u8], offset: usize) -> Option<i64> {
+    let bytes = data.get(offset..offset + 7)?;
+    let mut extended = [0u8; 8];
+    extended[..7].copy_from_slice(bytes);
+    if bytes[6] & 0x80 != 0 {
+        extended[7] = u8::MAX;
+    }
+    Some(i64::from_le_bytes(extended))
+}
+
+/// Decode the active trader buffer: the live positions and order counts of hot traders, keyed by
+/// (trader id, asset id). Hot traders' trader accounts are not updated as they trade; this
+/// buffer (and the index's collateral) is their current state.
+pub fn decode_active(header: &[u8], arenas: &[&[u8]]) -> Result<Vec<ActivePosition>, String> {
+    let name = "active trader buffer";
+    let (_, nodes) = walk_tree(name, "active_trader_buffer", header, arenas, ACTIVE_NODE)?;
+    let bad = || format!("{name} node is truncated");
+    let mut out = Vec::with_capacity(nodes.len());
+    for (_, b) in nodes {
+        let v = 24;
+        out.push(ActivePosition {
+            trader_id: u32_at(b, 16).ok_or_else(bad)?,
+            asset_id: u32_at(b, 20).ok_or_else(bad)?,
+            base_lot_position: i64_at(b, v).ok_or_else(bad)?,
+            virtual_quote_lot_position: i64_at(b, v + 8).ok_or_else(bad)?,
+            cumulative_funding_snapshot: i64_at(b, v + 16).ok_or_else(bad)?,
+            position_sequence_number: *b.get(v + 24).ok_or_else(bad)?,
+            accumulated_funding: i56_at(b, v + 25).ok_or_else(bad)?,
+            best_ask_ticks: u32_at(b, v + 32).ok_or_else(bad)?,
+            ask_ref: u32_at(b, v + 36).ok_or_else(bad)?,
+            best_bid_ticks: u32_at(b, v + 40).ok_or_else(bad)?,
+            bid_ref: u32_at(b, v + 44).ok_or_else(bad)?,
+            ask_lots: u32_at(b, v + 48).ok_or_else(bad)?,
+            ask_reduce_only_lots: u32_at(b, v + 52).ok_or_else(bad)?,
+            bid_lots: u32_at(b, v + 56).ok_or_else(bad)?,
+            bid_reduce_only_lots: u32_at(b, v + 60).ok_or_else(bad)?,
+        });
+    }
+    Ok(out)
+}
+
+/// `active_positions` rows.
+#[must_use]
+pub fn active_rows(
+    positions: &[ActivePosition],
+    at: At,
+    index: &TraderIndex,
+    symbols: &HashMap<u64, String>,
+) -> Vec<Value> {
+    positions
+        .iter()
+        .map(|p| {
+            row(
+                at,
+                json!({
+                    "trader_id": p.trader_id,
+                    "trader": index.trader(p.trader_id),
+                    "asset_id": p.asset_id,
+                    "symbol": symbols.get(&u64::from(p.asset_id)),
+                    "base_lot_position": p.base_lot_position,
+                    "virtual_quote_lot_position": p.virtual_quote_lot_position,
+                    "cumulative_funding_snapshot": p.cumulative_funding_snapshot,
+                    "accumulated_funding": p.accumulated_funding,
+                    "position_sequence_number": p.position_sequence_number,
+                    "best_ask_ticks": p.best_ask_ticks,
+                    "ask_ref": p.ask_ref,
+                    "best_bid_ticks": p.best_bid_ticks,
+                    "bid_ref": p.bid_ref,
+                    "ask_lots": p.ask_lots,
+                    "ask_reduce_only_lots": p.ask_reduce_only_lots,
+                    "bid_lots": p.bid_lots,
+                    "bid_reduce_only_lots": p.bid_reduce_only_lots,
+                }),
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 //! `snapshot run`: the long-running lane. Five loops share one RPC client (its own request
 //! ceiling) and one staging area: the exchange view every `exchangeRefreshSeconds` (which markets
-//! exist and where their accounts live), order books with their spline collections and the global
-//! trader index every `bookIntervalSeconds`, the perp asset map every `marketIntervalSeconds`,
+//! exist and where their accounts live), order books with their spline collections, the global
+//! trader index and the active trader buffer every `bookIntervalSeconds`, the perp asset map every `marketIntervalSeconds`,
 //! every trader account every `traderIntervalSeconds`, and the flush and status writer. A book,
 //! spline collection or trader that did not change since the previous read gets a summary row
 //! only; every account is written in full (decoded and raw) once after each flush, so each file
@@ -48,6 +48,8 @@ pub struct Exchange {
     pub asset_map: String,
     /// Global trader index accounts, header first.
     pub index: Vec<String>,
+    /// Active trader buffer accounts, header first (empty when the view lists none).
+    pub active: Vec<String>,
     /// The raw view (validation reads its stats snapshots).
     pub view: Value,
 }
@@ -60,13 +62,16 @@ pub fn parse_exchange(view: Value) -> Result<Exchange, String> {
         .and_then(Value::as_str)
         .ok_or("exchange view has no perpAssetMap")?
         .to_owned();
-    let index: Vec<String> = keys
-        .get("globalTraderIndex")
-        .and_then(Value::as_array)
-        .ok_or("exchange view has no globalTraderIndex")?
-        .iter()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
+    let list = |name: &str| -> Vec<String> {
+        keys.get(name)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .collect()
+    };
+    let index = list("globalTraderIndex");
+    let active = list("activeTraderBuffer");
     let mut markets = Vec::new();
     for m in view
         .get("markets")
@@ -90,10 +95,16 @@ pub fn parse_exchange(view: Value) -> Result<Exchange, String> {
     if index.is_empty() || markets.is_empty() {
         return Err("exchange view lists no markets or no trader index".into());
     }
+    if index.len() + active.len() > 100 {
+        return Err(
+            "exchange view lists more trader index and buffer accounts than one call reads".into(),
+        );
+    }
     Ok(Exchange {
         markets,
         asset_map,
         index,
+        active,
         view,
     })
 }
@@ -349,31 +360,66 @@ impl Lane {
         let exchange = self.exchange().ok_or("no exchange view yet")?;
         let captured_ms = now_ms();
         let mut raw = Vec::new();
-        // The trader index first, so this tick's orders resolve against it.
-        let answer = self
-            .rpc
-            .multiple(&exchange.index)
-            .await
-            .map_err(|e| e.to_string())?;
+        // The trader index and the active trader buffer first, in one call, so this tick's
+        // orders resolve against the index.
+        let keys: Vec<String> = exchange
+            .index
+            .iter()
+            .chain(&exchange.active)
+            .cloned()
+            .collect();
+        let answer = self.rpc.multiple(&keys).await.map_err(|e| e.to_string())?;
         let at = At {
             captured_ms,
             slot: answer.slot,
         };
         let mut buffers = Vec::new();
-        for account in &answer.accounts {
+        let mut active_changed = false;
+        let mut active_due = false;
+        for (i, account) in answer.accounts.iter().enumerate() {
             let account = self.owned(account.as_ref())?;
-            let (sha, _, _) = self.observe(&account.pubkey, &account.data);
-            raw.extend(self.raw_row(at, "global_trader_index", account, None, &sha));
+            let kind = if i < exchange.index.len() {
+                "global_trader_index"
+            } else {
+                "active_trader_buffer"
+            };
+            let (sha, changed, due) = self.observe(&account.pubkey, &account.data);
+            if kind == "active_trader_buffer" {
+                active_changed |= changed;
+                active_due |= due;
+            }
+            raw.extend(self.raw_row(at, kind, account, None, &sha));
             buffers.push(account.data.as_slice());
         }
-        let (header, arenas) = buffers.split_first().ok_or("no trader index account")?;
+        let (index_buffers, active_buffers) = buffers.split_at(exchange.index.len());
+        let (header, arenas) = index_buffers
+            .split_first()
+            .ok_or("no trader index account")?;
         let index = TraderIndex::decode(header, arenas)?;
         let index_size = index.by_id.len();
         let index = Arc::new(index);
-        {
+        let symbols = {
             let mut state = self.state.lock().expect("state");
             state.index = Some(Arc::clone(&index));
             state.index_slot = answer.slot;
+            state.symbols.clone()
+        };
+        let mut active_rows = Vec::new();
+        let mut active_count = None;
+        if let Some((header, arenas)) = active_buffers.split_first() {
+            let positions = decode::decode_active(header, arenas)?;
+            active_count = Some(positions.len());
+            if active_due {
+                active_rows = decode::active_rows(&positions, at, &index, &symbols);
+                let reason = if active_changed {
+                    "changed"
+                } else {
+                    "baseline"
+                };
+                for r in &mut active_rows {
+                    r["reason"] = json!(reason);
+                }
+            }
         }
         let per_call = (self.config.accounts_per_call / 2).max(1);
         let mut snapshots = Vec::new();
@@ -478,6 +524,8 @@ impl Lane {
             .with("ordersWritten", orders.len())
             .with("splinesWritten", splines.len())
             .with("indexTraders", index_size)
+            .with("activePositions", active_count)
+            .with("activeRowsWritten", active_rows.len())
             .with("ordersWithTraderId", with_id)
             .with("ordersResolved", resolved)
             .with("rawWritten", raw.len());
@@ -487,6 +535,7 @@ impl Lane {
                 ("book_snapshots", snapshots),
                 ("book_orders", orders),
                 ("splines", splines),
+                ("active_positions", active_rows),
                 ("raw_accounts", raw),
             ],
         )
