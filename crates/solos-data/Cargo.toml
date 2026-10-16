@@ -13,6 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 phoenix-codec = { path = "../phoenix-codec" }
+# Official Phoenix Rise account layouts (same release as the event codec) for the state snapshots.
+phoenix-rise-accounts = { version = "=0.6.12", features = ["serde"] }
+# The snapshot lane asks the RPC for `base64+zstd` account data and keeps the frames as raw bytes.
+zstd = "0.13"
 solana-wire = { path = "../solana-wire" }
 duckdb = { version = "=1.4.5", features = ["bundled", "json", "parquet"] }
 serde.workspace = true

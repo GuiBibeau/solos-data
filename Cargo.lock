@@ -4959,6 +4959,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-rise-accounts"
+version = "0.6.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5935fbffbb20cc6f168a11bfca4519797f65ad34fa027fd80c3e2ee00bc7866e"
+dependencies = [
+ "borsh",
+ "bs58",
+ "bytemuck",
+ "phoenix-rise-math",
+ "serde",
+ "sha2-const-stable",
+ "solana-pubkey 4.2.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "phoenix-rise-events"
 version = "0.6.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9822,6 +9838,7 @@ dependencies = [
  "jetstreamer-firehose",
  "nix 0.30.1",
  "phoenix-codec",
+ "phoenix-rise-accounts",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
@@ -9840,6 +9857,7 @@ dependencies = [
  "uuid",
  "wincode",
  "zip",
+ "zstd 0.13.3",
 ]
 
 [[package]]

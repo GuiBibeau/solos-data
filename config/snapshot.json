@@ -1,0 +1,28 @@
+{
+  "programId": "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih",
+  "exchangeUrl": "https://perp-api.phoenix.trade/v1/view/exchange",
+  "dataDir": "data/phoenix_state",
+  "bookIntervalSeconds": 10,
+  "marketIntervalSeconds": 10,
+  "traderIntervalSeconds": 600,
+  "exchangeRefreshSeconds": 300,
+  "flushSeconds": 3600,
+  "flushBytes": 1000000000,
+  "rawEverySeconds": {
+    "orderbook": 60,
+    "spline_collection": 60,
+    "perp_asset_map": 300,
+    "global_trader_index": 60,
+    "trader": 0
+  },
+  "accountsPerCall": 100,
+  "traderPageLimit": 2000,
+  "requestsPerSecond": 5,
+  "credits": {
+    "getMultipleAccounts": 1,
+    "getAccountInfo": 1,
+    "getProgramAccountsV2": 1,
+    "getProgramAccounts": 10
+  },
+  "maxRetries": 6
+}

@@ -20,6 +20,7 @@ pub fn main(args: &[String]) -> i32 {
         "decoder" => decoder(&args[1..]),
         "collector" => collector(&args[1..]),
         "augment" => augment(&args[1..]),
+        "snapshot" => snapshot(&args[1..]),
         "dev" => dev(&args[1..]),
         "health" => health(&args[1..]),
         _ => {
@@ -28,7 +29,14 @@ pub fn main(args: &[String]) -> i32 {
                 Obj::new()
                     .with(
                         "groups",
-                        json!(["collector", "decoder", "augment", "health", "dev"])
+                        json!([
+                            "collector",
+                            "decoder",
+                            "augment",
+                            "snapshot",
+                            "health",
+                            "dev"
+                        ])
                     )
                     .to_json()
             );
@@ -725,6 +733,188 @@ fn status_errors(status: &Obj) -> i64 {
         .and_then(|t| t.get("errors"))
         .and_then(Value::as_i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------------------------
+// snapshot
+
+const SNAPSHOT_COMMANDS: [(&str, &str); 7] = [
+    (
+        "run",
+        "Long-running state snapshots: books, splines and the trader index every bookIntervalSeconds, the perp asset map every marketIntervalSeconds, every trader account every traderIntervalSeconds: [--duration-seconds N]",
+    ),
+    (
+        "once",
+        "Read everything once, publish it and print the status",
+    ),
+    (
+        "validate",
+        "Check the decoders against the exchange view and the trader index (read-only, writes nothing)",
+    ),
+    ("status", "Read status.json"),
+    ("catalog", "Read catalog.json"),
+    (
+        "query",
+        "Read-only SQL over the catalogued files: --sql SELECT ... FROM book_orders | book_snapshots | splines | market_state | traders | trader_positions | trader_index | raw_accounts",
+    ),
+    (
+        "account",
+        "Save accounts' provider zstd frames for test fixtures: --pubkeys A,B --out DIR",
+    ),
+];
+
+fn snapshot(args: &[String]) -> i32 {
+    let command = args.first().map(String::as_str).unwrap_or("help");
+    if command == "help" || command == "--help" {
+        let mut commands = Obj::new();
+        for (name, text) in SNAPSHOT_COMMANDS {
+            commands.set(name, text);
+        }
+        println!(
+            "{}",
+            Obj::new()
+                .with_obj("commands", commands)
+                .with(
+                    "config",
+                    "--config config/snapshot.json; SOLOS_DATA_STATE_DIR overrides dataDir; SOLANA_RPC_URL is the provider"
+                )
+                .to_json()
+        );
+        return 0;
+    }
+    match snapshot_command(command, args) {
+        Ok(code) => code,
+        Err(error) => {
+            log(
+                "snapshot_fatal",
+                Obj::new().with("error", safe_error(&error.to_string())),
+            );
+            1
+        }
+    }
+}
+
+fn snapshot_rpc(
+    config: &crate::snapshot::config::SnapshotConfig,
+) -> Result<Arc<crate::snapshot::rpc::HttpRpc>, StoreError> {
+    let url = std::env::var("SOLANA_RPC_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| StoreError::Check("SOLANA_RPC_URL is not set".into()))?;
+    crate::snapshot::rpc::HttpRpc::new(
+        url,
+        config.requests_per_second,
+        config.credits.clone(),
+        config.max_retries,
+    )
+    .map(Arc::new)
+    .map_err(|e| StoreError::Check(e.to_string()))
+}
+
+fn snapshot_command(command: &str, args: &[String]) -> Result<i32, StoreError> {
+    use crate::snapshot::{query, rpc::StateRpc, service, validate};
+    let config = crate::snapshot::config::load_snapshot_config(flag(args, "--config"))?;
+    let root = config.data_dir.clone();
+    match command {
+        "status" | "catalog" => {
+            let name = if command == "status" {
+                "status.json"
+            } else {
+                "catalog.json"
+            };
+            print!("{}", std::fs::read_to_string(root.join(name))?);
+            Ok(0)
+        }
+        "query" => {
+            let sql = flag(args, "--sql")
+                .ok_or_else(|| StoreError::Check("query requires --sql".into()))?;
+            println!("{}", query::query_state(&root, sql)?.to_json());
+            Ok(0)
+        }
+        "account" => {
+            let keys: Vec<String> = flag(args, "--pubkeys")
+                .ok_or_else(|| StoreError::Check("account requires --pubkeys".into()))?
+                .split(',')
+                .map(str::to_owned)
+                .collect();
+            let out = PathBuf::from(
+                flag(args, "--out")
+                    .ok_or_else(|| StoreError::Check("account requires --out".into()))?,
+            );
+            std::fs::create_dir_all(&out)?;
+            let rpc = snapshot_rpc(&config)?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            let answer = runtime
+                .block_on(rpc.multiple(&keys))
+                .map_err(|e| StoreError::Check(e.to_string()))?;
+            let mut saved = Vec::new();
+            for account in answer.accounts.iter().flatten() {
+                if account.owner != config.program_id {
+                    return Err(StoreError::Check("account is not owned by Phoenix".into()));
+                }
+                std::fs::write(out.join(format!("{}.zst", account.pubkey)), &account.zstd)?;
+                saved.push(json!({ "pubkey": account.pubkey, "bytes": account.data.len(),
+                    "zstdBytes": account.zstd.len(), "kind": crate::snapshot::decode::kind_of(&account.data) }));
+            }
+            println!(
+                "{}",
+                Obj::new()
+                    .with("slot", answer.slot)
+                    .with("accounts", saved)
+                    .to_json()
+            );
+            Ok(0)
+        }
+        "validate" => {
+            let rpc = snapshot_rpc(&config)?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            let report = runtime.block_on(async {
+                let http = reqwest::Client::new();
+                let view: Value = http
+                    .get(&config.exchange_url)
+                    .send()
+                    .await
+                    .map_err(|_| "exchange view request failed".to_owned())?
+                    .json()
+                    .await
+                    .map_err(|_| "exchange view is not JSON".to_owned())?;
+                let exchange = service::parse_exchange(view)?;
+                validate::validate(
+                    rpc.as_ref(),
+                    &exchange,
+                    &config.program_id,
+                    config.trader_page_limit,
+                )
+                .await
+            });
+            let report = report.map_err(StoreError::Check)?;
+            let failed = report.get("failed").and_then(Value::as_u64).unwrap_or(1);
+            println!("{}", report.with_obj("rpc", rpc.meter()).to_json());
+            Ok(i32::from(failed > 0))
+        }
+        "run" | "once" => {
+            let rpc = snapshot_rpc(&config)?;
+            let duration = flag(args, "--duration-seconds")
+                .map(str::parse::<u64>)
+                .transpose()
+                .map_err(|_| StoreError::Check("--duration-seconds must be an integer".into()))?
+                .map(std::time::Duration::from_secs);
+            let stop = stop_flag()?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            let (lane, thread) = service::start(config, rpc, stop)?;
+            let status = runtime.block_on(async {
+                if command == "once" {
+                    lane.once().await
+                } else {
+                    lane.run(duration).await
+                }
+            });
+            service::finish(lane, thread)?;
+            println!("{}", status?.to_json());
+            Ok(0)
+        }
+        _ => Err(StoreError::Check("unknown snapshot command".into())),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
