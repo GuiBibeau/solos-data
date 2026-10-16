@@ -18,6 +18,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 mod lanes;
+mod snapshot;
 pub use lanes::{error_class, lane_progress, progress_record};
 
 /// The thresholds; every field has a default, so the config file may name only some.
@@ -55,6 +56,17 @@ pub struct Thresholds {
     pub capture_status_warn_minutes: i64,
     /// The capture lane's last hourly Elfa cycle older than this warns, minutes.
     pub elfa_cycle_warn_minutes: i64,
+    /// The snapshot lane's `status.json` older than this warns while it says it is running,
+    /// minutes (written every 30 s).
+    pub snapshot_status_warn_minutes: i64,
+    /// ... and older than this is critical.
+    pub snapshot_status_critical_minutes: i64,
+    /// The last order book snapshot older than this warns while the lane runs, minutes.
+    pub snapshot_books_stale_warn_minutes: i64,
+    /// ... and older than this is critical.
+    pub snapshot_books_stale_critical_minutes: i64,
+    /// The last trader scan older than this warns while the lane runs, minutes.
+    pub snapshot_traders_stale_warn_minutes: i64,
     /// Free space on the data volume below this warns, GB.
     pub disk_free_warn_gb: u64,
     /// ... and below this is critical, GB.
@@ -79,6 +91,11 @@ impl Default for Thresholds {
             sync_status_warn_minutes: 150,
             capture_status_warn_minutes: 10,
             elfa_cycle_warn_minutes: 150,
+            snapshot_status_warn_minutes: 5,
+            snapshot_status_critical_minutes: 30,
+            snapshot_books_stale_warn_minutes: 5,
+            snapshot_books_stale_critical_minutes: 30,
+            snapshot_traders_stale_warn_minutes: 45,
             disk_free_warn_gb: 500,
             disk_free_critical_gb: 100,
         }
@@ -94,12 +111,15 @@ pub struct Paths {
     pub decoded: PathBuf,
     /// The augment root.
     pub augment: PathBuf,
+    /// The state snapshot root.
+    pub state: PathBuf,
     /// The `health.json` to write.
     pub out: PathBuf,
 }
 
 impl Paths {
-    /// From `SOLOS_DATA_RAW_DIR`, `SOLOS_DATA_DECODED_DIR`, `SOLOS_DATA_AUGMENT_DIR` and
+    /// From `SOLOS_DATA_RAW_DIR`, `SOLOS_DATA_DECODED_DIR`, `SOLOS_DATA_AUGMENT_DIR`,
+    /// `SOLOS_DATA_STATE_DIR` and
     /// `SOLOS_DATA_HEALTH_FILE`, relative defaults under `data/` otherwise.
     #[must_use]
     pub fn from_env() -> Paths {
@@ -110,6 +130,7 @@ impl Paths {
             raw: var("SOLOS_DATA_RAW_DIR", "data/phoenix_raw"),
             decoded: var("SOLOS_DATA_DECODED_DIR", "data/phoenix_decoded/v1"),
             augment: var("SOLOS_DATA_AUGMENT_DIR", "data/augment"),
+            state: var("SOLOS_DATA_STATE_DIR", "data/phoenix_state"),
             out: var("SOLOS_DATA_HEALTH_FILE", "data/health.json"),
         }
     }
@@ -156,6 +177,8 @@ pub struct Inputs {
     pub sync_status: Snapshot,
     /// Augment `status-capture.json`.
     pub capture_status: Snapshot,
+    /// The snapshot lane's `status.json` (absent while the lane is not installed).
+    pub snapshot_status: Snapshot,
     /// Free bytes on the data volume.
     pub disk_free_bytes: Option<u64>,
     /// The previous `health.json`.
@@ -240,6 +263,7 @@ pub fn evaluate(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>) -> Value {
     let decoded = decoded_section(inputs, t, now, &mut f);
     let raw = raw_section(inputs, t, now, &mut f);
     let augment = augment_section(inputs, t, now, &mut f);
+    let snapshot = snapshot::section(inputs, t, now, &mut f);
     let disk = match inputs.disk_free_bytes {
         Some(free) => {
             let gb = free as f64 / 1e9;
@@ -272,6 +296,7 @@ pub fn evaluate(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>) -> Value {
         "decoded": decoded,
         "raw": raw,
         "augment": augment,
+        "snapshot": snapshot,
         "disk": disk,
         "thresholds": t,
     })
@@ -514,6 +539,7 @@ pub fn run(paths: &Paths, t: &Thresholds) -> Result<Value, StoreError> {
         decoded_catalog: read(paths.decoded.join("catalog.json")),
         sync_status: read(paths.augment.join("status.json")),
         capture_status: read(paths.augment.join("status-capture.json")),
+        snapshot_status: read(paths.state.join("status.json")),
         disk_free_bytes: disk_free(paths.raw.parent().unwrap_or(&paths.raw)),
         previous: read(paths.out.clone()).value,
     };
@@ -580,6 +606,7 @@ mod tests {
                     "elfaAuto": { "errors": 0 }, "lastCycles": { "elfaAt": "2026-10-10T07:30:00Z" } }),
                 40,
             ),
+            snapshot_status: Snapshot::default(),
             disk_free_bytes: Some(3_000_000_000_000),
             previous: None,
         }
@@ -694,6 +721,7 @@ mod tests {
             raw: root.join("phoenix_raw"),
             decoded: root.join("phoenix_decoded/v1"),
             augment: root.join("augment"),
+            state: root.join("phoenix_state"),
             out: root.join("health.json"),
         };
         for dir in [&paths.raw, &paths.decoded, &paths.augment] {

@@ -142,6 +142,7 @@ pub async fn validate(
                 .ok_or("trader index account missing")
         })
         .collect::<Result<_, _>>()?;
+    let index_slot = answer.slot;
     let index = TraderIndex::decode(buffers[0], &buffers[1..])?;
     let ids = index.ids();
     let prefix = decode::trader_prefix();
@@ -149,6 +150,8 @@ pub async fn validate(
     let mut scanned: HashSet<String> = HashSet::new();
     let (mut collateral_same, mut collateral_diff, mut missing, mut key_same) =
         (0u64, 0u64, 0u64, 0u64);
+    let (mut hot, mut flags_diff) = (0u64, 0u64);
+    let mut diff_sample = Vec::new();
     let mut pages = 0;
     loop {
         let page = rpc
@@ -163,15 +166,30 @@ pub async fn validate(
             };
             key_same += u64::from(t.key.to_string() == account.pubkey);
             scanned.insert(account.pubkey.clone());
+            let is_hot = t.state.flags & 1 != 0;
+            hot += u64::from(is_hot);
             match ids
                 .get(account.pubkey.as_str())
                 .and_then(|id| index.by_id.get(id))
             {
-                None => missing += 1,
-                Some(e) if e.collateral == t.state.quote_lot_collateral.as_inner() => {
-                    collateral_same += 1
+                None => missing += u64::from(is_hot),
+                Some(e) => {
+                    flags_diff += u64::from(e.flags != t.state.flags);
+                    if e.collateral == t.state.quote_lot_collateral.as_inner() {
+                        collateral_same += 1;
+                    } else {
+                        collateral_diff += 1;
+                        if diff_sample.len() < 5 {
+                            diff_sample.push(
+                                json!({ "trader": account.pubkey, "index": e.collateral,
+                                "account": t.state.quote_lot_collateral.as_inner(),
+                                "accountSequenceSlot": t.sequence_number.last_update_slot,
+                                "positions": t.positions.entries.len(), "pageSlot": page.slot,
+                                "indexSlot": index_slot }),
+                            );
+                        }
+                    }
                 }
-                Some(_) => collateral_diff += 1,
             }
         }
         match page.next {
@@ -186,7 +204,7 @@ pub async fn validate(
         .count();
     c.check(
         missing == 0,
-        "every trader account is in the index",
+        "every hot trader account is in the index",
         json!(missing),
     );
     c.check(
@@ -301,6 +319,9 @@ pub async fn validate(
         .with("indexTraders", index.by_id.len())
         .with("indexArenas", index.num_arenas)
         .with("traderAccounts", scanned.len())
+        .with("hotTraderAccounts", hot)
+        .with("flagsDifferFromIndex", flags_diff)
+        .with("collateralDiffSample", Value::Array(diff_sample))
         .with("traderPages", pages)
         .with("collateralEqualToIndex", collateral_same)
         .with("collateralDiffersFromIndex", collateral_diff)

@@ -33,6 +33,11 @@ pub struct SnapshotConfig {
     /// account is never copied again, and every account is copied once after each flush so
     /// each file set holds a baseline. `0` keeps every change.
     pub raw_every_seconds: BTreeMap<String, u64>,
+    /// Minimum seconds between two baseline raw copies of the same account, per kind (the
+    /// trader accounts are tens of thousands of mostly dormant accounts: one baseline a day).
+    /// Kinds not listed take a baseline after every flush.
+    #[serde(default)]
+    pub raw_baseline_seconds: BTreeMap<String, u64>,
     /// Accounts per `getMultipleAccounts` call (the RPC accepts at most 100).
     pub accounts_per_call: usize,
     /// Accounts per `getProgramAccountsV2` page.
@@ -51,6 +56,12 @@ impl SnapshotConfig {
     #[must_use]
     pub fn raw_every(&self, kind: &str) -> u64 {
         self.raw_every_seconds.get(kind).copied().unwrap_or(0)
+    }
+
+    /// Baseline spacing for a kind of account; `0` is a baseline after every flush.
+    #[must_use]
+    pub fn raw_baseline(&self, kind: &str) -> u64 {
+        self.raw_baseline_seconds.get(kind).copied().unwrap_or(0)
     }
 
     /// Credits a call to `method` costs.

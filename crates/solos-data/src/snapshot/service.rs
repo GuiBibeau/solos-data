@@ -311,10 +311,13 @@ impl Lane {
         sha: &str,
     ) -> Option<Value> {
         let every_ms = i64::try_from(self.config.raw_every(kind)).unwrap_or(0) * 1000;
+        let baseline_ms = i64::try_from(self.config.raw_baseline(kind)).unwrap_or(0) * 1000;
         let mut state = self.state.lock().expect("state");
         let epoch = state.epoch;
         let seen = state.seen.entry(account.pubkey.clone()).or_default();
-        let reason = if seen.raw_epoch != epoch {
+        let baseline_due = seen.raw_epoch != epoch
+            && (seen.raw_ms == 0 || at.captured_ms - seen.raw_ms >= baseline_ms);
+        let reason = if baseline_due {
             "baseline"
         } else if seen.raw_sha != sha && at.captured_ms - seen.raw_ms >= every_ms {
             "changed"
@@ -540,6 +543,7 @@ impl Lane {
         let mut cursor: Option<String> = None;
         let (mut traders, mut positions, mut raw) = (Vec::new(), Vec::new(), Vec::new());
         let (mut pages, mut errors, mut mismatched, mut missing) = (0u64, 0u64, 0u64, 0u64);
+        let (mut scanned, mut changed, mut hot) = (0u64, 0u64, 0u64);
         let (mut first_slot, mut last_slot) = (u64::MAX, 0u64);
         loop {
             if self.stopping() {
@@ -563,13 +567,21 @@ impl Lane {
                 slot: page.slot,
             };
             for account in &page.accounts {
-                let (sha, _, _) = self.observe(&account.pubkey, &account.data);
+                let (sha, is_changed, due) = self.observe(&account.pubkey, &account.data);
                 raw.extend(self.raw_row(at, "trader", account, None, &sha));
                 match decode::decode_trader(&account.data, at, &account.pubkey, &symbols, &ids) {
                     Ok(mut rows) => {
+                        scanned += 1;
+                        changed += u64::from(is_changed);
                         rows.trader["sha256"] = json!(sha);
+                        let flags = rows
+                            .trader
+                            .get("flags")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(0);
+                        hot += flags & 1;
                         match ids.get(account.pubkey.as_str()) {
-                            None => missing += 1,
+                            None => missing += flags & 1,
                             Some(id) => {
                                 let indexed = index.as_ref().and_then(|i| i.by_id.get(id));
                                 if indexed.map(|e| e.collateral)
@@ -579,8 +591,10 @@ impl Lane {
                                 }
                             }
                         }
-                        traders.push(rows.trader);
-                        positions.extend(rows.positions);
+                        if due {
+                            traders.push(rows.trader);
+                            positions.extend(rows.positions);
+                        }
                     }
                     Err(error) => {
                         errors += 1;
@@ -608,11 +622,14 @@ impl Lane {
         };
         let detail = Obj::new()
             .with("pages", pages)
-            .with("traders", traders.len())
-            .with("positions", positions.len())
+            .with("traders", scanned)
+            .with("hotTraders", hot)
+            .with("changedTraders", changed)
+            .with("traderRowsWritten", traders.len())
+            .with("positionRowsWritten", positions.len())
             .with("decodeErrors", errors)
             .with("indexTraders", index_rows.len())
-            .with("tradersMissingFromIndex", missing)
+            .with("hotTradersMissingFromIndex", missing)
             .with("collateralDiffersFromIndex", mismatched)
             .with(
                 "firstPageSlot",

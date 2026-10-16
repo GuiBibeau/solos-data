@@ -1,0 +1,28 @@
+[Unit]
+Description=solos-data Phoenix state snapshots: order books, splines, market state, trader index and trader accounts (ADR-0011)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/solos-data
+# SOLANA_RPC_URL only; the lane keeps its own request ceiling (config/snapshot.json).
+EnvironmentFile=%h/.config/solos-data/collector.env
+Environment=SOLOS_DATA_STATE_DIR=%h/.local/share/solos-data/phoenix_state
+Environment=SOLOS_DATA_DB_MEMORY=4GB
+# A separate binary path: installing or upgrading this lane never swaps the collector's binary.
+ExecStart=%h/.local/share/solos-data/bin/solos-data.snapshot snapshot run --config config/snapshot.json
+Restart=always
+RestartSec=15
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=16G
+TasksMax=256
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

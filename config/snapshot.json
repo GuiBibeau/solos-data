@@ -15,8 +15,11 @@
     "global_trader_index": 60,
     "trader": 0
   },
+  "rawBaselineSeconds": {
+    "trader": 86400
+  },
   "accountsPerCall": 100,
-  "traderPageLimit": 2000,
+  "traderPageLimit": 5000,
   "requestsPerSecond": 5,
   "credits": {
     "getMultipleAccounts": 1,
