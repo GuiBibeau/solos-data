@@ -149,6 +149,28 @@ pub fn archive_relation(
     )))
 }
 
+/// The newest slot whose checkpoint copies may be trimmed: `hot_slots` below the watermark `W`,
+/// and never into rows an active tail cycle may still write. While the cycle walks (its `next`
+/// is still its `floor`) that is everything from the floor up, the overlap it re-lists included;
+/// once it publishes chunk by chunk its walk is done, and only slots from `next` up are unsettled.
+/// Bounding by the floor for the whole cycle kept every chunk a catch-up cycle published in the
+/// checkpoint until the cycle ended, days later (2026-10-17, ADR-0008).
+#[must_use]
+pub fn trim_cutoff(watermark_slot: i64, hot_slots: i64, tail: Option<&Value>) -> i64 {
+    let hot = watermark_slot - hot_slots;
+    let Some(cycle) = tail else {
+        return hot;
+    };
+    let field = |name: &str| cycle.get(name).and_then(Value::as_i64);
+    let guard = match (field("floor"), field("next")) {
+        (Some(floor), Some(next)) if next > floor => next - 1,
+        (Some(floor), _) => floor - 1,
+        (None, Some(next)) => next - 1,
+        (None, None) => return hot,
+    };
+    hot.min(guard)
+}
+
 /// Delete only checkpoint copies; every source field remains in the verified raw archive.
 pub fn prune_published(
     store: &mut Store,
@@ -161,14 +183,7 @@ pub fn prune_published(
     };
     let tail = store.get("tail-active")?;
     let w_slot = watermark.get("slot").and_then(Value::as_i64).unwrap_or(0);
-    let cutoff = match tail
-        .as_ref()
-        .and_then(|t| t.get("floor"))
-        .and_then(Value::as_i64)
-    {
-        Some(floor) => (w_slot - hot_slots).min(floor - 1),
-        None => w_slot - hot_slots,
-    };
+    let cutoff = trim_cutoff(w_slot, hot_slots, tail.as_ref());
     register_bounds(store)?;
     write_catalog(store, root)?;
     let ranges_rows = store.rows("SELECT slot_from,slot_to FROM published_ranges", &[])?;
@@ -358,4 +373,29 @@ pub fn collect_legacy(store: &mut Store, root: &Path) -> Result<Obj, StoreError>
         .with("removedFiles", removed_files)
         .with("removedBytes", removed_bytes)
         .with("retainedFiles", retained))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trim_cutoff;
+    use serde_json::json;
+
+    #[test]
+    fn the_cutoff_follows_the_watermark_through_a_publishing_tail_cycle() {
+        assert_eq!(trim_cutoff(500_000, 10_000, None), 490_000);
+        // Walking: nothing from the floor up, even below the hot window.
+        let walking = json!({ "floor": 485_000, "next": 485_000, "ceiling": 900_000 });
+        assert_eq!(trim_cutoff(485_150, 10_000, Some(&walking)), 475_150);
+        assert_eq!(trim_cutoff(500_000, 100, Some(&walking)), 484_999);
+        // The 2026-10-17 box: a catch-up cycle from 456,378,852 published to 456,552,851.
+        let publishing =
+            json!({ "floor": 456_378_852, "next": 456_552_852, "ceiling": 457_908_259 });
+        assert_eq!(
+            trim_cutoff(456_552_851, 10_000, Some(&publishing)),
+            456_542_851
+        );
+        // Never past the next unpublished chunk, whatever the hot window.
+        assert_eq!(trim_cutoff(456_552_851, 0, Some(&publishing)), 456_552_851);
+        assert_eq!(trim_cutoff(456_552_851, -5, Some(&publishing)), 456_552_851);
+    }
 }

@@ -54,8 +54,14 @@ fn status_record<'a>(status: &'a Value, lane: &str) -> Option<&'a Value> {
     status.get(field)
 }
 
-/// When the lane last published a chunk: its record's `completedAt`.
+/// When the lane last published a chunk: its record's `completedAt`; for maintenance, when its
+/// last pass completed (`maintenance.at`).
 fn published_at(status: &Value, lane: &str) -> Option<DateTime<Utc>> {
+    if lane == "maintenance" {
+        return at_path(Some(status), &["maintenance", "at"])
+            .and_then(Value::as_str)
+            .and_then(parse_time);
+    }
     status_record(status, lane)
         .and_then(|r| r.get("completedAt"))
         .and_then(Value::as_str)
@@ -63,6 +69,9 @@ fn published_at(status: &Value, lane: &str) -> Option<DateTime<Utc>> {
 }
 
 fn status_progress(status: &Value, lane: &str) -> Value {
+    if lane == "maintenance" {
+        return Value::Null;
+    }
     status_record(status, lane)
         .filter(|v| !v.is_null())
         .map_or(Value::Null, |record| lane_progress(lane, record))
@@ -202,7 +211,7 @@ pub(super) fn streak_section(
         return Value::Null;
     };
     let mut out = serde_json::Map::new();
-    for lane in ["tail", "backfill"] {
+    for lane in ["tail", "backfill", "maintenance"] {
         let Some(s) = streak(status, lane) else {
             continue;
         };
@@ -250,6 +259,48 @@ pub(super) fn streak_section(
         );
     }
     Value::Object(out)
+}
+
+/// Storage maintenance: minutes since the collector's last pass (`maintenance.at`, written by
+/// every pass). From 2026-10-13 to 2026-10-17 no pass ran while a tail cycle caught up, and the
+/// checkpoint grew from 7 GB to 1.12 TB until DuckDB ran out of memory (ADR-0008).
+pub(super) fn maintenance_section(
+    status: Option<&Value>,
+    t: &Thresholds,
+    now: DateTime<Utc>,
+    f: &mut Findings,
+) -> Value {
+    let Some(status) = status else {
+        return Value::Null;
+    };
+    let record = status.get("maintenance").filter(|m| !m.is_null());
+    // A collector that runs maintenance on its own schedule reports a `maintenance` lane.
+    let scheduled = at_path(Some(status), &["lanes", "maintenance"]).is_some();
+    let at = record
+        .and_then(|r| r.get("at"))
+        .and_then(Value::as_str)
+        .and_then(parse_time);
+    let minutes = at.map(|at| (now - at).num_minutes());
+    if minutes.is_none() && (record.is_some() || scheduled) {
+        f.warn
+            .push("no completed checkpoint maintenance pass recorded".into());
+    }
+    if let Some(m) = minutes
+        && m >= t.maintenance_stale_warn_minutes
+    {
+        let what = format!("no checkpoint maintenance pass for {m} min");
+        if m >= t.maintenance_stale_critical_minutes {
+            f.critical.push(what);
+        } else {
+            f.warn.push(what);
+        }
+    }
+    json!({
+        "at": at.map(stamp),
+        "minutesSince": minutes,
+        "trimmedRows": record.and_then(|r| r.get("trimmedRows")),
+        "ranges": record.and_then(|r| r.get("ranges")),
+    })
 }
 
 #[cfg(test)]
@@ -424,5 +475,56 @@ mod tests {
         );
         assert_eq!(progress_record("tail"), "W");
         assert_eq!(progress_record("backfill"), "backfill");
+    }
+
+    #[test]
+    fn a_checkpoint_left_untrimmed_goes_critical() {
+        let now = "2026-10-17T11:34:20.000Z";
+        let mut status = incident(now);
+        status["lanes"]["tail"]["errorStreak"] = json!(0);
+        status["lanes"]["backfill"]["errorStreak"] = json!(0);
+        // The box on 2026-10-17: the last pass at 08:38 UTC on 2026-10-13.
+        status["maintenance"] =
+            json!({ "at": "2026-10-13T08:38:45.209Z", "trimmedRows": 2_300_875, "ranges": 1 });
+        let report = judge(status.clone(), now);
+        assert!(report["critical"].as_array().unwrap().iter().any(|c| {
+            c.as_str()
+                .unwrap()
+                .starts_with("no checkpoint maintenance pass for")
+        }));
+        status["maintenance"]["at"] = json!("2026-10-17T11:20:00.000Z");
+        let report = judge(status.clone(), now);
+        let findings: Vec<&str> = ["warn", "critical"]
+            .iter()
+            .flat_map(|level| report[*level].as_array().unwrap())
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        assert!(!findings.iter().any(|c| c.contains("maintenance")));
+        assert_eq!(report["raw"]["maintenance"]["minutesSince"], 14);
+        // A new collector whose passes all fail before the first success: no record, a streak.
+        status.as_object_mut().unwrap().remove("maintenance");
+        status["lanes"]["maintenance"] = json!({ "enabled": true, "errorStreak": 12,
+            "streakSince": "2026-10-17T11:22:00.000Z", "lastErrorAt": "2026-10-17T11:33:00.000Z",
+            "lastErrorClass": "other", "progress": null });
+        let report = judge(status, now);
+        let text = |level: &str| {
+            report[level]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            text("warn")
+                .iter()
+                .any(|c| c == "no completed checkpoint maintenance pass recorded")
+        );
+        assert!(
+            text("critical")
+                .iter()
+                .any(|c| c.starts_with("maintenance lane: 12 consecutive errors (other)"))
+        );
+        assert_eq!(report["raw"]["maintenance"]["minutesSince"], Value::Null);
     }
 }

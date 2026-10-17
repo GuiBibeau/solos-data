@@ -26,23 +26,74 @@ fn rpc_code(message: &str) -> Option<i64> {
     rest[..end].parse().ok()
 }
 
-async fn record_error(db: &Db, provider: &Provider, lanes: &Lanes, lane: &str, error: &StoreError) {
+pub use crate::db::fatal_class;
+
+/// The exit status of a fatal error, so systemd's `Restart=always` restarts the collector.
+pub const FATAL_EXIT_CODE: i32 = 70;
+
+/// What the service does after logging `collector_fatal`, given the lane and the class.
+pub type FatalHook = Arc<dyn Fn(&str, &'static str) + Send + Sync>;
+
+/// The production hook: exit at once, before any lane runs another statement. Reopening the
+/// database replays its write-ahead log; startup recovery removes files written for a range whose
+/// registration never committed.
+#[must_use]
+pub fn exit_on_fatal() -> FatalHook {
+    Arc::new(|_lane, _class| {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        std::process::exit(FATAL_EXIT_CODE);
+    })
+}
+
+/// Record a lane's error and count it in its streak. A fatal error (see [`fatal_class`]) skips
+/// the database, logs `collector_fatal` and calls `fatal`; the result says whether it was fatal.
+pub async fn lane_error(
+    db: &Db,
+    provider_name: &str,
+    lanes: &Lanes,
+    lane: &str,
+    error: &StoreError,
+    fatal: &FatalHook,
+) -> bool {
+    let message = error.to_string();
     let detail = Obj::new()
         .with("lane", lane)
-        .with("error", safe_error(&error.to_string()))
+        .with("error", safe_error(&message))
         .with("at", now());
-    let value = detail.to_value();
-    let provider_name = provider.provider_name().to_owned();
-    let lane = lane.to_owned();
     let text = detail.str("error").unwrap_or("").to_owned();
     let at = detail.str("at").unwrap_or("").to_owned();
+    if let Some(class) = fatal_class(&message) {
+        lanes.error(lane, &text, &at, None);
+        log("collector_error", detail);
+        // `refused`: this lane's job was refused by the writer after another job's fatal error;
+        // the class is that error's.
+        log(
+            "collector_fatal",
+            Obj::new()
+                .with("lane", lane)
+                .with("class", class)
+                .with("refused", crate::db::refused_reason(&message).is_some())
+                .with("exitCode", FATAL_EXIT_CODE),
+        );
+        fatal(lane, class);
+        return true;
+    }
+    let value = detail.to_value();
+    let provider_name = provider_name.to_owned();
+    let lane = lane.to_owned();
     // Best effort: when the database is failing the marker is unreadable and the streak goes on.
-    let progress = db
-        .get(crate::health::progress_record(&lane))
-        .await
-        .ok()
-        .flatten()
-        .map(|record| crate::health::lane_progress(&lane, &record));
+    // Maintenance has no progress marker; its streak ends with a successful pass.
+    let progress = if lane == "maintenance" {
+        None
+    } else {
+        db.get(crate::health::progress_record(&lane))
+            .await
+            .ok()
+            .flatten()
+            .map(|record| crate::health::lane_progress(&lane, &record))
+    };
     lanes.error(&lane, &text, &at, progress);
     let _ = db
         .run(move |store| {
@@ -55,10 +106,67 @@ async fn record_error(db: &Db, provider: &Provider, lanes: &Lanes, lane: &str, e
         })
         .await;
     log("collector_error", detail);
+    false
 }
 
-/// Run until a signal arrives or a lane fails fatally.
+/// Storage maintenance on its own schedule, so that a tail cycle catching up for days cannot hold
+/// back checkpoint trimming (2026-10-17, ADR-0008). A pass that trimmed a range is followed by
+/// another after `busy`, so a backlog drains between the lanes' writes; otherwise after `idle`.
+async fn maintenance_loop(
+    db: Db,
+    config: Config,
+    lanes: Arc<Lanes>,
+    report: impl Fn(StoreError) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+    stopped: Arc<AtomicBool>,
+) {
+    let idle = Duration::from_secs(config.maintenance_interval_seconds);
+    let busy = Duration::from_secs(5).min(idle);
+    let mut delay = idle;
+    loop {
+        let started = Instant::now();
+        while started.elapsed() < delay {
+            if stopped.load(Ordering::Relaxed) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let config2 = config.clone();
+        match db
+            .run(move |store| maintain(store, &config2, false, false))
+            .await
+        {
+            Ok(result) => {
+                lanes.success("maintenance", &now());
+                delay = if result.int("ranges").unwrap_or(0) > 0 {
+                    busy
+                } else {
+                    idle
+                };
+                log("storage_maintenance", result);
+            }
+            Err(error) => {
+                if stopped.load(Ordering::Relaxed) || report(error).await {
+                    return;
+                }
+                delay = idle;
+            }
+        }
+    }
+}
+
+/// Run until a signal arrives or a lane fails fatally; a fatal error exits the process.
 pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), StoreError> {
+    run_with(provider, db, config, exit_on_fatal()).await
+}
+
+/// [`run`] with the fatal-error hook chosen by the caller.
+pub async fn run_with(
+    provider: Arc<Provider>,
+    db: Db,
+    config: Config,
+    fatal: FatalHook,
+) -> Result<(), StoreError> {
+    db.guard_fatal();
     let data_dir = config.data_dir.clone();
     db.run(move |store| recover_files(store, &data_dir)).await?;
     confirm_mainnet(provider.as_ref()).await?;
@@ -109,13 +217,14 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
     };
 
     let history = {
-        let (provider, db, config, exchange, stopped, lanes) = (
+        let (provider, db, config, exchange, stopped, lanes, fatal) = (
             Arc::clone(&provider),
             db.clone(),
             config.clone(),
             Arc::clone(&exchange),
             Arc::clone(&stopped),
             Arc::clone(&lanes),
+            Arc::clone(&fatal),
         );
         async move {
             if !config.backfill_enabled {
@@ -193,7 +302,11 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
                         if stopped.load(Ordering::Relaxed) {
                             return Ok(());
                         }
-                        record_error(&db, &provider, &lanes, "backfill", &error).await;
+                        let name = provider.provider_name().to_owned();
+                        if lane_error(&db, &name, &lanes, "backfill", &error, &fatal).await {
+                            stopped.store(true, Ordering::Relaxed);
+                            return Ok(());
+                        }
                         if matches!(rpc_code(&error.to_string()), Some(401 | 403)) {
                             stopped.store(true, Ordering::Relaxed);
                             return Ok(());
@@ -207,7 +320,7 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
     };
 
     let follower = {
-        let (provider, db, config, exchange, stopped, http, lanes) = (
+        let (provider, db, config, exchange, stopped, http, lanes, fatal) = (
             Arc::clone(&provider),
             db.clone(),
             config.clone(),
@@ -215,10 +328,10 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
             Arc::clone(&stopped),
             http.clone(),
             Arc::clone(&lanes),
+            Arc::clone(&fatal),
         );
         async move {
             let mut last_refresh = Instant::now();
-            let mut last_maintenance = Instant::now();
             let mut error_streak = 0u64;
             if !config.tail_enabled {
                 log("tail_lane_disabled", Obj::new());
@@ -240,16 +353,6 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
                         lanes.success("tail", &now());
                     }
                     error_streak = 0;
-                    if last_maintenance.elapsed()
-                        > Duration::from_secs(config.maintenance_interval_seconds)
-                    {
-                        let config2 = config.clone();
-                        let result = db
-                            .run(move |store| maintain(store, &config2, false, false))
-                            .await?;
-                        log("storage_maintenance", result);
-                        last_maintenance = Instant::now();
-                    }
                     Ok(())
                 }
                 .await;
@@ -258,7 +361,11 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
                         break;
                     }
                     error_streak += 1;
-                    record_error(&db, &provider, &lanes, "tail", &error).await;
+                    let name = provider.provider_name().to_owned();
+                    if lane_error(&db, &name, &lanes, "tail", &error, &fatal).await {
+                        stopped.store(true, Ordering::Relaxed);
+                        break;
+                    }
                 }
                 let _ = db.set("tail-health", json!({ "errorStreak": error_streak, "cycleDurationSeconds": started.elapsed().as_secs_f64() })).await;
                 let delay = Duration::from_secs(config.tail_interval_seconds)
@@ -290,8 +397,42 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
         }
     };
 
-    let (history_result, follower_result, (), ()) =
-        tokio::join!(history, follower, observer, announcer);
+    let maintainer = {
+        let (provider2, db2, lanes2, fatal2, stopped2) = (
+            Arc::clone(&provider),
+            db.clone(),
+            Arc::clone(&lanes),
+            Arc::clone(&fatal),
+            Arc::clone(&stopped),
+        );
+        let report = move |error: StoreError| {
+            let (provider, db, lanes, fatal, stopped) = (
+                Arc::clone(&provider2),
+                db2.clone(),
+                Arc::clone(&lanes2),
+                Arc::clone(&fatal2),
+                Arc::clone(&stopped2),
+            );
+            Box::pin(async move {
+                let name = provider.provider_name().to_owned();
+                let fatal = lane_error(&db, &name, &lanes, "maintenance", &error, &fatal).await;
+                if fatal {
+                    stopped.store(true, Ordering::Relaxed);
+                }
+                fatal
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        };
+        maintenance_loop(
+            db.clone(),
+            config.clone(),
+            Arc::clone(&lanes),
+            report,
+            Arc::clone(&stopped),
+        )
+    };
+
+    let (history_result, follower_result, (), (), ()) =
+        tokio::join!(history, follower, observer, announcer, maintainer);
     history_result?;
     follower_result?;
     let (provider2, root) = (Arc::clone(&provider), config.data_dir.clone());
@@ -303,4 +444,33 @@ pub async fn run(provider: Arc<Provider>, db: Db, config: Config) -> Result<(), 
         Obj::new().with("metrics", provider.counters().to_json()),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fatal_class;
+
+    #[test]
+    fn errors_that_leave_duckdb_unusable_are_fatal_others_are_retried() {
+        let cases = [
+            (
+                "TransactionContext Error: Failed to commit: Failed to rollback transaction. Cannot continue operation",
+                Some("rollback_failed"),
+            ),
+            (
+                "TransactionContext Error: Failed to commit: Out of Memory Error: could not allocate block",
+                Some("commit_failed"),
+            ),
+            (
+                "Out of Memory Error: failed to allocate data of size 32.0 KiB (59.6 GiB/59.6 GiB used)",
+                Some("oom"),
+            ),
+            ("Constraint Error: Duplicate key \"signature: x\"", None),
+            ("getBlock failed (code 429)", None),
+            ("archive does not match checkpoint rows", None),
+        ];
+        for (message, class) in cases {
+            assert_eq!(fatal_class(message), class, "{message}");
+        }
+    }
 }

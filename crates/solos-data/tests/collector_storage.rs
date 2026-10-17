@@ -451,6 +451,14 @@ async fn offline_checkpoint_repack_preserves_every_row_cursor_view_and_primary_k
         repack_checkpoint(&f.root).unwrap().get("ok"),
         Some(&Value::Bool(true))
     );
+    // The way back: the closed original, still readable, beside the rewritten file.
+    let previous = f.root.join(solos_data::repack::PREVIOUS);
+    let conn = duckdb::Connection::open(&previous).unwrap();
+    let kept: i64 = conn
+        .query_row("SELECT count(*) FROM transactions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(kept, 1);
+    conn.close().unwrap();
     let store = Store::open(&f.root, solos_data::collector::schema::SCHEMA).unwrap();
     let (db, thread) = solos_data::db::Db::spawn(store);
     f.db = db;

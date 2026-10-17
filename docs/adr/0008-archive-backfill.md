@@ -171,3 +171,29 @@ lane's run of consecutive errors with no chunk published (warn 3, critical 10, n
 the error class), from a `lanes` object the collector writes to `status.json` (runbook, "Dataset
 health"). Recovering a poisoned connection without a restart is open
 (`docs/issues/002-poisoned-connection.md`).
+
+Checkpoint growth, 2026-10-17: the checkpoint had grown from about 7 GB after its rewrite on
+2026-10-13 to 1.12 TB (195.4M transactions and 221.3M signatures, oldest slot 368.6M), and the
+collector hung on DuckDB `Out of Memory` again on 2026-10-16 at 16:57 UTC with the 64GB buffer.
+Two causes, both introduced by re-enabling the tail on 2026-10-13. First, storage maintenance
+(compaction, trimming of published checkpoint copies, the automatic rewrite) ran only from the tail
+loop, after a tail cycle returned; a tail catching up from 2026-10-05 runs one cycle for days (the
+cycle that ended on 2026-10-16 took 38 hours), so from 2026-10-13 08:38 UTC nothing was trimmed
+while the archive lane kept adding about 150,000 transactions every ten minutes. The one pass that
+ran, at 16:55 UTC on 2026-10-16 against the grown checkpoint, ran out of memory two minutes later.
+Second, the trimming cutoff stopped at the active tail cycle's floor for the whole cycle, so the
+chunks a catch-up cycle published stayed in the checkpoint until it ended. The primary-key indexes
+over hundreds of millions of rows took the buffer; the process used 114 GB (peak 147 GB) the next
+morning. After the 04:44 UTC restart the new cycle walked 1.53M slots of signatures for three hours
+before its first chunk, so the tail published nothing until 08:05 UTC.
+
+Fix: maintenance runs on its own schedule beside the lanes (every `maintenanceIntervalSeconds`,
+and again after 5 s while a pass still trims a range, so a backlog drains between the lanes'
+writes). The cutoff follows the watermark through a publishing tail cycle: it stops at the floor
+only while the cycle walks, then at the next unpublished chunk. The automatic rewrite waits until a
+pass finds nothing left to trim, so it never copies a checkpoint full of published rows, and every
+rewrite keeps the closed original as `checkpoint.prev.duckdb` (a hard link) until the next one.
+An error that leaves DuckDB unusable (a failed rollback or commit, or out of memory) now ends the
+collector with exit code 70 after a `collector_fatal` line, and systemd's `Restart=always` restarts
+it (`docs/issues/002-poisoned-connection.md`, closed). Per-chunk memory was not the cause: a tail
+chunk is 1,000 slots (about 17,000 transactions) and an archive chunk about 150,000.

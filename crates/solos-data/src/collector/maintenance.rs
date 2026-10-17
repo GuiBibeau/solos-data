@@ -95,7 +95,14 @@ pub fn maintain(
         None
     };
     store.exec_batch("CHECKPOINT")?;
-    let checkpoint = reclaim_checkpoint(store, 16 * 1024u64.pow(3))?;
+    // Rewrite only once trimming has caught up: a rewrite copies and digests every live row with
+    // the lanes waiting, so a checkpoint still full of published copies (1.1 TB, 195M
+    // transactions on 2026-10-17) is trimmed first and rewritten when only hot rows remain.
+    let checkpoint = if ranges == 0 {
+        reclaim_checkpoint(store, 16 * 1024u64.pow(3))?
+    } else {
+        None
+    };
     let mut result = Obj::new()
         .with("at", now())
         .with("trimmedRows", trimmed)
