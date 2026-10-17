@@ -24,6 +24,26 @@ an old catalog and the replacement passes checksum/count verification.
 archive lane publishes faster than the checkpoint is trimmed, or the checkpoint grows until the
 next rewrite.
 
+Maintenance (compaction, checkpoint trimming, the automatic rewrite) runs on its own schedule
+beside the lanes: every `maintenanceIntervalSeconds`, and again 5 s after a pass that trimmed a
+range, so a backlog drains between the lanes' writes. Each pass logs `storage_maintenance`
+(`trimmedRows`, `ranges`, `checkpoint`); a failing pass logs `collector_error` with lane
+`maintenance`. Trimming keeps the newest `checkpointHotSlots` below the watermark and never touches
+an active tail cycle's unpublished slots (from its floor while it walks, from its next chunk once it
+publishes). The automatic rewrite runs only on a pass that found nothing left to trim, once the file
+is at least 16 GB and twice its size after the previous rewrite. Every rewrite (automatic or
+`collector repack`) keeps the closed original as `checkpoint.prev.duckdb` in the raw root, a hard
+link that costs no space until the new file replaces it; it is the way back if the rewritten file
+is ever in doubt, and the next rewrite replaces it. Remove it by hand to reclaim its space once the
+collector has run on the new file. The off-box backup never uploads it (it copies catalog files
+only). To watch a backlog drain:
+
+```sh
+journalctl --user -u solos-data-phoenix -o cat --since -1h | grep -E '"event":"storage_maintenance"' | tail -5
+python3 -c 'import json, os; s = json.load(open(os.path.expanduser("~/.local/share/solos-data/phoenix_raw/status.json"))); print(s["checkpointCounts"], s.get("retention"), s.get("checkpointRepack"))'
+ls -l ~/.local/share/solos-data/phoenix_raw/checkpoint*.duckdb
+```
+
 Historical collection below the last published Old Faithful epoch comes from the
 archive lane (ADR-0008) when `archiveBackfillEnabled` is true in `config/phoenix.json`.
 It needs no credential; it reads `files.old-faithful.net` and spends compute units
@@ -364,6 +384,7 @@ of `config/health.json`; a field left out keeps its default.
 | collector alive | raw `status.json` `at` | > 10 min old | > 60 min old |
 | backfill progress | raw `status.json` `backfill.next` against the previous `health.json` | unchanged for 120 min (not when `phase` is `complete`) | |
 | tail progress | raw `status.json` `watermark.completedAt` (written with every published tail chunk), only while the tail is enabled (`lanes.tail.enabled`) | not advanced for 15 min | not advanced for 60 min |
+| checkpoint maintenance | raw `status.json` `maintenance.at` (written by every storage maintenance pass) | > 15 min old | > 60 min old |
 | lane error streaks | raw `status.json` `lanes.{tail,backfill}`: consecutive `collector_error`s with no chunk published in between (the lane's progress marker unchanged), last error < 30 min old | 3 in a row | 10 in a row; the finding names the lane and the error class (`oom`, `constraint`, `rollback_failed`, `rpc`, `other`) |
 | augment sync | `status.json` age and `sources.*.errors` | > 150 min old, or errors in the last run | |
 | augment capture | `status-capture.json` age and the lanes' `errors` | > 10 min old, errors grown since the previous check, the Elfa credit guard tripped, the last Elfa hourly cycle > 150 min ago | |
@@ -426,7 +447,36 @@ A drop-in overrides the installed unit's `Environment=` line and survives copyin
 `ops/` over it; remove it once the installed unit says 64GB. The new value takes effect only on a
 restart, which needs the operator. A collector whose lanes both log `collector_error` every 30 s,
 `rollback_failed` then `constraint`, has a poisoned DuckDB connection: only a restart recovers it
-(`docs/issues/002-poisoned-connection.md`).
+(`docs/issues/002-poisoned-connection.md`). Since 2026-10-17 the collector does that itself, see
+below.
+
+### Fatal errors restart the collector (since 2026-10-17)
+
+An error after which DuckDB cannot be trusted (a failed rollback or "cannot continue", a failed
+commit, or out of memory) ends the collector: the lane logs `collector_error`, then
+`collector_fatal` with `lane`, `class` (`rollback_failed`, `commit_failed`, `oom`) and `exitCode`
+70, and the process exits without touching the database again. systemd restarts it after
+`RestartSec` (15 s); DuckDB replays its write-ahead log and startup recovery removes files written
+for a range that never registered. Other errors are retried after 30 s as before.
+
+```sh
+journalctl --user -u solos-data-phoenix -o cat --since -1d | grep -E '"event":"(collector_fatal|collector_started)"'
+systemctl --user show solos-data-phoenix -p NRestarts -p ExecMainStatus
+```
+
+A few restarts a day are the mechanism working. Restarts every minute or two with the same class
+mean the fault reproduces on a fresh connection (most likely `oom` in a maintenance pass): look at
+the checkpoint size and the last `storage_maintenance` line before raising the memory.
+
+### Memory
+
+`SOLOS_DATA_DB_MEMORY=64GB` covers the tail and the archive lane writing together while the
+checkpoint is trimmed: it then holds the hot window plus the unpublished rows of the tail cycle in
+flight (a catch-up cycle lists all its signatures before its first chunk, about 26M rows for 1.5M
+slots). What exhausted 32GB on 2026-10-14 and 64GB on 2026-10-16 was the checkpoint itself, no
+longer trimmed from 2026-10-13 and grown to 1.12 TB: its primary-key indexes over hundreds of
+millions of rows filled the buffer (ADR-0008, "Checkpoint growth, 2026-10-17"). If the checkpoint
+grows again, check that `storage_maintenance` lines appear every minute before changing memory.
 
 ## Off-box backup
 

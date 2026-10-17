@@ -42,6 +42,11 @@ pub struct Thresholds {
     pub tail_stale_warn_minutes: i64,
     /// ... and for this long is critical, minutes.
     pub tail_stale_critical_minutes: i64,
+    /// The collector's last storage maintenance pass (`maintenance.at`) older than this warns,
+    /// minutes: an untrimmed checkpoint grew to 1.12 TB and ran DuckDB out of memory (2026-10-17).
+    pub maintenance_stale_warn_minutes: i64,
+    /// ... and older than this is critical, minutes.
+    pub maintenance_stale_critical_minutes: i64,
     /// This many consecutive errors on a lane with no chunk published in between warns.
     pub error_streak_warn: i64,
     /// ... and this many is critical.
@@ -73,6 +78,8 @@ impl Default for Thresholds {
             backfill_stall_minutes: 120,
             tail_stale_warn_minutes: 15,
             tail_stale_critical_minutes: 60,
+            maintenance_stale_warn_minutes: 15,
+            maintenance_stale_critical_minutes: 60,
             error_streak_warn: 3,
             error_streak_critical: 10,
             error_streak_window_minutes: 30,
@@ -382,6 +389,7 @@ fn raw_section(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>, f: &mut Find
     }
     let tail = lanes::tail_section(status, t, now, f);
     let streaks = lanes::streak_section(status, t, now, f);
+    let maintenance = lanes::maintenance_section(status, t, now, f);
     json!({
         "statusAgeSeconds": inputs.raw_status.age_s,
         "catalogFiles": at_path(inputs.raw_catalog.value.as_ref(), &["files"])
@@ -395,6 +403,7 @@ fn raw_section(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>, f: &mut Find
             "unchangedMinutes": unchanged_minutes,
         },
         "tail": tail,
+        "maintenance": maintenance,
         "errorStreaks": streaks,
     })
 }

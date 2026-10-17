@@ -252,6 +252,44 @@ pub(super) fn streak_section(
     Value::Object(out)
 }
 
+/// Storage maintenance: minutes since the collector's last pass (`maintenance.at`, written by
+/// every pass). From 2026-10-13 to 2026-10-17 no pass ran while a tail cycle caught up, and the
+/// checkpoint grew from 7 GB to 1.12 TB until DuckDB ran out of memory (ADR-0008).
+pub(super) fn maintenance_section(
+    status: Option<&Value>,
+    t: &Thresholds,
+    now: DateTime<Utc>,
+    f: &mut Findings,
+) -> Value {
+    let Some(record) = status
+        .and_then(|s| s.get("maintenance"))
+        .filter(|m| !m.is_null())
+    else {
+        return Value::Null;
+    };
+    let at = record
+        .get("at")
+        .and_then(Value::as_str)
+        .and_then(parse_time);
+    let minutes = at.map(|at| (now - at).num_minutes());
+    if let Some(m) = minutes
+        && m >= t.maintenance_stale_warn_minutes
+    {
+        let what = format!("no checkpoint maintenance pass for {m} min");
+        if m >= t.maintenance_stale_critical_minutes {
+            f.critical.push(what);
+        } else {
+            f.warn.push(what);
+        }
+    }
+    json!({
+        "at": at.map(stamp),
+        "minutesSince": minutes,
+        "trimmedRows": record.get("trimmedRows"),
+        "ranges": record.get("ranges"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::evaluate;
@@ -424,5 +462,31 @@ mod tests {
         );
         assert_eq!(progress_record("tail"), "W");
         assert_eq!(progress_record("backfill"), "backfill");
+    }
+
+    #[test]
+    fn a_checkpoint_left_untrimmed_goes_critical() {
+        let now = "2026-10-17T11:34:20.000Z";
+        let mut status = incident(now);
+        status["lanes"]["tail"]["errorStreak"] = json!(0);
+        status["lanes"]["backfill"]["errorStreak"] = json!(0);
+        // The box on 2026-10-17: the last pass at 08:38 UTC on 2026-10-13.
+        status["maintenance"] =
+            json!({ "at": "2026-10-13T08:38:45.209Z", "trimmedRows": 2_300_875, "ranges": 1 });
+        let report = judge(status.clone(), now);
+        assert!(report["critical"].as_array().unwrap().iter().any(|c| {
+            c.as_str()
+                .unwrap()
+                .starts_with("no checkpoint maintenance pass for")
+        }));
+        status["maintenance"]["at"] = json!("2026-10-17T11:20:00.000Z");
+        let report = judge(status.clone(), now);
+        let findings: Vec<&str> = ["warn", "critical"]
+            .iter()
+            .flat_map(|level| report[*level].as_array().unwrap())
+            .map(|c| c.as_str().unwrap())
+            .collect();
+        assert!(!findings.iter().any(|c| c.contains("maintenance")));
+        assert_eq!(report["raw"]["maintenance"]["minutesSince"], 14);
     }
 }

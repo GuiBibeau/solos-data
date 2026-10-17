@@ -7,6 +7,9 @@ use crate::jsonout::Obj;
 use crate::store::{StoreError, memory_connection, query_rows, query_scalar, sql_string};
 use std::path::Path;
 
+/// The previous checkpoint after a rewrite, kept until the next one.
+pub const PREVIOUS: &str = "checkpoint.prev.duckdb";
+
 /// Rewrite `<root>/checkpoint.duckdb`. The writer must be closed.
 pub fn repack_checkpoint(root: &Path) -> Result<Obj, StoreError> {
     let source = root.join("checkpoint.duckdb");
@@ -68,6 +71,11 @@ pub fn repack_checkpoint(root: &Path) -> Result<Obj, StoreError> {
     }
     sync_path(&candidate)?;
     let bytes_after = std::fs::metadata(&candidate)?.len();
+    // The way back: the closed original stays reachable as `checkpoint.prev.duckdb` (a hard link,
+    // no copy) until the next rewrite replaces it or the operator removes it.
+    let previous = root.join(PREVIOUS);
+    remove_if_exists(&previous)?;
+    std::fs::hard_link(&source, &previous)?;
     std::fs::rename(&candidate, &source)?;
     sync_path(root)?;
     Ok(Obj::new()

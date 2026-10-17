@@ -1,4 +1,5 @@
-//! Each lane's state for `status.json` `lanes`: whether it is enabled and its run of consecutive
+//! Each lane's state for `status.json` `lanes` (the tail, the backfill, and storage maintenance,
+//! which runs on its own schedule since 2026-10-17): whether it is enabled and its run of consecutive
 //! errors. Kept in memory, not in DuckDB, so it is still counted when the database is the thing
 //! failing (the 2026-10-14 incident). A streak resets when the lane succeeds (a tail cycle) or
 //! when its progress marker moved since the previous error (a backfill chunk published); health
@@ -25,7 +26,11 @@ struct LaneState {
 pub struct Lanes(Mutex<BTreeMap<&'static str, LaneState>>);
 
 fn key(lane: &str) -> &'static str {
-    if lane == "tail" { "tail" } else { "backfill" }
+    match lane {
+        "tail" => "tail",
+        "maintenance" => "maintenance",
+        _ => "backfill",
+    }
 }
 
 impl Lanes {
@@ -39,6 +44,7 @@ impl Lanes {
         Lanes(Mutex::new(BTreeMap::from([
             ("tail", lane(tail)),
             ("backfill", lane(backfill)),
+            ("maintenance", lane(true)),
         ])))
     }
 
