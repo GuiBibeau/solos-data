@@ -384,7 +384,7 @@ of `config/health.json`; a field left out keeps its default.
 | collector alive | raw `status.json` `at` | > 10 min old | > 60 min old |
 | backfill progress | raw `status.json` `backfill.next` against the previous `health.json` | unchanged for 120 min (not when `phase` is `complete`) | |
 | tail progress | raw `status.json` `watermark.completedAt` (written with every published tail chunk), only while the tail is enabled (`lanes.tail.enabled`) | not advanced for 15 min | not advanced for 60 min |
-| checkpoint maintenance | raw `status.json` `maintenance.at` (written by every storage maintenance pass) | > 15 min old | > 60 min old |
+| checkpoint maintenance | raw `status.json` `maintenance.at` (written by every storage maintenance pass); the `maintenance` lane's error streak is judged with the lanes below | > 15 min old, or no pass recorded | > 60 min old |
 | lane error streaks | raw `status.json` `lanes.{tail,backfill}`: consecutive `collector_error`s with no chunk published in between (the lane's progress marker unchanged), last error < 30 min old | 3 in a row | 10 in a row; the finding names the lane and the error class (`oom`, `constraint`, `rollback_failed`, `rpc`, `other`) |
 | augment sync | `status.json` age and `sources.*.errors` | > 150 min old, or errors in the last run | |
 | augment capture | `status-capture.json` age and the lanes' `errors` | > 10 min old, errors grown since the previous check, the Elfa credit guard tripped, the last Elfa hourly cycle > 150 min ago | |
@@ -455,7 +455,8 @@ below.
 An error after which DuckDB cannot be trusted (a failed rollback or "cannot continue", a failed
 commit, or out of memory) ends the collector: the lane logs `collector_error`, then
 `collector_fatal` with `lane`, `class` (`rollback_failed`, `commit_failed`, `oom`) and `exitCode`
-70, and the process exits without touching the database again. systemd restarts it after
+70, and the process exits without touching the database again: the writer refuses every job after
+the failing one, already queued ones included (`checkpoint connection poisoned: ...`). systemd restarts it after
 `RestartSec` (15 s); DuckDB replays its write-ahead log and startup recovery removes files written
 for a range that never registered. Other errors are retried after 30 s as before.
 

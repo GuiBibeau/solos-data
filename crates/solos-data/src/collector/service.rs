@@ -26,23 +26,7 @@ fn rpc_code(message: &str) -> Option<i64> {
     rest[..end].parse().ok()
 }
 
-/// Error classes after which the checkpoint connection is not trusted
-/// (`docs/issues/002-poisoned-connection.md`): a failed rollback, a failed commit, and DuckDB
-/// running out of its buffer. In the 2026-10-14 and 2026-10-16 incidents none of them cleared on
-/// the same connection; every later write failed until the operator restarted the service.
-#[must_use]
-pub fn fatal_class(message: &str) -> Option<&'static str> {
-    let m = message.to_ascii_lowercase();
-    if m.contains("failed to rollback") || m.contains("cannot continue operation") {
-        Some("rollback_failed")
-    } else if m.contains("failed to commit") {
-        Some("commit_failed")
-    } else if m.contains("out of memory") {
-        Some("oom")
-    } else {
-        None
-    }
-}
+pub use crate::db::fatal_class;
 
 /// The exit status of a fatal error, so systemd's `Restart=always` restarts the collector.
 pub const FATAL_EXIT_CODE: i32 = 70;
@@ -179,6 +163,7 @@ pub async fn run_with(
     config: Config,
     fatal: FatalHook,
 ) -> Result<(), StoreError> {
+    db.guard_fatal();
     let data_dir = config.data_dir.clone();
     db.run(move |store| recover_files(store, &data_dir)).await?;
     confirm_mainnet(provider.as_ref()).await?;

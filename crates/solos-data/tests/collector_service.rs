@@ -130,3 +130,59 @@ async fn a_failed_rollback_ends_the_collector_before_any_more_database_work() {
     assert_eq!(f.scalar("SELECT count(*) AS n FROM errors"), "1");
     f.close();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_guarded_writer_runs_nothing_after_a_failed_rollback_queued_jobs_included() {
+    let mut f = Fixture::new();
+    f.db.guard_fatal();
+    insert_tx(&f, "before", 10);
+    // The failing job and a publication-like write queued right behind it, before any lane can
+    // react to the failure.
+    let failing = f.db.run(|_store| -> Result<(), StoreError> {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        Err(StoreError::Check(
+            "TransactionContext Error: Failed to commit: Failed to rollback transaction. Cannot continue operation".into(),
+        ))
+    });
+    let queued = f.db.run(|store| {
+        store.exec_batch("INSERT INTO published_ranges VALUES (10, 10)")?;
+        Ok(())
+    });
+    let (failing, queued) = tokio::join!(failing, queued);
+    assert!(failing.is_err());
+    let refused = queued.unwrap_err().to_string();
+    assert!(
+        refused.starts_with("checkpoint connection poisoned"),
+        "{refused}"
+    );
+    assert_eq!(
+        solos_data::collector::service::fatal_class(&refused),
+        Some("rollback_failed")
+    );
+    assert!(f.db.poisoned().unwrap().contains("Failed to rollback"));
+    // Read the store directly: the queued write never ran.
+    let store = f.thread.take().unwrap().join(f.db.clone());
+    let ranges = store
+        .rows("SELECT count(*) AS n FROM published_ranges", &[])
+        .unwrap();
+    assert_eq!(ranges[0].int("n"), Some(0));
+    store.close().unwrap();
+    let _ = std::fs::remove_dir_all(&f.root);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unguarded_writer_keeps_running_after_errors() {
+    let f = Fixture::new();
+    let oom =
+        f.db.run(|_store| -> Result<(), StoreError> {
+            Err(StoreError::Check(
+                "Out of Memory Error: failed to pin block".into(),
+            ))
+        })
+        .await;
+    assert!(oom.is_err());
+    insert_tx(&f, "after", 10);
+    assert!(f.db.poisoned().is_none());
+    assert_eq!(f.scalar("SELECT count(*) AS n FROM transactions"), "1");
+    f.close();
+}

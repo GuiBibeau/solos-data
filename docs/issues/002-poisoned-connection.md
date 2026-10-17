@@ -39,11 +39,15 @@ of memory (`oom`). The second incident, at 16:57 UTC on 2026-10-16, began with `
 Out of Memory Error` and then failed every statement with `Out of Memory Error` for 12 hours, the
 buffer never released, so an out-of-memory error is fatal on its own. On any of them the lane logs
 `collector_error` and `collector_fatal` (`lane`, `class`, `exitCode`) without touching the database
-and the process exits with code 70 before any lane runs another statement; systemd restarts it
+and the process exits with code 70. Jobs already queued on the writer thread when the failure
+happens do not run either: the collector's writer is guarded (`Db::guard_fatal`), so the first job
+that fails with one of these classes poisons it and every later job, queued or new, fails with
+`checkpoint connection poisoned: <error>` (itself fatal) without touching the connection; systemd restarts it
 after `RestartSec` (15 s), DuckDB replays its write-ahead log, and startup recovery removes files
 written for a range whose registration never committed. Any other error is retried after 30 s as
 before. `tests/collector_service.rs` injects the failed-rollback and out-of-memory messages: the
-hook is called with the lane and class, and no error row or published range is written. A
+hook is called with the lane and class, no error row or published range is written, and a write
+queued behind the failing job never runs. A
 deterministic out-of-memory error would restart the collector in a loop; health shows the streaks
 and the journal the `collector_fatal` lines.
 
