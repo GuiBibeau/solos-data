@@ -21,11 +21,12 @@ enum Message {
 /// the 2026-10-14 and 2026-10-16 incidents none of them cleared on the same connection.
 #[must_use]
 pub fn fatal_class(message: &str) -> Option<&'static str> {
+    // A job refused by a poisoned writer carries the original error: classify that one.
+    if let Some(reason) = refused_reason(message) {
+        return Some(fatal_class(reason).unwrap_or("rollback_failed"));
+    }
     let m = message.to_ascii_lowercase();
-    if m.contains("failed to rollback")
-        || m.contains("cannot continue operation")
-        || m.contains(POISONED)
-    {
+    if m.contains("failed to rollback") || m.contains("cannot continue operation") {
         Some("rollback_failed")
     } else if m.contains("failed to commit") {
         Some("commit_failed")
@@ -38,6 +39,14 @@ pub fn fatal_class(message: &str) -> Option<&'static str> {
 
 /// The error every job gets once a guarded writer has seen a fatal error.
 const POISONED: &str = "checkpoint connection poisoned";
+
+/// The original error of a job refused by a poisoned writer, or `None` for any other message.
+#[must_use]
+pub fn refused_reason(message: &str) -> Option<&str> {
+    message
+        .strip_prefix(POISONED)
+        .map(|rest| rest.trim_start_matches(':').trim_start())
+}
 
 #[derive(Default)]
 struct Guard {

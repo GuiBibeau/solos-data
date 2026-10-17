@@ -171,6 +171,33 @@ async fn a_guarded_writer_runs_nothing_after_a_failed_rollback_queued_jobs_inclu
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_job_refused_after_an_out_of_memory_commit_reports_the_original_class() {
+    let mut f = Fixture::new();
+    f.db.guard_fatal();
+    let failing = f.db.run(|_store| -> Result<(), StoreError> {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        Err(StoreError::Check(
+            "TransactionContext Error: Failed to commit: Out of Memory Error: could not allocate block".into(),
+        ))
+    });
+    let queued = f.db.run(|store| store.exec_batch("SELECT 1"));
+    let (failing, queued) = tokio::join!(failing, queued);
+    assert!(failing.is_err());
+    let lanes = Lanes::new(true, true);
+    let (hook, calls) = recorder();
+    // The queued job's lane may react first: it still reports the commit failure's class.
+    let refused = queued.unwrap_err();
+    assert!(lane_error(&f.db, "fixture", &lanes, "backfill", &refused, &hook).await);
+    assert_eq!(
+        *calls.lock().unwrap(),
+        vec![("backfill".to_owned(), "commit_failed")]
+    );
+    let store = f.thread.take().unwrap().join(f.db.clone());
+    store.close().unwrap();
+    let _ = std::fs::remove_dir_all(&f.root);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn an_unguarded_writer_keeps_running_after_errors() {
     let f = Fixture::new();
     let oom =

@@ -67,11 +67,14 @@ pub async fn lane_error(
     if let Some(class) = fatal_class(&message) {
         lanes.error(lane, &text, &at, None);
         log("collector_error", detail);
+        // `refused`: this lane's job was refused by the writer after another job's fatal error;
+        // the class is that error's.
         log(
             "collector_fatal",
             Obj::new()
                 .with("lane", lane)
                 .with("class", class)
+                .with("refused", crate::db::refused_reason(&message).is_some())
                 .with("exitCode", FATAL_EXIT_CODE),
         );
         fatal(lane, class);
