@@ -199,7 +199,7 @@ pub async fn bulk(rpc: &dyn Rpc, program: &str, from: i64, to: i64) -> Result<Ve
     loop {
         let options = json!({
             "commitment": "finalized", "transactionDetails": "full", "sortOrder": "asc", "limit": 100,
-            "encoding": "base64", "maxSupportedTransactionVersion": 0, "paginationToken": token,
+            "encoding": "base64", "maxSupportedTransactionVersion": 1, "paginationToken": token,
             "filters": { "slot": { "gte": from, "lte": to }, "status": "succeeded", "tokenAccounts": "none" }
         });
         let reply = call(rpc, "getTransactionsForAddress", json!([program, options]))
@@ -233,7 +233,7 @@ pub async fn bulk(rpc: &dyn Rpc, program: &str, from: i64, to: i64) -> Result<Ve
 ///
 /// RPC failure or an answer without wire or meta.
 pub async fn single(rpc: &dyn Rpc, signature: &str) -> Result<Option<Tx>, String> {
-    let options = json!({ "commitment": "finalized", "encoding": "base64", "maxSupportedTransactionVersion": 0 });
+    let options = json!({ "commitment": "finalized", "encoding": "base64", "maxSupportedTransactionVersion": 1 });
     let reply = call(rpc, "getTransaction", json!([signature, options]))
         .await
         .map_err(rpc_error)?;
