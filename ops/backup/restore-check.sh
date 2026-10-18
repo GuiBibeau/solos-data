@@ -33,12 +33,15 @@ jq -r --arg root "$raw_root/" --arg dir "$raw_dir/" '.files[] | (.path | ltrimst
 sed 's|^[0-9a-f]*  raw/||' "$work/sums.txt" > "$work/raw-files.txt"
 rc copy "$dest/phoenix_raw" "$work/raw" --files-from-raw "$work/raw-files.txt"
 
-# Augment: a random sample of complete files from both lanes' catalogs.
+# Augment: a random sample of complete files from every lane's catalog.
 for c in catalog.json catalog-capture.json; do
   rc copyto "$dest/augment/$c" "$work/augment-$c"
 done
+# The venues lane (ADR-0012) is optional: a bucket without its catalog samples the others.
+rc copyto "$dest/augment/catalog-venues.json" "$work/augment-catalog-venues.json" 2>/dev/null \
+  || printf '{"files":[]}' > "$work/augment-catalog-venues.json"
 jq -s -r '.[].files[] | select(.complete and .source != "tardis") | "\(.sha256)  augment/\(.path)"' \
-  "$work/augment-catalog.json" "$work/augment-catalog-capture.json" | shuf -n "$augment_files" > "$work/augment-sums.txt"
+  "$work/augment-catalog.json" "$work/augment-catalog-capture.json" "$work/augment-catalog-venues.json" | shuf -n "$augment_files" > "$work/augment-sums.txt"
 sed 's|^[0-9a-f]*  augment/||' "$work/augment-sums.txt" > "$work/augment-files.txt"
 rc copy "$dest/augment" "$work/augment" --files-from-raw "$work/augment-files.txt"
 

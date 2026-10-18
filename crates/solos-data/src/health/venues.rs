@@ -70,6 +70,21 @@ pub(super) fn section(
     if pyth_enabled && pyth_minutes.is_none_or(|m| m >= t.venues_status_warn_minutes) && age < 600 {
         f.warn.push("venues pyth: no recent poll".into());
     }
+    let polled = pyth_minutes.is_some();
+    if pyth_enabled && polled && num(at_path(Some(status), &["pyth", "freshFeeds"])) == Some(0) {
+        f.warn
+            .push("venues pyth: no feed has an update within maxAgeSeconds".into());
+    }
+    let sponsored: Vec<&str> = at_path(Some(status), &["pyth", "sponsoredStale"])
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if pyth_enabled && !sponsored.is_empty() {
+        f.warn.push(format!(
+            "venues pyth: sponsored feeds stale or absent: {}",
+            sponsored.join(", ")
+        ));
+    }
     let mismatched = num(at_path(Some(status), &["pyth", "mismatched"])).unwrap_or(0);
     if mismatched > 0 {
         f.warn.push(format!(
@@ -97,7 +112,7 @@ mod tests {
             "venues": {
                 "jupiter": { "lagSlots": 100, "errorStreak": 0, "lastCycleAt": "2026-10-18T11:59:30Z" },
                 "flash": { "lagSlots": 20_000, "errorStreak": 4, "lastCycleAt": "2026-10-18T11:30:00Z" } },
-            "pyth": { "enabled": true, "lastPollAt": "2026-10-18T11:59:55Z", "mismatched": 0 } });
+            "pyth": { "enabled": true, "lastPollAt": "2026-10-18T11:59:55Z", "mismatched": 0, "freshFeeds": 12, "sponsoredStale": [] } });
         let mut f = Findings::default();
         let out = section(
             Some(&status),
@@ -113,6 +128,25 @@ mod tests {
             [
                 "venues flash: 4 failed cycles in a row",
                 "venues flash: last cycle 30 min ago"
+            ]
+        );
+        let mut stale = status.clone();
+        stale["pyth"]["freshFeeds"] = json!(0);
+        stale["pyth"]["sponsoredStale"] = json!(["SOL"]);
+        stale["venues"] = json!({});
+        let mut g = Findings::default();
+        section(
+            Some(&stale),
+            Some(30),
+            &Thresholds::default(),
+            at(now),
+            &mut g,
+        );
+        assert_eq!(
+            g.warn,
+            [
+                "venues pyth: no feed has an update within maxAgeSeconds",
+                "venues pyth: sponsored feeds stale or absent: SOL"
             ]
         );
         let mut quiet = Findings::default();

@@ -160,11 +160,15 @@ pub async fn manifest(
         if oldest < from || page.len() < PAGE {
             return Ok(out);
         }
-        before = page
+        let next = page
             .last()
             .and_then(|e| e.get("signature"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        if next == before {
+            return Err("manifest cursor did not advance".into());
+        }
+        before = next;
     }
 }
 

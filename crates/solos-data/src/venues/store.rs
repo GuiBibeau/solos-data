@@ -239,14 +239,17 @@ pub struct Flushed {
     pub errors: u64,
 }
 
-fn hour_of(row: &Value, table: &Table, now_ms: i64) -> String {
+/// The partition of rows without a time (a transaction whose block time the provider did not
+/// know): one fixed file, so a refetched window lands in the same file and merges.
+pub const UNDATED: &str = "undated";
+
+fn hour_of(row: &Value, table: &Table) -> String {
     let value = row.get(table.time.0).and_then(Value::as_i64);
-    let ms = match (value, table.time.1) {
-        (Some(v), true) => v,
-        (Some(v), false) => v.saturating_mul(1000),
-        (None, _) => now_ms,
-    };
-    hour_label(ms)
+    match (value, table.time.1) {
+        (Some(v), true) => hour_label(v),
+        (Some(v), false) => hour_label(v.saturating_mul(1000)),
+        (None, _) => UNDATED.to_owned(),
+    }
 }
 
 /// The `SELECT` that types a staged file and adds `ts`.
@@ -276,10 +279,7 @@ pub async fn flush(ctx: &Ctx, buffer: &Buffer, now_ms: i64) -> Flushed {
         };
         let mut by_hour: BTreeMap<String, Vec<Value>> = BTreeMap::new();
         for row in rows {
-            by_hour
-                .entry(hour_of(&row, table, now_ms))
-                .or_default()
-                .push(row);
+            by_hour.entry(hour_of(&row, table)).or_default().push(row);
         }
         for (hour, rows) in by_hour {
             match write_hour(ctx, &source, table, &hour, &rows, now_ms).await {
@@ -399,13 +399,10 @@ mod tests {
     fn rows_land_in_their_utc_hour() {
         assert_eq!(hour_label(1_760_000_000_000), "2025-10-09T08");
         let row = json!({ "block_time": 1_760_000_000 });
-        assert_eq!(hour_of(&row, &EVENTS, 0), "2025-10-09T08");
+        assert_eq!(hour_of(&row, &EVENTS), "2025-10-09T08");
         let row = json!({ "at_ms": 1_760_003_600_000_i64 });
-        assert_eq!(hour_of(&row, &ACCOUNTS, 0), "2025-10-09T09");
-        assert_eq!(
-            hour_of(&json!({}), &EVENTS, 1_760_000_000_000),
-            "2025-10-09T08"
-        );
+        assert_eq!(hour_of(&row, &ACCOUNTS), "2025-10-09T09");
+        assert_eq!(hour_of(&json!({}), &EVENTS), UNDATED);
     }
 
     #[test]

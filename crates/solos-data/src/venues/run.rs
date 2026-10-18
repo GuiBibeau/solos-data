@@ -54,7 +54,12 @@ struct PythStats {
     rows: u64,
     errors: u64,
     mismatched: u64,
+    mismatched_total: u64,
     stale: u64,
+    /// Feeds whose newest update is within `maxAgeSeconds`, in the last poll.
+    fresh: u64,
+    /// Sponsored feeds that are stale or absent, in the last poll.
+    sponsored_stale: Vec<String>,
     last_poll_at: Option<String>,
     last_error: Option<String>,
     /// Newest publish time read per symbol, stored or not.
@@ -430,6 +435,7 @@ async fn pyth_loop(lanes: &Lanes) {
                 let mut mismatched = 0;
                 let mut stale = 0;
                 let mut published = Vec::new();
+                let mut fresh_symbols: Vec<&str> = Vec::new();
                 for read in &reads {
                     let Some(feed) = cfg.feeds.iter().find(|f| f.account == read.address) else {
                         continue;
@@ -444,8 +450,11 @@ async fn pyth_loop(lanes: &Lanes) {
                             published.push((feed.symbol.clone(), update.publish_time));
                             if at / 1000 - update.publish_time > cfg.max_age_seconds {
                                 stale += 1;
-                            } else if lanes.last.newer(&update) {
-                                rows.push(pyth::row(feed, &read.address, &update, at, slot));
+                            } else {
+                                fresh_symbols.push(&feed.symbol);
+                                if lanes.last.newer(&update) {
+                                    rows.push(pyth::row(feed, &read.address, &update, at, slot));
+                                }
                             }
                         }
                         Err(_) => errors += 1,
@@ -455,8 +464,16 @@ async fn pyth_loop(lanes: &Lanes) {
                 stats.polls += 1;
                 stats.rows += rows.len() as u64;
                 stats.errors += errors;
-                stats.mismatched += mismatched;
+                stats.mismatched = mismatched;
+                stats.mismatched_total += mismatched;
                 stats.stale = stale;
+                stats.fresh = fresh_symbols.len() as u64;
+                stats.sponsored_stale = cfg
+                    .feeds
+                    .iter()
+                    .filter(|f| f.sponsored && !fresh_symbols.contains(&f.symbol.as_str()))
+                    .map(|f| f.symbol.clone())
+                    .collect();
                 stats.published.extend(published);
                 stats.last_poll_at = Some(now());
                 drop(stats);
@@ -568,7 +585,10 @@ async fn write_status(lanes: &Lanes, final_write: bool) -> Result<Obj, StoreErro
             .with("rows", p.rows)
             .with("errors", p.errors)
             .with("mismatched", p.mismatched)
+            .with("mismatchedTotal", p.mismatched_total)
             .with("staleFeeds", p.stale)
+            .with("freshFeeds", p.fresh)
+            .with("sponsoredStale", p.sponsored_stale.clone())
             .with("maxAgeSeconds", lanes.config.pyth.max_age_seconds)
             .with_obj("feedAgeSeconds", {
                 let now_s = now_ms() / 1000;
