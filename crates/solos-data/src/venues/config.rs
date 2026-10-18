@@ -77,6 +77,11 @@ pub struct Pyth {
     /// Seconds between polls.
     #[serde(default = "five")]
     pub interval_seconds: u64,
+    /// An update older than this when read is counted as stale and not stored, seconds (a feed
+    /// nobody pushes any more still holds its last price; equities and metals pause outside
+    /// their market hours, so the default is a week).
+    #[serde(default = "week")]
+    pub max_age_seconds: i64,
     /// The feeds.
     #[serde(default)]
     pub feeds: Vec<Feed>,
@@ -116,6 +121,10 @@ pub struct VenuesConfig {
 
 fn yes() -> bool {
     true
+}
+
+fn week() -> i64 {
+    604_800
 }
 
 fn five() -> u64 {

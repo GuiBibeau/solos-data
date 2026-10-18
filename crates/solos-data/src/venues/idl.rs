@@ -24,6 +24,30 @@ pub fn discriminator(namespace: &str, name: &str) -> [u8; 8] {
     out
 }
 
+/// The JSON text of an on-chain Anchor IDL account: discriminator, authority, `u32` length,
+/// then the zlib-compressed IDL. The account lives at
+/// `createWithSeed(findProgramAddress([], program), "anchor:idl", program)`.
+///
+/// # Errors
+///
+/// A short account, a length past its end, or data that does not inflate to UTF-8.
+pub fn inflate_idl_account(data: &[u8]) -> Result<String, String> {
+    use std::io::Read as _;
+    let header = 8 + 32 + 4;
+    let len = data
+        .get(40..44)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+        .ok_or("IDL account shorter than its header")?;
+    let body = data
+        .get(header..header + len)
+        .ok_or("IDL length past the account end")?;
+    let mut text = String::new();
+    flate2::read::ZlibDecoder::new(body)
+        .read_to_string(&mut text)
+        .map_err(|e| format!("IDL does not inflate: {e}"))?;
+    Ok(text)
+}
+
 /// Why a payload did not decode.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
@@ -552,6 +576,20 @@ mod tests {
         { "name": "size", "type": "u64", "index": false },
         { "name": "fee", "type": { "option": "i64" }, "index": false } ] }]
     }"#;
+
+    #[test]
+    fn an_onchain_idl_account_inflates() {
+        use std::io::Write as _;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(br#"{"events":[]}"#).unwrap();
+        let body = z.finish().unwrap();
+        let mut data = vec![0u8; 40];
+        data.extend(u32::try_from(body.len()).unwrap().to_le_bytes());
+        data.extend(&body);
+        data.extend([0u8; 64]);
+        assert_eq!(inflate_idl_account(&data).unwrap(), r#"{"events":[]}"#);
+        assert!(inflate_idl_account(&data[..50]).is_err());
+    }
 
     #[test]
     fn anchor_tags_match_their_definitions() {

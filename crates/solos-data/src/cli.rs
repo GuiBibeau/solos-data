@@ -62,6 +62,7 @@ fn venues(args: &[String]) -> i32 {
             println!("{}", status.to_json());
             Ok(0)
         }),
+        "idl" => venues_idl(args),
         "status" => crate::venues::config::load(flag(args, "--config")).and_then(|config| {
             let path = crate::augment::ledger::Lane::Venues.status_path(&config.data_dir);
             print!("{}", std::fs::read_to_string(path)?);
@@ -76,6 +77,7 @@ fn venues(args: &[String]) -> i32 {
                         Obj::new()
                             .with("run", "collect Jupiter Perps and Flash Trade transactions, events and state, and Pyth prices, until SIGTERM (ADR-0012)")
                             .with("status", "print status-venues.json")
+                            .with("idl", "--address <program IDL account> --out <file>: fetch and inflate a program's on-chain Anchor IDL")
                     )
                     .with("config", "--config config/venues.json; SOLOS_DATA_AUGMENT_DIR overrides dataDir; SOLANA_RPC_URL is the provider")
                     .with("query", "the tables join the augment views: solos-data augment query --sql ... (jupiter_events, flash_instructions, pyth_prices, ...)")
@@ -94,6 +96,66 @@ fn venues(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+/// `venues idl`: one `getAccountInfo` of an on-chain Anchor IDL account, inflated to a file.
+fn venues_idl(args: &[String]) -> Result<i32, StoreError> {
+    let (Some(address), Some(out)) = (flag(args, "--address"), flag(args, "--out")) else {
+        return Err(StoreError::Check(
+            "idl requires --address <account> --out <file>".into(),
+        ));
+    };
+    let rpc = crate::venues::rpc::provider(2.0, 1, stop_flag()?)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let params = json!([address, { "commitment": "finalized", "encoding": "base64" }]);
+    let reply = runtime
+        .block_on(crate::venues::rpc::call(
+            rpc.as_ref(),
+            "getAccountInfo",
+            params,
+        ))
+        .map_err(|e| StoreError::Check(e.to_string()))?;
+    let data = reply
+        .result
+        .pointer("/value/data/0")
+        .and_then(Value::as_str)
+        .ok_or_else(|| StoreError::Check("no such account".into()))?;
+    let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
+        .map_err(|e| StoreError::Check(e.to_string()))?;
+    let text = crate::venues::idl::inflate_idl_account(&bytes).map_err(StoreError::Check)?;
+    let idl: Value = serde_json::from_str(&text).map_err(|e| StoreError::Check(e.to_string()))?;
+    std::fs::write(
+        out,
+        serde_json::to_string(&idl).map_err(|e| StoreError::Check(e.to_string()))?,
+    )?;
+    let parsed = crate::venues::idl::Idl::parse(&text).map_err(StoreError::Check)?;
+    let (events, accounts, instructions) = parsed.counts();
+    println!(
+        "{}",
+        Obj::new()
+            .with("address", address)
+            .with(
+                "slot",
+                reply
+                    .result
+                    .pointer("/context/slot")
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            )
+            .with(
+                "version",
+                idl.get("version")
+                    .or_else(|| idl.pointer("/metadata/version"))
+                    .cloned()
+                    .unwrap_or(Value::Null)
+            )
+            .with("events", events)
+            .with("accounts", accounts)
+            .with("instructions", instructions)
+            .with("check", parsed.check().err())
+            .to_json()
+    );
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -13,8 +13,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// The methods the lane calls.
-pub const METHODS: [&str; 6] = [
+pub const METHODS: [&str; 7] = [
     "getSlot",
+    "getAccountInfo",
     "getSignaturesForAddress",
     "getTransactionsForAddress",
     "getTransaction",

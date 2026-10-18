@@ -54,8 +54,11 @@ struct PythStats {
     rows: u64,
     errors: u64,
     mismatched: u64,
+    stale: u64,
     last_poll_at: Option<String>,
     last_error: Option<String>,
+    /// Newest publish time read per symbol, stored or not.
+    published: std::collections::BTreeMap<String, i64>,
 }
 
 struct Lanes {
@@ -414,6 +417,8 @@ async fn pyth_loop(lanes: &Lanes) {
                 let mut rows = Vec::new();
                 let mut errors = 0;
                 let mut mismatched = 0;
+                let mut stale = 0;
+                let mut published = Vec::new();
                 for read in &reads {
                     let Some(feed) = cfg.feeds.iter().find(|f| f.account == read.address) else {
                         continue;
@@ -425,7 +430,10 @@ async fn pyth_loop(lanes: &Lanes) {
                             mismatched += 1
                         }
                         Ok(update) => {
-                            if lanes.last.newer(&update) {
+                            published.push((feed.symbol.clone(), update.publish_time));
+                            if at / 1000 - update.publish_time > cfg.max_age_seconds {
+                                stale += 1;
+                            } else if lanes.last.newer(&update) {
                                 rows.push(pyth::row(feed, &read.address, &update, at, slot));
                             }
                         }
@@ -437,6 +445,8 @@ async fn pyth_loop(lanes: &Lanes) {
                 stats.rows += rows.len() as u64;
                 stats.errors += errors;
                 stats.mismatched += mismatched;
+                stats.stale = stale;
+                stats.published.extend(published);
                 stats.last_poll_at = Some(now());
                 drop(stats);
                 lanes.buffer.push("pyth", store::PRICES.dataset, rows);
@@ -533,6 +543,19 @@ async fn write_status(lanes: &Lanes, final_write: bool) -> Result<Obj, StoreErro
             .with("rows", p.rows)
             .with("errors", p.errors)
             .with("mismatched", p.mismatched)
+            .with("staleFeeds", p.stale)
+            .with("maxAgeSeconds", lanes.config.pyth.max_age_seconds)
+            .with_obj("feedAgeSeconds", {
+                let now_s = now_ms() / 1000;
+                let mut ages = Obj::new();
+                for feed in &lanes.config.pyth.feeds {
+                    ages.set(
+                        &feed.symbol,
+                        p.published.get(&feed.symbol).map(|t| now_s - t),
+                    );
+                }
+                ages
+            })
             .with("lastPollAt", p.last_poll_at.clone())
             .with("lastError", p.last_error.clone())
     };
