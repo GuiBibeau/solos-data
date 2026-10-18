@@ -227,15 +227,19 @@ async fn tx_loop(lanes: &Lanes, state: &VenueState) {
     let ctx = &lanes.ctx;
     let name = state.venue.name.clone();
     let key = cursor_key(&name);
-    let stored = {
-        let key = key.clone();
-        ctx.db.run(move |s| get_progress(s, &key)).await
-    };
-    let mut cursor = match stored {
-        Ok(value) => value.and_then(|v| v.get("next").and_then(Value::as_i64)),
-        Err(error) => {
-            record_error(state, &error.to_string());
+    // The stored cursor, retried until it reads: a venue never runs without knowing it, and the
+    // error streak shows in the status and health while it fails.
+    let mut cursor = loop {
+        if ctx.stopping() {
             return;
+        }
+        let key = key.clone();
+        match ctx.db.run(move |s| get_progress(s, &key)).await {
+            Ok(value) => break value.and_then(|v| v.get("next").and_then(Value::as_i64)),
+            Err(error) => {
+                record_error(state, &error.to_string());
+                pause(ctx, lanes.config.cycle_seconds).await;
+            }
         }
     };
     let rpc: &dyn Rpc = lanes.rpc.as_ref();
