@@ -243,7 +243,18 @@ async fn tx_loop(lanes: &Lanes, state: &VenueState) {
                 continue;
             }
         };
-        let from = *cursor.get_or_insert(finalized);
+        if cursor.is_none() {
+            // A first run starts at the finalized slot; record it before collecting, so a crash
+            // before the first flush resumes there instead of skipping to a later tip.
+            let (k, v) = (key.clone(), cursor_value(finalized));
+            if let Err(error) = ctx.db.run(move |s| ledger::set_progress(s, &k, &v)).await {
+                record_error(state, &error.to_string());
+                pause(ctx, lanes.config.cycle_seconds).await;
+                continue;
+            }
+            cursor = Some(finalized);
+        }
+        let from = cursor.unwrap_or(finalized);
         state.stats.lock().expect("venue stats").finalized = Some(finalized);
         if from > finalized {
             pause(ctx, lanes.config.cycle_seconds).await;

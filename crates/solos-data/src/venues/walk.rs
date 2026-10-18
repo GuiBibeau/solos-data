@@ -216,11 +216,15 @@ pub async fn bulk(rpc: &dyn Rpc, program: &str, from: i64, to: i64) -> Result<Ve
             }
             out.push(tx);
         }
-        token = reply
+        let next = reply
             .result
             .get("paginationToken")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        if next.is_some() && next == token {
+            return Err("bulk pagination token did not advance".into());
+        }
+        token = next;
         if token.is_none() || entries.is_empty() {
             return Ok(out);
         }

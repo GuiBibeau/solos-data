@@ -180,6 +180,8 @@ struct Fixture {
     bulk: Vec<Value>,
     single: BTreeMap<String, Value>,
     calls: Mutex<Vec<String>>,
+    /// Answer every bulk page with the same token.
+    stuck: bool,
 }
 
 impl Rpc for Fixture {
@@ -192,6 +194,9 @@ impl Rpc for Fixture {
                 let token = params[1]["paginationToken"].as_str();
                 // Two pages: the first carries a token, the second none.
                 match token {
+                    _ if self.stuck => {
+                        json!({ "data": self.bulk[..1].to_vec(), "paginationToken": "p2" })
+                    }
                     None => json!({ "data": self.bulk[..1].to_vec(), "paginationToken": "p2" }),
                     Some(_) => json!({ "data": self.bulk[1..].to_vec(), "paginationToken": null }),
                 }
@@ -259,6 +264,7 @@ fn fixture_rpc(serve_last: bool) -> Fixture {
         bulk,
         single,
         calls: Mutex::new(Vec::new()),
+        stuck: false,
     }
 }
 
@@ -315,6 +321,13 @@ fn a_window_with_an_unserved_signature_or_a_short_manifest_is_refused() {
         error.contains("1 manifest signatures not served"),
         "{error}"
     );
+    // A bulk provider that repeats its pagination token.
+    let mut rpc = fixture_rpc(true);
+    rpc.stuck = true;
+    let error = runtime
+        .block_on(walk::cycle(&rpc, PROGRAM, &idl, (900, 1_000), true))
+        .unwrap_err();
+    assert!(error.contains("did not advance"), "{error}");
     // A page that ends before reaching the window start and is followed by an empty page.
     let mut rpc = fixture_rpc(true);
     rpc.signatures.truncate(2);

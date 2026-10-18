@@ -91,7 +91,10 @@ are recorded in `config/venues.json` and in the status.
   `signature, path`; `at_ms, account`; `feed_id, publish_time`) with what the hour already
   holds; a file is replaced by an atomic rename and never deleted, so a reader of an older catalog
   never meets a missing file. The cursors are recorded after every file they cover is registered;
-  a crash in between refetches the window and the merge drops the duplicates. An hour is
+  a crash in between refetches the window and the merge drops the duplicates. A first run
+  records its starting slot before its first cycle. Polled rows (accounts, Pyth) have no window to
+  refetch: SIGTERM flushes them, a crash loses at most `flushSeconds` of them (the trade-off the
+  Hyperliquid asset contexts made in ADR-0009), and the account rows resume with the next poll. An hour is
   `complete` in the catalog once it ended an hour before the write.
 - **Health and backup.** `solos-data health` judges `status-venues.json` when it exists: its age
   (15 min), each venue's slot lag behind the finalized slot (warn 1,500 slots, about ten minutes;
