@@ -183,7 +183,7 @@
         "pyth": "XAG/USD",
         "feedId": "f2fb02c32b055c805e7238d628e5e9dadef274376114eb1f012337cabe93871e",
         "account": "H9JxsWwtDZxjSL6m7cdCVsWibj3JBMD9sxqLjadoZnot",
-        "sponsored": true
+        "sponsored": false
       },
       {
         "symbol": "USDC",

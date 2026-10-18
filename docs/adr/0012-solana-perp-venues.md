@@ -146,3 +146,35 @@ delegation program and refreshed on commits). Its v1 trade history (to about 202
 L1 and in the archive. Zeta has nothing in the dataset's period. Jupiter's oracle is its own
 (Doves, `DoVEsk76QybCEHQGzkvYPWLQu9gzNoZZZt3TPiL597e`), not Pyth; the custody accounts name the
 oracle accounts, which are not collected yet.
+
+## Production validation (2026-10-18)
+
+Deployed from `main` at 6c5b044 (PR #40) at 15:55 UTC. The binary is
+`~/.local/share/solos-data/bin/solos-data.venues` and the config with its IDLs is copied to
+`~/.config/solos-data/venues/`, both set through a drop-in of `solos-data-venues.service`, so the
+`~/solos-data` checkout and the collector, decoder, augment, health and backup units and their
+binary were not touched. Once the main binary and checkout are redeployed from a commit with this
+lane, the drop-in can go. The first 15 minutes:
+
+| Measure | 15 minutes | Per day |
+|---|---|---|
+| Requests (getSlot 60, getSignaturesForAddress 60, getTransactionsForAddress 89, getMultipleAccounts 210, getProgramAccounts 3) | 422 | about 40,000 (0.5 a second) |
+| Helius credits (Helius prices) | 1,250 | about 120,000 |
+| Hour files (jupiter 535 KB, flash 16 KB, pyth 20 KB) | 0.57 MB | about 55 MB |
+| Jupiter successful transactions (failed, skipped: 52) | 301 | about 29,000 |
+| Jupiter events, all decoded | 186 | |
+| Jupiter instructions, all named | 394 | |
+| Flash L1 transactions | 0 | |
+| Pyth rows (13 feeds fresh) | 217 | about 21,000 |
+
+Zero errors, zero cycles with an unlisted or singly fetched transaction, lag 0 slots, and no
+throttle in the collector's journal over the same quarter hour. Both thresholds the user set
+(2M credits and 5 GB a day) are met by more than an order of magnitude, so the unit stays
+enabled.
+
+Pyth coverage on the day: fresh are SOL, BTC, ETH, kBONK (BONK/USD), JUP, PUMP, FARTCOIN, USDC,
+USDT, JLP, HYPE, AAVE, and GOLD (XAU/USD, paused over the weekend). SILVER (XAG/USD) is in Pyth's
+sponsored list but its account was last updated 107 days ago, so it is configured as not
+sponsored; the other unsponsored accounts (XRP, DOGE, SUI, BNB, AVAX, LINK, RAY, kPEPE and the
+equities) are stale by weeks to years, and ENA, LTC, ADA, kSHIB and WTIOIL have no shard-0
+account. Those markets need Hermes (a key) or a pusher of our own.
