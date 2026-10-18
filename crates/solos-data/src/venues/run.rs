@@ -484,17 +484,20 @@ async fn status_loop(lanes: &Lanes) {
     }
 }
 
-fn venue_obj(state: &VenueState) -> Obj {
+/// A venue's status; `cursor` is the durable one (recorded after its files), `collectedThrough`
+/// the next slot of the newest cycle, which may still be only in the buffer.
+fn venue_obj(state: &VenueState, durable: Option<i64>) -> Obj {
     let s = state.stats.lock().expect("venue stats");
     let t = &s.totals;
     Obj::new()
         .with("programId", state.venue.program_id.as_str())
         .with("idlSource", state.venue.idl_source.clone())
-        .with("cursor", s.cursor)
+        .with("cursor", durable)
+        .with("collectedThrough", s.cursor)
         .with("finalized", s.finalized)
         .with(
             "lagSlots",
-            s.cursor.zip(s.finalized).map(|(c, f)| (f + 1 - c).max(0)),
+            durable.zip(s.finalized).map(|(c, f)| (f + 1 - c).max(0)),
         )
         .with("cycles", s.cycles)
         .with("manifest", t.manifest)
@@ -519,20 +522,31 @@ fn venue_obj(state: &VenueState) -> Obj {
 
 async fn write_status(lanes: &Lanes, final_write: bool) -> Result<Obj, StoreError> {
     let root = lanes.ctx.root.clone();
-    let summary = lanes
+    let keys: Vec<String> = lanes
+        .venues
+        .iter()
+        .map(|v| cursor_key(&v.venue.name))
+        .collect();
+    let (summary, durable) = lanes
         .ctx
         .db
         .run(move |store| {
             ledger::write_catalog(store, &root, Lane::Venues)?;
-            ledger::summary(store)
+            let mut durable = Vec::new();
+            for key in &keys {
+                let next =
+                    get_progress(store, key)?.and_then(|v| v.get("next").and_then(Value::as_i64));
+                durable.push(next);
+            }
+            Ok((ledger::summary(store)?, durable))
         })
         .await?;
     let counters = lanes.rpc.counters().to_value();
     let spent = credits(&counters, &lanes.config.credit_costs);
     let hours = lanes.started.elapsed().as_secs_f64() / 3600.0;
     let mut venues = Obj::new();
-    for state in &lanes.venues {
-        venues.set_obj(&state.venue.name, venue_obj(state));
+    for (state, durable) in lanes.venues.iter().zip(durable) {
+        venues.set_obj(&state.venue.name, venue_obj(state, durable));
     }
     let pyth = {
         let p = lanes.pyth.lock().expect("pyth stats");

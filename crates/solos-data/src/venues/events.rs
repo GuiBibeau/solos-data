@@ -161,7 +161,10 @@ pub fn log_payloads(meta: &Value, program: &str) -> Vec<Vec<u8>> {
         };
         match verb {
             "invoke" => stack.push(id),
-            "success" | "failed" if stack.last() == Some(&id) => {
+            // A failure reads `Program <id> failed: <reason>`.
+            verb if (verb == "success" || verb.starts_with("failed"))
+                && stack.last() == Some(&id) =>
+            {
                 stack.pop();
             }
             _ => {}
@@ -271,6 +274,8 @@ mod tests {
             "Program Q invoke [2]",
             "Program data: BAUG",
             "Program Q success",
+            "Program R invoke [2]",
+            "Program R failed: custom program error: 0x1",
             "Program data: Bwg= CQ==",
             "Program P success",
             "Program data: Cg==",
