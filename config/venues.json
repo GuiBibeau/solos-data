@@ -20,7 +20,7 @@
       "programId": "PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu",
       "enabled": true,
       "idl": "idl/jupiter-perpetuals.json",
-      "idlSource": "github.com/julianfssen/jupiter-perps-anchor-idl-parsing@630cfd72 src/idl/jupiter-perpetuals-idl-json.json (linked from developers.jup.ag/docs/perps)",
+      "idlSource": "on-chain Anchor IDL account 38GK1i4cQPAxqrbfKX4RRMNfXpKRn5PgLFHVJeXm1C8Y at slot 458478391 (solos-data venues idl); supersedes github.com/julianfssen/jupiter-perps-anchor-idl-parsing@630cfd72, which lacks 4 events",
       "storeTransactions": true,
       "accounts": [
         {
@@ -67,8 +67,8 @@
       "name": "flash",
       "programId": "FLASH6Lo6h3iasJKWDs2F8TkW2UKf3s15C8PMGuVfgBn",
       "enabled": true,
-      "idl": "idl/flash-perpetuals-v2.json",
-      "idlSource": "github.com/flash-trade/flash-sdk-v2@6517555e src/idl/perpetuals.json (IDL 16.2.0)",
+      "idl": "idl/flash-perpetuals.json",
+      "idlSource": "on-chain Anchor IDL account dK94tgJUbS8ZotN2ELzCmRvWEfpD2REMHRQneK1ngSd at slot 458478393, IDL 16.3.0 (solos-data venues idl); github.com/flash-trade/flash-sdk-v2@6517555e has 16.2.0",
       "storeTransactions": true,
       "accounts": [
         {
@@ -368,6 +368,7 @@
         "account": "5tZizzQN776ZWTibPJKecjk1DkTSDHu47dXM3SxR5D5i",
         "sponsored": false
       }
-    ]
+    ],
+    "maxAgeSeconds": 604800
   }
 }
