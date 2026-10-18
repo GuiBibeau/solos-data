@@ -197,3 +197,19 @@ An error that leaves DuckDB unusable (a failed rollback or commit, or out of mem
 collector with exit code 70 after a `collector_fatal` line, and systemd's `Restart=always` restarts
 it (`docs/issues/002-poisoned-connection.md`, closed). Per-chunk memory was not the cause: a tail
 chunk is 1,000 slots (about 17,000 transactions) and an archive chunk about 150,000.
+
+Checkpoint drain, 2026-10-18: the fix above makes trimming independent of the tail, but it does not
+drain a grown checkpoint in service, as the paragraph above implied ("so a backlog drains between
+the lanes' writes"). The first in-service pass over the 1.2 TB checkpoint ran out of the 64GB buffer
+and poisoned its write-ahead log; the collector came back with `SOLOS_DATA_DB_MEMORY` at 400GB and
+`MemoryMax=700G` (in the drop-in and in `collector.env`, whose `EnvironmentFile=` wins over
+`Environment=`). From 07:22 UTC trimming then took 2.5M rows per 100,000-slot pass in under a
+minute, but every pass ended with a `CHECKPOINT` of 5 to 6 minutes on the 1.2 TB file (72
+checkpoints took 23,090 s of the first 7.7 hours), so it drained about 5M transactions an hour (142M
+to 105M by 15:02 UTC, about 20 hours to go) and held the single writer: 2 tail chunks and 1 archive
+chunk an hour, the tail 1.26M slots behind and the backfill flagged as stalled. A large backlog is
+rewritten offline instead: `collector repack --keep-hot` (runbook, the checkpoint commands near the
+top) proves the published copies against the archive with the trimming check, copies only the rows
+trimming would keep into a new file, proves the copy, and swaps it in, keeping the original as
+`checkpoint.prev.duckdb`. In-service trimming stays for the steady state, where a pass finds one
+100,000-slot range at most.

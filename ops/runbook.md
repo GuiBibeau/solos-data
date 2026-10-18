@@ -26,7 +26,7 @@ next rewrite.
 
 Maintenance (compaction, checkpoint trimming, the automatic rewrite) runs on its own schedule
 beside the lanes: every `maintenanceIntervalSeconds`, and again 5 s after a pass that trimmed a
-range, so a backlog drains between the lanes' writes. Each pass logs `storage_maintenance`
+range, so a small backlog drains between the lanes' writes. Each pass logs `storage_maintenance`
 (`trimmedRows`, `ranges`, `checkpoint`); a failing pass logs `collector_error` with lane
 `maintenance`. Trimming keeps the newest `checkpointHotSlots` below the watermark and never touches
 an active tail cycle's unpublished slots (from its floor while it walks, from its next chunk once it
@@ -36,7 +36,16 @@ is at least 16 GB and twice its size after the previous rewrite. Every rewrite (
 link that costs no space until the new file replaces it; it is the way back if the rewritten file
 is ever in doubt, and the next rewrite replaces it. Remove it by hand to reclaim its space once the
 collector has run on the new file. The off-box backup never uploads it (it copies catalog files
-only). To watch a backlog drain:
+only).
+
+A large backlog does not drain in service. Every pass ends with a DuckDB `CHECKPOINT`, and on a
+grown file that checkpoint dominates: on 2026-10-18 the 1.2 TB checkpoint trimmed about 2.5M rows
+per 100,000-slot pass in under a minute, then checkpointed for 5 to 6 minutes (72 checkpoints,
+23,090 s of 27,600 s), so it drained about 5M transactions an hour and held the single writer
+while doing it: the tail published 2 chunks an hour and the backfill 1. With more than a few
+million published rows waiting (`checkpointCounts` far above the hot window, `storage_maintenance`
+reporting `ranges: 1` on every pass), stop the collector and rewrite offline with
+`collector repack --keep-hot` (below) instead. To watch a backlog drain:
 
 ```sh
 journalctl --user -u solos-data-phoenix -o cat --since -1h | grep -E '"event":"storage_maintenance"' | tail -5
@@ -51,17 +60,32 @@ only on the signature manifest and a sampled `getBlock` cross-check. Set
 `JETSTREAMER_THREADS` to bound its parallelism on a shared machine. After a burst of provider
 throttles the limiter recovers slowly by design; restarting the collector resets its rate.
 
-For an existing large checkpoint, stop its writer and run:
+For an existing large checkpoint, stop its writer and run, with the service's environment
+(`SOLOS_DATA_DB_MEMORY`, and `SOLOS_DATA_DB_THREADS` raised for the run):
 
 ```sh
-solos-data collector maintain --all
-solos-data collector repack
+solos-data collector repack --keep-hot --dry-run   # optional: the proof alone, changes nothing
+solos-data collector repack --keep-hot
 solos-data collector verify-storage
 ```
 
-Then restart the collector. `maintain --all` verifies archived contents before
-trimming copies. `repack` verifies every table before atomically replacing the
-closed checkpoint. Never run these offline commands while a writer is running.
+Then restart the collector. `repack --keep-hot` builds a new checkpoint holding only the rows the
+collector still needs and swaps it in. It drops the signature, transaction, ordering and RPC-page
+rows inside the published coverage up to the trimming cutoff (the same cutoff as in-service
+trimming: the hot window below the watermark, never an active tail cycle's unpublished slots),
+after proving them chunk by chunk (`--slots-per-check`, default 1,000,000 slots) equal to their
+newest published Parquet copy with the same whole-row digest check trimming uses. A chunk that
+fails the proof keeps its rows and is listed under `unverified`. Everything else is copied row for
+row: rows above the cutoff or outside the coverage, rows without a slot, `program_versions`, and
+every other table (`kv` with the watermark, walks, cycle and backfill progress, file
+registrations, published ranges, addresses, exchange snapshots). The new file is proven before the
+swap: per table, the rows left out equal the rows proven against the archive, and the kept rows
+equal the copy as whole-row digest multisets in both directions. The original stays as
+`checkpoint.prev.duckdb`, and the result is recorded under `checkpoint-repack` (so the automatic
+rewrite measures growth from the new size). Published Parquet and `catalog.json` are not changed
+(the catalog is rewritten with the same files and coverage). `maintain --all` still trims in place,
+but on a large checkpoint it is the slow in-service drain run offline; plain `repack` copies every
+row, published copies included. Never run these offline commands while a writer is running.
 `maintain --all --legacy` optionally scans superseded files from older releases.
 This can take much longer and retains any file whose full contents do not match
 the latest archive. It is separate from routine cleanup and checkpoint rewrites.
@@ -471,13 +495,21 @@ the checkpoint size and the last `storage_maintenance` line before raising the m
 
 ### Memory
 
+The service's `SOLOS_DATA_DB_MEMORY` is set twice on the box: by the drop-in `memory.conf`
+(`Environment=`) and by `collector.env` (`EnvironmentFile=`). systemd applies the environment file
+after `Environment=` lines, so the value in `collector.env` wins; change both. Since 2026-10-18 the
+box runs 400GB with `MemoryMax=700G` (the in-service trim of the 1.2 TB checkpoint ran out of 64GB;
+ADR-0008, "Checkpoint drain, 2026-10-18").
+
 `SOLOS_DATA_DB_MEMORY=64GB` covers the tail and the archive lane writing together while the
 checkpoint is trimmed: it then holds the hot window plus the unpublished rows of the tail cycle in
 flight (a catch-up cycle lists all its signatures before its first chunk, about 26M rows for 1.5M
 slots). What exhausted 32GB on 2026-10-14 and 64GB on 2026-10-16 was the checkpoint itself, no
 longer trimmed from 2026-10-13 and grown to 1.12 TB: its primary-key indexes over hundreds of
 millions of rows filled the buffer (ADR-0008, "Checkpoint growth, 2026-10-17"). If the checkpoint
-grows again, check that `storage_maintenance` lines appear every minute before changing memory.
+grows again, check that `storage_maintenance` lines appear every minute before changing memory;
+if it has already grown past a few million published rows, stop the collector and run
+`collector repack --keep-hot` rather than letting the in-service trim drain it.
 
 ## Off-box backup
 

@@ -3,7 +3,6 @@
 //! one-time legacy cleanup. A port of `archive.ts`, `retention.ts` and `legacy-gc.ts`.
 
 use super::catalog::{merge_coverage, write_catalog};
-use super::writer::TABLES;
 use crate::fsutil::file_hash;
 use crate::jsonout::{Obj, now};
 use crate::lease::has_readers;
@@ -171,15 +170,68 @@ pub fn trim_cutoff(watermark_slot: i64, hot_slots: i64, tail: Option<&Value>) ->
     hot.min(guard)
 }
 
-/// Delete only checkpoint copies; every source field remains in the verified raw archive.
-pub fn prune_published(
+/// The checkpoint tables whose rows are copies of published Parquet; `program_versions` is not
+/// archived and stays whole.
+pub const TRIMMED_TABLES: [&str; 4] = ["signatures", "transactions", "slot_order", "rpc_pages"];
+
+/// Prove that every row of `table` in `[from, to]` equals its newest published copy (whole-row
+/// digests, signature-keyed), and return how many rows that is. An error means the rows must stay:
+/// no archive covers them, a file's checksum or row count changed, or a row differs.
+pub fn verify_archived(
+    store: &mut Store,
+    table: &str,
+    from: i64,
+    to: i64,
+    verified: &mut HashSet<String>,
+) -> Result<i64, StoreError> {
+    let n = store
+        .rows(
+            &format!("SELECT count(*) AS n FROM {table} WHERE slot BETWEEN ? AND ?"),
+            &[&from, &to],
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+        .int("n")
+        .unwrap_or(0);
+    if n == 0 {
+        return Ok(0);
+    }
+    let Some(archive) = archive_relation(store, table, from, to, verified, true)? else {
+        return Err(StoreError::Check("unarchived checkpoint rows".into()));
+    };
+    let digest = checkpoint_digest(store, table, false)?;
+    let key = if table == "rpc_pages" {
+        "page_id"
+    } else {
+        "signature"
+    };
+    let missing = store
+        .rows(&format!("SELECT count(*) AS n FROM (SELECT {key} AS signature,{digest} AS digest FROM {table} WHERE slot BETWEEN {from} AND {to} EXCEPT ({archive}))"), &[])?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
+    if missing.int("n").unwrap_or(1) != 0 {
+        return Err(StoreError::Check(
+            "archive does not match checkpoint rows".into(),
+        ));
+    }
+    Ok(n)
+}
+
+/// Merged `(from, to)` slot ranges.
+pub type Coverage = Vec<(i64, i64)>;
+
+/// The trimming cutoff ([`trim_cutoff`]) and the published coverage clipped to it: the only
+/// slots whose checkpoint copies may go. `None` before the first watermark. Registers missing
+/// file bounds and rewrites `catalog.json` first, so the catalog matches what is checked.
+pub fn trimmable_coverage(
     store: &mut Store,
     root: &Path,
     hot_slots: i64,
-    max_slots: i64,
-) -> Result<Obj, StoreError> {
+) -> Result<Option<(i64, Coverage)>, StoreError> {
     let Some(watermark) = store.get("W")? else {
-        return Ok(Obj::new().with("ranges", 0).with("removedRows", 0));
+        return Ok(None);
     };
     let tail = store.get("tail-active")?;
     let w_slot = watermark.get("slot").and_then(Value::as_i64).unwrap_or(0);
@@ -199,6 +251,19 @@ pub fn prune_published(
             .filter(|r| r.0 <= r.1)
             .collect(),
     );
+    Ok(Some((cutoff, coverage)))
+}
+
+/// Delete only checkpoint copies; every source field remains in the verified raw archive.
+pub fn prune_published(
+    store: &mut Store,
+    root: &Path,
+    hot_slots: i64,
+    max_slots: i64,
+) -> Result<Obj, StoreError> {
+    let Some((cutoff, coverage)) = trimmable_coverage(store, root, hot_slots)? else {
+        return Ok(Obj::new().with("ranges", 0).with("removedRows", 0));
+    };
     let cursor = store.get("retention-cursor")?.map_or(0, |v| {
         v.as_str()
             .and_then(|s| s.parse::<i64>().ok())
@@ -233,38 +298,10 @@ pub fn prune_published(
         let (from, to) = (*first, *last);
         store.exec_batch("BEGIN")?;
         let result: Result<(), StoreError> = (|| {
-            for table in TABLES.iter().filter(|t| **t != "program_versions") {
-                let count = store
-                    .rows(
-                        &format!("SELECT count(*) AS n FROM {table} WHERE slot BETWEEN ? AND ?"),
-                        &[&from, &to],
-                    )?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
-                let n = count.int("n").unwrap_or(0);
+            for table in TRIMMED_TABLES {
+                let n = verify_archived(store, table, from, to, &mut verified)?;
                 if n == 0 {
                     continue;
-                }
-                let Some(archive) = archive_relation(store, table, from, to, &mut verified, true)?
-                else {
-                    return Err(StoreError::Check("unarchived checkpoint rows".into()));
-                };
-                let digest = checkpoint_digest(store, table, false)?;
-                let key = if *table == "rpc_pages" {
-                    "page_id"
-                } else {
-                    "signature"
-                };
-                let missing = store
-                    .rows(&format!("SELECT count(*) AS n FROM (SELECT {key} AS signature,{digest} AS digest FROM {table} WHERE slot BETWEEN {from} AND {to} EXCEPT ({archive}))"), &[])?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default();
-                if missing.int("n").unwrap_or(1) != 0 {
-                    return Err(StoreError::Check(
-                        "archive does not match checkpoint rows".into(),
-                    ));
                 }
                 store.exec(
                     &format!("DELETE FROM {table} WHERE slot BETWEEN ? AND ?"),
