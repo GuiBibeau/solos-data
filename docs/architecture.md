@@ -50,6 +50,15 @@ histories into one file per day or month. A small ledger records every file and 
 each series is complete, so a rerun only fetches what is new. `augment capture` keeps
 the streams that cannot be fetched later (recent-only candles, asset contexts, Elfa).
 
+## Other Solana venues
+
+`solos-data venues run` follows Jupiter Perps (and Flash Trade's remaining on-chain activity)
+over RPC: each cycle lists the program's successful signatures for a finalized slot window, fetches
+the transactions in bulk (and any the bulk pages missed one by one), and stores the transactions,
+the program's instructions and its Anchor events decoded through the on-chain IDL. Pool, custody
+and market accounts are read every minute and Pyth price feed accounts every five seconds. Hour
+files go under the augment root with a ledger of their own (ADR-0012).
+
 ## Read and move data
 
 `catalog.json` lists published files and their hashes. Query commands open those
@@ -73,6 +82,7 @@ records the missing checks, snapshots and reconstructed state.
 | `crates/phoenix-codec/` | Rust library and stdio binary around the official Phoenix event SDK |
 | `crates/solana-wire/` | Rust parser for legacy, v0 and v1 transaction envelopes |
 | `crates/solos-data/` | Rust `solos-data` binary: `collector` (RPC tail and backfill, Jetstreamer archive lane behind the `archive` feature), `decoder`, and `dev` tooling (`compare-decoded`, `crash-writer`) |
+| `crates/solos-data/src/venues/` | Other Solana perp venues and Pyth: IDL-driven Borsh decoding, forward transaction cycles, account polling (ADR-0012) |
 | `tests/` | Offline fixtures and interruption/restart tests |
 | `config/` | Rates, batch sizes and default data paths |
 | `ops/` | Linux services and installation notes |
