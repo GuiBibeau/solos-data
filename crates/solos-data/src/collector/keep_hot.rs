@@ -68,10 +68,12 @@ pub fn keep_predicate(drops: &[(i64, i64)]) -> String {
     format!("NOT coalesce({any}, false)")
 }
 
-/// Verify every chunk of the trimmable coverage against the archive. Changes nothing.
+/// Verify every chunk of the trimmable coverage against the archive. Changes no rows; with a
+/// `root` it first registers missing file bounds and rewrites `catalog.json`, as trimming does,
+/// and without one (the dry run) it writes nothing at all.
 pub fn plan(
     store: &mut Store,
-    root: &Path,
+    root: Option<&Path>,
     hot_slots: i64,
     chunk_slots: i64,
 ) -> Result<Plan, StoreError> {
@@ -128,7 +130,7 @@ pub fn plan(
     Ok(plan)
 }
 
-/// Plan, then (unless `dry_run`) rewrite and swap. The store is closed during the rewrite and
+/// Plan, then (unless `dry_run`, which writes nothing) rewrite and swap. The store is closed during the rewrite and
 /// reopened on the new file, where the result is recorded as `checkpoint-repack`.
 pub fn repack_keep_hot(
     store: &mut Store,
@@ -138,7 +140,12 @@ pub fn repack_keep_hot(
 ) -> Result<Obj, StoreError> {
     let started = std::time::Instant::now();
     let root = store.root.clone();
-    let plan = plan(store, &root, hot_slots, chunk_slots)?;
+    let plan = plan(
+        store,
+        (!dry_run).then_some(root.as_path()),
+        hot_slots,
+        chunk_slots,
+    )?;
     let mut report = Obj::new()
         .with("at", now())
         .with("mode", "keep-hot")

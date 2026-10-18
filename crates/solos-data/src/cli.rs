@@ -278,7 +278,7 @@ const COLLECTOR_COMMANDS: [(&str, &str); 17] = [
     ),
     (
         "repack",
-        "Offline verified atomic checkpoint rewrite to reclaim space; --keep-hot copies only rows not yet trimmable (published copies are checked against the archive and left out; --slots-per-check 1000000, --dry-run); stop writer first",
+        "Offline verified atomic checkpoint rewrite to reclaim space; --keep-hot copies only rows not yet trimmable (published copies are checked against the archive and left out; --slots-per-check 1000000; --dry-run writes nothing); stop writer first",
     ),
     (
         "relocate",

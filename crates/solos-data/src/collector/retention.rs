@@ -227,7 +227,7 @@ pub type Coverage = Vec<(i64, i64)>;
 /// file bounds and rewrites `catalog.json` first, so the catalog matches what is checked.
 pub fn trimmable_coverage(
     store: &mut Store,
-    root: &Path,
+    root: Option<&Path>,
     hot_slots: i64,
 ) -> Result<Option<(i64, Coverage)>, StoreError> {
     let Some(watermark) = store.get("W")? else {
@@ -236,8 +236,10 @@ pub fn trimmable_coverage(
     let tail = store.get("tail-active")?;
     let w_slot = watermark.get("slot").and_then(Value::as_i64).unwrap_or(0);
     let cutoff = trim_cutoff(w_slot, hot_slots, tail.as_ref());
-    register_bounds(store)?;
-    write_catalog(store, root)?;
+    if let Some(root) = root {
+        register_bounds(store)?;
+        write_catalog(store, root)?;
+    }
     let ranges_rows = store.rows("SELECT slot_from,slot_to FROM published_ranges", &[])?;
     let coverage = merge_coverage(
         ranges_rows
@@ -261,7 +263,7 @@ pub fn prune_published(
     hot_slots: i64,
     max_slots: i64,
 ) -> Result<Obj, StoreError> {
-    let Some((cutoff, coverage)) = trimmable_coverage(store, root, hot_slots)? else {
+    let Some((cutoff, coverage)) = trimmable_coverage(store, Some(root), hot_slots)? else {
         return Ok(Obj::new().with("ranges", 0).with("removedRows", 0));
     };
     let cursor = store.get("retention-cursor")?.map_or(0, |v| {

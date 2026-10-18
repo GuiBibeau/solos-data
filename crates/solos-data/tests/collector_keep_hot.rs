@@ -6,8 +6,10 @@ mod collector_common;
 
 use collector_common::*;
 use serde_json::{Value, json};
+use solos_data::collector::catalog::write_catalog;
 use solos_data::collector::keep_hot::repack_keep_hot;
 use solos_data::collector::reader::query_dataset;
+use solos_data::collector::retention::register_bounds;
 use solos_data::collector::writer::publish_range;
 
 fn publish(f: &Fixture, from: i64, to: i64) {
@@ -150,11 +152,20 @@ async fn a_chunk_that_fails_the_archive_check_is_kept_whole() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_dry_run_verifies_and_changes_nothing() {
+async fn a_dry_run_verifies_and_writes_nothing() {
     let f = seeded();
+    // As the running collector leaves it: bounds registered, catalog written.
+    let root = f.root.clone();
+    f.db.run_blocking(move |store| {
+        register_bounds(store)?;
+        write_catalog(store, &root).map(|_| ())
+    })
+    .unwrap();
+    let catalog = std::fs::read(f.root.join("catalog.json")).unwrap();
     let report =
         f.db.run_blocking(|store| repack_keep_hot(store, 200, 50, true))
             .unwrap();
+    assert_eq!(std::fs::read(f.root.join("catalog.json")).unwrap(), catalog);
     assert_eq!(report.get("dryRun"), Some(&json!(true)));
     assert_eq!(report.get("dropped").unwrap()["transactions"], json!(1));
     assert_eq!(f.scalar("SELECT count(*) AS n FROM transactions"), "3");
