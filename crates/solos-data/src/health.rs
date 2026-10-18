@@ -1,6 +1,7 @@
 //! `solos-data health`: one read-only pass over the JSON snapshots the services already write
 //! (the raw collector's `status.json` and `catalog.json`, the decoder's `status.json` and
-//! `catalog.json`, the augment lanes' `status.json` and `status-capture.json`) plus the free
+//! `catalog.json`, the augment lanes' `status.json`, `status-capture.json` and
+//! `status-venues.json`) plus the free
 //! space of the data volume, judged against the thresholds of `config/health.json`. The result
 //! is written to `health.json` (atomically) and summarized in one `health` log line with its
 //! `warn` and `critical` lists. Two checks need a previous observation (backfill movement and
@@ -18,6 +19,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 mod lanes;
+mod venues;
 pub use lanes::{error_class, lane_progress, progress_record};
 
 /// The thresholds; every field has a default, so the config file may name only some.
@@ -60,6 +62,13 @@ pub struct Thresholds {
     pub capture_status_warn_minutes: i64,
     /// The capture lane's last hourly Elfa cycle older than this warns, minutes.
     pub elfa_cycle_warn_minutes: i64,
+    /// The venues lane's `status-venues.json` (written every minute) or a venue's last cycle
+    /// older than this warns, minutes (ADR-0012).
+    pub venues_status_warn_minutes: i64,
+    /// A venue more slots than this behind the finalized slot warns.
+    pub venues_lag_warn_slots: i64,
+    /// ... and more than this is critical.
+    pub venues_lag_critical_slots: i64,
     /// Free space on the data volume below this warns, GB.
     pub disk_free_warn_gb: u64,
     /// ... and below this is critical, GB.
@@ -86,6 +95,9 @@ impl Default for Thresholds {
             sync_status_warn_minutes: 150,
             capture_status_warn_minutes: 10,
             elfa_cycle_warn_minutes: 150,
+            venues_status_warn_minutes: 15,
+            venues_lag_warn_slots: 1_500,
+            venues_lag_critical_slots: 9_000,
             disk_free_warn_gb: 500,
             disk_free_critical_gb: 100,
         }
@@ -163,6 +175,8 @@ pub struct Inputs {
     pub sync_status: Snapshot,
     /// Augment `status-capture.json`.
     pub capture_status: Snapshot,
+    /// Augment `status-venues.json` (ADR-0012); absent while the lane has never run.
+    pub venues_status: Snapshot,
     /// Free bytes on the data volume.
     pub disk_free_bytes: Option<u64>,
     /// The previous `health.json`.
@@ -247,6 +261,13 @@ pub fn evaluate(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>) -> Value {
     let decoded = decoded_section(inputs, t, now, &mut f);
     let raw = raw_section(inputs, t, now, &mut f);
     let augment = augment_section(inputs, t, now, &mut f);
+    let venues = venues::section(
+        inputs.venues_status.value.as_ref(),
+        inputs.venues_status.age_s,
+        t,
+        now,
+        &mut f,
+    );
     let disk = match inputs.disk_free_bytes {
         Some(free) => {
             let gb = free as f64 / 1e9;
@@ -279,6 +300,7 @@ pub fn evaluate(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>) -> Value {
         "decoded": decoded,
         "raw": raw,
         "augment": augment,
+        "venues": venues,
         "disk": disk,
         "thresholds": t,
     })
@@ -523,6 +545,7 @@ pub fn run(paths: &Paths, t: &Thresholds) -> Result<Value, StoreError> {
         decoded_catalog: read(paths.decoded.join("catalog.json")),
         sync_status: read(paths.augment.join("status.json")),
         capture_status: read(paths.augment.join("status-capture.json")),
+        venues_status: read(paths.augment.join("status-venues.json")),
         disk_free_bytes: disk_free(paths.raw.parent().unwrap_or(&paths.raw)),
         previous: read(paths.out.clone()).value,
     };
@@ -589,6 +612,7 @@ mod tests {
                     "elfaAuto": { "errors": 0 }, "lastCycles": { "elfaAt": "2026-10-10T07:30:00Z" } }),
                 40,
             ),
+            venues_status: Snapshot::default(),
             disk_free_bytes: Some(3_000_000_000_000),
             previous: None,
         }

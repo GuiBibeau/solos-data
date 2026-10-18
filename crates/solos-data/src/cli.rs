@@ -22,13 +22,14 @@ pub fn main(args: &[String]) -> i32 {
         "augment" => augment(&args[1..]),
         "dev" => dev(&args[1..]),
         "health" => health(&args[1..]),
+        "venues" => venues(&args[1..]),
         _ => {
             println!(
                 "{}",
                 Obj::new()
                     .with(
                         "groups",
-                        json!(["collector", "decoder", "augment", "health", "dev"])
+                        json!(["collector", "decoder", "augment", "venues", "health", "dev"])
                     )
                     .to_json()
             );
@@ -48,6 +49,51 @@ pub fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn has(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+// ---------------------------------------------------------------------------------------------
+// venues
+
+fn venues(args: &[String]) -> i32 {
+    let command = args.first().map(String::as_str).unwrap_or("help");
+    let result = match command {
+        "run" => crate::venues::config::load(flag(args, "--config")).and_then(|config| {
+            let status = crate::venues::run::run(config, stop_flag()?)?;
+            println!("{}", status.to_json());
+            Ok(0)
+        }),
+        "status" => crate::venues::config::load(flag(args, "--config")).and_then(|config| {
+            let path = crate::augment::ledger::Lane::Venues.status_path(&config.data_dir);
+            print!("{}", std::fs::read_to_string(path)?);
+            Ok(0)
+        }),
+        _ => {
+            println!(
+                "{}",
+                Obj::new()
+                    .with_obj(
+                        "commands",
+                        Obj::new()
+                            .with("run", "collect Jupiter Perps and Flash Trade transactions, events and state, and Pyth prices, until SIGTERM (ADR-0012)")
+                            .with("status", "print status-venues.json")
+                    )
+                    .with("config", "--config config/venues.json; SOLOS_DATA_AUGMENT_DIR overrides dataDir; SOLANA_RPC_URL is the provider")
+                    .with("query", "the tables join the augment views: solos-data augment query --sql ... (jupiter_events, flash_instructions, pyth_prices, ...)")
+                    .to_json()
+            );
+            Ok(0)
+        }
+    };
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            log(
+                "venues_fatal",
+                Obj::new().with("error", safe_error(&error.to_string())),
+            );
+            1
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

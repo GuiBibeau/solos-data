@@ -28,11 +28,14 @@ pub enum Lane {
     /// `augment capture`: `capture.duckdb`, `catalog-capture.json`, `status-capture.json`,
     /// `staging-capture/`.
     Capture,
+    /// `venues run` (ADR-0012): `venues/checkpoint.duckdb`, `catalog-venues.json`,
+    /// `status-venues.json`, `staging-venues/`.
+    Venues,
 }
 
 impl Lane {
-    /// Both lanes, sync first.
-    pub const ALL: [Lane; 2] = [Lane::Sync, Lane::Capture];
+    /// Every lane, sync first.
+    pub const ALL: [Lane; 3] = [Lane::Sync, Lane::Capture, Lane::Venues];
 
     /// The lane's name in logs and status.
     #[must_use]
@@ -40,6 +43,7 @@ impl Lane {
         match self {
             Lane::Sync => "sync",
             Lane::Capture => "capture",
+            Lane::Venues => "venues",
         }
     }
 
@@ -50,6 +54,7 @@ impl Lane {
         match self {
             Lane::Sync => root.to_path_buf(),
             Lane::Capture => root.join("capture"),
+            Lane::Venues => root.join("venues"),
         }
     }
 
@@ -59,6 +64,7 @@ impl Lane {
         match self {
             Lane::Sync => root.join("catalog.json"),
             Lane::Capture => root.join("catalog-capture.json"),
+            Lane::Venues => root.join("catalog-venues.json"),
         }
     }
 
@@ -68,6 +74,7 @@ impl Lane {
         match self {
             Lane::Sync => root.join("status.json"),
             Lane::Capture => root.join("status-capture.json"),
+            Lane::Venues => root.join("status-venues.json"),
         }
     }
 
@@ -77,6 +84,7 @@ impl Lane {
         match self {
             Lane::Sync => root.join("staging"),
             Lane::Capture => root.join("staging-capture"),
+            Lane::Venues => root.join("staging-venues"),
         }
     }
 }
