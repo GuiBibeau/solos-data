@@ -90,12 +90,12 @@ done
 # Augment: snapshot its catalogs first, then the whole tree (files that grow are rewritten in
 # place on the box, so compare checksums; unchanged files are never re-uploaded).
 mkdir -p "$work/augment-meta"
-for f in catalog.json catalog-capture.json status.json status-capture.json; do
+for f in catalog.json catalog-capture.json catalog-venues.json status.json status-capture.json status-venues.json; do
   if [ -f "$augment/$f" ]; then cp "$augment/$f" "$work/augment-meta/$f"; fi
 done
 # The Tardis.dev files are not uploaded (below), so the uploaded catalogs do not list them
 # either: a restored root's catalog then names only files that exist.
-for f in catalog.json catalog-capture.json; do
+for f in catalog.json catalog-capture.json catalog-venues.json; do
   if [ -f "$work/augment-meta/$f" ]; then
     if jq '.files |= map(select(.source != "tardis"))' "$work/augment-meta/$f" > "$work/augment-meta/$f.tmp"; then
       mv "$work/augment-meta/$f.tmp" "$work/augment-meta/$f"

@@ -1,0 +1,29 @@
+[Unit]
+Description=solos-data venues: Jupiter Perps and Flash Trade transactions, events and state, Pyth prices (ADR-0012)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/solos-data
+# SOLANA_RPC_URL: the same provider account as the collector; the lane has its own limiter.
+EnvironmentFile=%h/.config/solos-data/collector.env
+Environment=SOLOS_DATA_AUGMENT_DIR=%h/.local/share/solos-data/augment
+Environment=SOLOS_DATA_DB_MEMORY=4GB
+Environment=SOLOS_DATA_DB_THREADS=4
+ExecStart=%h/.local/share/solos-data/bin/solos-data venues run --config config/venues.json
+Nice=10
+Restart=always
+RestartSec=30
+TimeoutStopSec=120
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+MemoryMax=16G
+TasksMax=256
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

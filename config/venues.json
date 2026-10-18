@@ -1,0 +1,374 @@
+{
+  "dataDir": "data/augment",
+  "requestsPerSecond": 20,
+  "cycleSeconds": 30,
+  "flushSeconds": 300,
+  "accountsIntervalSeconds": 60,
+  "discoverIntervalSeconds": 3600,
+  "maxSlotsPerCycle": 2000,
+  "creditCosts": {
+    "getSlot": 1,
+    "getSignaturesForAddress": 1,
+    "getTransactionsForAddress": 10,
+    "getTransaction": 1,
+    "getMultipleAccounts": 1,
+    "getProgramAccounts": 10
+  },
+  "venues": [
+    {
+      "name": "jupiter",
+      "programId": "PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu",
+      "enabled": true,
+      "idl": "idl/jupiter-perpetuals.json",
+      "idlSource": "on-chain Anchor IDL account 38GK1i4cQPAxqrbfKX4RRMNfXpKRn5PgLFHVJeXm1C8Y at slot 458478391 (solos-data venues idl); supersedes github.com/julianfssen/jupiter-perps-anchor-idl-parsing@630cfd72, which lacks 4 events",
+      "storeTransactions": true,
+      "accounts": [
+        {
+          "address": "5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq",
+          "kind": "pool",
+          "label": "JLP"
+        },
+        {
+          "address": "7xS2gz2bTp3fwCC7knJvUWTEU9Tycczu6VhJYKgi1wdz",
+          "kind": "custody",
+          "label": "SOL"
+        },
+        {
+          "address": "AQCGyheWPLeo6Qp9WpYS9m3Qj479t7R636N9ey1rEjEn",
+          "kind": "custody",
+          "label": "ETH"
+        },
+        {
+          "address": "5Pv3gM9JrFFH883SWAhvJC9RPYmo8UNxuFtv5bMMALkm",
+          "kind": "custody",
+          "label": "BTC"
+        },
+        {
+          "address": "G18jKKXQwBbrHeiK3C9MRXhkHsLHf7XgCSisykV46EZa",
+          "kind": "custody",
+          "label": "USDC"
+        },
+        {
+          "address": "4vkNeXiYEUizLdrpdPS1eC2mccyM4NUPRtERrk6ZETkk",
+          "kind": "custody",
+          "label": "USDT"
+        },
+        {
+          "address": "DdwY1ELc9rRK7xNL3hTXabSFBmVrTPpfsUZSv2Y3LL1U",
+          "kind": "custody",
+          "label": "JupUSD"
+        }
+      ],
+      "discover": [
+        "Custody"
+      ]
+    },
+    {
+      "name": "flash",
+      "programId": "FLASH6Lo6h3iasJKWDs2F8TkW2UKf3s15C8PMGuVfgBn",
+      "enabled": true,
+      "idl": "idl/flash-perpetuals.json",
+      "idlSource": "on-chain Anchor IDL account dK94tgJUbS8ZotN2ELzCmRvWEfpD2REMHRQneK1ngSd at slot 458478393, IDL 16.3.0 (solos-data venues idl); github.com/flash-trade/flash-sdk-v2@6517555e has 16.2.0",
+      "storeTransactions": true,
+      "accounts": [
+        {
+          "address": "HfF7GCcEc76xubFCHLLXRdYcgRzwjEPdfKWqzRS8Ncog",
+          "kind": "pool",
+          "label": "Crypto.1"
+        },
+        {
+          "address": "KwhpybQPe9xuZFmAfcjLHj3ukownWex1ratyascAC1X",
+          "kind": "pool",
+          "label": "Virtual.1"
+        },
+        {
+          "address": "D6bfytnxoZBSzJM7fcixg5sgWJ2hj8SbwkPvb2r8XpbH",
+          "kind": "pool",
+          "label": "Governance.1"
+        },
+        {
+          "address": "6HukhSeVVLQekKaGJYkwztBacjhKLKywVPrmcvccaYMz",
+          "kind": "pool",
+          "label": "Community.1"
+        },
+        {
+          "address": "DP1FnZjWzDjSMQA64BcMzUdpDpyAQ6723d5fpX4yTk5G",
+          "kind": "pool",
+          "label": "Community.2"
+        },
+        {
+          "address": "Crk3yzGpPCt9thXmV9wCkBM9nBq8EHhBct71ArkKY9wA",
+          "kind": "pool",
+          "label": "Trump.1"
+        },
+        {
+          "address": "B2FWYRHJpDe8T9CeWz7JR2MLqfvxKxa6oRwJLZF62FW9",
+          "kind": "pool",
+          "label": "Ore.1"
+        },
+        {
+          "address": "Fa64Ua4bzN295egkQEqtyrWNeQMiFZ5Uxfq2DcQ4Sb3h",
+          "kind": "pool",
+          "label": "Equity.1"
+        }
+      ],
+      "discover": [
+        "Market",
+        "Custody"
+      ]
+    }
+  ],
+  "pyth": {
+    "enabled": true,
+    "intervalSeconds": 5,
+    "feeds": [
+      {
+        "symbol": "SOL",
+        "pyth": "SOL/USD",
+        "feedId": "ef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d",
+        "account": "7UVimffxr9ow1uXYxsr4LHAcV58mLzhmwaeKvJ1pjLiE",
+        "sponsored": true
+      },
+      {
+        "symbol": "BTC",
+        "pyth": "BTC/USD",
+        "feedId": "e62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43",
+        "account": "4cSM2e6rvbGQUFiJbqytoVMi5GgghSMr8LwVrT9VPSPo",
+        "sponsored": true
+      },
+      {
+        "symbol": "ETH",
+        "pyth": "ETH/USD",
+        "feedId": "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace",
+        "account": "42amVS4KgzR9rA28tkVYqVXjq9Qa8dcZQMbH5EYFX6XC",
+        "sponsored": true
+      },
+      {
+        "symbol": "kBONK",
+        "pyth": "BONK/USD",
+        "feedId": "72b021217ca3fe68922a19aaf990109cb9d84e9ad004b4d2025ad6f529314419",
+        "account": "DBE3N8uNjhKPRHfANdwGvCZghWXyLPdqdSbEW2XFwBiX",
+        "sponsored": true
+      },
+      {
+        "symbol": "JUP",
+        "pyth": "JUP/USD",
+        "feedId": "0a0408d619e9380abad35060f9192039ed5042fa6f82301d0e48bb52be830996",
+        "account": "7dbob1psH1iZBS7qPsm3Kwbf5DzSXK8Jyg31CTgTnxH5",
+        "sponsored": true
+      },
+      {
+        "symbol": "PUMP",
+        "pyth": "PUMP/USD",
+        "feedId": "7a01fca212788bba7c5bf8c9efd576a8a722f070d2c17596ff7bb609b8d5c3b9",
+        "account": "HMm3GPbdnqGwbkTnUUqCFsH8AMHDdEC3Lg8gcPD3HJSH",
+        "sponsored": true
+      },
+      {
+        "symbol": "FARTCOIN",
+        "pyth": "FARTCOIN/USD",
+        "feedId": "58cd29ef0e714c5affc44f269b2c1899a52da4169d7acc147b9da692e6953608",
+        "account": "2t8eUbYKjidMs3uSeYM9jXM9uudYZwGkSeTB4TKjmvnC",
+        "sponsored": true
+      },
+      {
+        "symbol": "GOLD",
+        "pyth": "XAU/USD",
+        "feedId": "765d2ba906dbc32ca17cc11f5310a89e9ee1f6420508c63861f2f8ba4ee34bb2",
+        "account": "2uPQGpm8X4ZkxMHxrAW1QuhXcse1AHEgPih6Xp9NuEWW",
+        "sponsored": true
+      },
+      {
+        "symbol": "SILVER",
+        "pyth": "XAG/USD",
+        "feedId": "f2fb02c32b055c805e7238d628e5e9dadef274376114eb1f012337cabe93871e",
+        "account": "H9JxsWwtDZxjSL6m7cdCVsWibj3JBMD9sxqLjadoZnot",
+        "sponsored": true
+      },
+      {
+        "symbol": "USDC",
+        "pyth": "USDC/USD",
+        "feedId": "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
+        "account": "Dpw1EAVrSB1ibxiDQyTAW6Zip3J4Btk2x4SgApQCeFbX",
+        "sponsored": true
+      },
+      {
+        "symbol": "USDT",
+        "pyth": "USDT/USD",
+        "feedId": "2b89b9dc8fdf9f34709a5b106b472f0f39bb6ca9ce04b0fd7f2e971688e2e53b",
+        "account": "HT2PLQBcG5EiCcNSaMHAjSgd9F98ecpATbk4Sk5oYuM",
+        "sponsored": true
+      },
+      {
+        "symbol": "JLP",
+        "pyth": "JLP/USD",
+        "feedId": "c811abc82b4bad1f9bd711a2773ccaa935b03ecef974236942cec5e0eb845a3a",
+        "account": "2TTGSRSezqFzeLUH8JwRUbtN66XLLaymfYsWRTMjfiMw",
+        "sponsored": true
+      },
+      {
+        "symbol": "HYPE",
+        "feedId": "4279e31cc369bbcc2faf022b382b080e32a8e689ff20fbc530d2a603eb6cd98b",
+        "account": "6usXZCEM4kf1KHGDTzgQLAWtDMNdzLjfAUYSwGKJm19Y",
+        "sponsored": false
+      },
+      {
+        "symbol": "XRP",
+        "feedId": "ec5d399846a9209f3fe5881d70aae9268c94339ff9817e8d18ff19fa05eea1c8",
+        "account": "Ae3LGcV5Wt5Z11xvhxSX1h65uNyjuX4qYFFbgifLx5eX",
+        "sponsored": false
+      },
+      {
+        "symbol": "DOGE",
+        "feedId": "dcef50dd0a4cd2dcc17e45df1676dcb336a11a61c69df7a0299b0150c672d25c",
+        "account": "681QkKLoAQrB5h23Ewq9c8rjM19RBuzqwXZf2RPr9Pyw",
+        "sponsored": false
+      },
+      {
+        "symbol": "SUI",
+        "feedId": "23d7315113f5b1d3ba7a83604c44b94d79f4fd69af77f804fc7f920a6dc65744",
+        "account": "GgV3a7YeVRga9prjNGEDBG9NwatSaD8rwjZ4GNjPiXTq",
+        "sponsored": false
+      },
+      {
+        "symbol": "BNB",
+        "feedId": "2f95862b045670cd22bee3114c39763a4a08beeb663b145d283c31d7d1101c4f",
+        "account": "A3qp5QG9xGeJR1gexbW9b9eMMsMDLzx3rhud9SnNhwb4",
+        "sponsored": false
+      },
+      {
+        "symbol": "AVAX",
+        "feedId": "93da3352f9f1d105fdfe4971cfa80e9dd777bfc5d0f683ebb6e1294b92137bb7",
+        "account": "HUBqpBf3aGJdVQndFHmMUd1eMcixt7S4swYPCx8A93K1",
+        "sponsored": false
+      },
+      {
+        "symbol": "LINK",
+        "feedId": "8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221",
+        "account": "7bWHpGtb2j3jqbpA5gFctdmgZELubiZDBxmt1pEzkBHR",
+        "sponsored": false
+      },
+      {
+        "symbol": "ENA",
+        "feedId": "b7910ba7322db020416fcac28b48c01212fd9cc8fbcbaf7d30477ed8605f6bd4",
+        "account": "HHw9FsrZWPPwDyS8AeZSEat3B4ncBvXfNoWsqm5pff1T",
+        "sponsored": false
+      },
+      {
+        "symbol": "AAVE",
+        "feedId": "2b9ab1e972a281585084148ba1389800799bd4be63b957507db1349314e47445",
+        "account": "38aAZxne9JkspNZPzz5oqtLHWKVDAZuP4ZTcnkGfJSJg",
+        "sponsored": false
+      },
+      {
+        "symbol": "LTC",
+        "feedId": "6e3f3fa8253588df9326580180233eb791e03b443a3ba7a1d892e73874e19a54",
+        "account": "2ciNmEPiMDgW6kTzHm3BDyX5qsvFTLyLk278RHSmfdt4",
+        "sponsored": false
+      },
+      {
+        "symbol": "ADA",
+        "feedId": "2a01deaec9e51a579277b34b122399984d0bbf57e2458a7e42fecd2829867a0d",
+        "account": "EWJioo2ZMLRbgUaPpj34aNpNX7HGXTmXsCKtpMUskY9t",
+        "sponsored": false
+      },
+      {
+        "symbol": "kPEPE",
+        "feedId": "d69731a2e74ac1ce884fc3890f7ee324b6deb66147055249568869ed700882e4",
+        "account": "3adfGDsTjqC55Mw5MfzpcLpNMKGGPBwc9M8xAYq4VEQe",
+        "sponsored": false
+      },
+      {
+        "symbol": "kSHIB",
+        "feedId": "f0d57deca57b3da2fe63a493f4c25925fdfd8edf834b20f93e1f84dbd1504d4a",
+        "account": "FkphkegaYbsZdjQki1PMngmrvkLZczujiJEbibm877AQ",
+        "sponsored": false
+      },
+      {
+        "symbol": "RAY",
+        "feedId": "91568baa8beb53db23eb3fb7f22c6e8bd303d103919e19733f2bb642d3e7987a",
+        "account": "Hhipna3EoWR7u8pDruUg8RxhP5F6XLh6SEHMVDmZhWi8",
+        "sponsored": false
+      },
+      {
+        "symbol": "WTIOIL",
+        "feedId": "f2464139c45f26097e0173b03207c4a490dbd8bf1b72dfbf064eeb832c7c2933",
+        "account": "9MWouZQyeC82KVGh1xnGTZH3PSinwiTwezhdrV7tBoU7",
+        "sponsored": false
+      },
+      {
+        "symbol": "NVDA",
+        "feedId": "b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593",
+        "account": "2w1Tg1XTZbUib7srfRoStJ4v5JXVsK7roQEGMsMaGZFC",
+        "sponsored": false
+      },
+      {
+        "symbol": "TSLA",
+        "feedId": "16dad506d7db8da01c87581c87ca897a012a153557d4d578c3b9c9e1bc0632f1",
+        "account": "E8WFH8brgP58arcuW2wwsPHiomYrSvrgWTsRLZLAEZUQ",
+        "sponsored": false
+      },
+      {
+        "symbol": "AAPL",
+        "feedId": "49f6b65cb1de6b10eaf75e7c03ca029c306d0357e91b5311b175084a5ad55688",
+        "account": "DJ2FyTgUAkEtXW3U5P9PF19meFTRtW4ZWKKFgACfVbUy",
+        "sponsored": false
+      },
+      {
+        "symbol": "SPY",
+        "feedId": "19e09bb805456ada3979a7d1cbb4b6d63babc3a0f8e8a9509f68afa5c4c11cd5",
+        "account": "9owhtgrdLiUMAH9JKxYFt5pUY4Luy4EzzLhdcWPVuDyy",
+        "sponsored": false
+      },
+      {
+        "symbol": "QQQ",
+        "feedId": "9695e2b96ea7b3859da9ed25b7a46a920a776e2fdae19a7bcfdf2b219230452d",
+        "account": "EwssJrQ7UVz6itHEaQQsKWikhZ3iHddyxRhmR7pTvwt5",
+        "sponsored": false
+      },
+      {
+        "symbol": "MSFT",
+        "feedId": "d0ca23c1cc005e004ccf1db5bf76aeb6a49218f43dac3d4b275e92de12ded4d1",
+        "account": "7VYuuJxz8w2rLA9tJG2KZ9T1fSMcjC7uECoYA6nDaqtK",
+        "sponsored": false
+      },
+      {
+        "symbol": "AMZN",
+        "feedId": "b5d0e0fa58a1f8b81498ae670ce93c872d14434b72c364885d4fa1b257cbb07a",
+        "account": "GBkjjFxbaFY9TBHpAPypk5JBchpPPve2jskAcd9zuFNd",
+        "sponsored": false
+      },
+      {
+        "symbol": "GOOGL",
+        "feedId": "5a48c03e9b9cb337801073ed9d166817473697efff0d138874e0f6a33d6d5aa6",
+        "account": "HShKFQqhYkUiXpVyyLmrAALXwWqHB7ikLmPbrwJzpRNh",
+        "sponsored": false
+      },
+      {
+        "symbol": "META",
+        "feedId": "78a3e3b8e676a8f73c439f5d749737034b139bbbe899ba5775216fba596607fe",
+        "account": "GsKrMNoa1Mqjpif4SYk2WjdduWZP699hXRdP51yBM6K2",
+        "sponsored": false
+      },
+      {
+        "symbol": "COIN",
+        "feedId": "fee33f2a978bf32dd6b662b65ba8083c6773b494f8401194ec1870c640860245",
+        "account": "91JXaWGHr57awfqhXQP2TxrkLX6CpvtBaaRjz1PEQqXn",
+        "sponsored": false
+      },
+      {
+        "symbol": "MSTR",
+        "feedId": "e1e80251e5f5184f2195008382538e847fafc36f751896889dd3d1b1f6111f09",
+        "account": "HJGvGyWrAXdZPG4Q7LNkkKja72FDkJW7ixuyg3u6vZyP",
+        "sponsored": false
+      },
+      {
+        "symbol": "HOOD",
+        "feedId": "306736a4035846ba15a3496eed57225b64cc19230a50d14f3ed20fd7219b7849",
+        "account": "5tZizzQN776ZWTibPJKecjk1DkTSDHu47dXM3SxR5D5i",
+        "sponsored": false
+      }
+    ],
+    "maxAgeSeconds": 604800
+  }
+}

@@ -391,6 +391,47 @@ systemctl --user enable --now solos-data-augment-capture.service
 journalctl --user -u solos-data-augment-capture.service -o cat -f
 ```
 
+## Other Solana perp venues and Pyth
+
+`solos-data venues run --config config/venues.json` (ADR-0012) collects Jupiter Perps (and Flash
+Trade's remaining L1 activity) from mainnet: every successful program transaction, its program
+instructions and its Anchor events decoded through the programs' on-chain IDLs, the pool, custody
+and market accounts every minute, and the Pyth push-oracle prices of the Phoenix markets every five
+seconds. It writes hour files under the augment root (`tables/jupiter/…`, `tables/flash/…`,
+`tables/pyth/prices/…`) with its own ledger (`venues/checkpoint.duckdb`), `catalog-venues.json` and
+`status-venues.json`, and its own RPC limiter (`requestsPerSecond`, 20) on the collector's provider
+account. It never touches the collector's checkpoint or cursors.
+
+```sh
+cp ops/solos-data-venues.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now solos-data-venues.service
+journalctl --user -u solos-data-venues.service -o cat | grep -E '"event":"venues_(cycle|error|file)"' | tail -20
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data venues status | python3 -m json.tool | head -60
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment query --sql \
+  "SELECT name, count(*) AS n, count(fields) AS decoded FROM jupiter_events GROUP BY 1 ORDER BY 2 DESC"
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment query --sql \
+  "SELECT symbol, count(*) AS rows, max(ts) FROM pyth_prices GROUP BY 1 ORDER BY 1"
+```
+
+Each cycle logs `venues_cycle` (`manifest`, `bulk`, `single`, `unlisted`, `failed`, `events`,
+`undecoded`, `unknown`, `lagSlots`); a failed cycle logs `venues_error` and retries the same window.
+The status has, per venue, the cursor and its lag behind the finalized slot, the totals, the
+error streak and the last error; `rpc.credits` and `rpc.creditsPerDay` estimate the Helius credits
+from the request counters and `creditCosts`; `pyth.feedAgeSeconds` is each feed's age (null: the
+account does not exist; stale feeds are not stored, `pyth.maxAgeSeconds`). `undecoded` above zero
+means a program changed a layout: fetch the program's IDL again and commit it.
+
+```sh
+# The program's Anchor IDL account (createWithSeed(findProgramAddress([], program), "anchor:idl", program)).
+set -a; . ~/.config/solos-data/collector.env; set +a
+solos-data venues idl --address 38GK1i4cQPAxqrbfKX4RRMNfXpKRn5PgLFHVJeXm1C8Y --out config/idl/jupiter-perpetuals.json
+```
+
+A restart resumes from the stored cursor; a window flushed but not yet recorded is fetched again
+and merged. To start over, stop the unit and delete `venues/` and `tables/{jupiter,flash,pyth}` under
+the augment root together.
+
 ## Dataset health
 
 `solos-data health` reads the JSON snapshots the services already write (raw `status.json` and
@@ -409,6 +450,7 @@ of `config/health.json`; a field left out keeps its default.
 | backfill progress | raw `status.json` `backfill.next` against the previous `health.json` | unchanged for 120 min (not when `phase` is `complete`) | |
 | tail progress | raw `status.json` `watermark.completedAt` (written with every published tail chunk), only while the tail is enabled (`lanes.tail.enabled`) | not advanced for 15 min | not advanced for 60 min |
 | checkpoint maintenance | raw `status.json` `maintenance.at` (written by every storage maintenance pass); the `maintenance` lane's error streak is judged with the lanes below | > 15 min old, or no pass recorded | > 60 min old |
+| venues lane | augment `status-venues.json` (ADR-0012), only when it exists | file > 15 min old, a venue's last cycle > 15 min ago, lag > 1,500 slots, 3 failed cycles in a row, no Pyth poll | lag > 9,000 slots, 10 failed cycles in a row |
 | lane error streaks | raw `status.json` `lanes.{tail,backfill,maintenance}`: consecutive `collector_error`s with no chunk published in between (the lane's progress marker unchanged), last error < 30 min old | 3 in a row | 10 in a row; the finding names the lane and the error class (`oom`, `constraint`, `rollback_failed`, `rpc`, `other`) |
 | augment sync | `status.json` age and `sources.*.errors` | > 150 min old, or errors in the last run | |
 | augment capture | `status-capture.json` age and the lanes' `errors` | > 10 min old, errors grown since the previous check, the Elfa credit guard tripped, the last Elfa hourly cycle > 150 min ago | |
