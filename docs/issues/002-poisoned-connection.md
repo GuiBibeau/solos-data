@@ -55,3 +55,8 @@ Memory: the tail and the archive lane writing together exhausted 32GB and then 6
 checkpoint was no longer trimmed (ADR-0008, "Checkpoint growth, 2026-10-17"), not because of what
 the two lanes write per chunk. With trimming on its own schedule the checkpoint holds the hot window
 and the unpublished rows of the tail cycle in flight; 64GB stays the setting (runbook, "Memory").
+
+Correction, 2026-10-18: 64GB did not hold for the in-service trim of the grown 1.2 TB checkpoint;
+the box runs 400GB (runbook, "Memory"), and a grown checkpoint is rewritten offline with
+`collector repack --keep-hot` instead of drained in service (ADR-0008, "Checkpoint drain,
+2026-10-18").

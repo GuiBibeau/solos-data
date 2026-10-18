@@ -5,6 +5,7 @@
 use crate::fsutil::sync_path;
 use crate::jsonout::Obj;
 use crate::store::{StoreError, memory_connection, query_rows, query_scalar, sql_string};
+use duckdb::Connection;
 use std::path::Path;
 
 /// The previous checkpoint after a rewrite, kept until the next one.
@@ -39,22 +40,12 @@ pub fn repack_checkpoint(root: &Path) -> Result<Obj, StoreError> {
         )?;
         for table in tables {
             let name = table.str("table_name").unwrap_or("").replace('"', "\"\"");
-            let mismatch = query_scalar(
+            let mismatch = digest_mismatch(
                 &conn,
-                &format!(
-                    "SELECT count(*) AS n FROM (
-        (SELECT sha256(to_json(t)) FROM original.\"{name}\" t EXCEPT ALL SELECT sha256(to_json(t)) FROM packed.\"{name}\" t) UNION ALL
-        (SELECT sha256(to_json(t)) FROM packed.\"{name}\" t EXCEPT ALL SELECT sha256(to_json(t)) FROM original.\"{name}\" t))"
-                ),
-                &[],
+                &format!("SELECT * FROM original.\"{name}\""),
+                &format!("SELECT * FROM packed.\"{name}\""),
             )?;
-            if mismatch
-                .as_str()
-                .and_then(|s| s.parse::<i64>().ok())
-                .or_else(|| mismatch.as_i64())
-                .unwrap_or(1)
-                != 0
-            {
+            if mismatch != 0 {
                 return Err(StoreError::Check(
                     "repacked checkpoint data mismatch".into(),
                 ));
@@ -63,21 +54,7 @@ pub fn repack_checkpoint(root: &Path) -> Result<Obj, StoreError> {
         conn.execute_batch("CHECKPOINT packed")?;
         conn.close().map_err(|(_, e)| e)?;
     }
-    let wal = root.join("checkpoint.duckdb.wal");
-    if std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0 {
-        return Err(StoreError::Check(
-            "checkpoint WAL remains; refusing replacement".into(),
-        ));
-    }
-    sync_path(&candidate)?;
-    let bytes_after = std::fs::metadata(&candidate)?.len();
-    // The way back: the closed original stays reachable as `checkpoint.prev.duckdb` (a hard link,
-    // no copy) until the next rewrite replaces it or the operator removes it.
-    let previous = root.join(PREVIOUS);
-    remove_if_exists(&previous)?;
-    std::fs::hard_link(&source, &previous)?;
-    std::fs::rename(&candidate, &source)?;
-    sync_path(root)?;
+    let bytes_after = swap_in(root, &candidate)?;
     Ok(Obj::new()
         .with("ok", true)
         .with("bytesBefore", bytes_before)
@@ -87,6 +64,46 @@ pub fn repack_checkpoint(root: &Path) -> Result<Obj, StoreError> {
             i64::try_from(bytes_before).unwrap_or(i64::MAX)
                 - i64::try_from(bytes_after).unwrap_or(i64::MAX),
         ))
+}
+
+/// Rows of `left` missing from `right` plus rows of `right` missing from `left`, as whole-row
+/// digest multisets (`sha256(to_json(row))`); 0 means equal.
+pub fn digest_mismatch(conn: &Connection, left: &str, right: &str) -> Result<i64, StoreError> {
+    let mismatch = query_scalar(
+        conn,
+        &format!(
+            "SELECT count(*) AS n FROM (
+        (SELECT sha256(to_json(t)) FROM ({left}) t EXCEPT ALL SELECT sha256(to_json(t)) FROM ({right}) t) UNION ALL
+        (SELECT sha256(to_json(t)) FROM ({right}) t EXCEPT ALL SELECT sha256(to_json(t)) FROM ({left}) t))"
+        ),
+        &[],
+    )?;
+    Ok(mismatch
+        .as_str()
+        .and_then(|s| s.parse::<i64>().ok())
+        .or_else(|| mismatch.as_i64())
+        .unwrap_or(1))
+}
+
+/// Replace `<root>/checkpoint.duckdb` with the closed, checkpointed `candidate`; the original stays
+/// reachable as [`PREVIOUS`] (a hard link, no copy) until the next rewrite replaces it or the
+/// operator removes it. Refuses while the original has a write-ahead log. Returns the new size.
+pub fn swap_in(root: &Path, candidate: &Path) -> Result<u64, StoreError> {
+    let source = root.join("checkpoint.duckdb");
+    let wal = root.join("checkpoint.duckdb.wal");
+    if std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0) > 0 {
+        return Err(StoreError::Check(
+            "checkpoint WAL remains; refusing replacement".into(),
+        ));
+    }
+    sync_path(candidate)?;
+    let bytes_after = std::fs::metadata(candidate)?.len();
+    let previous = root.join(PREVIOUS);
+    remove_if_exists(&previous)?;
+    std::fs::hard_link(&source, &previous)?;
+    std::fs::rename(candidate, &source)?;
+    sync_path(root)?;
+    Ok(bytes_after)
 }
 
 fn remove_if_exists(path: &Path) -> std::io::Result<()> {

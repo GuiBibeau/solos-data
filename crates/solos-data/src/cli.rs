@@ -278,7 +278,7 @@ const COLLECTOR_COMMANDS: [(&str, &str); 17] = [
     ),
     (
         "repack",
-        "Offline verified atomic checkpoint rewrite to reclaim space; stop writer first",
+        "Offline verified atomic checkpoint rewrite to reclaim space; --keep-hot copies only rows not yet trimmable (published copies are checked against the archive and left out; --slots-per-check 1000000; --dry-run writes nothing); stop writer first",
     ),
     (
         "relocate",
@@ -404,7 +404,7 @@ fn collector_command(command: &str, args: &[String]) -> Result<(), StoreError> {
     if command == "probe" {
         config.data_dir = config.data_dir.join("probe");
     }
-    if command == "repack" {
+    if command == "repack" && !has(args, "--keep-hot") {
         println!(
             "{}",
             crate::repack::repack_checkpoint(&config.data_dir)?.to_json()
@@ -561,6 +561,21 @@ fn offline_or_live(
                 "{}",
                 crate::collector::maintenance::relocate(store)?.to_json()
             ),
+            "repack" => {
+                let chunk = flag(args, "--slots-per-check")
+                    .map_or(Ok(1_000_000), str::parse::<i64>)
+                    .map_err(|_| StoreError::Check("invalid --slots-per-check".into()))?;
+                println!(
+                    "{}",
+                    crate::collector::keep_hot::repack_keep_hot(
+                        store,
+                        config.checkpoint_hot_slots,
+                        chunk,
+                        has(args, "--dry-run")
+                    )?
+                    .to_json()
+                );
+            }
             "capabilities" | "probe" | "run" => {
                 let limiter = Arc::new(Limiter::new(
                     config.cu_per_second * config.utilization,
