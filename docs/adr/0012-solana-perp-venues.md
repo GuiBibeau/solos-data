@@ -97,7 +97,7 @@ are recorded in `config/venues.json` and in the status.
   Hyperliquid asset contexts made in ADR-0009), and the account rows resume with the next poll. An hour is
   `complete` in the catalog once it ended an hour before the write.
 - **Health and backup.** `solos-data health` judges `status-venues.json` when it exists: its age
-  (15 min), each venue's slot lag behind the finalized slot (warn 1,500 slots, about ten minutes;
+  (15 min), each venue's slot lag behind the finalized slot (warn 3,000 slots, about twenty minutes;
   critical 9,000), its run of failed cycles (the collector's streak thresholds) and the Pyth poll.
   The nightly backup copies the venues tables with the rest of the augment root and snapshots
   `catalog-venues.json` and `status-venues.json` with the other catalogs: this is our own
@@ -146,3 +146,38 @@ delegation program and refreshed on commits). Its v1 trade history (to about 202
 L1 and in the archive. Zeta has nothing in the dataset's period. Jupiter's oracle is its own
 (Doves, `DoVEsk76QybCEHQGzkvYPWLQu9gzNoZZZt3TPiL597e`), not Pyth; the custody accounts name the
 oracle accounts, which are not collected yet.
+
+## Production validation (2026-10-18/19)
+
+Deployed from `main` at 6c5b044 (PR #40) at 15:55 UTC on 2026-10-18, as its own unit beside the
+running services, which were not restarted or changed. Measured over the first 11.2 hours (status
+counters and the catalog, 2026-10-19 03:06 UTC):
+
+| Measure | 11.2 hours | Per day |
+|---|---|---|
+| Requests (getMultipleAccounts 9,339, getTransactionsForAddress 4,012, getSignaturesForAddress 2,669, getSlot 2,669, getProgramAccounts 36) | 18,725 | about 40,000 (0.5 a second) |
+| Helius credits (Helius prices) | 55,157 | about 118,000 |
+| Hour files (jupiter 36.1 MB, flash 0.2 MB, pyth 0.35 MB) and ledger (0.4 MB) | 37 MB | about 78 MB |
+| Jupiter successful transactions (failed, skipped: 5,491) | 21,316 | about 46,000 |
+| Jupiter events, all decoded (0 undecoded, 0 unknown) | 18,501 | |
+| Jupiter instructions, all named | 28,857 | |
+| Flash L1 transactions | 1 | |
+| Pyth rows (13 feeds fresh) | 9,436 | about 20,000 |
+
+Zero errors and zero restarts; every manifest signature came in the bulk pages (no single fetch,
+nothing unlisted); 1,334 cycles each ended at the finalized slot. Both thresholds the user set (2M
+credits and 5 GB a day) are met by more than an order of magnitude, so the unit stays enabled.
+Transactions are three quarters of the bytes; `storeTransactions: false` would cut the lane to
+about 20 MB a day if space ever matters.
+
+The durable cursor trails the finalized slot by up to a flush interval plus a cycle (1,253 slots
+was seen), so the health warning for a venue's lag is 3,000 slots (about twenty minutes) rather
+than 1,500. Flash's one L1 transaction carried a self-CPI event whose discriminator
+(`c221320d4a1d99aa`) the 16.3.0 IDL does not list; its bytes are kept.
+
+Pyth coverage on the day: fresh are SOL, BTC, ETH, kBONK (BONK/USD), JUP, PUMP, FARTCOIN, USDC,
+USDT, JLP, HYPE, AAVE, and GOLD (XAU/USD, paused over the weekend). SILVER (XAG/USD) is in Pyth's
+sponsored list but its account was last updated 107 days ago, so it is configured as not
+sponsored; the other unsponsored accounts (XRP, DOGE, SUI, BNB, AVAX, LINK, RAY, kPEPE and the
+equities) are stale by weeks to years, and ENA, LTC, ADA, kSHIB and WTIOIL have no shard-0
+account. Those markets need Hermes (a key) or a pusher of our own.

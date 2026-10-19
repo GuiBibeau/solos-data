@@ -96,7 +96,7 @@ impl Default for Thresholds {
             capture_status_warn_minutes: 10,
             elfa_cycle_warn_minutes: 150,
             venues_status_warn_minutes: 15,
-            venues_lag_warn_slots: 1_500,
+            venues_lag_warn_slots: 3_000,
             venues_lag_critical_slots: 9_000,
             disk_free_warn_gb: 500,
             disk_free_critical_gb: 100,
