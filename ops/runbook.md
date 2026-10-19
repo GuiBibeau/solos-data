@@ -231,7 +231,8 @@ SOLOS_DATA_DECODED_DIR=/path/to/decoded/v1 solos-data decoder status
 ## Augmentation lane
 
 `solos-data augment sync --config config/augment.json` (ADR-0009) downloads the free exogenous
-data for the Phoenix markets (Binance USD-M dumps, Hyperliquid and Bybit funding, Deribit DVOL,
+data for the Phoenix markets (Binance USD-M dumps, Bybit and OKX tick dumps, Hyperliquid and
+Bybit funding, Deribit DVOL,
 DefiLlama stablecoins, SEC filings, Phoenix earnings dates, Fear and Greed, Polymarket and
 Kalshi odds) into `SOLOS_DATA_AUGMENT_DIR` (default `dataDir`, `data/augment`) and exits. It is
 idempotent: closed periods are fetched once, the open day or month is rewritten each run, and
@@ -256,7 +257,7 @@ SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment quer
 dataset (files, symbols, rows, bytes, oldest and newest period). `augment_series_error` lines
 name the source, dataset, symbol and item that failed; the item is retried on the next run.
 `--source <name>` (`binance`, `hyperliquid`, `deribit`, `defillama`, `bybit`, `sec`,
-`alternative`, `polymarket`, `kalshi`, `phoenix`) and `--symbol <SYM>` restrict a run for a
+`alternative`, `polymarket`, `kalshi`, `phoenix`, `tardis`, `okx`, `hyperliquid_s3`) and `--symbol <SYM>` restrict a run for a
 check. Query views are named `<source>_<dataset>` (`binance_klines`, `hyperliquid_funding`,
 `deribit_dvol_60s`, `defillama_stablecoins`, `sec_filings`, `alternative_fear_greed`,
 `polymarket_prices`, `kalshi_candles_1h`, `phoenix_earnings_dates`).
@@ -289,12 +290,55 @@ SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment quer
 To re-download one series, delete its rows from `files` and its `progress` record in
 `checkpoint.duckdb` with no run active, or delete the whole root to start over.
 
-The large datasets (Binance `aggTrades` and `bookDepth` under `largeDatasets`, Bybit tick trades
-under `bybit.trades`) are off by default and stay off while `diskBudgetGb` is 0. Set the budget to
-the size the augment root may reach, in GB, and list the datasets; a run stops adding large files
-once the lane's registered bytes pass the budget (`augment_budget_reached`) and resumes where it
-left off when the budget is raised. SOLUSDT alone is about 17 MB of gzip ticks a day on Bybit;
-size the budget from `augment status`'s per-dataset bytes after a day.
+The exchange tick dumps (ADR-0009, "Exchange dumps") are walked newest day first from
+`walk.startDate` (2025-10-01) for the crypto markets: Binance `aggTrades` and `bookDepth`
+(`binance.largeDatasets`, SHA-256 checked), Bybit tick trades (`bybit.trades`) and OKX swap
+trades and monthly funding (`sources.okx`). They need the lane's `diskBudgetGb` above 0 (1,000
+on the box). Each walk spends at most `walk.runMinutes` (45) of a run and stops at its own
+`walk.budgetGb`; the status note of the source says why it stopped, and the next hourly run
+continues where it left off. A period the venue does not serve and that ended more than three
+days ago is recorded as absent (`progress` key `<source>/<dataset>/<symbol>`); a failed file is
+an `augment_series_error` and is retried next run. OKX partitions are OKX's UTC+8 days. The
+dumps are excluded from the R2 backup. Binance's data is CC BY-NC-SA 4.0, non-commercial
+research only, no live trading use (ADR-0009, "Terms").
+
+```sh
+python3 -c 'import json, os; s = json.load(open(os.path.expanduser("~/.local/share/solos-data/augment/status.json"))); [print(k, s["sources"].get(k)) for k in ("binance", "bybit", "okx", "hyperliquid_s3")]'
+journalctl --user -u solos-data-augment.service -o cat | grep -E '"event":"augment_(dump_yield|budget_reached|series_error)"' | tail
+python3 - <<'PY'
+import collections, json, os
+files = json.load(open(os.path.expanduser("~/.local/share/solos-data/augment/catalog.json")))["files"]
+agg = collections.defaultdict(lambda: [set(), 0, 0, "9", "0"])
+for f in files:
+    k = f["source"] + "/" + f["dataset"]
+    if k in ("binance/aggTrades", "binance/bookDepth", "bybit/trades", "okx/trades", "okx/funding"):
+        a = agg[k]; a[0].add(f["symbol"]); a[1] += 1; a[2] += f["bytes"]; a[3] = min(a[3], f["period"]); a[4] = max(a[4], f["period"])
+for k, (syms, n, b, lo, hi) in sorted(agg.items()):
+    print(k, len(syms), "symbols", n, "files", round(b / 1e9, 1), "GB", lo, hi)
+PY
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment query --sql \
+  "SELECT phoenix_symbol, count(*) AS trades, min(ts), max(ts) FROM okx_trades GROUP BY 1 ORDER BY 2 DESC LIMIT 5"
+```
+
+A one-symbol check: `augment sync --source okx --symbol SOL`.
+
+Hyperliquid's S3 archive (`sources.hyperliquidS3`) is requester-pays: the AWS account whose keys
+sign the requests pays the transfer ($0.09/GB from `hyperliquid-archive`, $0.114/GB from
+`hl-mainnet-node-data`). Without keys the source logs `augment_source_disabled` and sends
+nothing. Create an IAM user whose policy allows only `s3:GetObject` and `s3:ListBucket` on
+`hyperliquid-archive` and `hl-mainnet-node-data` (and their `/*`), and put its keys in
+`augment.env` without them touching the terminal or the history:
+
+```sh
+~/.local/bin/solos-hl-aws-keys          # hidden input; backs up augment.env, prints only the lengths
+systemctl --user start --no-block solos-data-augment.service
+journalctl --user -u solos-data-augment.service -o cat | grep -E '"event":"augment_hl_s3_estimate"' | tail -1
+```
+
+With `estimateOnly: true` (committed) the runs only list the window, a day once, and the status
+note gives the bytes and price per dataset. Read it, then set `estimateOnly` to false (and
+`fills` to true if wanted) in `config/augment.json`; each run then downloads at most
+`transferGbPerRun` (20 GB, about $1.80).
 
 Tardis.dev (`sources.tardis`, ADR-0009 "Tardis.dev") downloads the free first-of-month CSV
 samples for the Phoenix crypto markets on Binance USD-M, Bybit, OKX swaps, Hyperliquid and

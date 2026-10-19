@@ -48,6 +48,9 @@ fn config_for(server: &Server, root: &std::path::Path) -> AugmentConfig {
     sources.kalshi.enabled = false;
     sources.phoenix.enabled = false;
     sources.tardis.enabled = false;
+    sources.okx.enabled = false;
+    sources.hyperliquid_s3.enabled = false;
+    sources.binance.large_datasets.clear();
     config.sources = sources;
     config
 }

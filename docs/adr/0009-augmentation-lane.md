@@ -474,3 +474,140 @@ billed by the interval: Perpetuals data plan $700 (Solo), $1,000 (Pro), $350 (Ac
 quarterly or yearly only, eligibility checked); one exchange with all symbols $350 (Solo); selected
 instruments $50 each a month; minimum order $300. The key goes in `augment.env` with
 `~/.local/bin/solos-tardis-key` on the box (hidden input; prints only its length).
+
+## Exchange dumps: Binance, Bybit and OKX tick files, Hyperliquid S3 (2026-10-19)
+
+The world-model work needs trade-level flow on the large venues for the same months the Phoenix
+dataset covers, and Tardis.dev's free samples are one day a month. The user approved on
+2026-10-19 adding the free files the exchanges publish themselves, for the Phoenix crypto
+markets, from 2025-10-01.
+
+### Sources
+
+| Source | Dataset | Files | Window | Notes |
+|---|---|---|---|---|
+| Binance USD-M (`data.binance.vision`) | `binance/aggTrades` | day per symbol | 2025-10-01 → yesterday | `daily/aggTrades/<SYM>/<SYM>-aggTrades-<day>.zip`, SHA-256 `.CHECKSUM` verified; columns as published (`agg_trade_id`, `transact_time_ms`, `price`, `quantity`, first and last trade id, `is_buyer_maker`) |
+| | `binance/bookDepth` | day per symbol | same | depth and notional within ±1…5 % of the mid, a row per band about every 30 s |
+| Bybit (`public.bybit.com/trading/<SYM>/`) | `bybit/trades` | day per symbol | same | every trade as published (time in µs, side, size, price, tick direction, match id, gross value, home and foreign notional, `RPI` when present) |
+| OKX (official historical-data files) | `okx/trades` | day per instrument | same | `static.okx.com/cdn/okex/traderecords/trades/daily/<YYYYMMDD>/<INST>-trades-<day>.zip`: trade id, side, price, size (contracts), `time_ms` |
+| | `okx/funding` | month per instrument | 2025-10 → last month | `swaprates/monthly/<YYYYMM>/<INST>-fundingrates-<month>.zip` |
+| Hyperliquid S3 (requester pays) | `hyperliquid_s3/l2Book`, `asset_ctxs`, `fills` | day per coin (`asset_ctxs`: day, all coins) | same | off without AWS credentials; see below |
+
+All four walk the crypto markets of the symbol map (`kinds: ["crypto"]`): 47 on Binance, 47 on
+Bybit, 46 on OKX, 46 on Hyperliquid. The equity and commodity listings some venues carry
+(`SKHYUSDT`, `OPENUSDT`, `XAUTUSDT`, the HIP-3 `xyz:` perps) are left out.
+
+**Not fetched.** Binance `trades` (every fill; `aggTrades` carries the same prices, sizes,
+aggressor side and the first and last trade id of each aggregate at two thirds of the bytes:
+11.5 GB against 7.5 GB for BTCUSDT over the window). Binance `bookTicker`: the USD-M dumps
+stopped on 2024-03-30, nothing exists in the window. Binance monthly zips: the daily files
+cover the whole window with their own checksums, keep each download under ~100 MB and land
+in day partitions directly; a monthly BTCUSDT `aggTrades` zip is 440 MB that would have to be
+split. OKX open interest: OKX's historical-data service offers trades, 1-minute candles, funding,
+order books (400 and 50 levels, 0.5 GB a day for BTC alone) and borrowing rates, no open
+interest; open interest stays with Hyperliquid's capture and Binance `metrics`. OKX order books
+are not fetched (size). The OKX funding of the open month is not published until the month is
+over; Hyperliquid, Binance and Bybit funding cover the present.
+
+**OKX's day is UTC+8.** The file labelled `2025-10-12` holds 2025-10-11 16:00 to 2025-10-12
+16:00 UTC, the monthly funding file starts at 16:00 UTC on the last day of the previous month.
+The partition keeps OKX's label; `ts` and `time_ms` are UTC, so a query by time is right and a
+query by partition is eight hours early. OKX publishes no checksum file; the zip's CRC-32 is
+checked when the entry is read, and HTTPS covers the transfer. The files are the ones the
+official `GET /api/v5/public/market-data-history` (no key) returns as download links; the source
+builds the same URLs instead of asking the API, which allows ten days per call.
+
+### The walk
+
+`dumps.rs` is one walker for the three free sources. Each (source, dataset, symbol) is a series
+of dated files at URLs the period names; there is no listing. The walker asks for every series'
+newest wanted period, then every series' next older one, down to `walk.startDate`, so whatever a
+run fetches is whole cross-sections of the recent past (monthly series first). A file is final
+once published, so the ledger's `files` table is the progress record; a 404 for a period that
+ended more than three days ago is remembered as `absent` in the series' progress record (a
+market listed later), a younger one is "not published yet" and asked again next run. A failed
+file (transfer, checksum, conversion) stops its series for the run; the others go on. Each
+walk stops at `walk.runMinutes` (45) and the next hourly run continues it, so the sync's other
+sources stay current during the backfill, at `walk.budgetGb` of registered files for the
+source's walk datasets, and at the lane's `diskBudgetGb` (now 1,000). The status note says
+which (`run time budget spent; …`, `walk budgetGb reached`). Zips are unpacked off the async
+threads, straight to the staging file. The Bybit tick walk replaces the oldest-first walk of
+phase 3; the box had never enabled it.
+
+### Hyperliquid S3
+
+`hyperliquid-archive` (us-east-1: `market_data/<YYYYMMDD>/<H>/l2Book/<COIN>.lz4`,
+`asset_ctxs/<YYYYMMDD>.csv.lz4`) and `hl-mainnet-node-data` (ap-northeast-1:
+`node_fills_by_block/hourly/<YYYYMMDD>/<H>.lz4`) are requester-pays: every GET is signed
+(SigV4, `x-amz-request-payer: requester`) and the transfer is billed to the signing account.
+The source is off and sends nothing while `HL_AWS_ACCESS_KEY_ID` and `HL_AWS_SECRET_ACCESS_KEY`
+(optionally `HL_AWS_SESSION_TOKEN`) are missing from `augment.env`; the status shows
+`disabled` with the reason. With them, and `estimateOnly: true` (the committed default), each run
+lists the window day by day (`ListObjectsV2`; listings are cached in the progress record, so a
+day is listed once) and writes the bytes and transfer price per dataset into the status note and
+`augment_hl_s3_estimate`, downloading nothing. Setting `estimateOnly` to false downloads, newest
+UTC day first, at most `transferGbPerRun` (20) per run, `runMinutes` and `budgetGb` (300):
+`l2Book` for `bookSymbols` (BTC, ETH, SOL) as one Parquet day per coin with ten levels a side
+(price, size, order count), the level count and total size per side; `asset_ctxs` as published;
+`fills` (off by default) flattened from each block's `events` to one row per fill (user, coin,
+price, size, side, direction, start position, closed PnL, fee, order and trade id, hash, block)
+for the mapped coins. Hyperliquid uploads the archive about monthly "with no guarantee", so a day
+without files is absent only after 45 days. The `l2Book` and fill line formats are parsed from
+Hyperliquid's documented shapes and checked by unit fixtures, not yet against a downloaded file;
+an unparseable day is an error and nothing is registered for it.
+
+Cost: transfer out of S3 to the internet is $0.09/GB from us-east-1 and $0.114/GB from
+ap-northeast-1 (AWS list prices, first 10 TB a month), plus $0.0004 per 1,000 GETs and $0.005
+per 1,000 listings. Nothing public states the archive's size, and listing it needs the
+credentials. A rough range for the window: `l2Book` of three coins at 2–20 MB an hour each is
+55–550 GB, $5–$50; `asset_ctxs` a few MB a day, under $1; node fills of every coin at an
+estimated 0.2–1 GB a day are 80–400 GB, $9–$45 (they are filtered after the transfer, so the
+cost is for all coins). The first keyed run in `estimateOnly` replaces this with the measured
+figure for a few cents of listings.
+
+### Terms
+
+- **Binance.** The *Binance Vision Dataset Terms* (v1.0, 2026-08-26, in the
+  `binance-public-data` repository) license every `data.binance.vision` dataset under
+  CC BY-NC-SA 4.0 and limit use to non-commercial research: academic research, "algorithmic
+  historical backtesting for purely personal non-production research", non-commercial
+  evaluations. They forbid live proprietary trading execution, automated commercial order
+  generation and signal distribution for compensation (4.2), hosting or commercially exploiting
+  the data or derived feeds (4.3), and require attribution and the same licence for any
+  redistributed derivative work (4.5); commercial use needs a written enterprise licence (3.4).
+  This applies to the Binance datasets the lane already held (klines, metrics, funding) as much as
+  to the new ones: the dataset is for research; a model trained on it must not drive live
+  trading without that licence. They also ask clients to keep to rate limits (7.1, 7.2): the
+  lane's two requests a second per host.
+- **OKX.** The historical-data page and API state no data licence; OKX's general Terms of Service
+  apply. Research use, no redistribution.
+- **Bybit.** `public.bybit.com` states no terms; Bybit's general Terms of Service apply. Research
+  use, no redistribution.
+- **Hyperliquid.** The docs state only that the requester pays; no data licence is stated.
+
+None of these is uploaded anywhere but the private R2 backup, and the tick dumps are not
+uploaded at all (below).
+
+### Sizes
+
+Measured from the venues' listings and `Content-Length` headers on 2026-10-19 for the
+2025-10-01 → 2026-10-18 window (383 days), and from converted files on the box:
+
+| Dataset | Download | Parquet on disk | Files |
+|---|---|---|---|
+| Binance `aggTrades` (47 symbols) | 60.0 GB zip | PARQUET_AGG | ~17,900 |
+| Binance `bookDepth` (47) | 8.2 GB zip | PARQUET_DEPTH | ~17,900 |
+| Bybit `trades` (47) | ~215 GB gzip (~207 GB a year) | PARQUET_BYBIT | ~18,000 |
+| OKX `trades` (46) | ~48 GB zip (45.8 GB for 2025-10 → 2026-09) | PARQUET_OKX | ~17,000 |
+| OKX `funding` (46) | < 1 MB | < 10 MB | ~540 |
+
+The largest symbols dominate: ETH, BTC and ZEC are 22 GB of Binance's 60 and 65 GB of Bybit's
+207. Per year the four free datasets are about 330 GB of downloads and DISK_YEAR of Parquet,
+under the 1 TB the user set for this work; the walk budgets (Binance 150, Bybit 300, OKX 120,
+Hyperliquid 300 GB) and the lane's `diskBudgetGb` of 1,000 are ceilings, not targets.
+
+**Backup.** The tick dumps are not uploaded to R2: they are free to download again and would
+multiply the bucket's size. `backup.sh` skips `tables/binance/aggTrades`, `tables/binance/bookDepth`,
+`tables/bybit/trades` and `tables/okx/trades` and drops them from the uploaded catalogs; the
+restore check skips them. OKX funding and the Hyperliquid S3 files (which cost money to fetch
+again) are backed up.

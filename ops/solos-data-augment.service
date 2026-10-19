@@ -1,5 +1,5 @@
 [Unit]
-Description=solos-data augmentation sync: Binance dumps, Hyperliquid and Bybit funding, Deribit DVOL, DefiLlama, SEC filings, Fear and Greed, Polymarket, Kalshi, Phoenix earnings dates
+Description=solos-data augmentation sync: Binance, Bybit and OKX dumps, Hyperliquid and Bybit funding, Deribit DVOL, DefiLlama, SEC filings, Fear and Greed, Polymarket, Kalshi, Phoenix earnings dates
 After=network-online.target
 Wants=network-online.target
 
@@ -13,6 +13,9 @@ ExecStart=%h/.local/share/solos-data/bin/solos-data augment sync --config config
 TimeoutStartSec=infinity
 TimeoutStopSec=120
 UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
 NoNewPrivileges=true
 PrivateTmp=true
 MemoryMax=32G

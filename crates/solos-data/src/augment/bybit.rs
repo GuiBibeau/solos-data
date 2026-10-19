@@ -1,16 +1,14 @@
 //! Bybit's v5 market API: the funding history of a linear perpetual is a paged history, newest
 //! first, 200 rows per page. Tick-trade dumps (`public.bybit.com`, one gzip CSV per symbol and
-//! day) are the opt-in large dataset, walked day by day from the progress record.
+//! day) are the opt-in large dataset, walked newest first by `dumps`.
 
 use super::config::{Bybit, Symbol};
-use super::http::{Http, HttpError, with_query};
-use super::ledger::{get_progress, register, set_progress};
-use super::parquet::{Target, read_json_array, staging_path, write_parquet};
-use super::periods::{Granularity, Period, date_of_ms, periods_through};
-use super::series::{Ctx, Outcome, RowsFuture, Series};
-use crate::jsonout::{Obj, log, now, safe_error};
+use super::http::{Http, with_query};
+use super::parquet::read_json_array;
+use super::periods::Granularity;
+use super::series::{RowsFuture, Series};
 use crate::store::{StoreError, sql_string};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::path::Path;
 
 /// Rows per page.
@@ -123,9 +121,6 @@ pub fn time_of(row: &Value) -> Option<i64> {
     }
 }
 
-/// A day this old with no dump is a day without trades, not a day not yet published.
-pub const UNPUBLISHED_DAYS: i64 = 3;
-
 /// URL of one day's tick dump.
 #[must_use]
 pub fn trades_url(files_url: &str, symbol: &str, label: &str) -> String {
@@ -133,29 +128,6 @@ pub fn trades_url(files_url: &str, symbol: &str, label: &str) -> String {
         "{}/trading/{symbol}/{symbol}{label}.csv.gz",
         files_url.trim_end_matches('/')
     )
-}
-
-/// Progress key of a symbol's tick dumps.
-#[must_use]
-pub fn trades_key(symbol: &str) -> String {
-    format!("bybit/trades/{symbol}")
-}
-
-/// Which day to try first and which is the last one that can exist (the day before yesterday
-/// is always published; yesterday may be).
-#[must_use]
-pub fn trades_window(
-    progress: Option<&Value>,
-    start: chrono::NaiveDate,
-    now_ms: i64,
-) -> (Period, Period) {
-    let first = progress
-        .and_then(|p| p.get("completeThrough"))
-        .and_then(Value::as_str)
-        .and_then(Period::parse)
-        .map_or_else(|| Period::containing(start, Granularity::Day), Period::next);
-    let yesterday = Period::containing(date_of_ms(now_ms - 86_400_000), Granularity::Day);
-    (first, yesterday)
 }
 
 /// The typed projection of a dump's CSV; `columns` are the header names DuckDB found.
@@ -176,139 +148,82 @@ pub fn trades_select(from: &str, columns: &[String], constants: &str) -> String 
     )
 }
 
-/// Sync the tick dumps of every symbol with a Bybit market, under the disk budget.
-pub async fn sync_trades(
-    ctx: &Ctx,
+/// The tick dumps of every symbol of the walk's kinds, as dump series for the newest-first walk
+/// (ADR-0009, exchange dumps).
+#[must_use]
+pub fn trade_kinds(
     cfg: &Bybit,
     symbols: &[Symbol],
     only_symbol: Option<&str>,
-) -> Outcome {
-    let mut outcome = Outcome::default();
+) -> Vec<std::sync::Arc<dyn super::dumps::Kind>> {
+    let mut out: Vec<std::sync::Arc<dyn super::dumps::Kind>> = Vec::new();
     for symbol in symbols {
         let Some(venue) = symbol.bybit.as_deref() else {
             continue;
         };
-        if only_symbol.is_some_and(|s| s != symbol.phoenix && s != venue) {
+        if !cfg.walk.kinds.contains(&symbol.kind)
+            || only_symbol.is_some_and(|s| s != symbol.phoenix && s != venue)
+        {
             continue;
         }
-        if ctx.stopping() {
-            break;
-        }
-        match sync_symbol_trades(ctx, cfg, venue, &symbol.phoenix, &mut outcome).await {
-            Ok(true) => {}
-            Ok(false) => break,
-            Err(error) => {
-                outcome.errors += 1;
-                log_trades_error(venue, "walk", &error.to_string());
-            }
-        }
+        out.push(std::sync::Arc::new(TradeDumps {
+            files_url: cfg.files_url.clone(),
+            venue: venue.to_owned(),
+            phoenix: symbol.phoenix.clone(),
+        }));
     }
-    outcome
+    out
 }
 
-/// Walk one symbol's days; `Ok(false)` means the budget is spent and the walk should stop.
-async fn sync_symbol_trades(
-    ctx: &Ctx,
-    cfg: &Bybit,
-    venue: &str,
-    phoenix: &str,
-    outcome: &mut Outcome,
-) -> Result<bool, StoreError> {
-    let key = trades_key(venue);
-    let lookup = key.clone();
-    let progress = ctx
-        .db
-        .run(move |store| get_progress(store, &lookup))
-        .await?;
-    let (first, last) = trades_window(progress.as_ref(), ctx.start, ctx.now_ms);
-    for day in periods_through(first, last.start_ms()) {
-        if ctx.stopping() {
-            return Ok(true);
-        }
-        if !ctx.within_budget("bybit/trades").await {
-            return Ok(false);
-        }
-        let url = trades_url(&cfg.files_url, venue, &day.label());
-        let fetched = match ctx.http.get_bytes(&url, &[]).await {
-            Ok(fetched) => fetched,
-            Err(HttpError::NotFound) => {
-                if ctx.now_ms - day.end_ms() < UNPUBLISHED_DAYS * 86_400_000 {
-                    return Ok(true);
-                }
-                let value = json!({ "completeThrough": day.label(), "updatedAt": now() });
-                let key = key.clone();
-                ctx.db
-                    .run(move |store| set_progress(store, &key, &value))
-                    .await?;
-                continue;
-            }
-            Err(error) => {
-                outcome.errors += 1;
-                log_trades_error(venue, &day.label(), &error.to_string());
-                return Ok(true);
-            }
-        };
-        let staged = staging_path(&ctx.staging(), "csv.gz");
-        std::fs::write(&staged, &fetched.body)?;
-        let target = Target {
-            source: "bybit".into(),
-            dataset: "trades".into(),
-            symbol: venue.into(),
-            phoenix_symbol: Some(phoenix.into()),
-            period: day.label(),
-            complete: true,
-        };
+/// One symbol's daily tick dumps (`public.bybit.com/trading/<SYMBOL>/<SYMBOL><day>.csv.gz`).
+pub struct TradeDumps {
+    files_url: String,
+    venue: String,
+    phoenix: String,
+}
+
+impl super::dumps::Kind for TradeDumps {
+    fn source(&self) -> &str {
+        "bybit"
+    }
+    fn dataset(&self) -> &str {
+        "trades"
+    }
+    fn symbol(&self) -> &str {
+        &self.venue
+    }
+    fn phoenix(&self) -> &str {
+        &self.phoenix
+    }
+    fn granularity(&self) -> Granularity {
+        Granularity::Day
+    }
+    fn url(&self, label: &str) -> String {
+        trades_url(&self.files_url, &self.venue, label)
+    }
+    fn container(&self) -> super::dumps::Container {
+        super::dumps::Container::Gzip
+    }
+    fn select(
+        &self,
+        store: &mut crate::store::Store,
+        staged: &Path,
+        constants: &str,
+    ) -> Result<String, StoreError> {
         let from = format!(
             "read_csv({}, header=true, compression='gzip', auto_detect=true, all_varchar=true)",
             sql_string(&staged.to_string_lossy())
         );
-        let progress = json!({ "completeThrough": day.label(), "updatedAt": now() });
-        let (root, key_for_run) = (ctx.root.clone(), key.clone());
-        let result = ctx
-            .db
-            .run(move |store| {
-                let columns: Vec<String> = store
-                    .rows(
-                        &format!("SELECT column_name FROM (DESCRIBE SELECT * FROM {from})"),
-                        &[],
-                    )?
-                    .iter()
-                    .filter_map(|row| row.str("column_name").map(str::to_owned))
-                    .collect();
-                let select = trades_select(&from, &columns, &target.constant_columns());
-                let record = write_parquet(store, &root, &select, &target)?;
-                register(store, &record, Some((&key_for_run, &progress)))?;
-                Ok(record.row_count)
-            })
-            .await;
-        let _ = std::fs::remove_file(&staged);
-        let rows = result?;
-        outcome.files += 1;
-        outcome.rows += u64::try_from(rows).unwrap_or(0);
-        log(
-            "augment_file",
-            Obj::new()
-                .with("source", "bybit")
-                .with("dataset", "trades")
-                .with("symbol", venue)
-                .with("period", day.label())
-                .with("rows", rows)
-                .with("complete", true),
-        );
+        let columns: Vec<String> = store
+            .rows(
+                &format!("SELECT column_name FROM (DESCRIBE SELECT * FROM {from})"),
+                &[],
+            )?
+            .iter()
+            .filter_map(|row| row.str("column_name").map(str::to_owned))
+            .collect();
+        Ok(trades_select(&from, &columns, constants))
     }
-    Ok(true)
-}
-
-fn log_trades_error(venue: &str, item: &str, error: &str) {
-    log(
-        "augment_series_error",
-        Obj::new()
-            .with("source", "bybit")
-            .with("dataset", "trades")
-            .with("symbol", venue)
-            .with("item", item)
-            .with("error", safe_error(error)),
-    );
 }
 
 #[cfg(test)]
@@ -318,21 +233,11 @@ mod tests {
     const SAMPLE: &str = include_str!("../../../../tests/data/augment/bybit-funding.json");
 
     #[test]
-    fn trade_dump_paths_and_windows() {
+    fn trade_dump_paths_and_selects() {
         assert_eq!(
             trades_url("https://public.bybit.com/", "SOLUSDT", "2026-10-07"),
             "https://public.bybit.com/trading/SOLUSDT/SOLUSDT2026-10-07.csv.gz"
         );
-        let start = super::super::periods::parse_date("2026-01-01").unwrap();
-        let now_ms = 1_791_547_200_000; // 2026-10-09T12:00Z
-        let (first, last) = trades_window(None, start, now_ms);
-        assert_eq!(
-            (first.label(), last.label()),
-            ("2026-01-01".into(), "2026-10-08".into())
-        );
-        let progress = json!({ "completeThrough": "2026-10-06" });
-        let (first, _) = trades_window(Some(&progress), start, now_ms);
-        assert_eq!(first.label(), "2026-10-07");
         let with_rpi = trades_select(
             "read_csv('x')",
             &["timestamp".into(), "RPI".into()],
