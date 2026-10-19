@@ -489,7 +489,7 @@ markets, from 2025-10-01.
 | Binance USD-M (`data.binance.vision`) | `binance/aggTrades` | day per symbol | 2025-10-01 → yesterday | `daily/aggTrades/<SYM>/<SYM>-aggTrades-<day>.zip`, SHA-256 `.CHECKSUM` verified; columns as published (`agg_trade_id`, `transact_time_ms`, `price`, `quantity`, first and last trade id, `is_buyer_maker`) |
 | | `binance/bookDepth` | day per symbol | same | depth and notional within ±1…5 % of the mid, a row per band about every 30 s |
 | Bybit (`public.bybit.com/trading/<SYM>/`) | `bybit/trades` | day per symbol | same | every trade as published (time in µs, side, size, price, tick direction, match id, gross value, home and foreign notional, `RPI` when present) |
-| OKX (official historical-data files) | `okx/trades` | day per instrument | same | `static.okx.com/cdn/okex/traderecords/trades/daily/<YYYYMMDD>/<INST>-trades-<day>.zip`: trade id, side, price, size (contracts), `time_ms` |
+| OKX (official historical-data files) | `okx/trades` | day per instrument | same | `static.okx.com/cdn/okex/traderecords/trades/daily/<YYYYMMDD>/<INST>-trades-<day>.zip`: trade id, side, price, size (contracts), `time_ms`, and `trade_source` from OKX's seventh column `source` (files since November 2025; null before) |
 | | `okx/funding` | month per instrument | 2025-10 → last month | `swaprates/monthly/<YYYYMM>/<INST>-fundingrates-<month>.zip` |
 | Hyperliquid S3 (requester pays) | `hyperliquid_s3/l2Book`, `asset_ctxs`, `fills` | day per coin (`asset_ctxs`: day, all coins) | same | off without AWS credentials; see below |
 
@@ -590,19 +590,21 @@ uploaded at all (below).
 
 ### Sizes
 
-Measured from the venues' listings and `Content-Length` headers on 2026-10-19 for the
-2025-10-01 → 2026-10-18 window (383 days), and from converted files on the box:
+Downloads measured from the venues' listings and `Content-Length` headers on 2026-10-19 for the
+2025-10-01 → 2026-10-18 window (383 days); the Parquet ratio measured by converting four
+symbols (BTC, SOL, DOGE, PEPE) over 2026-10-14 → 18 with this code (Bybit's ratio is high
+because every trade carries a UUID match id; OKX's because its zips are already dense):
 
 | Dataset | Download | Parquet on disk | Files |
 |---|---|---|---|
-| Binance `aggTrades` (47 symbols) | 60.0 GB zip | PARQUET_AGG | ~17,900 |
-| Binance `bookDepth` (47) | 8.2 GB zip | PARQUET_DEPTH | ~17,900 |
-| Bybit `trades` (47) | ~215 GB gzip (~207 GB a year) | PARQUET_BYBIT | ~18,000 |
-| OKX `trades` (46) | ~48 GB zip (45.8 GB for 2025-10 → 2026-09) | PARQUET_OKX | ~17,000 |
+| Binance `aggTrades` (47 symbols) | 60.0 GB zip | ~40 GB (0.67 of the zip) | ~17,900 |
+| Binance `bookDepth` (47) | 8.2 GB zip | ~6 GB (0.75) | ~17,900 |
+| Bybit `trades` (47) | ~215 GB gzip (~207 GB a year) | ~195 GB (0.90) | ~18,000 |
+| OKX `trades` (46) | ~48 GB zip (45.8 GB for 2025-10 → 2026-09) | ~43 GB (0.90) | ~17,000 |
 | OKX `funding` (46) | < 1 MB | < 10 MB | ~540 |
 
 The largest symbols dominate: ETH, BTC and ZEC are 22 GB of Binance's 60 and 65 GB of Bybit's
-207. Per year the four free datasets are about 330 GB of downloads and DISK_YEAR of Parquet,
+207. Per year the four free datasets are about 320 GB of downloads and about 270 GB of Parquet,
 under the 1 TB the user set for this work; the walk budgets (Binance 150, Bybit 300, OKX 120,
 Hyperliquid 300 GB) and the lane's `diskBudgetGb` of 1,000 are ceilings, not targets.
 

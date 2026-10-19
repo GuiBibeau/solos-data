@@ -123,21 +123,86 @@ impl Kind for Series {
     ) -> Result<String, StoreError> {
         // Rows start with the instrument name, so only the header name tells a header line apart.
         let header = staged_starts_with(staged, "instrument_name")?;
-        let (columns, select, order) = if self.funding {
-            (FUNDING_COLUMNS, FUNDING_SELECT, "funding_time")
+        let first = first_line(staged)?;
+        let (base, select, order) = if self.funding {
+            (FUNDING_COLUMNS, FUNDING_SELECT.to_owned(), "funding_time")
         } else {
-            (TRADE_COLUMNS, TRADE_SELECT, "created_time, trade_id")
+            (TRADE_COLUMNS, String::new(), "created_time, trade_id")
         };
+        let columns = columns_for(base, &first, header);
+        let select = if self.funding {
+            select
+        } else {
+            let source = if columns.iter().any(|(n, _)| n == "source") {
+                "source AS trade_source"
+            } else {
+                "NULL::VARCHAR AS trade_source"
+            };
+            format!("{TRADE_SELECT}, {source}")
+        };
+        let typed: Vec<(&str, &str)> = columns.iter().map(|(n, t)| (n.as_str(), *t)).collect();
         Ok(format!(
             "SELECT {select}, {constants} FROM {} ORDER BY {order}",
-            read_csv(staged, columns, header)
+            read_csv(staged, &typed, header)
         ))
     }
+}
+
+fn first_line(path: &Path) -> Result<String, StoreError> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    std::io::BufReader::new(std::fs::File::open(path)?).read_line(&mut line)?;
+    Ok(line.trim_end().to_owned())
+}
+
+/// The CSV columns of a file whose first line is `first`: the known ones in order, then any
+/// column OKX added since (named from the header, `extra_<n>` without one) as `VARCHAR`. Files
+/// from November 2025 carry a seventh trade column, `source`.
+#[must_use]
+pub fn columns_for(
+    base: &[(&'static str, &'static str)],
+    first: &str,
+    header: bool,
+) -> Vec<(String, &'static str)> {
+    let fields: Vec<&str> = first.split(',').collect();
+    let mut out: Vec<(String, &'static str)> =
+        base.iter().map(|(n, t)| ((*n).to_owned(), *t)).collect();
+    for (i, field) in fields.iter().enumerate().skip(base.len()) {
+        let name = if header
+            && !field.is_empty()
+            && field
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            (*field).to_owned()
+        } else {
+            format!("extra_{i}")
+        };
+        out.push((name, "VARCHAR"));
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn added_columns_are_kept() {
+        let seven = columns_for(
+            TRADE_COLUMNS,
+            "instrument_name,trade_id,side,price,size,created_time,source",
+            true,
+        );
+        assert_eq!(seven.len(), 7);
+        assert_eq!(seven[6], ("source".to_owned(), "VARCHAR"));
+        let bare = columns_for(TRADE_COLUMNS, "SOL-USDT-SWAP,1,buy,1,1,1,0", false);
+        assert_eq!(bare[6].0, "extra_6");
+        assert_eq!(
+            columns_for(TRADE_COLUMNS, "SOL-USDT-SWAP,1,buy,1,1,1", false).len(),
+            6
+        );
+    }
 
     #[test]
     fn urls() {

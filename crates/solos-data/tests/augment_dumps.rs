@@ -91,7 +91,7 @@ fn mount(server: &Server) {
         None,
     );
     let trades = format!(
-        "instrument_name,trade_id,side,price,size,created_time\nSOL-USDT-SWAP,7,sell,120.1,6.5,{}\nSOL-USDT-SWAP,6,buy,120.0,1,{}\n",
+        "instrument_name,trade_id,side,price,size,created_time,source\nSOL-USDT-SWAP,7,sell,120.1,6.5,{},0\nSOL-USDT-SWAP,6,buy,120.0,1,{},1\n",
         OCT8_MS - 8 * 3_600_000 + 2,
         OCT8_MS - 8 * 3_600_000 + 1
     );
@@ -165,12 +165,14 @@ fn dumps_walk_newest_first_with_checksums_absences_and_reruns() {
     assert_eq!(depth[0]["n"], "4");
     let okx = rows(
         &config,
-        "SELECT count(*) AS n, min(trade_id) AS lo, sum(size) AS sz, min(ts)::VARCHAR AS first FROM okx_trades",
+        "SELECT count(*) AS n, min(trade_id) AS lo, sum(size) AS sz, min(ts)::VARCHAR AS first, count(trade_source) AS src FROM okx_trades",
     );
     assert_eq!(okx[0]["n"], "3");
     assert_eq!(okx[0]["lo"], "5");
     assert_eq!(okx[0]["sz"], 9.5);
     assert_eq!(okx[0]["first"], "2026-10-07 00:00:00");
+    // The seven-column files (since November 2025) keep OKX's `source` column.
+    assert_eq!(okx[0]["src"], "2");
     let funding = rows(
         &config,
         "SELECT count(*) AS n, min(funding_rate) AS lo FROM okx_funding",
