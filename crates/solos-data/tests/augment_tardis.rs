@@ -38,6 +38,8 @@ fn config_for(server: &Server, root: &std::path::Path) -> AugmentConfig {
         &mut s.polymarket.enabled,
         &mut s.kalshi.enabled,
         &mut s.phoenix.enabled,
+        &mut s.okx.enabled,
+        &mut s.hyperliquid_s3.enabled,
     ] {
         *enabled = false;
     }

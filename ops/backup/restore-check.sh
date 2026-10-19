@@ -40,7 +40,7 @@ done
 # The venues lane (ADR-0012) is optional: a bucket without its catalog samples the others.
 rc copyto "$dest/augment/catalog-venues.json" "$work/augment-catalog-venues.json" 2>/dev/null \
   || printf '{"files":[]}' > "$work/augment-catalog-venues.json"
-jq -s -r '.[].files[] | select(.complete and .source != "tardis") | "\(.sha256)  augment/\(.path)"' \
+jq -s -r '.[].files[] | select(.complete and .source != "tardis" and ((.source + "/" + .dataset) | IN("binance/aggTrades", "binance/bookDepth", "bybit/trades", "okx/trades") | not)) | "\(.sha256)  augment/\(.path)"' \
   "$work/augment-catalog.json" "$work/augment-catalog-capture.json" "$work/augment-catalog-venues.json" | shuf -n "$augment_files" > "$work/augment-sums.txt"
 sed 's|^[0-9a-f]*  augment/||' "$work/augment-sums.txt" > "$work/augment-files.txt"
 rc copy "$dest/augment" "$work/augment" --files-from-raw "$work/augment-files.txt"

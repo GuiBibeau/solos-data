@@ -274,7 +274,109 @@ pub fn label_before(dataset: &Dataset, start: chrono::NaiveDate) -> String {
     super::periods::Period::containing(previous, dataset.granularity).label()
 }
 
-/// Sync every enabled dataset for every symbol with a Binance market.
+/// The large datasets (`aggTrades`, `bookDepth`) as dump series for the newest-first walk
+/// (ADR-0009, exchange dumps): one per dataset and symbol of the walk's kinds.
+#[must_use]
+pub fn dump_kinds(
+    cfg: &Binance,
+    symbols: &[Symbol],
+    only_symbol: Option<&str>,
+) -> Vec<std::sync::Arc<dyn super::dumps::Kind>> {
+    let mut out: Vec<std::sync::Arc<dyn super::dumps::Kind>> = Vec::new();
+    for name in &cfg.large_datasets {
+        let Some(dataset) = dataset_static(name) else {
+            continue;
+        };
+        for symbol in symbols {
+            let Some(venue) = symbol.binance.as_deref() else {
+                continue;
+            };
+            if !cfg.walk.kinds.contains(&symbol.kind)
+                || only_symbol.is_some_and(|s| s != symbol.phoenix && s != venue)
+            {
+                continue;
+            }
+            out.push(std::sync::Arc::new(DumpSeries {
+                files_url: cfg.files_url.trim_end_matches('/').to_owned(),
+                verify_checksums: cfg.verify_checksums,
+                dataset,
+                venue: venue.to_owned(),
+                phoenix: symbol.phoenix.clone(),
+            }));
+        }
+    }
+    out
+}
+
+/// The large datasets the dump walk knows; any other name is not walked (and the config
+/// validation refuses it).
+fn dataset_static(name: &str) -> Option<&'static Dataset> {
+    static AGG: std::sync::OnceLock<Option<Dataset>> = std::sync::OnceLock::new();
+    static DEPTH: std::sync::OnceLock<Option<Dataset>> = std::sync::OnceLock::new();
+    match name {
+        "aggTrades" => AGG.get_or_init(|| dataset("aggTrades")).as_ref(),
+        "bookDepth" => DEPTH.get_or_init(|| dataset("bookDepth")).as_ref(),
+        _ => None,
+    }
+}
+
+/// One large dataset of one symbol, as daily dump files.
+pub struct DumpSeries {
+    files_url: String,
+    verify_checksums: bool,
+    dataset: &'static Dataset,
+    venue: String,
+    phoenix: String,
+}
+
+impl super::dumps::Kind for DumpSeries {
+    fn source(&self) -> &str {
+        "binance"
+    }
+    fn dataset(&self) -> &str {
+        self.dataset.name
+    }
+    fn symbol(&self) -> &str {
+        &self.venue
+    }
+    fn phoenix(&self) -> &str {
+        &self.phoenix
+    }
+    fn granularity(&self) -> Granularity {
+        self.dataset.granularity
+    }
+    fn url(&self, label: &str) -> String {
+        format!(
+            "{}/{}{}",
+            self.files_url,
+            self.dataset.prefix(&self.venue),
+            self.dataset.file_name(&self.venue, label)
+        )
+    }
+    fn checksum_url(&self, label: &str) -> Option<String> {
+        self.verify_checksums
+            .then(|| format!("{}.CHECKSUM", self.url(label)))
+    }
+    fn container(&self) -> super::dumps::Container {
+        super::dumps::Container::Zip
+    }
+    fn select(
+        &self,
+        _store: &mut crate::store::Store,
+        staged: &std::path::Path,
+        constants: &str,
+    ) -> Result<String, StoreError> {
+        let header = super::dumps::staged_has_header(staged)?;
+        Ok(format!(
+            "SELECT {}, {constants} FROM {} ORDER BY 1",
+            self.dataset.select,
+            read_csv(staged, self.dataset.columns, header)
+        ))
+    }
+}
+
+/// Sync every phase-1 dataset for every symbol with a Binance market (the large ones are walked
+/// by `dumps`).
 pub async fn sync(
     ctx: &Ctx,
     cfg: &Binance,
@@ -282,18 +384,12 @@ pub async fn sync(
     only_symbol: Option<&str>,
 ) -> Outcome {
     let mut outcome = Outcome::default();
-    let names: Vec<(&String, bool)> = cfg
-        .datasets
-        .iter()
-        .map(|n| (n, false))
-        .chain(cfg.large_datasets.iter().map(|n| (n, true)))
-        .collect();
-    for (name, large) in names {
+    for name in &cfg.datasets {
         let Some(dataset) = dataset(name) else {
             continue;
         };
         for symbol in symbols {
-            if ctx.stopping() || (large && !ctx.within_budget(name).await) {
+            if ctx.stopping() {
                 return outcome;
             }
             let Some(venue) = symbol.binance.as_deref() else {

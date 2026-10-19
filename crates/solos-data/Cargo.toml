@@ -33,6 +33,9 @@ zip = { version = "6", default-features = false, features = ["deflate-flate2-zli
 # EDGAR answers gzip when asked; the lane inflates the body itself. Tests build gzip fixtures
 # for the Bybit tick dumps with the same crate.
 flate2 = "1"
+# AWS SigV4 for the requester-pays Hyperliquid S3 archive (HMAC-SHA256) and its lz4 frames.
+hmac = "0.12"
+lz4 = "1.28"
 # The Elfa Auto event stream is read through reqwest's `bytes_stream`.
 futures-util = "0.3"
 jetstreamer-firehose = { git = "https://github.com/anza-xyz/jetstreamer", rev = "048d2cd", optional = true }

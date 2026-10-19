@@ -93,11 +93,13 @@ mkdir -p "$work/augment-meta"
 for f in catalog.json catalog-capture.json catalog-venues.json status.json status-capture.json status-venues.json; do
   if [ -f "$augment/$f" ]; then cp "$augment/$f" "$work/augment-meta/$f"; fi
 done
-# The Tardis.dev files are not uploaded (below), so the uploaded catalogs do not list them
-# either: a restored root's catalog then names only files that exist.
+# The Tardis.dev files and the exchange tick dumps are not uploaded (below), so the uploaded
+# catalogs do not list them either: a restored root's catalog then names only files that exist.
+# The tick dumps (Binance aggTrades and bookDepth, Bybit and OKX trades; ADR-0009, exchange
+# dumps) are free to download again from the venues and are hundreds of GB.
 for f in catalog.json catalog-capture.json catalog-venues.json; do
   if [ -f "$work/augment-meta/$f" ]; then
-    if jq '.files |= map(select(.source != "tardis"))' "$work/augment-meta/$f" > "$work/augment-meta/$f.tmp"; then
+    if jq '.files |= map(select(.source != "tardis" and ((.source + "/" + .dataset) | IN("binance/aggTrades", "binance/bookDepth", "bybit/trades", "okx/trades") | not)))' "$work/augment-meta/$f" > "$work/augment-meta/$f.tmp"; then
       mv "$work/augment-meta/$f.tmp" "$work/augment-meta/$f"
     else
       rm -f "$work/augment-meta/$f" "$work/augment-meta/$f.tmp"
@@ -108,7 +110,9 @@ done
 # external service provider before its data is disclosed to it (ADR-0009, Tardis.dev section).
 run_step augment-files 1 copy "$augment" "$dest/augment" --checksum --fast-list \
   --filter '- checkpoint.duckdb*' --filter '- /staging*/**' --filter '- *.tmp' \
-  --filter '- /catalog*.json' --filter '- /status*.json' --filter '- /tables/tardis/**' || true
+  --filter '- /catalog*.json' --filter '- /status*.json' --filter '- /tables/tardis/**' \
+  --filter '- /tables/binance/aggTrades/**' --filter '- /tables/binance/bookDepth/**' \
+  --filter '- /tables/bybit/trades/**' --filter '- /tables/okx/trades/**' || true
 
 run_step config 1 copy "$checkout/config" "$dest/config" --checksum --filter '- *.env' || true
 run_step units 1 copy "$units" "$dest/systemd-user" --checksum \

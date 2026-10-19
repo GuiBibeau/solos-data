@@ -57,6 +57,36 @@ pub struct Binance {
     /// Compare each file with its published `.CHECKSUM`.
     #[serde(default = "d_true")]
     pub verify_checksums: bool,
+    /// How `largeDatasets` are walked: newest day first, from `walk.startDate`.
+    #[serde(default)]
+    pub walk: DumpWalk,
+}
+
+/// A walk over an exchange's dated dump files (ADR-0009, exchange dumps 2026-10-19): newest
+/// period first down to `startDate`, across every series day by day, bounded per run in time
+/// and per source in bytes, so the hourly sync stays short and a stopped run resumes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DumpWalk {
+    /// First UTC day (or month) walked, `YYYY-MM-DD`.
+    pub start_date: String,
+    /// Symbol kinds covered (`crypto`).
+    pub kinds: Vec<String>,
+    /// Size, in GB, the walk's datasets may reach in the ledger before it stops adding files.
+    pub budget_gb: f64,
+    /// Minutes one sync run may spend on the walk before yielding to the next run.
+    pub run_minutes: u64,
+}
+
+impl Default for DumpWalk {
+    fn default() -> Self {
+        DumpWalk {
+            start_date: "2025-10-01".into(),
+            kinds: vec!["crypto".into()],
+            budget_gb: 0.0,
+            run_minutes: 45,
+        }
+    }
 }
 
 /// Hyperliquid info API.
@@ -140,6 +170,138 @@ pub struct Bybit {
     /// Tick trades dumps (large; opt-in).
     #[serde(default)]
     pub trades: bool,
+    /// How the tick dumps are walked.
+    #[serde(default)]
+    pub walk: DumpWalk,
+}
+
+/// OKX historical market data: the official static files the
+/// `/api/v5/public/market-data-history` endpoint links to (trades daily, funding monthly).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Okx {
+    /// Whether the source runs.
+    pub enabled: bool,
+    /// Base of the static files (`https://static.okx.com/cdn/okex/traderecords`).
+    pub files_url: String,
+    /// Daily swap trades.
+    pub trades: bool,
+    /// Monthly swap funding rates.
+    pub funding: bool,
+    /// The walk.
+    pub walk: DumpWalk,
+}
+
+impl Default for Okx {
+    fn default() -> Self {
+        Okx {
+            enabled: false,
+            files_url: "https://static.okx.com/cdn/okex/traderecords".into(),
+            trades: false,
+            funding: false,
+            walk: DumpWalk::default(),
+        }
+    }
+}
+
+/// AWS credentials for the requester-pays Hyperliquid buckets, kept out of `Debug` output.
+#[derive(Clone)]
+pub struct AwsKeys {
+    /// Access key id.
+    pub access_key_id: String,
+    /// Secret access key.
+    pub secret_access_key: String,
+    /// Session token of temporary credentials.
+    pub session_token: Option<String>,
+}
+
+impl std::fmt::Debug for AwsKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "AwsKeys(<{} chars>, <{} chars>)",
+            self.access_key_id.len(),
+            self.secret_access_key.len()
+        )
+    }
+}
+
+/// The variables the Hyperliquid S3 credentials are read from (the sync unit's `augment.env`).
+pub const HL_AWS_ENV: [&str; 3] = [
+    "HL_AWS_ACCESS_KEY_ID",
+    "HL_AWS_SECRET_ACCESS_KEY",
+    "HL_AWS_SESSION_TOKEN",
+];
+
+/// The Hyperliquid credentials, when both required variables are set and not empty.
+#[must_use]
+pub fn hl_aws_keys_from_env() -> Option<AwsKeys> {
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
+    Some(AwsKeys {
+        access_key_id: read(HL_AWS_ENV[0])?,
+        secret_access_key: read(HL_AWS_ENV[1])?,
+        session_token: read(HL_AWS_ENV[2]),
+    })
+}
+
+/// Hyperliquid's requester-pays S3 archive (ADR-0009, exchange dumps): hourly `l2Book`
+/// snapshots, daily asset contexts and hourly node fills. Off without `HL_AWS_*` credentials;
+/// with them, `estimateOnly` lists and prices the window before anything is downloaded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HyperliquidS3 {
+    /// Whether the source runs (it also needs the credentials).
+    pub enabled: bool,
+    /// `hyperliquid-archive` endpoint (`market_data/`, `asset_ctxs/`).
+    pub archive_url: String,
+    /// Its region, for signing.
+    pub archive_region: String,
+    /// `hl-mainnet-node-data` endpoint (`node_fills_by_block/`).
+    pub node_url: String,
+    /// Its region.
+    pub node_region: String,
+    /// List and price the window only; download nothing.
+    pub estimate_only: bool,
+    /// Hourly `l2Book` snapshots of `bookSymbols`.
+    pub l2_book: bool,
+    /// Daily asset contexts of every coin.
+    pub asset_ctxs: bool,
+    /// Hourly node fills, kept for the mapped coins.
+    pub fills: bool,
+    /// Phoenix symbols whose books are fetched.
+    pub book_symbols: Vec<String>,
+    /// Transfer, in GB, one run may download (requester pays it).
+    pub transfer_gb_per_run: f64,
+    /// The walk (start, kinds, total budget, minutes per run).
+    pub walk: DumpWalk,
+    /// From `HL_AWS_*`, never from the file.
+    #[serde(skip)]
+    pub keys: Option<AwsKeys>,
+}
+
+impl Default for HyperliquidS3 {
+    fn default() -> Self {
+        HyperliquidS3 {
+            enabled: false,
+            archive_url: "https://hyperliquid-archive.s3.us-east-1.amazonaws.com".into(),
+            archive_region: "us-east-1".into(),
+            node_url: "https://hl-mainnet-node-data.s3.ap-northeast-1.amazonaws.com".into(),
+            node_region: "ap-northeast-1".into(),
+            estimate_only: true,
+            l2_book: false,
+            asset_ctxs: false,
+            fills: false,
+            book_symbols: Vec::new(),
+            transfer_gb_per_run: 0.0,
+            walk: DumpWalk::default(),
+            keys: None,
+        }
+    }
 }
 
 /// One exchange of the Tardis.dev source: its id, where each Phoenix market's symbol comes
@@ -444,6 +606,12 @@ pub struct Sources {
     /// Tardis.dev datasets (off unless configured).
     #[serde(default)]
     pub tardis: Tardis,
+    /// OKX historical market data files.
+    #[serde(default)]
+    pub okx: Okx,
+    /// Hyperliquid's requester-pays S3 archive.
+    #[serde(default, rename = "hyperliquidS3")]
+    pub hyperliquid_s3: HyperliquidS3,
 }
 
 /// `config/augment.json`.
@@ -540,6 +708,7 @@ pub fn load_augment_config(path: Option<&str>) -> Result<AugmentConfig, StoreErr
     config.data_dir = crate::fsutil::resolve(&cwd, &data_dir);
     config.sources.sec.user_agent = sec_user_agent_from_env();
     config.sources.tardis.api_key = tardis_key_from_env();
+    config.sources.hyperliquid_s3.keys = hl_aws_keys_from_env();
     validate(&config)?;
     Ok(config)
 }
@@ -635,11 +804,18 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
         }
     }
     let binance = &config.sources.binance;
-    for dataset in binance.datasets.iter().chain(&binance.large_datasets) {
-        if !BINANCE_DATASETS.iter().any(|(name, _)| name == dataset) {
-            return Err(StoreError::Check(format!(
-                "unknown Binance dataset {dataset}"
-            )));
+    // Phase-1 datasets are listed and walked oldest first; the large ones are dump walks.
+    for (datasets, large) in [(&binance.datasets, false), (&binance.large_datasets, true)] {
+        for dataset in datasets {
+            if !BINANCE_DATASETS
+                .iter()
+                .any(|(name, is_large)| name == dataset && *is_large == large)
+            {
+                return Err(StoreError::Check(format!(
+                    "Binance dataset {dataset} is not a {} dataset",
+                    if large { "large" } else { "phase-1" }
+                )));
+            }
         }
     }
     for resolution in &config.sources.deribit.resolutions {
@@ -665,10 +841,43 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
         &config.sources.kalshi.base_url,
         &config.sources.phoenix.markets_url,
         &config.sources.tardis.datasets_url,
+        &config.sources.okx.files_url,
+        &config.sources.hyperliquid_s3.archive_url,
+        &config.sources.hyperliquid_s3.node_url,
     ] {
         check_url(url)?;
     }
+    for (name, walk) in [
+        ("binance.walk", &binance.walk),
+        ("bybit.walk", &config.sources.bybit.walk),
+        ("okx.walk", &config.sources.okx.walk),
+        ("hyperliquidS3.walk", &config.sources.hyperliquid_s3.walk),
+    ] {
+        validate_walk(name, walk)?;
+    }
+    let hl = &config.sources.hyperliquid_s3;
+    if !(hl.transfer_gb_per_run >= 0.0 && hl.transfer_gb_per_run.is_finite())
+        || [&hl.archive_region, &hl.node_region]
+            .iter()
+            .any(|r| r.is_empty() || !r.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    {
+        return Err(StoreError::Check("invalid hyperliquidS3 settings".into()));
+    }
     super::tardis::validate(&config.sources.tardis)
+}
+
+fn validate_walk(name: &str, walk: &DumpWalk) -> Result<(), StoreError> {
+    let kinds_ok = walk
+        .kinds
+        .iter()
+        .all(|k| ["crypto", "equity", "commodity"].contains(&k.as_str()));
+    if super::periods::parse_date(&walk.start_date).is_none()
+        || !(walk.budget_gb >= 0.0 && walk.budget_gb.is_finite())
+        || !kinds_ok
+    {
+        return Err(StoreError::Check(format!("invalid {name}")));
+    }
+    Ok(())
 }
 
 /// Source URLs are https, or http on the loopback address (tests).
@@ -737,6 +946,19 @@ mod tests {
         assert!(config.sources.kalshi.series.contains(&"KXFED".to_owned()));
         assert!(check_url("http://127.0.0.1:8080").is_ok());
         assert!(check_url("http://example.com").is_err());
+    }
+
+    #[test]
+    fn binance_datasets_stay_in_their_walk() {
+        let path = repository_config_path();
+        let mut config = load_augment_config(path.to_str()).unwrap();
+        config.sources.binance.large_datasets = vec!["metrics".into()];
+        assert!(validate(&config).is_err());
+        config.sources.binance.large_datasets = vec!["bookDepth".into()];
+        config.sources.binance.datasets = vec!["aggTrades".into()];
+        assert!(validate(&config).is_err());
+        config.sources.binance.datasets = vec!["klines".into()];
+        assert!(validate(&config).is_ok());
     }
 
     #[test]

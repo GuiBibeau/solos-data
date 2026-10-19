@@ -38,6 +38,8 @@ fn config_for(server: &Server, root: &std::path::Path, source: &str) -> AugmentC
         &mut s.kalshi.enabled,
         &mut s.phoenix.enabled,
         &mut s.tardis.enabled,
+        &mut s.okx.enabled,
+        &mut s.hyperliquid_s3.enabled,
     ] {
         *enabled = false;
     }

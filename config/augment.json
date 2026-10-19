@@ -2,7 +2,7 @@
   "dataDir": "data/augment",
   "startDate": "2026-01-01",
   "requestsPerSecond": 2.0,
-  "diskBudgetGb": 0.0,
+  "diskBudgetGb": 1000.0,
   "sources": {
     "binance": {
       "enabled": true,
@@ -16,8 +16,19 @@
         "indexPriceKlines",
         "metrics"
       ],
-      "largeDatasets": [],
-      "verifyChecksums": true
+      "largeDatasets": [
+        "aggTrades",
+        "bookDepth"
+      ],
+      "verifyChecksums": true,
+      "walk": {
+        "startDate": "2025-10-01",
+        "kinds": [
+          "crypto"
+        ],
+        "budgetGb": 150.0,
+        "runMinutes": 45
+      }
     },
     "hyperliquid": {
       "enabled": true,
@@ -84,7 +95,15 @@
       "baseUrl": "https://api.bybit.com",
       "filesUrl": "https://public.bybit.com",
       "fundingHistory": true,
-      "trades": false
+      "trades": true,
+      "walk": {
+        "startDate": "2025-10-01",
+        "kinds": [
+          "crypto"
+        ],
+        "budgetGb": 300.0,
+        "runMinutes": 45
+      }
     },
     "elfa": {
       "enabled": true,
@@ -441,6 +460,45 @@
           ]
         }
       ]
+    },
+    "okx": {
+      "enabled": true,
+      "filesUrl": "https://static.okx.com/cdn/okex/traderecords",
+      "trades": true,
+      "funding": true,
+      "walk": {
+        "startDate": "2025-10-01",
+        "kinds": [
+          "crypto"
+        ],
+        "budgetGb": 120.0,
+        "runMinutes": 45
+      }
+    },
+    "hyperliquidS3": {
+      "enabled": true,
+      "archiveUrl": "https://hyperliquid-archive.s3.us-east-1.amazonaws.com",
+      "archiveRegion": "us-east-1",
+      "nodeUrl": "https://hl-mainnet-node-data.s3.ap-northeast-1.amazonaws.com",
+      "nodeRegion": "ap-northeast-1",
+      "estimateOnly": true,
+      "l2Book": true,
+      "assetCtxs": true,
+      "fills": false,
+      "bookSymbols": [
+        "BTC",
+        "ETH",
+        "SOL"
+      ],
+      "transferGbPerRun": 20.0,
+      "walk": {
+        "startDate": "2025-10-01",
+        "kinds": [
+          "crypto"
+        ],
+        "budgetGb": 300.0,
+        "runMinutes": 45
+      }
     }
   },
   "symbols": [

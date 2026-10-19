@@ -130,7 +130,7 @@ async fn run_sources(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Vec<
             }
         })
     };
-    let (binance, hyperliquid, deribit, defillama, bybit, exogenous, tardis) = tokio::join!(
+    let (binance, hyperliquid, deribit, defillama, bybit, exogenous, tardis, (okx, hl_s3)) = tokio::join!(
         run_binance(ctx, config, filter),
         run_hyperliquid(ctx, config, filter),
         run_deribit(ctx, config, filter),
@@ -138,6 +138,7 @@ async fn run_sources(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Vec<
         run_bybit(ctx, config, filter),
         run_exogenous(ctx, config, filter),
         run_tardis(ctx, config, filter),
+        async { tokio::join!(run_okx(ctx, config, filter), run_hl_s3(ctx, config, filter)) },
     );
     catalog_writer.abort();
     let (sec, alternative, polymarket, kalshi, phoenix) = exogenous;
@@ -153,6 +154,8 @@ async fn run_sources(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Vec<
         ("kalshi", kalshi),
         ("phoenix", phoenix),
         ("tardis", tardis),
+        ("okx", okx),
+        ("hyperliquid_s3", hl_s3),
     ]
     .into_iter()
     .filter_map(|(name, outcome)| outcome.map(|o| (name.to_owned(), o)))
@@ -220,7 +223,32 @@ async fn run_binance(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Opti
     if !cfg.enabled || !filter.allows("binance") {
         return None;
     }
-    Some(super::binance::sync(ctx, cfg, &config.symbols, filter.symbol.as_deref()).await)
+    let symbol = filter.symbol.as_deref();
+    let mut outcome = super::binance::sync(ctx, cfg, &config.symbols, symbol).await;
+    let kinds = super::binance::dump_kinds(cfg, &config.symbols, symbol);
+    if !kinds.is_empty() && !ctx.stopping() {
+        let walked = super::dumps::walk(ctx, "binance", &cfg.walk, kinds).await;
+        outcome.add(&walked);
+        outcome.note = walked.note;
+    }
+    Some(outcome)
+}
+
+async fn run_okx(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option<Outcome> {
+    let cfg = &config.sources.okx;
+    if !cfg.enabled || !filter.allows("okx") {
+        return None;
+    }
+    let kinds = super::okx::kinds(cfg, &config.symbols, filter.symbol.as_deref());
+    Some(super::dumps::walk(ctx, super::okx::SOURCE, &cfg.walk, kinds).await)
+}
+
+async fn run_hl_s3(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option<Outcome> {
+    let cfg = &config.sources.hyperliquid_s3;
+    if !cfg.enabled || !filter.allows(super::hls3::SOURCE) {
+        return None;
+    }
+    Some(super::hls3::sync(ctx, cfg, &config.symbols, filter.symbol.as_deref()).await)
 }
 
 async fn run_hyperliquid(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option<Outcome> {
@@ -256,14 +284,21 @@ async fn run_bybit(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option
         return None;
     }
     let mut outcome = Outcome::default();
-    if cfg.trades {
-        outcome.add(
-            &super::bybit::sync_trades(ctx, cfg, &config.symbols, filter.symbol.as_deref()).await,
-        );
+    if cfg.funding_history {
+        outcome.add(&run_bybit_funding(ctx, config, filter).await);
     }
-    if !cfg.funding_history {
-        return Some(outcome);
+    if cfg.trades && !ctx.stopping() {
+        let kinds = super::bybit::trade_kinds(cfg, &config.symbols, filter.symbol.as_deref());
+        let walked = super::dumps::walk(ctx, "bybit", &cfg.walk, kinds).await;
+        outcome.add(&walked);
+        outcome.note = walked.note;
     }
+    Some(outcome)
+}
+
+async fn run_bybit_funding(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Outcome {
+    let cfg = &config.sources.bybit;
+    let mut outcome = Outcome::default();
     for symbol in &config.symbols {
         let Some(venue) = symbol.bybit.as_deref() else {
             continue;
@@ -278,7 +313,7 @@ async fn run_bybit(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option
         };
         outcome.add(&sync_series(ctx, &series).await);
     }
-    Some(outcome)
+    outcome
 }
 
 async fn run_deribit(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option<Outcome> {

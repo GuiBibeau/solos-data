@@ -360,6 +360,8 @@ fn bybit_funding_is_a_paged_month_series() {
         .symbols
         .retain(|s| s.phoenix == "SOL" || s.phoenix == "kSHIB");
     config.sources.bybit.base_url = server.base.clone();
+    // The tick dumps have their own test; off here so nothing reaches the network.
+    config.sources.bybit.trades = false;
     let status = solos_data::augment::sync::run_sync(
         &config,
         NOW_MS,
@@ -430,6 +432,7 @@ fn bybit_trade_dumps_walk_days_under_the_disk_budget() {
     config.sources.bybit.files_url = server.base.clone();
     config.sources.bybit.funding_history = false;
     config.sources.bybit.trades = true;
+    config.sources.bybit.walk.start_date = "2026-10-04".into();
     let filter = solos_data::augment::sync::Filter {
         source: Some("bybit".into()),
         symbol: None,
@@ -463,6 +466,21 @@ fn bybit_trade_dumps_walk_days_under_the_disk_budget() {
     assert_eq!(out[0]["with_rpi"], "6");
     assert_eq!(out[0]["first"], "2026-10-06 00:00:00.1");
     assert_eq!(out[0]["px"], 120.64);
+    // Newest first: yesterday is the first day asked for, the oldest the last.
+    let order: Vec<String> = server
+        .hits()
+        .into_iter()
+        .map(|h| h.path)
+        .filter(|p| p.starts_with("/trading/"))
+        .collect();
+    assert_eq!(
+        order.first().map(String::as_str),
+        Some("/trading/SOLUSDT/SOLUSDT2026-10-08.csv.gz")
+    );
+    assert_eq!(
+        order.last().map(String::as_str),
+        Some("/trading/SOLUSDT/SOLUSDT2026-10-04.csv.gz")
+    );
     // Rerun: nothing new, the 404 for 10-05 is not retried, today is still not asked for.
     let hits_before = server.hit_count();
     let status = run(&config);
@@ -474,13 +492,14 @@ fn bybit_trade_dumps_walk_days_under_the_disk_budget() {
         .map(|h| h.path)
         .collect();
     assert!(paths.is_empty(), "{paths:?}");
-    // A budget is a ceiling on the registered bytes: a fresh root admits the first file, then
-    // the lane stops adding large files; a zero budget keeps the large datasets off entirely.
-    config.disk_budget_gb = 0.000_001;
+    // The walk's budget is a ceiling on its registered bytes: a fresh root admits the first
+    // file, then the walk stops; a zero lane budget keeps the large datasets off entirely.
     let mut fresh = config.clone();
+    fresh.sources.bybit.walk.budget_gb = 0.000_001;
     fresh.data_dir = tempdir("solos-augment");
     let status = run(&fresh);
     assert_eq!(status["sources"]["bybit"]["files"], 1);
+    assert_eq!(status["sources"]["bybit"]["note"], "walk budgetGb reached");
     let _ = std::fs::remove_dir_all(&fresh.data_dir);
     config.disk_budget_gb = 0.0;
     let mut off = config.clone();
