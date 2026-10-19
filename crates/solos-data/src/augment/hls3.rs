@@ -446,6 +446,9 @@ struct Plan<'a> {
     coins: BTreeMap<String, String>,
     /// The `bookSymbols` coins.
     book_coins: BTreeSet<String>,
+    /// A `--symbol` run: fills are written for that coin only, so the day is not recorded as
+    /// done for every coin.
+    filtered: bool,
 }
 
 /// Sync the source.
@@ -492,6 +495,7 @@ pub async fn sync(
         },
         coins,
         book_coins,
+        filtered: only.is_some(),
     };
     if cfg.estimate_only {
         estimate(ctx, &plan).await
@@ -673,6 +677,11 @@ async fn download(ctx: &Ctx, plan: &Plan<'_>) -> Outcome {
         }
         if state.used >= budget {
             state.stop = Some(super::dumps::BUDGET_REACHED);
+            break;
+        }
+        // The lane-wide ceiling holds too, as for the free dumps.
+        if !ctx.within_budget(SOURCE).await {
+            state.stop = Some("diskBudgetGb is 0 or reached");
             break;
         }
         let day = match list_day(ctx, plan, &period).await {
@@ -911,6 +920,9 @@ async fn fetch_fills(
         write_keep(ctx, "fills", coin, phoenix, label, &select, state, outcome).await?;
     }
     let _ = std::fs::remove_file(&staged);
+    if plan.filtered {
+        return Ok(());
+    }
     state.fills_done.insert(label.to_owned());
     let value = json!({ "done": state.fills_done.iter().collect::<Vec<_>>(), "updatedAt": now() });
     ctx.db

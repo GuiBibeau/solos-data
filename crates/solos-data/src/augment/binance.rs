@@ -284,9 +284,9 @@ pub fn dump_kinds(
 ) -> Vec<std::sync::Arc<dyn super::dumps::Kind>> {
     let mut out: Vec<std::sync::Arc<dyn super::dumps::Kind>> = Vec::new();
     for name in &cfg.large_datasets {
-        if dataset(name).is_none() {
+        let Some(dataset) = dataset_static(name) else {
             continue;
-        }
+        };
         for symbol in symbols {
             let Some(venue) = symbol.binance.as_deref() else {
                 continue;
@@ -299,7 +299,7 @@ pub fn dump_kinds(
             out.push(std::sync::Arc::new(DumpSeries {
                 files_url: cfg.files_url.trim_end_matches('/').to_owned(),
                 verify_checksums: cfg.verify_checksums,
-                dataset: dataset_static(name),
+                dataset,
                 venue: venue.to_owned(),
                 phoenix: symbol.phoenix.clone(),
             }));
@@ -308,12 +308,15 @@ pub fn dump_kinds(
     out
 }
 
-fn dataset_static(name: &str) -> &'static Dataset {
-    static AGG: std::sync::OnceLock<Dataset> = std::sync::OnceLock::new();
-    static DEPTH: std::sync::OnceLock<Dataset> = std::sync::OnceLock::new();
+/// The large datasets the dump walk knows; any other name is not walked (and the config
+/// validation refuses it).
+fn dataset_static(name: &str) -> Option<&'static Dataset> {
+    static AGG: std::sync::OnceLock<Option<Dataset>> = std::sync::OnceLock::new();
+    static DEPTH: std::sync::OnceLock<Option<Dataset>> = std::sync::OnceLock::new();
     match name {
-        "bookDepth" => DEPTH.get_or_init(|| dataset("bookDepth").expect("bookDepth")),
-        _ => AGG.get_or_init(|| dataset("aggTrades").expect("aggTrades")),
+        "aggTrades" => AGG.get_or_init(|| dataset("aggTrades")).as_ref(),
+        "bookDepth" => DEPTH.get_or_init(|| dataset("bookDepth")).as_ref(),
+        _ => None,
     }
 }
 

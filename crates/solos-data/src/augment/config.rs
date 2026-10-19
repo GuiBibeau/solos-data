@@ -804,11 +804,18 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
         }
     }
     let binance = &config.sources.binance;
-    for dataset in binance.datasets.iter().chain(&binance.large_datasets) {
-        if !BINANCE_DATASETS.iter().any(|(name, _)| name == dataset) {
-            return Err(StoreError::Check(format!(
-                "unknown Binance dataset {dataset}"
-            )));
+    // Phase-1 datasets are listed and walked oldest first; the large ones are dump walks.
+    for (datasets, large) in [(&binance.datasets, false), (&binance.large_datasets, true)] {
+        for dataset in datasets {
+            if !BINANCE_DATASETS
+                .iter()
+                .any(|(name, is_large)| name == dataset && *is_large == large)
+            {
+                return Err(StoreError::Check(format!(
+                    "Binance dataset {dataset} is not a {} dataset",
+                    if large { "large" } else { "phase-1" }
+                )));
+            }
         }
     }
     for resolution in &config.sources.deribit.resolutions {
@@ -939,6 +946,19 @@ mod tests {
         assert!(config.sources.kalshi.series.contains(&"KXFED".to_owned()));
         assert!(check_url("http://127.0.0.1:8080").is_ok());
         assert!(check_url("http://example.com").is_err());
+    }
+
+    #[test]
+    fn binance_datasets_stay_in_their_walk() {
+        let path = repository_config_path();
+        let mut config = load_augment_config(path.to_str()).unwrap();
+        config.sources.binance.large_datasets = vec!["metrics".into()];
+        assert!(validate(&config).is_err());
+        config.sources.binance.large_datasets = vec!["bookDepth".into()];
+        config.sources.binance.datasets = vec!["aggTrades".into()];
+        assert!(validate(&config).is_err());
+        config.sources.binance.datasets = vec!["klines".into()];
+        assert!(validate(&config).is_ok());
     }
 
     #[test]
