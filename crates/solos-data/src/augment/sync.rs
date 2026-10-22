@@ -58,6 +58,10 @@ pub fn run_sync(
         &config.sources.hyperliquid.base_url,
         config.sources.hyperliquid.requests_per_second,
     );
+    http.set_host_rate(
+        &config.sources.kalshi.base_url,
+        config.sources.kalshi.requests_per_second,
+    );
     let ctx = Ctx {
         http,
         db: db.clone(),
@@ -77,7 +81,7 @@ pub fn run_sync(
             .with("symbol", filter.symbol.clone()),
     );
     let runtime = tokio::runtime::Runtime::new()?;
-    let sources = runtime.block_on(run_sources(&ctx, config, filter));
+    let (sources, kalshi) = runtime.block_on(run_sources(&ctx, config, filter));
     let mut totals = Outcome::default();
     let mut per_source = Obj::new();
     for (name, outcome) in &sources {
@@ -98,6 +102,7 @@ pub fn run_sync(
         .with("stopped", ctx.stopping())
         .with("recovered", recovered)
         .with_obj("sources", per_source)
+        .with_obj("kalshi", kalshi)
         .with_obj("totals", totals.to_obj())
         .with_rows("datasets", summary);
     ledger::write_status(&config.data_dir, Lane::Sync, &status)?;
@@ -114,7 +119,11 @@ pub fn run_sync(
     Ok(status)
 }
 
-async fn run_sources(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Vec<(String, Outcome)> {
+async fn run_sources(
+    ctx: &Ctx,
+    config: &AugmentConfig,
+    filter: &Filter,
+) -> (Vec<(String, Outcome)>, Obj) {
     let catalog_writer = {
         let db = ctx.db.clone();
         let root = ctx.root.clone();
@@ -142,7 +151,11 @@ async fn run_sources(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Vec<
     );
     catalog_writer.abort();
     let (sec, alternative, polymarket, kalshi, phoenix) = exogenous;
-    [
+    let (kalshi, kalshi_detail) = match kalshi {
+        Some((outcome, detail)) => (Some(outcome), detail),
+        None => (None, Obj::new().with("enabled", false)),
+    };
+    let sources = [
         ("binance", binance),
         ("hyperliquid", hyperliquid),
         ("deribit", deribit),
@@ -159,14 +172,15 @@ async fn run_sources(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Vec<
     ]
     .into_iter()
     .filter_map(|(name, outcome)| outcome.map(|o| (name.to_owned(), o)))
-    .collect()
+    .collect();
+    (sources, kalshi_detail)
 }
 
 type Five = (
     Option<Outcome>,
     Option<Outcome>,
     Option<Outcome>,
-    Option<Outcome>,
+    Option<(Outcome, Obj)>,
     Option<Outcome>,
 );
 

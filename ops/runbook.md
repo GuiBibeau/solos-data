@@ -272,7 +272,7 @@ name the source, dataset, symbol and item that failed; the item is retried on th
 `alternative`, `polymarket`, `kalshi`, `phoenix`, `tardis`, `okx`, `hyperliquid_s3`) and `--symbol <SYM>` restrict a run for a
 check. Query views are named `<source>_<dataset>` (`binance_klines`, `hyperliquid_funding`,
 `deribit_dvol_60s`, `defillama_stablecoins`, `sec_filings`, `alternative_fear_greed`,
-`polymarket_prices`, `kalshi_candles_1h`, `phoenix_earnings_dates`).
+`polymarket_prices`, `kalshi_candles_1m`, `phoenix_earnings_dates`).
 
 The exogenous sources (ADR-0009, "Exogenous triggers and alerts") run in the same sync. SEC
 EDGAR filings need the issuers' CIKs in the symbol map (`secCik`) and a declared User-Agent
@@ -289,8 +289,9 @@ Without it (or without an `@` in it) each sync logs one `augment_source_disabled
 `sources.sec.disabled: true` with the reason; `augment sec-map` refuses to run. `augment sec-map` reports the CIK of every equity symbol from
 EDGAR's `company_tickers.json`, `--write` stores them in the config, and the lane refuses a CIK
 whose EDGAR tickers do not include the symbol (`augment_series_error` with the issuer's name).
-Polymarket events and Kalshi series are curated lists in the config; add the next month's
-events when the current ones close.
+Polymarket events are a curated list in the config; add the next month's events when the
+current ones close. Kalshi series are curated too, but each one is expanded into all its
+contracts by the lane (below).
 
 ```sh
 SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment sync --source sec --symbol NVDA
@@ -298,6 +299,42 @@ solos-data augment sec-map            # report; add --write to store the CIKs in
 SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment query --sql \
   "SELECT ticker, form, ts, url FROM sec_filings WHERE form IN ('8-K', '10-Q') ORDER BY ts DESC LIMIT 20"
 ```
+
+### Kalshi ladders
+
+Kalshi data is collected under the operator's written permission
+([docs/licences/kalshi-consent.md](../docs/licences/kalshi-consent.md)): internal storage, the R2
+backup and internal research only. Never copy `tables/kalshi/` to GitHub, a public bucket or a
+shared drive, and treat Kalshi-derived features as research-only (ADR-0009, "Kalshi ladders").
+
+`sources.kalshi.series` lists the series (`KXBTCD`, `KXGOLDD`, `KXINXU`, `KXFED`, …) with their
+kind, candle interval and how much of each ladder is kept (`windowPct`, `maxStrikes`,
+`maxLifeHours`, `trades`). Each sync lists the series' live contracts, stores every event that
+closed since the last run, then spends the rest of its budget (`runMinutes` 40, `maxRequests`
+24,000, at `requestsPerSecond` 10, half the Basic tier's read limit) on the backward walk to
+`startDate` (2025-10-01). Progress is in the ledger under `kalshi/<SERIES>`; a stopped run
+resumes there. Datasets: `kalshi_contracts` (every market's metadata), `kalshi_candles_1m` /
+`kalshi_candles_60m` (bid, ask and trade OHLC of the kept strikes), `kalshi_trades`, partitioned
+`tables/kalshi/<dataset>/<SERIES>/<close day>.parquet`; every row has `fetched_at_ms`. The legacy
+`kalshi_markets` and `kalshi_candles_1h` files of the earlier lane stay on disk and are no
+longer written.
+
+```sh
+# one series, now (the timer does the same every hour for all of them)
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment sync --source kalshi --symbol KXSOLD
+# where each walk is: head (forward), tail (backward), archive listing, requests and 429s
+jq '.kalshi' ~/.local/share/solos-data/augment/status.json
+solos-data health --json | jq '.kalshi'
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment query --sql \
+  "SELECT symbol, min(ts), max(ts), count(*) FROM kalshi_candles_1m GROUP BY 1 ORDER BY 1"
+```
+
+`solos-data health` warns when a series' forward walk is more than a day behind, when its
+backward walk has not moved for six hours while not done, and when one run met 100 or more
+`429` answers. On `429` the client holds every Kalshi request for the `Retry-After` (or the
+backoff) and retries; lower `requestsPerSecond` if the warning repeats. Adding a series is a
+config change; its walk starts at the next run. Deleting `kalshi/<SERIES>` from the ledger's
+progress table restarts that series' walks (files are merged on their keys, nothing duplicates).
 
 To re-download one series, delete its rows from `files` and its `progress` record in
 `checkpoint.duckdb` with no run active, or delete the whole root to start over.

@@ -62,6 +62,10 @@ pub struct Thresholds {
     pub capture_status_warn_minutes: i64,
     /// The capture lane's last hourly Elfa cycle older than this warns, minutes.
     pub elfa_cycle_warn_minutes: i64,
+    /// A Kalshi series whose backfill has not moved for this long warns, minutes.
+    pub kalshi_stall_minutes: i64,
+    /// Kalshi `429` answers in one sync run at or above this warn.
+    pub kalshi_throttle_warn: i64,
     /// The venues lane's `status-venues.json` (written every minute) or a venue's last cycle
     /// older than this warns, minutes (ADR-0012).
     pub venues_status_warn_minutes: i64,
@@ -95,6 +99,8 @@ impl Default for Thresholds {
             sync_status_warn_minutes: 150,
             capture_status_warn_minutes: 10,
             elfa_cycle_warn_minutes: 150,
+            kalshi_stall_minutes: d_kalshi_stall(),
+            kalshi_throttle_warn: d_kalshi_throttle(),
             venues_status_warn_minutes: 15,
             venues_lag_warn_slots: 3_000,
             venues_lag_critical_slots: 9_000,
@@ -242,6 +248,14 @@ impl Findings {
     }
 }
 
+fn d_kalshi_stall() -> i64 {
+    360
+}
+
+fn d_kalshi_throttle() -> i64 {
+    100
+}
+
 fn num(value: Option<&Value>) -> Option<i64> {
     match value? {
         Value::Number(n) => n.as_i64(),
@@ -261,6 +275,13 @@ pub fn evaluate(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>) -> Value {
     let decoded = decoded_section(inputs, t, now, &mut f);
     let raw = raw_section(inputs, t, now, &mut f);
     let augment = augment_section(inputs, t, now, &mut f);
+    let (kalshi, kalshi_warn) = crate::augment::kalshi::health::section(
+        inputs.sync_status.value.as_ref(),
+        now,
+        t.kalshi_stall_minutes,
+        t.kalshi_throttle_warn,
+    );
+    f.warn.extend(kalshi_warn);
     let venues = venues::section(
         inputs.venues_status.value.as_ref(),
         inputs.venues_status.age_s,
@@ -300,6 +321,7 @@ pub fn evaluate(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>) -> Value {
         "decoded": decoded,
         "raw": raw,
         "augment": augment,
+        "kalshi": kalshi,
         "venues": venues,
         "disk": disk,
         "thresholds": t,

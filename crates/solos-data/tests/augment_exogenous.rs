@@ -1,7 +1,7 @@
 //! The exogenous sync sources against an in-process HTTP server: SEC filings per issuer and
 //! month with the ticker guard and a continuation file, Fear and Greed as year files from 2018,
-//! Polymarket events expanded to token price series, Kalshi series expanded to market candles,
-//! and Phoenix earnings dates merged per day. Everything runs with a fixed clock.
+//! Polymarket events expanded to token price series and Phoenix earnings dates merged per day.
+//! Everything runs with a fixed clock. Kalshi has its own suite (`augment_kalshi.rs`).
 
 mod augment_common;
 
@@ -61,11 +61,6 @@ fn config_for(server: &Server, root: &std::path::Path, source: &str) -> AugmentC
             s.polymarket.gamma_url = server.base.clone();
             s.polymarket.clob_url = server.base.clone();
             s.polymarket.events.truncate(1);
-        }
-        "kalshi" => {
-            s.kalshi.enabled = true;
-            s.kalshi.base_url = server.base.clone();
-            s.kalshi.series = vec!["KXFEDDECISION".into()];
         }
         _ => {
             s.phoenix.enabled = true;
@@ -334,66 +329,6 @@ fn polymarket_events_expand_to_token_price_series() {
     let status = run(&config, NOW_MS + 60_000);
     assert_eq!(status["sources"]["polymarket"]["files"], 1 + 2);
     assert_eq!(server.hit_count() - hits_before, 1 + 4);
-    let _ = std::fs::remove_dir_all(&root);
-}
-
-#[test]
-fn kalshi_series_expand_to_market_candles() {
-    let server = Server::start();
-    server.serve_bytes("/markets", fixture("kalshi-markets.json"));
-    server.route(
-        "/series/KXFEDDECISION/markets/KXFEDDECISION-28JAN-H26/candlesticks",
-        |request| {
-            assert_eq!(request.param("period_interval").as_deref(), Some("60"));
-            let start: i64 = request.param("start_ts").unwrap().parse().unwrap();
-            let end: i64 = request.param("end_ts").unwrap().parse().unwrap();
-            let candles: Vec<Value> = (1..)
-                .map(|i| start + i * 3600)
-                .take_while(|t| *t <= end && *t <= NOW_MS / 1000)
-                .map(|t| json!({ "end_period_ts": t, "yes_bid": { "open_dollars": "0.10", "close_dollars": "0.11" }, "yes_ask": { "close_dollars": "0.20" }, "price": {}, "volume_fp": "1.50", "open_interest_fp": "7.00" }))
-                .collect();
-            Response::json(&json!({ "candlesticks": candles, "ticker": "KXFEDDECISION-28JAN-H26" }))
-        },
-    );
-    server.route(
-        "/series/KXFEDDECISION/markets/KXFEDDECISION-28JAN-H25/candlesticks",
-        |_| Response::json(&json!({ "candlesticks": [] })),
-    );
-    let root = tempdir("solos-augment");
-    let mut config = config_for(&server, &root, "kalshi");
-    config.start_date = "2026-09-01".into();
-    let status = run(&config, NOW_MS);
-    assert_eq!(status["totals"]["errors"], 0, "{status}");
-    // One catalogue file and the traded market's September and October; the untraded market
-    // closes September without a file and stops at the open month.
-    assert_eq!(status["sources"]["kalshi"]["files"], 1 + 2);
-    let listing = server.hits_of("/markets");
-    assert_eq!(listing, 1);
-    assert!(
-        server
-            .hits()
-            .iter()
-            .find(|h| h.path == "/markets")
-            .and_then(|h| h.param("min_close_ts"))
-            .is_some()
-    );
-    let markets = rows(
-        &config,
-        "SELECT ticker, status, series_ticker, event_ticker FROM kalshi_markets ORDER BY ticker",
-    );
-    assert_eq!(markets.len(), 2);
-    assert_eq!(markets[0]["series_ticker"], "KXFEDDECISION");
-    let candles = rows(
-        &config,
-        "SELECT symbol, count(*) AS n, min(ts)::VARCHAR AS first, max(yes_bid_close) AS bid, max(price_close) AS px FROM kalshi_candles_1h GROUP BY 1",
-    );
-    assert_eq!(candles.len(), 1);
-    assert_eq!(candles[0]["symbol"], "KXFEDDECISION-28JAN-H26");
-    assert_eq!(candles[0]["first"], "2026-09-01 00:00:00");
-    assert_eq!(candles[0]["bid"], 0.11);
-    assert_eq!(candles[0]["px"], Value::Null);
-    let hours = (NOW_MS / 1000 - 1_788_220_800) / 3600;
-    assert_eq!(candles[0]["n"], hours.to_string());
     let _ = std::fs::remove_dir_all(&root);
 }
 

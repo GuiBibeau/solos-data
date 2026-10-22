@@ -75,6 +75,7 @@ pub struct Http {
     interval: Duration,
     host_intervals: Mutex<HashMap<String, Duration>>,
     next_slot: Mutex<HashMap<String, Instant>>,
+    counts: Mutex<HashMap<String, (u64, u64)>>,
     attempts: u32,
     meter: OnceLock<Arc<CreditMeter>>,
 }
@@ -102,6 +103,7 @@ impl Http {
             interval: Duration::from_secs_f64(1.0 / requests_per_second.max(0.01)),
             host_intervals: Mutex::new(HashMap::new()),
             next_slot: Mutex::new(HashMap::new()),
+            counts: Mutex::new(HashMap::new()),
             attempts: 6,
             meter: OnceLock::new(),
         })
@@ -145,6 +147,45 @@ impl Http {
                 .and_then(|v| v.to_str().ok());
             meter.record(url, header, now_ms());
         }
+    }
+
+    /// Requests sent to the host of `url` since the client was created (retries included),
+    /// and the `429` answers among them.
+    #[must_use]
+    pub fn counts(&self, url: &str) -> (u64, u64) {
+        self.counts
+            .lock()
+            .expect("http counts")
+            .get(host_of(url))
+            .copied()
+            .unwrap_or((0, 0))
+    }
+
+    fn count(&self, url: &str) {
+        self.counts
+            .lock()
+            .expect("http counts")
+            .entry(host_of(url).to_owned())
+            .or_default()
+            .0 += 1;
+    }
+
+    /// A `429` from a host: count it and hold every caller of that host for `wait`, so
+    /// concurrent requests back off together instead of each meeting its own `429`.
+    fn throttled(&self, url: &str, reason: &str, wait: Duration) {
+        if reason != "HTTP 429" {
+            return;
+        }
+        self.counts
+            .lock()
+            .expect("http counts")
+            .entry(host_of(url).to_owned())
+            .or_default()
+            .1 += 1;
+        let mut slots = self.next_slot.lock().expect("http slots");
+        let until = Instant::now() + wait;
+        let slot = slots.entry(host_of(url).to_owned()).or_insert(until);
+        *slot = (*slot).max(until);
     }
 
     /// Wait for this host's next slot and claim the one after it.
@@ -222,6 +263,7 @@ impl Http {
             for (name, value) in headers {
                 request = request.header(*name, *value);
             }
+            self.count(url);
             let (reason, retry_after) =
                 match tokio::time::timeout(self.request_timeout, request.send()).await {
                     Ok(Ok(response)) => {
@@ -239,6 +281,7 @@ impl Http {
                 return Err(final_error(reason));
             }
             let wait = retry_after.unwrap_or(backoff);
+            self.throttled(url, &reason, wait);
             log(
                 "augment_http_retry",
                 Obj::new()
@@ -272,6 +315,7 @@ impl Http {
                 return Err(final_error(reason));
             }
             let wait = retry_after.unwrap_or(backoff);
+            self.throttled(url, &reason, wait);
             log(
                 "augment_http_retry",
                 Obj::new()
@@ -300,6 +344,7 @@ impl Http {
         for (name, value) in headers {
             request = request.header(*name, *value);
         }
+        self.count(url);
         let response = request
             .send()
             .await

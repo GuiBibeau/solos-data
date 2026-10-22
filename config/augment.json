@@ -380,13 +380,261 @@
     "kalshi": {
       "enabled": true,
       "baseUrl": "https://api.elections.kalshi.com/trade-api/v2",
+      "requestsPerSecond": 10.0,
+      "startDate": "2025-10-01",
+      "runMinutes": 40,
+      "maxRequests": 24000,
       "series": [
-        "KXFED",
-        "KXFEDDECISION",
-        "KXCPI",
-        "KXCPIYOY",
-        "KXRECSSNBER",
-        "KXU3"
+        {
+          "ticker": "KXBTCD",
+          "asset": "BTC",
+          "kind": "crypto",
+          "interval": 1,
+          "windowPct": 3.0,
+          "maxStrikes": 40,
+          "maxLifeHours": 26,
+          "trades": true
+        },
+        {
+          "ticker": "KXETHD",
+          "asset": "ETH",
+          "kind": "crypto",
+          "interval": 1,
+          "windowPct": 3.0,
+          "maxStrikes": 40,
+          "maxLifeHours": 26,
+          "trades": true
+        },
+        {
+          "ticker": "KXSOLD",
+          "asset": "SOL",
+          "kind": "crypto",
+          "interval": 1,
+          "windowPct": 3.0,
+          "maxStrikes": 40,
+          "maxLifeHours": 26,
+          "trades": true
+        },
+        {
+          "ticker": "KXBTC",
+          "asset": "BTC",
+          "kind": "crypto",
+          "interval": 1,
+          "windowPct": 3.0,
+          "maxStrikes": 30,
+          "maxLifeHours": 26,
+          "trades": false
+        },
+        {
+          "ticker": "KXETH",
+          "asset": "ETH",
+          "kind": "crypto",
+          "interval": 1,
+          "windowPct": 3.0,
+          "maxStrikes": 30,
+          "maxLifeHours": 26,
+          "trades": false
+        },
+        {
+          "ticker": "KXSOLE",
+          "asset": "SOL",
+          "kind": "crypto",
+          "interval": 1,
+          "windowPct": 3.0,
+          "maxStrikes": 30,
+          "maxLifeHours": 26,
+          "trades": false
+        },
+        {
+          "ticker": "KXXRPD",
+          "asset": "XRP",
+          "kind": "crypto",
+          "interval": 1,
+          "windowPct": 3.0,
+          "maxStrikes": 20,
+          "maxLifeHours": 26,
+          "trades": true
+        },
+        {
+          "ticker": "KXDOGED",
+          "asset": "DOGE",
+          "kind": "crypto",
+          "interval": 1,
+          "windowPct": 3.0,
+          "maxStrikes": 20,
+          "maxLifeHours": 26,
+          "trades": true
+        },
+        {
+          "ticker": "KXBNBD",
+          "asset": "BNB",
+          "kind": "crypto",
+          "interval": 1,
+          "windowPct": 3.0,
+          "maxStrikes": 20,
+          "maxLifeHours": 26,
+          "trades": true
+        },
+        {
+          "ticker": "KXHYPED",
+          "asset": "HYPE",
+          "kind": "crypto",
+          "interval": 1,
+          "windowPct": 3.0,
+          "maxStrikes": 20,
+          "maxLifeHours": 26,
+          "trades": true
+        },
+        {
+          "ticker": "KXGOLDD",
+          "asset": "GOLD",
+          "kind": "commodity",
+          "interval": 1,
+          "windowPct": 1.5,
+          "maxStrikes": 40,
+          "maxLifeHours": 30,
+          "trades": true
+        },
+        {
+          "ticker": "KXSILVERD",
+          "asset": "SILVER",
+          "kind": "commodity",
+          "interval": 1,
+          "windowPct": 2.0,
+          "maxStrikes": 40,
+          "maxLifeHours": 30,
+          "trades": true
+        },
+        {
+          "ticker": "KXCOPPERD",
+          "asset": "COPPER",
+          "kind": "commodity",
+          "interval": 1,
+          "windowPct": 2.0,
+          "maxStrikes": 40,
+          "maxLifeHours": 30,
+          "trades": true
+        },
+        {
+          "ticker": "KXWTI",
+          "asset": "WTI",
+          "kind": "commodity",
+          "interval": 1,
+          "windowPct": 2.5,
+          "maxStrikes": 40,
+          "maxLifeHours": 30,
+          "trades": true
+        },
+        {
+          "ticker": "KXINXU",
+          "asset": "SPX",
+          "kind": "equity",
+          "interval": 1,
+          "windowPct": 1.0,
+          "maxStrikes": 40,
+          "maxLifeHours": 30,
+          "trades": true
+        },
+        {
+          "ticker": "KXNASDAQ100U",
+          "asset": "NDX",
+          "kind": "equity",
+          "interval": 1,
+          "windowPct": 1.2,
+          "maxStrikes": 40,
+          "maxLifeHours": 30,
+          "trades": true
+        },
+        {
+          "ticker": "KXFED",
+          "asset": "FED",
+          "kind": "macro",
+          "interval": 60,
+          "windowPct": 0.0,
+          "maxStrikes": 0,
+          "maxLifeHours": 9600,
+          "trades": true
+        },
+        {
+          "ticker": "KXFEDDECISION",
+          "asset": "FED",
+          "kind": "macro",
+          "interval": 60,
+          "windowPct": 0.0,
+          "maxStrikes": 0,
+          "maxLifeHours": 9600,
+          "trades": true
+        },
+        {
+          "ticker": "KXCPI",
+          "asset": "CPI",
+          "kind": "macro",
+          "interval": 60,
+          "windowPct": 0.0,
+          "maxStrikes": 0,
+          "maxLifeHours": 9600,
+          "trades": true
+        },
+        {
+          "ticker": "KXCPICORE",
+          "asset": "CPI",
+          "kind": "macro",
+          "interval": 60,
+          "windowPct": 0.0,
+          "maxStrikes": 0,
+          "maxLifeHours": 9600,
+          "trades": true
+        },
+        {
+          "ticker": "KXCPIYOY",
+          "asset": "CPI",
+          "kind": "macro",
+          "interval": 60,
+          "windowPct": 0.0,
+          "maxStrikes": 0,
+          "maxLifeHours": 9600,
+          "trades": true
+        },
+        {
+          "ticker": "KXCPICOREYOY",
+          "asset": "CPI",
+          "kind": "macro",
+          "interval": 60,
+          "windowPct": 0.0,
+          "maxStrikes": 0,
+          "maxLifeHours": 9600,
+          "trades": true
+        },
+        {
+          "ticker": "KXPAYROLLS",
+          "asset": "NFP",
+          "kind": "macro",
+          "interval": 60,
+          "windowPct": 0.0,
+          "maxStrikes": 0,
+          "maxLifeHours": 9600,
+          "trades": true
+        },
+        {
+          "ticker": "KXGDP",
+          "asset": "GDP",
+          "kind": "macro",
+          "interval": 60,
+          "windowPct": 0.0,
+          "maxStrikes": 0,
+          "maxLifeHours": 9600,
+          "trades": true
+        },
+        {
+          "ticker": "KXU3",
+          "asset": "U3",
+          "kind": "macro",
+          "interval": 60,
+          "windowPct": 0.0,
+          "maxStrikes": 0,
+          "maxLifeHours": 9600,
+          "trades": true
+        }
       ]
     },
     "phoenix": {
