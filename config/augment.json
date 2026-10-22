@@ -566,6 +566,16 @@
           "trades": true
         },
         {
+          "ticker": "KXINX",
+          "asset": "SPX",
+          "kind": "equity",
+          "interval": 1,
+          "windowPct": 1.5,
+          "maxStrikes": 30,
+          "maxLifeHours": 30,
+          "trades": false
+        },
+        {
           "ticker": "KXNASDAQ100U",
           "asset": "NDX",
           "kind": "equity",
@@ -574,6 +584,16 @@
           "maxStrikes": 40,
           "maxLifeHours": 30,
           "trades": true
+        },
+        {
+          "ticker": "KXNASDAQ100",
+          "asset": "NDX",
+          "kind": "equity",
+          "interval": 1,
+          "windowPct": 1.8,
+          "maxStrikes": 30,
+          "maxLifeHours": 30,
+          "trades": false
         },
         {
           "ticker": "KXFED",

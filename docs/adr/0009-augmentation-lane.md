@@ -133,7 +133,7 @@ them cannot be fetched after the fact.
 | Phoenix | `phoenix/earnings_dates` | per sync | day, all markets | `metadata.earningsDates` of `perp-api.phoenix.trade/v1/view/exchange/markets`, merged on (symbol, date) so a moved date shows up as a new row |
 | alternative.me | `alternative/fear_greed` | 1 day | year | the whole index since 2018-02-01 from one call; the series overrides the lane's start date |
 | Polymarket | `polymarket/markets`, `polymarket/prices` | per sync, 1 h | day; month per market | the curated events in the config are expanded through Gamma (`/events/<id>`) into markets and outcome tokens; each token's CLOB `prices-history` at `fidelity=60` from the period's start (`startTs`; the API refuses a long `startTs`–`endTs` window) |
-| Kalshi | `kalshi/markets`, `kalshi/candles_1h` | per sync, 1 h | day; month per market | the curated series in the config are expanded through `/markets?series_ticker=…&min_close_ts=<start>` (both lanes of status, paged by cursor); hourly `candlesticks` per market with bid, ask and trade OHLC, volume and open interest. The public read endpoints need no key |
+| Kalshi | `kalshi/contracts`, `kalshi/candles_1m`, `kalshi/candles_60m`, `kalshi/trades` | per sync, 1 h | close day per series | replaced on 2026-10-22: see "Kalshi ladders" below. The earlier `kalshi/markets` and `kalshi/candles_1h` files stay on disk and are no longer written |
 
 The symbol map gained `secCik`: 34 of the 40 equity perps have an EDGAR issuer (TSM, ASML,
 BABA, NBIS and ARM file as foreign private issuers, 6-K and 20-F). SPY and QQQ are funds
@@ -159,11 +159,11 @@ symbol.
 
 Prediction markets are curated, not discovered: `polymarket.events` lists Gamma event ids
 (Fed decisions for the next three meetings, the September CPI prints, US recession by 2026 and
-2027, the yearly and monthly BTC, ETH and SOL price ladders, a national Bitcoin reserve) and
-`kalshi.series` lists series tickers (`KXFED`, `KXFEDDECISION`, `KXCPI`, `KXCPIYOY`,
-`KXRECSSNBER`, `KXU3`). Monthly events expire; adding the next month's is a config change. A
-closed market whose last month is complete in the ledger is skipped (`skipped` in the status),
-so the hourly run only refetches the open month of live markets.
+2027, the yearly and monthly BTC, ETH and SOL price ladders, a national Bitcoin reserve). Monthly
+events expire; adding the next month's is a config change. A closed market whose last month is
+complete in the ledger is skipped (`skipped` in the status), so the hourly run only refetches the
+open month of live markets. Kalshi's series list started the same way and was replaced on
+2026-10-22 ("Kalshi ladders").
 
 ### Capture lane
 
@@ -613,3 +613,149 @@ multiply the bucket's size. `backup.sh` skips `tables/binance/aggTrades`, `table
 `tables/bybit/trades` and `tables/okx/trades` and drops them from the uploaded catalogs; the
 restore check skips them. OKX funding and the Hyperliquid S3 files (which cost money to fetch
 again) are backed up.
+
+## Kalshi ladders (2026-10-22)
+
+The regime and world-model studies want what the event-contract markets priced for the next
+hour and day on the same assets the Phoenix venue lists (BTC, ETH, SOL and the other crypto
+majors, gold, silver, copper, WTI, the S&P 500 and the Nasdaq-100) and around the macro prints
+(FOMC, CPI, payrolls, GDP). On 2026-10-22 the operator recorded Kalshi's written permission
+([docs/licences/kalshi-consent.md](../licences/kalshi-consent.md)) and asked for the ladders to be
+collected from 2025-10-01, newest first, then kept current.
+
+### Terms and what they cover
+
+As recorded, the permission covers retrieval of public market data through the official API,
+internal storage and backup (the R2 bucket of ADR-0010 included), training internal ML models
+(rented cloud GPUs included) and own-account trading on derived signals; raw data is never
+redistributed. The lane therefore reads only Kalshi's public, keyless market-data endpoints under
+`https://api.elections.kalshi.com/trade-api/v2` (no account, no order or portfolio endpoint),
+identifies itself with the lane's User-Agent, stays at half the published read limit, and writes
+only under the augment root, which is never committed or published.
+
+**Commercial models are not covered as recorded.** The operator's long-term goal is a
+commercially offered Solana foundation model. The recorded scope says *internal* models and
+own-account trading; it says nothing about a model, its weights or its outputs being offered to
+third parties, and a narrower written text overrides the summary. Until the written permission
+(to be attached as `docs/licences/kalshi-consent.pdf`) is read and names that use, Kalshi-derived
+data is **research-only**: it may inform studies, internal models and own-account trading, but it
+is not a core input of any model meant to be offered commercially. Every Kalshi file and query
+view carries the `kalshi` source, so a training set can exclude it by source. **Flagged for the
+operator**: confirm with Kalshi whether training a commercially offered model (and serving its
+outputs) on this data is permitted, and record the answer here.
+
+### Two tiers
+
+Kalshi moves markets that settled before `GET /historical/cutoff` (`market_settled_ts`, on
+2026-10-22 `2026-08-23T00:00Z`) to an archive. Archived markets are listed only by
+`/historical/markets`, which ignores the close-time filters (it pages by cursor, newest close
+first, or looks a market up by `event_ticker`), and their candles come from
+`/historical/markets/{ticker}/candlesticks`, one market a call, and their fills from
+`/historical/trades`. The live tier (`/markets`, the batch `/markets/candlesticks` for up to 100
+markets and 10,000 candles a call, `/markets/trades`) serves the rest and answers an empty list
+for an archived market. Markets settled shortly before the cutoff can still show in the live
+listing, and the cutoff moves forward over time, so a market is routed by where it was listed and
+by its close against the cutoff, and a market the batch answer leaves out is asked in the archive.
+
+### The walk
+
+- **Catalogue.** Every run lists each series' live tier from a frontier (a day before the earliest
+  close of a market not yet final, else of the latest close). The archive is walked once, one
+  page of 1,000 markets a step, by cursor, until a close before `startDate`. Each page is merged
+  into `contracts` by close day before its cursor is saved, so a stopped run resumes without a
+  gap. `contracts` holds every market of the series (all strikes), not only the kept ones.
+- **Forward.** From the newest stored day through today: every event that closed at least ten
+  minutes ago is stored; today's file grows as the day's events close (`head_events` in the
+  ledger records which), and is marked complete after midnight.
+- **Backward.** One close day a step, from the day before the first forward day down to
+  `startDate` (2025-10-01), round-robin across the series, so each run moves every series. A
+  day below the cutoff waits until the archive walk has listed it (and the two days before it,
+  for the centre).
+- **Budget.** The Kalshi part of a sync stops after `runMinutes` (40) or `maxRequests` (24,000
+  requests, retries included), whichever comes first; the other sources of the hourly sync are
+  unaffected. A day is written only once all its events are fetched, so a day cut short is redone
+  by the next run. Progress is a JSON record per series in the ledger (`kalshi/<SERIES>`).
+- **Rate.** `requestsPerSecond` 10 on Kalshi's host, half the Basic tier's published read budget
+  (200 tokens a second at 10 tokens a read). A `429` holds every request to the host for its
+  `Retry-After` (else the client's exponential backoff) and is retried; the run's request and
+  `429` counts are in `status.json` (`kalshi.requests`, `kalshi.rateLimited`).
+
+### Which strikes
+
+A crypto ladder lists up to a few hundred strikes and most never trade. The kept strikes are
+chosen causally: the centre is the settled index value of the same series' latest event that
+closed at or before this event opened (`centre_source = previous_settle`), else, when none
+settled in the previous 48 hours, the median listed strike (`median`). The window is
+`windowPct` of the centre for a one-hour life, widened by the square root of the stored life in
+hours, then capped at the `maxStrikes` nearest the centre. Macro series keep every strike
+(`windowPct` 0). Candles cover each market's last `maxLifeHours` before its close (26 to 30
+hours for the price ladders, 400 days for macro), at 1 minute (price ladders) or 60 minutes
+(macro); trades are those of the kept markets that traded.
+
+### Datasets
+
+`tables/kalshi/<dataset>/<SERIES>/<close day>.parquet`, merged on the dataset's key so a rerun
+replaces rows:
+
+| Dataset | Key | Columns |
+|---|---|---|
+| `contracts` | `ticker` | series, event, asset, title, status, result, strike type, floor, cap and `strike`, created/open/close/expiration/settlement times (ms), `expiration_value` (the settled index), settlement value, last price, volume, open interest, `tier` |
+| `candles_1m`, `candles_60m` | `ticker, t` | `t` (period start, s), `end_t`, `yes_bid_*`, `yes_ask_*` and trade `price_*` OHLC (dollars), price mean and previous, volume, open interest, `strike`, `centre`, `centre_source`, `tier` |
+| `trades` | `trade_id` | created time (ms), yes and no price, count, taker side, outcome side, book side, block trade |
+
+Every row carries `fetched_at_ms`, the instant the lane received it. Prices are in dollars
+(Kalshi's `*_dollars` fields on the live tier, the bare fields in the archive); sizes are
+contracts (`*_fp`). A candle with no quote has null bid or ask fields.
+
+### Series and their true starts
+
+Measured on 2026-10-22 through the same public endpoints. "Archive walk" pages the series'
+whole archive listing (exact oldest close); "search" bisects on the 5 pm ET daily event (16:00
+for the index ladders) looked up by `event_ticker` in the archive, then scans that day's hours,
+so it assumes the series has no gap longer than a day. Events listed before late 2024 keep the
+pre-`KX` naming inside the `KX` series (`BTCD-24JUN1017` is a `KXBTCD` event). `/events`
+undercounts the archive (it lists `KXGOLDD` from 2026-05-26) and was not used.
+
+| Series | Kind | Interval | First close | How | Notes |
+|---|---|---|---|---|---|
+| `KXBTCD`, `KXETHD` | BTC, ETH above/below | 1 min | 2024-06-10 (as `BTCD-`/`ETHD-`); `KX` names from 2024-10-24 | search | hourly and 5 pm ET daily events |
+| `KXBTC`, `KXETH` | BTC, ETH range | 1 min | 2024-06-10 (as `BTC-`/`ETH-`); `KX` names from 2024-10-24 | search | |
+| `KXSOLD`, `KXSOLE` | SOL above/below, range | 1 min | 2025-12-09 14:00 UTC | search | the earlier "2026-01-02" probe was a page boundary; `KXSOL` lists nothing |
+| `KXXRPD` / `KXXRP` | XRP | 1 min | 2025-10-02 / 2025-10-03 | search | `KXRIPPLED` lists nothing |
+| `KXDOGED`, `KXDOGE` | DOGE | 1 min | 2024-11-25 | search | |
+| `KXBNBD`, `KXHYPED` | BNB, HYPE | 1 min | 2026-03-24 | search | |
+| `KXGOLDD`, `KXSILVERD`, `KXCOPPERD` | daily metals | 1 min | 2026-03-24 | archive walk | 3,423 / 3,463 / 3,820 archived markets |
+| `KXGOLDH`, `KXSILVERH`, `KXWTIH` | hourly metals, WTI | 1 min | 2026-07-07 | archive walk | ~27,000 archived and ~48,000 live markets each |
+| `KXWTI` | WTI daily | 1 min | 2022-09-09 (as `WTI-`) | archive walk | 3,141 archived markets since 2025-10 |
+| `KXINXU`, `KXNASDAQ100U` | S&P 500, Nasdaq-100 hourly above/below | 1 min | 2025-02-13 | search | |
+| `KXINX`, `KXNASDAQ100` | S&P 500, Nasdaq-100 daily range | 1 min | 2022-04-28, 2022-04-26 (as `INX-`, `NASDAQ100-`) | archive walk | 6,750 archived markets each since 2025-10 |
+| `KXFED` | Fed funds rate | 60 min | 2021-07-26 | archive walk | 402 archived, 258 live (meetings to 2028) |
+| `KXFEDDECISION` | FOMC decision | 60 min | 2023-05-03 | archive walk | |
+| `KXCPI`, `KXCPICORE` | CPI, core CPI MoM | 60 min | 2021-07-12, 2022-07-13 | archive walk | |
+| `KXCPIYOY`, `KXCPICOREYOY` | CPI, core CPI YoY | 60 min | 2022-12-13, 2023-01-12 | archive walk | |
+| `KXPAYROLLS` | nonfarm payrolls | 60 min | 2023-04-07 | archive walk | |
+| `KXGDP` | GDP growth | 60 min | 2021-07-28 | archive walk | |
+| `KXU3` | unemployment rate | 60 min | 2021-08-05 | archive walk | |
+
+The lane stores from 2025-10-01 (`startDate`), so `KXSOLD`/`KXSOLE`, `KXBNBD`/`KXHYPED`, the
+metals and the hourly WTI start later than that because they did not exist; `KXBRENTD` (Brent,
+2026-03-22) exists and is not in the list. At about 5,000 requests per stored day across the
+series (trades dominate: one page or more per kept market that traded), the backward walk needs
+roughly two million requests, about four days of hourly runs at the 24,000-request budget.
+
+### Health
+
+`solos-data health` has a `kalshi` section from the sync's `status.json`: per series the forward
+day (`behind` when more than a day old), the backward day and when it last moved (`stalled` after
+six hours while not done), and the run's requests and `429` answers (a warning at 100 in one
+run). Thresholds: `kalshiStallMinutes`, `kalshiThrottleWarn`.
+
+### Not collected
+
+The fifteen-minute series (`KXBTC15M`, `KXETH15M`, `KXGOLD15M`, `KXINX15M`, …): their markets
+live fifteen minutes and their information is in the one-minute candles of the hourly ladders.
+Weekly, monthly and yearly ladders, "when will X hit" and one-off markets: a config change adds
+one. Order books: Kalshi serves the current book only, not its history; the candles' bid and ask
+OHLC are the history there is. The legacy un-prefixed series (`FED`, `CPI`, `PAYROLLS`, `GDP`,
+`U3`, `INX`, `INXU`, `NASDAQ100`, `NASDAQ100U`, `WTI`, `GOLD`) list no markets: their history was
+moved under the `KX` series, older event tickers keep the old names (`KXWTI` lists `WTI-22DEC21`).
