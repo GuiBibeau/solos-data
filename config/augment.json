@@ -496,6 +496,16 @@
           "trades": true
         },
         {
+          "ticker": "KXGOLDH",
+          "asset": "GOLD",
+          "kind": "commodity",
+          "interval": 1,
+          "windowPct": 1.5,
+          "maxStrikes": 30,
+          "maxLifeHours": 26,
+          "trades": false
+        },
+        {
           "ticker": "KXSILVERD",
           "asset": "SILVER",
           "kind": "commodity",
@@ -504,6 +514,16 @@
           "maxStrikes": 40,
           "maxLifeHours": 30,
           "trades": true
+        },
+        {
+          "ticker": "KXSILVERH",
+          "asset": "SILVER",
+          "kind": "commodity",
+          "interval": 1,
+          "windowPct": 2.0,
+          "maxStrikes": 30,
+          "maxLifeHours": 26,
+          "trades": false
         },
         {
           "ticker": "KXCOPPERD",
@@ -524,6 +544,16 @@
           "maxStrikes": 40,
           "maxLifeHours": 30,
           "trades": true
+        },
+        {
+          "ticker": "KXWTIH",
+          "asset": "WTI",
+          "kind": "commodity",
+          "interval": 1,
+          "windowPct": 2.5,
+          "maxStrikes": 30,
+          "maxLifeHours": 26,
+          "trades": false
         },
         {
           "ticker": "KXINXU",
