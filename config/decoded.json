@@ -2,10 +2,10 @@
   "rawDir": "data/phoenix_raw",
   "dataDir": "data/phoenix_decoded/v1",
   "codecPath": "bin/solos-data-phoenix-codec",
-  "batchSize": 40000,
+  "batchSize": 25000,
   "maxBatchSources": 32,
   "pollMs": 2000,
-  "checkpointIntervalSeconds": 7200,
+  "checkpointIntervalSeconds": 1800,
   "compactionIntervalSeconds": 120,
   "compactionBudgetSeconds": 20,
   "compactionSettledBatches": 100

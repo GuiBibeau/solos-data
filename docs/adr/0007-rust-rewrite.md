@@ -115,7 +115,7 @@ figure for 1/75 of the rows.
 What changed, without changing what is published:
 
 - **A batch spans raw sources.** It takes the pending files in the order the one-file loop
-  consumes them, from each file's offset, until `batchSize` transactions (now 40,000) or
+  consumes them, from each file's offset, until `batchSize` transactions (25,000 in the deployment; see below) or
   `maxBatchSources` files (32). One `processed` lookup serves the whole batch, every source's
   offset and seen revisions commit in the batch's one transaction under one batch number, and each
   revision keeps its own source's publication instant. The batch ends before a file that repeats a
@@ -125,15 +125,31 @@ What changed, without changing what is published:
 - **The update touches only known signatures.** The lookup records which signatures `processed`
   already holds; the update is restricted to them and skipped when there are none, which during
   backfill is nearly always.
-- **Clocks are configuration.** `checkpointIntervalSeconds` is 7,200 in the deployment (a
-  checkpoint is a fixed ten minutes at this size; the price is a longer write-ahead-log replay
-  after a crash, about 0.5 GB of log an hour at the old pace). Compaction runs every
+- **Clocks are configuration.** `checkpointIntervalSeconds` is 1,800 in the deployment (a
+  checkpoint is a fixed ten minutes at this size; see below for why not longer). Compaction runs every
   `compactionIntervalSeconds` (120) for `compactionBudgetSeconds` (20) and reads the registrations
   once per pass instead of once per group; see ADR-0006 for the settled-group rule.
 - `decoded_batch` reports `batchSources`, `batchRaw`, the batch's slot bounds and the read,
   decode and publish seconds; `decoded_maintenance` reports the seconds of compaction, garbage
-  collection and checkpoint.
+  collection and checkpoint, and `engineMemory`: DuckDB's `duckdb_memory()` bytes and spilled
+  bytes per tag.
 
 Parallel decoders over disjoint epochs were not built: one process owns the checkpoint, the batch
 number orders revisions across the whole store, and a second writer would need its own store and a
 merge of `processed`. That remains the next step if one decoder is still the slower leg.
+
+Measured after the deploy at 10:29 UTC with 40,000-transaction batches and a 7,200-second
+checkpoint interval (10:31 to 11:16, 0.76 h, one restart included): 4.17 million newly processed
+transactions an hour (4.79 million raw rows) against 1.72 million, 131 batches of 13.6 s on
+average (read 2.5 s, decode 0.3 s, publish 8.6 s), and 1.29 million backfilled slots an hour
+against about 0.46 million. The `processed` lookup costs about 2 s per batch. Settled-group
+compaction merged 5,417 files and the garbage collector removed 3,509 in that window; the catalog
+fell from 12,367 files to 7,803 and the decoded-files health warning cleared.
+
+The one restart was the engine's: at 10:45 the decoder stopped logging and at 11:07 failed with
+`Out of Memory` at its 186 GiB buffer limit. The previous binary had run eleven hours at that
+limit with 10,000-transaction batches and a checkpoint every 25 minutes, and had out-of-memory
+looped at 96 GB the day before, so the `processed` index alone sits close to the limit; larger
+batches, settled merges and two hours of index changes held in memory between checkpoints left
+no headroom. The deployment now uses 25,000-transaction batches and a 1,800-second checkpoint
+interval, and `engineMemory` records which tag fills the buffer if it happens again.
