@@ -94,3 +94,46 @@ was the last large cost: eight calls of about 59 seconds in fifteen minutes with
 threshold already at 48 GB. It now runs every `checkpointIntervalSeconds` (default 900); the
 compaction and garbage passes keep their one-minute cadence. This is the second deliberate
 deviation from the TypeScript behaviour, after the limiter's recovery pace.
+
+## Backfill decoding (2026-10-22)
+
+Working back through the archived year, the decoder published 1.72 million transactions an hour
+(317 batches, three hours of logs from 06:56 to 09:56 UTC). Its storage timings over the preceding
+twelve hours, with `processed` at 1.49 billion rows and the checkpoint file at 573 GB, put the time
+in two places. Each explicit `CHECKPOINT` took 570 to 700 seconds (27 calls, 17,255 s of 42,800 s),
+so every 25 minutes the decoder stopped for ten; the write-ahead log had grown by only 94 MB in the
+eleven minutes before one of them, so the cost is the rewrite of the table's primary-key index,
+not the change. And each batch made two passes over `processed`: the lookup of the batch's
+signatures and the revision update (3.5 s on average, 13,540 s in all), although a backfilled
+signature is almost never there to update. A batch read only from one raw file, so a 22,000-row
+file took three batches (10,000, 10,000 and the rest) and paid those passes three times. A DuckDB
+1.4.4 experiment on a 20-million-row copy of the table's shape showed both: a 10,000-key `IN`
+lookup is planned as a sequential scan with a mark join (its cost follows the table, not the
+keys), and a checkpoint after a 200-row change took 7.3 seconds, about 1/75 of the production
+figure for 1/75 of the rows.
+
+What changed, without changing what is published:
+
+- **A batch spans raw sources.** It takes the pending files in the order the one-file loop
+  consumes them, from each file's offset, until `batchSize` transactions (now 40,000) or
+  `maxBatchSources` files (32). One `processed` lookup serves the whole batch, every source's
+  offset and seen revisions commit in the batch's one transaction under one batch number, and each
+  revision keeps its own source's publication instant. The batch ends before a file that repeats a
+  signature already in it, since two revisions must not share a batch number, and before a raw
+  merge, whose parents this very batch may finish. Across batches the latest-publication rule
+  already made the order of files irrelevant to which revision wins.
+- **The update touches only known signatures.** The lookup records which signatures `processed`
+  already holds; the update is restricted to them and skipped when there are none, which during
+  backfill is nearly always.
+- **Clocks are configuration.** `checkpointIntervalSeconds` is 7,200 in the deployment (a
+  checkpoint is a fixed ten minutes at this size; the price is a longer write-ahead-log replay
+  after a crash, about 0.5 GB of log an hour at the old pace). Compaction runs every
+  `compactionIntervalSeconds` (120) for `compactionBudgetSeconds` (20) and reads the registrations
+  once per pass instead of once per group; see ADR-0006 for the settled-group rule.
+- `decoded_batch` reports `batchSources`, `batchRaw`, the batch's slot bounds and the read,
+  decode and publish seconds; `decoded_maintenance` reports the seconds of compaction, garbage
+  collection and checkpoint.
+
+Parallel decoders over disjoint epochs were not built: one process owns the checkpoint, the batch
+number orders revisions across the whole store, and a second writer would need its own store and a
+merge of `processed`. That remains the next step if one decoder is still the slower leg.

@@ -8,6 +8,7 @@ use crate::fsutil::{file_hash, sync_path, write_durable};
 use crate::jsonout::{Obj, now};
 use crate::store::{Store, StoreError, sql_string};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// How far the source was consumed and which signatures this batch saw.
@@ -33,6 +34,28 @@ struct Published {
 
 /// Write the batch and commit its registrations.
 pub fn publish(store: &mut Store, rows: &Rows, source: &SourceProgress) -> Result<(), StoreError> {
+    publish_sources(store, rows, std::slice::from_ref(source), None)
+}
+
+/// Write one batch read from several sources and commit its registrations, every source's
+/// offset and every seen revision in one transaction under one batch number.
+///
+/// No signature may be seen by two sources of one batch (the caller ends a batch before a
+/// repeat), so the batch's revisions never tie on batch number. `known`, when given, is every
+/// seen signature `processed` already held when the batch was read: only those can be updated,
+/// so the update (a pass over the whole table) is skipped when none is. `None` keeps the
+/// unrestricted update.
+pub fn publish_sources(
+    store: &mut Store,
+    rows: &Rows,
+    sources: &[SourceProgress],
+    known: Option<&HashSet<String>>,
+) -> Result<(), StoreError> {
+    if sources.len() > 1 && sources.iter().any(|source| source.seen.is_none()) {
+        return Err(StoreError::Check(
+            "a batch of several sources needs every source's seen revisions".into(),
+        ));
+    }
     let batch = store.get("batch")?.map_or(0, |v| {
         v.as_str()
             .and_then(|s| s.parse::<i64>().ok())
@@ -104,35 +127,50 @@ pub fn publish(store: &mut Store, rows: &Rows, source: &SourceProgress) -> Resul
             let count = i64::try_from(file.count).unwrap_or(i64::MAX);
             store.exec("INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)", &[&file.path, &file.table, &count, &file.hash, &batch, &now()])?;
         }
-        let seen: Vec<(String, String)> = match &source.seen {
-            Some(seen) => seen.clone(),
-            None => rows
-                .get("decoded_transactions")
-                .iter()
-                .map(|row| (row.str("signature").unwrap_or("").to_owned(), row.str("source_hash").unwrap_or("").to_owned()))
-                .collect(),
-        };
+        let mut seen: Vec<(String, String, String)> = Vec::new();
+        for source in sources {
+            let at = source.at.clone().unwrap_or_default();
+            match &source.seen {
+                Some(pairs) => seen.extend(pairs.iter().map(|(signature, hash)| (signature.clone(), hash.clone(), at.clone()))),
+                None => seen.extend(rows
+                    .get("decoded_transactions")
+                    .iter()
+                    .map(|row| (row.str("signature").unwrap_or("").to_owned(), row.str("source_hash").unwrap_or("").to_owned(), at.clone()))),
+            }
+        }
         if !seen.is_empty() {
-            let keys = seen.iter().map(|(signature, _)| sql_string(signature)).collect::<Vec<_>>().join(",");
+            let keys = seen.iter().map(|(signature, _, _)| sql_string(signature)).collect::<Vec<_>>().join(",");
             let payload = Value::Array(
-                seen.iter().map(|(signature, hash)| Value::Object([("signature".to_owned(), Value::String(signature.clone())), ("source_hash".to_owned(), Value::String(hash.clone()))].into_iter().collect())).collect(),
+                seen.iter().map(|(signature, hash, at)| Value::Object([("signature".to_owned(), Value::String(signature.clone())), ("source_hash".to_owned(), Value::String(hash.clone())), ("publication_at".to_owned(), Value::String(at.clone()))].into_iter().collect())).collect(),
             )
             .to_string();
-            let at = source.at.clone().unwrap_or_default();
             store.exec_batch("CREATE OR REPLACE TEMP TABLE processed_batch(signature VARCHAR, source_hash VARCHAR, publication_at VARCHAR)")?;
-            store.exec("INSERT INTO processed_batch SELECT value->>'signature', value->>'source_hash', ? FROM json_each(?::JSON)", &[&at, &payload])?;
-            store.exec_batch(&format!(
-                "UPDATE processed SET source_hash=b.source_hash, publication_at=b.publication_at
-          FROM processed_batch b WHERE processed.signature=b.signature AND processed.signature IN ({keys})
+            store.exec("INSERT INTO processed_batch SELECT value->>'signature', value->>'source_hash', value->>'publication_at' FROM json_each(?::JSON)", &[&payload])?;
+            let update_keys = match known {
+                Some(known) => seen
+                    .iter()
+                    .filter(|(signature, _, _)| known.contains(signature))
+                    .map(|(signature, _, _)| sql_string(signature))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                None => keys.clone(),
+            };
+            if !update_keys.is_empty() {
+                store.exec_batch(&format!(
+                    "UPDATE processed SET source_hash=b.source_hash, publication_at=b.publication_at
+          FROM processed_batch b WHERE processed.signature=b.signature AND processed.signature IN ({update_keys})
           AND coalesce(processed.publication_at,'')<=b.publication_at"
-            ))?;
+                ))?;
+            }
             store.exec_batch(&format!(
                 "INSERT INTO processed SELECT * FROM processed_batch
           WHERE signature NOT IN (SELECT signature FROM processed WHERE signature IN ({keys}))"
             ))?;
         }
-        let offset = i64::try_from(source.offset).unwrap_or(i64::MAX);
-        store.exec("INSERT OR REPLACE INTO sources VALUES (?, ?, ?)", &[&source.hash, &source.path, &offset])?;
+        for source in sources {
+            let offset = i64::try_from(source.offset).unwrap_or(i64::MAX);
+            store.exec("INSERT OR REPLACE INTO sources VALUES (?, ?, ?)", &[&source.hash, &source.path, &offset])?;
+        }
         store.exec("INSERT OR REPLACE INTO kv VALUES (?, ?::JSON)", &[&"batch", &batch.to_string()])?;
         Ok(())
     })?;

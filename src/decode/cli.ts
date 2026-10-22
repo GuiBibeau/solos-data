@@ -19,7 +19,7 @@ async function main() {
   config.rawDir = resolve(process.env.SOLOS_DATA_RAW_DIR ?? config.rawDir);
   config.dataDir = resolve(process.env.SOLOS_DATA_DECODED_DIR ?? config.dataDir);
   config.codecPath = resolve(process.env.SOLOS_DATA_CODEC ?? config.codecPath);
-  if (!Number.isInteger(config.batchSize) || config.batchSize < 1 || config.batchSize > 10000) throw new Error('invalid batchSize');
+  if (!Number.isInteger(config.batchSize) || config.batchSize < 1 || config.batchSize > 100000) throw new Error('invalid batchSize');
   if (!Number.isInteger(config.pollMs) || config.pollMs < 100) throw new Error('invalid pollMs');
   if (config.rawDir === config.dataDir) throw new Error('raw and decoded roots must differ');
   if (command === 'status') { console.log(await readFile(join(config.dataDir, 'status.json'), 'utf8')); return; }

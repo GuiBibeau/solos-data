@@ -40,6 +40,13 @@ pub struct NextSource {
 
 /// Pick the unconsumed raw file with the newest transaction range.
 pub fn next_source(store: &mut Store, raw_root: &Path) -> Result<Option<NextSource>, StoreError> {
+    Ok(pending_sources(store, raw_root)?.into_iter().next())
+}
+
+/// Every unconsumed raw file in the order the decoder consumes them: newest transaction range
+/// first, then newest publication, then path. A batch may span several of them in this order;
+/// [`next_source`] is the first.
+pub fn pending_sources(store: &mut Store, raw_root: &Path) -> Result<Vec<NextSource>, StoreError> {
     let catalog = read_catalog(raw_root).map_err(StoreError::Check)?;
     let mut progress: HashMap<String, u64> = HashMap::new();
     for row in store.rows("SELECT * FROM sources", &[])? {
@@ -81,14 +88,17 @@ pub fn next_source(store: &mut Store, raw_root: &Path) -> Result<Option<NextSour
             .then_with(|| b.0.created_at.cmp(&a.0.created_at))
             .then_with(|| b.0.path.cmp(&a.0.path))
     });
-    Ok(candidates.into_iter().next().map(|(file, _)| {
-        let offset = progress.get(&file.sha256).copied().unwrap_or(0);
-        NextSource {
-            file,
-            offset,
-            catalog_at: catalog.at.clone(),
-        }
-    }))
+    Ok(candidates
+        .into_iter()
+        .map(|(file, _)| {
+            let offset = progress.get(&file.sha256).copied().unwrap_or(0);
+            NextSource {
+                file,
+                offset,
+                catalog_at: catalog.at.clone(),
+            }
+        })
+        .collect())
 }
 
 fn source_priority(store: &mut Store, root: &Path, file: &CatalogFile) -> Result<i64, StoreError> {
@@ -137,11 +147,28 @@ pub struct SourceRow {
     pub previous_hash: Option<String>,
     /// Publication instant of that revision, if any.
     pub previous_at: Option<String>,
+    /// Whether `processed` already holds a row for this signature.
+    pub known: bool,
 }
 
 /// Read `limit` rows after `offset` in descending (slot, signature) order, verifying the file
-/// hash once per process.
+/// hash once per process, with what `processed` knows about each signature.
 pub fn source_rows(
+    store: &mut Store,
+    raw_root: &Path,
+    file: &CatalogFile,
+    offset: u64,
+    limit: u64,
+    verified: &mut HashSet<String>,
+) -> Result<Vec<SourceRow>, StoreError> {
+    let mut rows = read_source_rows(store, raw_root, file, offset, limit, verified)?;
+    attach_previous(store, &mut rows)?;
+    Ok(rows)
+}
+
+/// [`source_rows`] without the `processed` lookup; `previous_*` are `None` and `known` false
+/// until [`attach_previous`] fills them.
+pub fn read_source_rows(
     store: &mut Store,
     raw_root: &Path,
     file: &CatalogFile,
@@ -191,59 +218,67 @@ pub fn source_rows(
         ),
         &[],
     )?;
-    // Point lookups avoid building a hash table for all previously decoded signatures.
-    let signatures: Vec<String> = raw
-        .iter()
-        .filter_map(|row| row.str("signature"))
-        .map(sql_string)
-        .collect();
-    let mut previous: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
-    if !signatures.is_empty() {
-        for row in store.rows(
-            &format!(
-                "SELECT * FROM processed WHERE signature IN ({})",
-                signatures.join(",")
-            ),
-            &[],
-        )? {
-            if let Some(signature) = row.str("signature") {
-                previous.insert(
-                    signature.to_owned(),
-                    (
-                        row.str("source_hash").map(str::to_owned),
-                        row.str("publication_at").map(str::to_owned),
-                    ),
-                );
-            }
-        }
-    }
     let rows: Vec<SourceRow> = raw
         .into_iter()
-        .map(|row| {
-            let signature = row.str("signature").unwrap_or("").to_owned();
-            let (previous_hash, previous_at) =
-                previous.get(&signature).cloned().unwrap_or((None, None));
-            SourceRow {
-                tx: RawTransaction {
-                    signature,
-                    slot: row.get("slot").cloned().unwrap_or(Value::Null),
-                    block_time: row.get("block_time").cloned().unwrap_or(Value::Null),
-                    tx_index: row.get("tx_index").cloned().unwrap_or(Value::Null),
-                    single_in_slot: row.get("single_in_slot").cloned().unwrap_or(Value::Null),
-                    tx_b64: row.str("tx_b64").map(str::to_owned),
-                    meta_json: row.str("meta_json").map(str::to_owned),
-                    terminal_error: row.str("terminal_error").map(str::to_owned),
-                    err: row.get("err").cloned().unwrap_or(Value::Null),
-                },
-                previous_hash,
-                previous_at,
-            }
+        .map(|row| SourceRow {
+            tx: RawTransaction {
+                signature: row.str("signature").unwrap_or("").to_owned(),
+                slot: row.get("slot").cloned().unwrap_or(Value::Null),
+                block_time: row.get("block_time").cloned().unwrap_or(Value::Null),
+                tx_index: row.get("tx_index").cloned().unwrap_or(Value::Null),
+                single_in_slot: row.get("single_in_slot").cloned().unwrap_or(Value::Null),
+                tx_b64: row.str("tx_b64").map(str::to_owned),
+                meta_json: row.str("meta_json").map(str::to_owned),
+                terminal_error: row.str("terminal_error").map(str::to_owned),
+                err: row.get("err").cloned().unwrap_or(Value::Null),
+            },
+            previous_hash: None,
+            previous_at: None,
+            known: false,
         })
         .collect();
     if rows.is_empty() && offset < file.row_count {
         return Err(StoreError::Check("raw source row count mismatch".into()));
     }
     Ok(rows)
+}
+
+/// Fill `previous_*` and `known` for every row from `processed` in one statement. The lookup
+/// costs a pass over `processed` whatever the number of signatures, so a batch makes it once.
+pub fn attach_previous(store: &mut Store, rows: &mut [SourceRow]) -> Result<(), StoreError> {
+    let signatures: Vec<String> = rows
+        .iter()
+        .map(|row| sql_string(&row.tx.signature))
+        .collect();
+    if signatures.is_empty() {
+        return Ok(());
+    }
+    let mut previous: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    for row in store.rows(
+        &format!(
+            "SELECT * FROM processed WHERE signature IN ({})",
+            signatures.join(",")
+        ),
+        &[],
+    )? {
+        if let Some(signature) = row.str("signature") {
+            previous.insert(
+                signature.to_owned(),
+                (
+                    row.str("source_hash").map(str::to_owned),
+                    row.str("publication_at").map(str::to_owned),
+                ),
+            );
+        }
+    }
+    for row in rows.iter_mut() {
+        if let Some((hash, at)) = previous.get(&row.tx.signature) {
+            row.previous_hash.clone_from(hash);
+            row.previous_at.clone_from(at);
+            row.known = true;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

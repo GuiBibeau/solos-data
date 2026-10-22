@@ -5,7 +5,7 @@ mod common;
 
 use common::*;
 use serde_json::Value;
-use solos_data::decoder::compact::compact_decoded;
+use solos_data::decoder::compact::{CompactionPolicy, compact_decoded, compact_decoded_with};
 use solos_data::decoder::normalize::Rows;
 use solos_data::decoder::publish::{SourceProgress, publish, recover, write_catalog};
 use solos_data::decoder::reader::{query_decoded, query_decoded_slots};
@@ -307,6 +307,51 @@ fn the_head_run_waits_for_thirty_two_files() {
     assert_eq!(report.int("merges"), Some(2));
     assert_eq!(active_files(&store, "fills").len(), 1);
     assert_eq!(count(&root, "SELECT count(*) AS n FROM fills"), 32);
+    store.close().unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_settled_group_merges_its_short_head_once_batches_land_elsewhere() {
+    let root = tempdir("decoded-settled");
+    let mut store = Store::open(&root, schema_static()).unwrap();
+    for i in 0..5 {
+        publish_revision(&mut store, i, 3, 100 + i % 3);
+    }
+    let policy = CompactionPolicy {
+        budget: Duration::from_secs(60),
+        settled_batches: Some(3),
+    };
+    // Batches still land in epoch 0: its five-file head waits for thirty-two.
+    let report = compact_decoded_with(&mut store, policy).unwrap();
+    assert_eq!(report.int("merges"), Some(0));
+    // The decoder moves on to epoch 1; three batches later epoch 0 is settled.
+    for i in 5..8 {
+        publish_revision(&mut store, i, 1000, 432_000 + i);
+    }
+    let before = fills_by_signature(&root);
+    let report = compact_decoded(&mut store, Duration::from_secs(60)).unwrap();
+    assert_eq!(
+        report.int("merges"),
+        Some(0),
+        "without the rule nothing merges"
+    );
+    let report = compact_decoded_with(&mut store, policy).unwrap();
+    assert_eq!(
+        report.int("merges"),
+        Some(2),
+        "fills and decoded_transactions of epoch 0"
+    );
+    assert_eq!(report.int("settledGroups"), Some(2));
+    let epoch0 = |table: &str| {
+        active_files(&store, table)
+            .into_iter()
+            .filter(|f| f.str("path").unwrap().contains("epoch=0/"))
+            .count()
+    };
+    assert_eq!(epoch0("fills"), 1);
+    assert_eq!(epoch0("decoded_transactions"), 1);
+    assert_eq!(fills_by_signature(&root), before, "latest revisions kept");
     store.close().unwrap();
     std::fs::remove_dir_all(root).unwrap();
 }
