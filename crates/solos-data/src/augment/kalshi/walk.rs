@@ -2,7 +2,10 @@
 //! and the trades of the kept markets that traded. A market the archive listed is fetched one
 //! market a call from `/historical`; a market the live tier listed goes through the live batch
 //! endpoint (even when it closed before the cutoff: it settled after it), and any market the
-//! batch answer leaves out (archived since it was listed) is retried in the archive. The day's rows are written once, after every event is fetched: a run stopped
+//! batch answer leaves out (archived since it was listed) is retried in the archive. Trades
+//! have their own cutoff: a market's fills created before it come from `/historical/trades`,
+//! the rest from `/markets/trades`, whatever tier lists the market; both are merged on
+//! `trade_id`. The day's rows are written once, after every event is fetched: a run stopped
 //! by its budget mid-day writes nothing for that day and the day is redone next run.
 
 use super::api::{self, Api};
@@ -53,6 +56,8 @@ pub struct Walk<'a> {
     pub ctx: &'a Ctx,
     /// The series.
     pub spec: &'a KalshiSeries,
+    /// Trades created before this are served only by the archive, milliseconds.
+    pub trades_cutoff_ms: i64,
     /// Whether the run may send another request.
     pub may_continue: &'a (dyn Fn() -> bool + Sync),
 }
@@ -192,35 +197,48 @@ impl Walk<'_> {
     }
 
     async fn event_trades(&self, day: &str, kept: &[&Contract]) -> Result<Vec<Value>, Stop> {
-        let mut out = Vec::new();
+        let mut out: Vec<Value> = Vec::new();
         for market in kept.iter().filter(|m| m.volume > 0.0) {
-            let mut historical = market.historical;
-            let mut cursor: Option<String> = None;
-            let mut fell_back = false;
-            loop {
-                self.check()?;
-                let (page, next) = self
-                    .api
-                    .trades(&market.ticker, historical, cursor.as_deref())
-                    .await?;
-                if page.is_empty() && cursor.is_none() && !historical && !fell_back {
-                    // Archived since it was listed: ask the archive once.
-                    historical = true;
-                    fell_back = true;
-                    continue;
-                }
-                let fetched_at = chrono::Utc::now().timestamp_millis();
-                out.extend(
-                    page.iter()
-                        .filter_map(|t| trade_row(t, &self.spec.ticker, day, fetched_at)),
-                );
-                cursor = next;
-                if cursor.is_none() || page.is_empty() {
-                    break;
+            // Each tier holds the fills on its side of the trade cutoff.
+            let tiers = [
+                (true, market.open_ms < self.trades_cutoff_ms),
+                (false, market.close_ms >= self.trades_cutoff_ms),
+            ];
+            for (historical, wanted) in tiers {
+                if wanted {
+                    out.extend(self.market_trades(day, &market.ticker, historical).await?);
                 }
             }
         }
+        out.sort_by(|a, b| a["trade_id"].as_str().cmp(&b["trade_id"].as_str()));
+        out.dedup_by(|a, b| a["trade_id"] == b["trade_id"]);
         Ok(out)
+    }
+
+    async fn market_trades(
+        &self,
+        day: &str,
+        ticker: &str,
+        historical: bool,
+    ) -> Result<Vec<Value>, Stop> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            self.check()?;
+            let (page, next) = self
+                .api
+                .trades(ticker, historical, cursor.as_deref())
+                .await?;
+            let fetched_at = chrono::Utc::now().timestamp_millis();
+            out.extend(
+                page.iter()
+                    .filter_map(|t| trade_row(t, &self.spec.ticker, day, fetched_at)),
+            );
+            cursor = next;
+            if cursor.is_none() || page.is_empty() {
+                return Ok(out);
+            }
+        }
     }
 }
 

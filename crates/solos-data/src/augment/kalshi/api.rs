@@ -61,14 +61,20 @@ impl<'a> Api<'a> {
         Ok((rows, next_cursor(&answer)))
     }
 
-    /// The archive boundary, milliseconds: markets settled before it are historical.
-    pub async fn cutoff_ms(&self) -> Result<i64, StoreError> {
+    /// The archive boundaries, milliseconds: markets settled before the first are historical,
+    /// trades created before the second are served only by `/historical/trades` (Kalshi moves
+    /// the two separately; the trade one falls back to the market one when absent).
+    pub async fn cutoffs(&self) -> Result<(i64, i64), StoreError> {
         let answer = self.get("/historical/cutoff", &[]).await?;
-        answer
-            .get("market_settled_ts")
-            .and_then(Value::as_str)
-            .and_then(super::rows::parse_ms)
-            .ok_or_else(|| StoreError::Check("cutoff has no market_settled_ts".into()))
+        let at = |key: &str| {
+            answer
+                .get(key)
+                .and_then(Value::as_str)
+                .and_then(super::rows::parse_ms)
+        };
+        let markets = at("market_settled_ts")
+            .ok_or_else(|| StoreError::Check("cutoff has no market_settled_ts".into()))?;
+        Ok((markets, at("trades_created_ts").unwrap_or(markets)))
     }
 
     /// One page of a series' live-tier markets closing at or after `min_close_s`.

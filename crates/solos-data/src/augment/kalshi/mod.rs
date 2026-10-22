@@ -60,6 +60,8 @@ struct Run<'a> {
     spec: &'a KalshiSeries,
     state: State,
     outcome: Outcome,
+    /// Trades created before this are served only by the archive, milliseconds.
+    trades_cutoff_ms: i64,
 }
 
 /// Sync the curated series; the outcome and the `kalshi` status block.
@@ -77,8 +79,8 @@ pub async fn sync(ctx: &Ctx, cfg: &Kalshi, only: Option<&str>) -> (Outcome, Obj)
         .as_deref()
         .and_then(parse_date)
         .unwrap_or(ctx.start);
-    let cutoff_ms = match api.cutoff_ms().await {
-        Ok(ms) => ms,
+    let (cutoff_ms, trades_cutoff_ms) = match api.cutoffs().await {
+        Ok(both) => both,
         Err(error) => {
             log_error("cutoff", "ALL", &error.to_string());
             let outcome = Outcome {
@@ -99,6 +101,7 @@ pub async fn sync(ctx: &Ctx, cfg: &Kalshi, only: Option<&str>) -> (Outcome, Obj)
             spec,
             state,
             outcome: Outcome::default(),
+            trades_cutoff_ms,
         });
     }
     let may_continue = || budget.ok();
@@ -131,6 +134,7 @@ pub async fn sync(ctx: &Ctx, cfg: &Kalshi, only: Option<&str>) -> (Outcome, Obj)
     let detail = Obj::new()
         .with("start", start.to_string())
         .with("cutoff", rows_day(cutoff_ms))
+        .with("tradesCutoff", rows_day(trades_cutoff_ms))
         .with("requests", sent)
         .with("rateLimited", limited)
         .with("seconds", budget.started.elapsed().as_secs())
@@ -301,6 +305,7 @@ async fn day(
         api,
         ctx,
         spec: run.spec,
+        trades_cutoff_ms: run.trades_cutoff_ms,
         may_continue: may,
     };
     match walk.day(&day.to_string(), contracts, skip, complete).await {

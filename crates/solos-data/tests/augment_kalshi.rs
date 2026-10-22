@@ -85,7 +85,8 @@ fn close_of(t: &str) -> i64 {
 fn serve(server: &Server) {
     server.serve_json(
         "/historical/cutoff",
-        json!({"market_settled_ts": iso(OCT9 - 4 * DAY)}),
+        // Trades move to the archive on their own cutoff: L0's fills straddle it.
+        json!({"market_settled_ts": iso(OCT9 - 4 * DAY), "trades_created_ts": iso(OCT9 - DAY + 15 * HOUR)}),
     );
     let live: Vec<Value> = events().iter().filter(|e| !e.3).flat_map(markets).collect();
     server.serve_json("/markets", json!({"markets": live, "cursor": ""}));
@@ -302,6 +303,26 @@ fn both_tiers_fill_the_kept_strikes_and_rerun_idempotently() {
         trades[0]["n"], "10",
         "strikes 100 and 101 traded: two in A, A0, L, L0, one in T, T0"
     );
+    let trade_hits = |path: &str, event: &str| {
+        server
+            .hits()
+            .iter()
+            .filter(|h| h.path == path)
+            .filter(|h| h.param("ticker").is_some_and(|t| t.contains(event)))
+            .count()
+    };
+    assert_eq!(
+        trade_hits("/historical/trades", "-L0-"),
+        2,
+        "before the trade cutoff"
+    );
+    assert_eq!(trade_hits("/markets/trades", "-L0-"), 2, "after it");
+    assert_eq!(
+        trade_hits("/historical/trades", "-L-"),
+        0,
+        "opened after it"
+    );
+    assert_eq!(trade_hits("/markets/trades", "-A-"), 0, "closed before it");
 
     // Same clock again: today's stored events are not fetched again, nothing duplicates.
     let before = batched.len();

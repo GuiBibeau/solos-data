@@ -656,7 +656,11 @@ markets and 10,000 candles a call, `/markets/trades`) serves the rest and answer
 for an archived market. Markets settled shortly before the cutoff can still show in the live
 listing (a market that closed before the cutoff but settled after it stays live), and the cutoff
 moves forward over time, so a market is routed by the tier that listed it, and a live-listed
-market the batch answer leaves out (archived since) is asked in the archive.
+market the batch answer leaves out (archived since) is asked in the archive. Trades have their
+own boundary (`trades_created_ts`, also 2026-08-23 today, moved independently): a kept market's
+fills created before it come from `/historical/trades` and the rest from `/markets/trades`,
+whichever tier lists the market, merged on `trade_id`; a market open across the boundary is
+asked in both.
 
 ### The walk
 
