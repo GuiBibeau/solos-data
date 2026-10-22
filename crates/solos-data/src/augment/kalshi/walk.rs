@@ -1,8 +1,8 @@
 //! One close day of one series: its events' kept strikes, their candles over the stored life,
-//! and the trades of the kept markets that traded. A market the archive serves (listed there,
-//! or closed before the cutoff) is fetched one market a call from `/historical`; the rest go
-//! through the live batch endpoint, and any market the batch answer leaves out is retried in
-//! the archive. The day's rows are written once, after every event is fetched: a run stopped
+//! and the trades of the kept markets that traded. A market the archive listed is fetched one
+//! market a call from `/historical`; a market the live tier listed goes through the live batch
+//! endpoint (even when it closed before the cutoff: it settled after it), and any market the
+//! batch answer leaves out (archived since it was listed) is retried in the archive. The day's rows are written once, after every event is fetched: a run stopped
 //! by its budget mid-day writes nothing for that day and the day is redone next run.
 
 use super::api::{self, Api};
@@ -53,8 +53,6 @@ pub struct Walk<'a> {
     pub ctx: &'a Ctx,
     /// The series.
     pub spec: &'a KalshiSeries,
-    /// The archive boundary, milliseconds.
-    pub cutoff_ms: i64,
     /// Whether the run may send another request.
     pub may_continue: &'a (dyn Fn() -> bool + Sync),
 }
@@ -66,10 +64,6 @@ impl Walk<'_> {
         } else {
             Err(Stop::Budget)
         }
-    }
-
-    fn archived(&self, m: &Contract) -> bool {
-        m.historical || m.close_ms < self.cutoff_ms
     }
 
     /// Store `day`'s closed events not in `skip`; `complete` marks the files final.
@@ -154,7 +148,7 @@ impl Walk<'_> {
         let interval = self.spec.interval;
         let mut out = Vec::new();
         let (archived, live): (Vec<&&Contract>, Vec<&&Contract>) =
-            kept.iter().partition(|m| self.archived(m));
+            kept.iter().partition(|m| m.historical);
         let mut missing: Vec<&Contract> = archived.into_iter().copied().collect();
         let tickers: Vec<String> = live.iter().map(|m| m.ticker.clone()).collect();
         let mut answered: HashMap<String, usize> = HashMap::new();
@@ -200,7 +194,7 @@ impl Walk<'_> {
     async fn event_trades(&self, day: &str, kept: &[&Contract]) -> Result<Vec<Value>, Stop> {
         let mut out = Vec::new();
         for market in kept.iter().filter(|m| m.volume > 0.0) {
-            let mut historical = self.archived(market);
+            let mut historical = market.historical;
             let mut cursor: Option<String> = None;
             let mut fell_back = false;
             loop {

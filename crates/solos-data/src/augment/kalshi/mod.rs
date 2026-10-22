@@ -200,7 +200,7 @@ async fn forward(
         } else {
             Vec::new()
         };
-        let Some(stored) = day(api, ctx, run, head, &skip, complete, cutoff_ms, may).await else {
+        let Some(stored) = day(api, ctx, run, head, &skip, complete, may).await else {
             return;
         };
         run.state.head = Some(head.to_string());
@@ -242,8 +242,15 @@ async fn backward(
         if run.state.hist_done {
             return false;
         }
-        return match catalogue::historical_step(api, ctx, run.spec, &mut run.state, ms_of(start))
-            .await
+        return match catalogue::historical_step(
+            api,
+            ctx,
+            run.spec,
+            &mut run.state,
+            ms_of(start),
+            cutoff_ms,
+        )
+        .await
         {
             Ok((files, rows)) => {
                 run.outcome.files += files;
@@ -258,10 +265,7 @@ async fn backward(
             }
         };
     }
-    if day(api, ctx, run, tail, &[], true, cutoff_ms, may)
-        .await
-        .is_none()
-    {
+    if day(api, ctx, run, tail, &[], true, may).await.is_none() {
         return false;
     }
     run.state.tail = Some((tail - Duration::days(1)).to_string());
@@ -279,7 +283,6 @@ async fn day(
     day: NaiveDate,
     skip: &[String],
     complete: bool,
-    cutoff_ms: i64,
     may: &(dyn Fn() -> bool + Sync),
 ) -> Option<Vec<String>> {
     let days: Vec<String> = (0..=2)
@@ -298,7 +301,6 @@ async fn day(
         api,
         ctx,
         spec: run.spec,
-        cutoff_ms,
         may_continue: may,
     };
     match walk.day(&day.to_string(), contracts, skip, complete).await {

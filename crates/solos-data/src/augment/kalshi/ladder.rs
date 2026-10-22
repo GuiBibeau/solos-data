@@ -5,6 +5,9 @@
 //! none within two days does the median listed strike stand in (`median`). The window is
 //! `windowPct` of the centre for a one-hour life, scaled by the square root of the stored life
 //! in hours, then capped to the `maxStrikes` nearest the centre. `windowPct = 0` keeps all.
+//! A predecessor counts only once its settlement was published (`settlement_ts`, else its close
+//! plus `SETTLE_GUARD_MS`) at or before the event opened: hourly events open as the previous one
+//! closes and settle minutes later, so the centre is then the settlement of the event before.
 
 use crate::augment::config::KalshiSeries;
 use std::collections::BTreeMap;
@@ -12,6 +15,8 @@ use std::collections::BTreeMap;
 const HOUR_MS: i64 = 3_600_000;
 /// How far back a predecessor's settlement may serve as the centre.
 const CENTRE_LOOKBACK_MS: i64 = 48 * HOUR_MS;
+/// When a market carries no settlement time, its value is taken as known this long after close.
+pub const SETTLE_GUARD_MS: i64 = 15 * 60_000;
 
 /// One market as the walk needs it.
 #[derive(Clone, Debug, PartialEq)]
@@ -28,6 +33,8 @@ pub struct Contract {
     pub close_ms: i64,
     /// The settled index value, once known.
     pub expiration_value: Option<f64>,
+    /// When the settlement was published, milliseconds.
+    pub settle_ms: Option<i64>,
     /// Lifetime volume (contracts).
     pub volume: f64,
     /// Listed by the archive tier.
@@ -48,10 +55,13 @@ pub struct Event {
 }
 
 impl Event {
-    /// The settled index value, the first market's that carries one.
+    /// The settled index value and when it was published: the first market that carries one.
     #[must_use]
-    pub fn settled_value(&self) -> Option<f64> {
-        self.markets.iter().find_map(|m| m.expiration_value)
+    pub fn settled(&self) -> Option<(i64, f64)> {
+        self.markets.iter().find_map(|m| {
+            let value = m.expiration_value?;
+            Some((m.settle_ms.unwrap_or(m.close_ms + SETTLE_GUARD_MS), value))
+        })
     }
 }
 
@@ -81,10 +91,10 @@ pub fn centre(event: &Event, known: &[Event]) -> (Option<f64>, &'static str) {
     let previous = known
         .iter()
         .filter(|e| e.ticker != event.ticker)
-        .filter(|e| e.close_ms <= event.open_ms && e.close_ms >= event.open_ms - CENTRE_LOOKBACK_MS)
-        .filter_map(|e| Some((e.close_ms, e.settled_value()?)))
+        .filter_map(|e| e.settled())
+        .filter(|(at, _)| *at <= event.open_ms && *at >= event.open_ms - CENTRE_LOOKBACK_MS)
         .filter(|(_, v)| v.is_finite() && *v > 0.0)
-        .max_by_key(|(close, _)| *close);
+        .max_by_key(|(at, _)| *at);
     if let Some((_, value)) = previous {
         return (Some(value), "previous_settle");
     }
@@ -154,6 +164,7 @@ mod tests {
                 open_ms: open_h * HOUR_MS,
                 close_ms: close_h * HOUR_MS,
                 expiration_value: settle,
+                settle_ms: settle.map(|_| close_h * HOUR_MS + 60_000),
                 volume: 0.0,
                 historical: false,
             })
@@ -162,16 +173,27 @@ mod tests {
 
     #[test]
     fn the_centre_is_the_previous_settlement_never_a_later_one() {
-        let mut all = ladder("E1", 0, 10, Some(104.2));
-        all.extend(ladder("E2", 10, 11, Some(96.0)));
-        all.extend(ladder("E3", 11, 12, None));
+        let mut all = ladder("E1", 0, 9, Some(104.2));
+        all.extend(ladder("E2", 9, 10, Some(96.0)));
+        all.extend(ladder("E3", 10, 11, None));
+        all.extend(ladder("E4", 11, 12, None));
         let evs = events(all);
         assert_eq!(
             evs.iter().map(|e| e.ticker.as_str()).collect::<Vec<_>>(),
-            ["E1", "E2", "E3"]
+            ["E1", "E2", "E3", "E4"]
         );
-        assert_eq!(centre(&evs[1], &evs), (Some(104.2), "previous_settle"));
-        assert_eq!(centre(&evs[2], &evs), (Some(96.0), "previous_settle"));
+        // E2 closes as E3 opens but settles a minute later: E3 sees E1's settlement.
+        assert_eq!(centre(&evs[2], &evs), (Some(104.2), "previous_settle"));
+        assert_eq!(centre(&evs[3], &evs), (Some(96.0), "previous_settle"));
+        let mut unstamped = evs[1].clone();
+        for m in &mut unstamped.markets {
+            m.settle_ms = None;
+        }
+        assert_eq!(
+            unstamped.settled().unwrap().0,
+            10 * HOUR_MS + SETTLE_GUARD_MS,
+            "no settlement time: the close plus the guard"
+        );
         // E1 has no predecessor: E2 and E3 close after it opened.
         assert_eq!(centre(&evs[0], &evs), (Some(100.0), "median"));
         let far = events(

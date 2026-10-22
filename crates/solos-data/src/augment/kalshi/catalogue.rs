@@ -2,11 +2,15 @@
 //! from a frontier (the earliest close among markets not yet final, else the latest close, less
 //! a day); the archive is walked once, newest close first, one page a step, by cursor. Each
 //! page is merged into the close-day files before its cursor is saved, so a stopped run resumes
-//! without a gap and a repeated page only rewrites the same rows.
+//! without a gap and a repeated page only rewrites the same rows. Pages are written open; a day
+//! is sealed (marked complete) only once the listing proves it whole: in the live tier, after the
+//! full listing, a past day after the frontier day whose markets are all final; in the archive, a
+//! day newer than the page's oldest close (or any day once the walk ends) and at least two days
+//! before the cutoff day (a market closing near the cutoff can settle after it, in the live tier).
 
 use super::api::Api;
 use super::rows::{Kind, market_row};
-use super::store::{Dest, write};
+use super::store::{Dest, seal, write};
 use crate::augment::config::KalshiSeries;
 use crate::augment::ledger::{get_progress, set_progress};
 use crate::augment::periods::date_of_ms;
@@ -80,14 +84,17 @@ fn is_final(market: &Value) -> bool {
     )
 }
 
-/// Merge one page into its close-day files; files and rows written.
+/// What one page wrote: files, rows, and per close day whether every market on it is final.
+type Written = (u64, u64, BTreeMap<String, bool>);
+
+/// Merge one page into its close-day files, all left open.
 async fn store_page(
     ctx: &Ctx,
     spec: &KalshiSeries,
     page: &[Value],
     tier: &str,
     start_ms: i64,
-) -> Result<(u64, u64), StoreError> {
+) -> Result<Written, StoreError> {
     let fetched_at = chrono::Utc::now().timestamp_millis();
     let mut days: BTreeMap<String, (Vec<Value>, bool)> = BTreeMap::new();
     for market in page {
@@ -109,19 +116,31 @@ async fn store_page(
         entry.0.push(row);
     }
     let (mut files, mut rows) = (0, 0);
+    let mut finality = BTreeMap::new();
     for (day, (batch, all_final)) in days {
         let dest = Dest {
             kind: Kind::Contracts,
             dataset: "contracts",
             series: &spec.ticker,
             day: &day,
-            complete: all_final,
+            complete: false,
         };
         write(ctx, &dest, &batch).await?;
         files += 1;
         rows += batch.len() as u64;
+        finality.insert(day, all_final);
     }
-    Ok((files, rows))
+    Ok((files, rows, finality))
+}
+
+/// The days of one listing that may be sealed: final, and inside `(after, before)`.
+#[must_use]
+pub fn sealable(finality: &BTreeMap<String, bool>, after: &str, before: &str) -> Vec<String> {
+    finality
+        .iter()
+        .filter(|(day, all_final)| **all_final && day.as_str() > after && day.as_str() < before)
+        .map(|(day, _)| day.clone())
+        .collect()
 }
 
 /// The next live frontier from one listing: a day before the earliest close of a market not
@@ -157,13 +176,17 @@ pub async fn live(
     let mut cursor: Option<String> = None;
     let mut seen = Vec::new();
     let (mut files, mut rows) = (0, 0);
+    let mut finality: BTreeMap<String, bool> = BTreeMap::new();
     loop {
         let (page, next) = api
             .live_markets(&spec.ticker, from / 1000, cursor.as_deref())
             .await?;
-        let (f, r) = store_page(ctx, spec, &page, "live", start_ms).await?;
+        let (f, r, days) = store_page(ctx, spec, &page, "live", start_ms).await?;
         files += f;
         rows += r;
+        for (day, all_final) in days {
+            *finality.entry(day).or_insert(true) &= all_final;
+        }
         seen.extend(page);
         cursor = next;
         if cursor.is_none() || ctx.stopping() {
@@ -172,6 +195,13 @@ pub async fn live(
     }
     if cursor.is_none() {
         state.live_from_ms = Some(next_live_from(&seen, from));
+        let today = date_of_ms(ctx.now_ms).to_string();
+        seal(
+            ctx,
+            &spec.ticker,
+            sealable(&finality, &date_of_ms(from).to_string(), &today),
+        )
+        .await?;
     }
     Ok((files, rows))
 }
@@ -183,11 +213,12 @@ pub async fn historical_step(
     spec: &KalshiSeries,
     state: &mut State,
     start_ms: i64,
+    cutoff_ms: i64,
 ) -> Result<(u64, u64), StoreError> {
     let (page, next) = api
         .historical_markets(&spec.ticker, state.hist_cursor.as_deref())
         .await?;
-    let written = store_page(ctx, spec, &page, "historical", start_ms).await?;
+    let (files, rows, finality) = store_page(ctx, spec, &page, "historical", start_ms).await?;
     let oldest = page
         .iter()
         .filter_map(|m| {
@@ -201,7 +232,13 @@ pub async fn historical_step(
     }
     state.hist_done = next.is_none() || page.is_empty() || oldest.is_some_and(|o| o < start_ms);
     state.hist_cursor = if state.hist_done { None } else { next };
-    Ok(written)
+    let after = match (state.hist_done, oldest) {
+        (false, Some(ms)) => date_of_ms(ms).to_string(),
+        _ => String::new(),
+    };
+    let before = (date_of_ms(cutoff_ms) - chrono::Duration::days(1)).to_string();
+    seal(ctx, &spec.ticker, sealable(&finality, &after, &before)).await?;
+    Ok((files, rows))
 }
 
 /// Whether the catalogue holds every contract closing on `day` and the two days before it (the
@@ -267,6 +304,29 @@ mod tests {
             next_live_from(&settled, ms("2026-10-22T00:00:00Z")),
             ms("2026-10-22T00:00:00Z"),
             "never moves back"
+        );
+    }
+
+    #[test]
+    fn only_whole_final_days_are_sealed() {
+        let finality: BTreeMap<String, bool> = [
+            ("2026-08-19", true),
+            ("2026-08-20", true),
+            ("2026-08-21", false),
+            ("2026-08-22", true),
+        ]
+        .into_iter()
+        .map(|(d, f)| (d.to_owned(), f))
+        .collect();
+        // An archive page whose oldest close is on the 19th, cutoff on the 23rd.
+        assert_eq!(
+            sealable(&finality, "2026-08-19", "2026-08-22"),
+            ["2026-08-20"]
+        );
+        // The walk ended: the oldest day is whole too.
+        assert_eq!(
+            sealable(&finality, "", "2026-08-22"),
+            ["2026-08-19", "2026-08-20"]
         );
     }
 

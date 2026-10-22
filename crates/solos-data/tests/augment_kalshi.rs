@@ -61,6 +61,7 @@ fn markets(ev: &Ev) -> Vec<Value> {
                 "strike_type": "greater", "floor_strike": k as f64, "open_time": iso(ev.1 - HOUR),
                 "close_time": iso(ev.1), "created_time": iso(ev.1 - 2 * HOUR),
                 "expiration_value": ev.2.map_or(String::new(), |v| v.to_string()),
+                "settlement_ts": ev.2.map(|_| iso(ev.1 + 60)),
                 "volume_fp": if k == 100 || k == 101 { "5.00" } else { "0.00" }, "open_interest_fp": "1.00"
             })
         })
@@ -200,6 +201,19 @@ fn per_event(config: &AugmentConfig) -> Value {
     json!(rows)
 }
 
+fn sealed_contract_days(config: &AugmentConfig) -> Vec<String> {
+    let text = std::fs::read_to_string(config.data_dir.join("catalog.json")).unwrap();
+    let catalog: Value = serde_json::from_str(&text).unwrap();
+    let files = catalog["files"].as_array().unwrap();
+    let mut days: Vec<String> = files
+        .iter()
+        .filter(|f| f["source"] == "kalshi" && f["dataset"] == "contracts" && f["complete"] == true)
+        .map(|f| f["period"].as_str().unwrap().to_owned())
+        .collect();
+    days.sort();
+    days
+}
+
 fn batch_tickers(server: &Server) -> Vec<String> {
     server
         .hits()
@@ -236,15 +250,26 @@ fn both_tiers_fill_the_kept_strikes_and_rerun_idempotently() {
         "the market closing before the start day is left out"
     );
     assert_eq!(contracts[0]["first"], "2026-10-04");
+    // Each event opens as its predecessor closes, and the predecessor settles a minute later:
+    // A and L fall back to the median (nothing else settled within two days), T and T0 take
+    // L's settlement (T0's own settlement came after T opened).
     let expected = json!([
-        {"e": "KXTEST-A", "n": "6", "k": "100.0,101.0,99.0", "c": 100.0, "src": "previous_settle"},
+        {"e": "KXTEST-A", "n": "6", "k": "100.0,101.0,102.0", "c": 101.0, "src": "median"},
         {"e": "KXTEST-A0", "n": "6", "k": "100.0,101.0,102.0", "c": 101.0, "src": "median"},
-        {"e": "KXTEST-L", "n": "9", "k": "100.0,101.0,102.0", "c": 101.0, "src": "previous_settle"},
+        {"e": "KXTEST-L", "n": "9", "k": "100.0,101.0,102.0", "c": 101.0, "src": "median"},
         {"e": "KXTEST-L0", "n": "9", "k": "100.0,101.0,102.0", "c": 101.0, "src": "median"},
-        {"e": "KXTEST-T", "n": "9", "k": "102.0,103.0,104.0", "c": 103.0, "src": "previous_settle"},
+        {"e": "KXTEST-T", "n": "9", "k": "101.0,102.0,103.0", "c": 102.3, "src": "previous_settle"},
         {"e": "KXTEST-T0", "n": "8", "k": "101.0,102.0,103.0", "c": 102.3, "src": "previous_settle"},
     ]);
     assert_eq!(per_event(&config), expected, "O is still open");
+    // Contract days are sealed only when the listing proves them whole: the 8th (live, after
+    // the frontier day, all final); not the 4th (the archive's oldest listed day sits one day
+    // before the cutoff, where a market may still settle in the live tier) nor today.
+    assert_eq!(
+        sealed_contract_days(&config),
+        vec!["2026-10-08".to_owned()],
+        "{status}"
+    );
     let batched = batch_tickers(&server);
     assert!(
         batched.iter().all(|t| !t.contains("-A")),
@@ -273,7 +298,10 @@ fn both_tiers_fill_the_kept_strikes_and_rerun_idempotently() {
         &config,
         "SELECT count(*) AS n, count(DISTINCT ticker) AS m FROM kalshi_trades",
     );
-    assert_eq!(trades[0]["n"], "9");
+    assert_eq!(
+        trades[0]["n"], "10",
+        "strikes 100 and 101 traded: two in A, A0, L, L0, one in T, T0"
+    );
 
     // Same clock again: today's stored events are not fetched again, nothing duplicates.
     let before = batched.len();
@@ -288,6 +316,8 @@ fn both_tiers_fill_the_kept_strikes_and_rerun_idempotently() {
     let events = per_event(&config);
     assert_eq!(events.as_array().unwrap().len(), 7);
     assert_eq!(events[4]["e"], "KXTEST-O");
+    assert_eq!(events[4]["c"], 103.0, "T0 settled before O opened");
+    assert_eq!(events[4]["src"], "previous_settle");
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -53,6 +53,29 @@ pub async fn write(ctx: &Ctx, dest: &Dest<'_>, rows: &[Value]) -> Result<i64, St
     result
 }
 
+/// Mark the `contracts` files of `days` complete in the ledger, once every market closing on
+/// them is known to be listed and final (the files themselves are not rewritten).
+pub async fn seal(ctx: &Ctx, series: &str, days: Vec<String>) -> Result<(), StoreError> {
+    if days.is_empty() {
+        return Ok(());
+    }
+    let series = series.to_owned();
+    ctx.db
+        .run(move |store| {
+            store.transaction(|store| {
+                for day in &days {
+                    store.exec(
+                        "UPDATE files SET complete = true
+                         WHERE source = ? AND dataset = 'contracts' AND symbol = ? AND period = ?",
+                        &[&SOURCE, &series, day],
+                    )?;
+                }
+                Ok(())
+            })
+        })
+        .await
+}
+
 /// The contracts of a series closing on `days`, from the files that exist.
 pub async fn contracts(
     ctx: &Ctx,
@@ -76,7 +99,7 @@ pub async fn contracts(
     }
     let sql = format!(
         "SELECT ticker, event_ticker, strike::VARCHAR AS strike, open_ms, close_ms,
-                expiration_value::VARCHAR AS expiration_value, volume::VARCHAR AS volume, tier
+                expiration_value::VARCHAR AS expiration_value, settle_ms, volume::VARCHAR AS volume, tier
          FROM read_parquet([{}], union_by_name=true)",
         files.join(", ")
     );
@@ -97,6 +120,7 @@ fn contract(row: &Obj) -> Option<Contract> {
         open_ms: row.int("open_ms").unwrap_or(close_ms),
         close_ms,
         expiration_value: float(row, "expiration_value"),
+        settle_ms: row.int("settle_ms"),
         volume: float(row, "volume").unwrap_or(0.0),
         historical: row.str("tier") == Some("historical"),
     })

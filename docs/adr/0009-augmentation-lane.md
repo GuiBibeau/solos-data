@@ -654,8 +654,9 @@ first, or looks a market up by `event_ticker`), and their candles come from
 `/historical/trades`. The live tier (`/markets`, the batch `/markets/candlesticks` for up to 100
 markets and 10,000 candles a call, `/markets/trades`) serves the rest and answers an empty list
 for an archived market. Markets settled shortly before the cutoff can still show in the live
-listing, and the cutoff moves forward over time, so a market is routed by where it was listed and
-by its close against the cutoff, and a market the batch answer leaves out is asked in the archive.
+listing (a market that closed before the cutoff but settled after it stays live), and the cutoff
+moves forward over time, so a market is routed by the tier that listed it, and a live-listed
+market the batch answer leaves out (archived since) is asked in the archive.
 
 ### The walk
 
@@ -663,7 +664,11 @@ by its close against the cutoff, and a market the batch answer leaves out is ask
   close of a market not yet final, else of the latest close). The archive is walked once, one
   page of 1,000 markets a step, by cursor, until a close before `startDate`. Each page is merged
   into `contracts` by close day before its cursor is saved, so a stopped run resumes without a
-  gap. `contracts` holds every market of the series (all strikes), not only the kept ones.
+  gap. `contracts` holds every market of the series (all strikes), not only the kept ones. Its
+  day files are written open and marked complete only when the listing proves the day whole:
+  after a full live listing, a past day after the frontier's day whose markets are all final; in
+  the archive, a day newer than the page's oldest close (any day once the walk ends) and at least
+  two days before the cutoff day.
 - **Forward.** From the newest stored day through today: every event that closed at least ten
   minutes ago is stored; today's file grows as the day's events close (`head_events` in the
   ledger records which), and is marked complete after midnight.
@@ -683,9 +688,11 @@ by its close against the cutoff, and a market the batch answer leaves out is ask
 ### Which strikes
 
 A crypto ladder lists up to a few hundred strikes and most never trade. The kept strikes are
-chosen causally: the centre is the settled index value of the same series' latest event that
-closed at or before this event opened (`centre_source = previous_settle`), else, when none
-settled in the previous 48 hours, the median listed strike (`median`). The window is
+chosen causally: the centre is the settled index value of the same series' latest event whose
+settlement was published (`settlement_ts`, else its close plus 15 minutes) at or before this
+event opened (`centre_source = previous_settle`), else, when none settled in the previous 48
+hours, the median listed strike (`median`). Hourly events open as the previous one closes and
+settle a few minutes later, so an hourly event is centred on the settlement two events back. The window is
 `windowPct` of the centre for a one-hour life, widened by the square root of the stored life in
 hours, then capped at the `maxStrikes` nearest the centre. Macro series keep every strike
 (`windowPct` 0). Candles cover each market's last `maxLifeHours` before its close (26 to 30
