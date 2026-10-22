@@ -330,6 +330,8 @@ fn both_tiers_fill_the_kept_strikes_and_rerun_idempotently() {
     assert_eq!(again["totals"]["errors"], 0, "{again}");
     assert_eq!(batch_tickers(&server).len(), before);
     assert_eq!(per_event(&config), expected);
+    // The frontier now sits on the 8th, so the listing merged into its file again: still sealed.
+    assert_eq!(sealed_contract_days(&config), vec!["2026-10-08".to_owned()]);
 
     // Three hours later the open event has closed and joins today's file.
     let later = run(&config, NOW_MS + 3 * 3_600_000);

@@ -680,9 +680,10 @@ asked in both.
   `startDate` (2025-10-01), round-robin across the series, so each run moves every series. A
   day below the cutoff waits until the archive walk has listed it (and the two days before it,
   for the centre).
-- **Budget.** The Kalshi part of a sync stops after `runMinutes` (40) or `maxRequests` (24,000
-  requests, retries included), whichever comes first; the other sources of the hourly sync are
-  unaffected. A day is written only once all its events are fetched, so a day cut short is redone
+- **Budget.** The Kalshi part of a sync starts no new call after `runMinutes` (40) or
+  `maxRequests` (24,000 requests, retries counted), whichever comes first; a call already started
+  finishes its retries (at most five more requests and their backoff), which is the bound on
+  the overshoot. The other sources of the hourly sync are unaffected. A day is written only once all its events are fetched, so a day cut short is redone
   by the next run. Progress is a JSON record per series in the ledger (`kalshi/<SERIES>`).
 - **Rate.** `requestsPerSecond` 10 on Kalshi's host, half the Basic tier's published read budget
   (200 tokens a second at 10 tokens a read). A `429` holds every request to the host for its

@@ -7,7 +7,7 @@ use crate::augment::ledger::register;
 use crate::augment::parquet::{Target, stage_json, write_merged};
 use crate::augment::series::Ctx;
 use crate::jsonout::Obj;
-use crate::store::{StoreError, sql_string};
+use crate::store::{Store, StoreError, sql_string};
 use serde_json::Value;
 
 /// Source name in the catalog.
@@ -41,16 +41,29 @@ pub async fn write(ctx: &Ctx, dest: &Dest<'_>, rows: &[Value]) -> Result<i64, St
     let select = dest.kind.select(&staged, &target.constant_columns());
     let key = dest.kind.key();
     let root = ctx.root.clone();
+    let keep_sealed = dest.kind == Kind::Contracts;
     let result = ctx
         .db
         .run(move |store| {
-            let record = write_merged(store, &root, &select, key, &target)?;
+            let mut record = write_merged(store, &root, &select, key, &target)?;
+            // A sealed contract day stays sealed when a later listing merges into it again.
+            if keep_sealed && !record.complete {
+                record.complete = sealed(store, &record.path)?;
+            }
             register(store, &record, None)?;
             Ok(record.row_count)
         })
         .await;
     let _ = std::fs::remove_file(&staged);
     result
+}
+
+fn sealed(store: &Store, path: &str) -> Result<bool, StoreError> {
+    let rows = store.rows(
+        "SELECT complete::INTEGER AS complete FROM files WHERE path = ?",
+        &[&path],
+    )?;
+    Ok(rows.first().and_then(|r| r.int("complete")) == Some(1))
 }
 
 /// Mark the `contracts` files of `days` complete in the ledger, once every market closing on
