@@ -154,9 +154,21 @@ write-ahead log replay after a crash. Transactions in a batch decode in parallel
 published rows and the progress record are assembled in source order, so output is identical to
 the sequential decoder.
 The explicit checkpoint that used to follow every minute's compaction now runs every
-`checkpointIntervalSeconds` (`config/decoded.json`, default 900): on a large store each one costs
-45 to 60 seconds whatever the amount of change, and the write-ahead log keeps committed batches
-durable in between.
+`checkpointIntervalSeconds` (`config/decoded.json`, default 900, 7,200 in the repository config):
+each one rewrites the `processed` index whatever the amount of change (570 to 700 seconds at 1.49
+billion rows on 2026-10-22), and the write-ahead log keeps committed batches durable in between.
+A longer interval means a longer log replay after a crash.
+
+The other decoder settings in `config/decoded.json` (ADR-0007, 2026-10-22): `batchSize`
+(transactions per batch, at most 100,000) and `maxBatchSources` (raw files one batch may span; 1
+restores one file per batch); `compactionIntervalSeconds` (default 60) and
+`compactionBudgetSeconds` (default 15) set how often compaction and garbage collection run and how
+long a pass keeps starting merges; `compactionSettledBatches` (default 100, 0 turns it off) is how
+many batches a `(table, epoch)` group must go without one before its head merges with two files
+(ADR-0006). To measure pace, read `decoded_batch` lines: `batchRaw` transactions from
+`batchSources` files covering `batchOldestSlot` to `batchNewestSlot`, with `readSeconds`,
+`decodeSeconds`, `publishSeconds` and `loopSeconds`; `decoded_maintenance` adds
+`compactionSeconds`, `garbageSeconds` and `checkpointSeconds`.
 
 
 Set `SOLOS_DATA_CU_PER_SECOND` to the provider account's real ceiling, not above it. Alchemy

@@ -10,6 +10,7 @@ use crate::fsutil::{file_hash, sync_path, tmp_path};
 use crate::jsonout::{Obj, now};
 use crate::store::{Store, StoreError, sql_string};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 /// Files the run at the head of a group needs before it merges. New batches land there, so
@@ -38,17 +39,18 @@ pub struct Candidate {
 ///
 /// Files are walked from the newest. A run grows while it stays inside [`MAX_ROWS`] and
 /// [`MAX_BYTES`]; the file that would overflow it closes the run. A closed run merges when it has
-/// [`HEAD_MIN_FILES`] files at the head of the group or [`INNER_MIN_FILES`] below it; otherwise the
-/// walk continues from the closing file. Runs are contiguous in batch order and a merged file keeps
+/// `head_minimum` files at the head of the group ([`HEAD_MIN_FILES`] while batches still land
+/// there, [`INNER_MIN_FILES`] once the group is settled) or [`INNER_MIN_FILES`] below it;
+/// otherwise the walk continues from the closing file. Runs are contiguous in batch order and a merged file keeps
 /// the run's highest batch id, so no older row is ever promoted above an excluded newer revision.
 #[must_use]
-pub fn select_run(files: Vec<Candidate>) -> Option<Vec<Candidate>> {
+pub fn select_run(files: Vec<Candidate>, head_minimum: usize) -> Option<Vec<Candidate>> {
     let mut run: Vec<Candidate> = Vec::new();
     let (mut bytes, mut rows) = (0u64, 0i64);
     let mut head = true;
     for file in files {
         if bytes + file.bytes > MAX_BYTES || rows + file.rows > MAX_ROWS {
-            if run.len() >= minimum(head) {
+            if run.len() >= minimum(head, head_minimum) {
                 return Some(run);
             }
             head = false;
@@ -62,43 +64,92 @@ pub fn select_run(files: Vec<Candidate>) -> Option<Vec<Candidate>> {
         rows += file.rows;
         run.push(file);
     }
-    (run.len() >= minimum(head)).then_some(run)
+    (run.len() >= minimum(head, head_minimum)).then_some(run)
 }
 
-fn minimum(head: bool) -> usize {
+fn minimum(head: bool, head_minimum: usize) -> usize {
     if head {
-        HEAD_MIN_FILES
+        head_minimum.max(INNER_MIN_FILES)
     } else {
         INNER_MIN_FILES
     }
 }
 
+/// How one maintenance pass compacts.
+#[derive(Clone, Copy, Debug)]
+pub struct CompactionPolicy {
+    /// Wall time during which the pass keeps starting merges; a running merge finishes.
+    pub budget: Duration,
+    /// A group whose newest batch is at least this many batches behind the decoder's latest is
+    /// settled: no batch lands at its head any more (a backfill moved past its epoch), so its
+    /// head run merges with [`INNER_MIN_FILES`] like any other. `None` never settles a group.
+    pub settled_batches: Option<i64>,
+}
+
 /// Merge at most one run per `(table, epoch)` group, largest groups first, until `budget` is
 /// spent; a merge that is running finishes. Returns `merges`, `mergedFiles` and `deferred`
-/// (groups not examined this pass).
+/// (groups not examined this pass). No group is ever settled.
 pub fn compact_decoded(store: &mut Store, budget: Duration) -> Result<Obj, StoreError> {
+    compact_decoded_with(
+        store,
+        CompactionPolicy {
+            budget,
+            settled_batches: None,
+        },
+    )
+}
+
+/// [`compact_decoded`] under `policy`; also reports `settledGroups` (groups merged under the
+/// settled rule this pass).
+pub fn compact_decoded_with(
+    store: &mut Store,
+    policy: CompactionPolicy,
+) -> Result<Obj, StoreError> {
     let started = Instant::now();
-    let groups = store.rows(
-        &format!(
-            "SELECT table_name,regexp_extract(path,'epoch=([0-9]+)',1) AS epoch,count(*) AS n
-    FROM files WHERE regexp_matches(path,'epoch=[0-9]+') GROUP BY table_name,epoch
-    HAVING count(*)>={INNER_MIN_FILES} ORDER BY n DESC,table_name,epoch"
-        ),
+    let latest = store.get("batch")?.map_or(0, |v| {
+        v.as_str()
+            .and_then(|s| s.parse::<i64>().ok())
+            .or_else(|| v.as_i64())
+            .unwrap_or(0)
+    });
+    // One read of the registrations, grouped here, instead of one query per group.
+    let mut groups: BTreeMap<(String, String), Vec<Obj>> = BTreeMap::new();
+    for file in store.rows(
+        "SELECT *,regexp_extract(path,'epoch=([0-9]+)',1) AS epoch FROM files
+    WHERE regexp_matches(path,'epoch=[0-9]+') ORDER BY batch_id DESC,path DESC",
         &[],
-    )?;
-    let (mut merges, mut merged_files, mut deferred) = (0u64, 0u64, 0u64);
-    for group in groups {
-        if started.elapsed() >= budget {
+    )? {
+        let key = (
+            file.str("table_name").unwrap_or("").to_owned(),
+            file.str("epoch").unwrap_or("").to_owned(),
+        );
+        groups.entry(key).or_default().push(file);
+    }
+    let mut ordered: Vec<((String, String), Vec<Obj>)> = groups
+        .into_iter()
+        .filter(|(_, files)| files.len() >= INNER_MIN_FILES)
+        .collect();
+    // Largest groups first, then table and epoch, as the per-group query ordered them.
+    ordered.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+    let (mut merges, mut merged_files, mut deferred, mut settled) = (0u64, 0u64, 0u64, 0u64);
+    for ((table, epoch), input) in ordered {
+        if started.elapsed() >= policy.budget {
             deferred += 1;
             continue;
         }
-        let table = group.str("table_name").unwrap_or("").to_owned();
-        let epoch = group.str("epoch").unwrap_or("").to_owned();
-        let input = store.rows(
-            "SELECT * FROM files WHERE table_name=?
-      AND regexp_extract(path,'epoch=([0-9]+)',1)=? ORDER BY batch_id DESC,path DESC",
-            &[&table, &epoch],
-        )?;
+        let newest = input
+            .iter()
+            .filter_map(|f| f.int("batch_id"))
+            .max()
+            .unwrap_or(0);
+        let is_settled = policy
+            .settled_batches
+            .is_some_and(|gap| latest - newest >= gap);
+        let head_minimum = if is_settled {
+            INNER_MIN_FILES
+        } else {
+            HEAD_MIN_FILES
+        };
         let mut candidates = Vec::with_capacity(input.len());
         for file in input {
             let path = store.root.join(file.str("path").unwrap_or(""));
@@ -106,13 +157,14 @@ pub fn compact_decoded(store: &mut Store, budget: Duration) -> Result<Obj, Store
             let rows = file.int("row_count").unwrap_or(0);
             candidates.push(Candidate { file, bytes, rows });
         }
-        let Some(run) = select_run(candidates) else {
+        let Some(run) = select_run(candidates, head_minimum) else {
             continue;
         };
         let files: Vec<Obj> = run.into_iter().map(|c| c.file).collect();
         merge(store, &table, &epoch, &files)?;
         merges += 1;
         merged_files += files.len() as u64;
+        settled += u64::from(is_settled);
     }
     if merges > 0 {
         write_catalog(store)?;
@@ -120,6 +172,7 @@ pub fn compact_decoded(store: &mut Store, budget: Duration) -> Result<Obj, Store
     Ok(Obj::new()
         .with("merges", merges)
         .with("mergedFiles", merged_files)
+        .with("settledGroups", settled)
         .with("deferred", deferred))
 }
 
@@ -257,32 +310,37 @@ mod tests {
         let mut files: Vec<Candidate> = (0..5).map(|i| candidate(100 - i, 10_000)).collect();
         files.push(candidate(90, MAX_ROWS));
         files.extend((0..20).map(|i| candidate(80 - i, 30_000)));
-        let run = select_run(files).expect("the stranded run merges");
+        let run = select_run(files, HEAD_MIN_FILES).expect("the stranded run merges");
         assert_eq!(batches(&run), (61..=80).rev().collect::<Vec<_>>());
     }
 
     #[test]
     fn the_head_merges_once_it_has_enough_files_and_stops_at_the_bound() {
         let files: Vec<Candidate> = (0..200).map(|i| candidate(1000 - i, 30_000)).collect();
-        let run = select_run(files).expect("a full head run merges");
+        let run = select_run(files, HEAD_MIN_FILES).expect("a full head run merges");
         assert_eq!(run.len(), 133);
         assert_eq!(batches(&run)[0], 1000);
         let short: Vec<Candidate> = (0..HEAD_MIN_FILES - 1)
             .map(|i| candidate(100 - i as i64, 1_000))
             .collect();
-        assert!(select_run(short).is_none());
+        assert!(select_run(short.clone(), HEAD_MIN_FILES).is_none());
+        // A settled group no longer waits: its short head run merges.
+        assert_eq!(
+            select_run(short, INNER_MIN_FILES).map(|r| r.len()),
+            Some(HEAD_MIN_FILES - 1)
+        );
     }
 
     #[test]
     fn a_lone_full_file_never_merges_with_itself() {
         let files = vec![candidate(10, MAX_ROWS), candidate(9, MAX_ROWS - 1)];
-        assert!(select_run(files).is_none());
+        assert!(select_run(files, HEAD_MIN_FILES).is_none());
         let files = vec![
             candidate(10, MAX_ROWS),
             candidate(9, 100),
             candidate(8, 100),
         ];
-        let run = select_run(files).expect("the two small files below merge");
+        let run = select_run(files, HEAD_MIN_FILES).expect("the two small files below merge");
         assert_eq!(batches(&run), vec![9, 8]);
     }
 }

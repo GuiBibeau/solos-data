@@ -255,17 +255,37 @@ pub fn load_decoder_config(args: &[String]) -> Result<DecoderConfig, StoreError>
         .ok_or_else(|| StoreError::Check("dataDir is required".into()))?;
     let batch_size = config.get("batchSize").and_then(Value::as_i64).unwrap_or(0);
     let poll_ms = config.get("pollMs").and_then(Value::as_i64).unwrap_or(0);
-    let checkpoint_interval = config
-        .get("checkpointIntervalSeconds")
-        .and_then(Value::as_i64)
-        .unwrap_or(900);
-    if checkpoint_interval < 0 {
-        return Err(StoreError::Check(
-            "invalid checkpointIntervalSeconds".into(),
-        ));
-    }
-    if !(1..=10_000).contains(&batch_size) {
+    let defaults = DecoderConfig::new(PathBuf::new(), PathBuf::new());
+    let optional = |name: &str, default: u64| -> Result<u64, StoreError> {
+        match config.get(name) {
+            None => Ok(default),
+            Some(value) => value
+                .as_u64()
+                .ok_or_else(|| StoreError::Check(format!("invalid {name}"))),
+        }
+    };
+    let checkpoint_interval = optional(
+        "checkpointIntervalSeconds",
+        defaults.checkpoint_interval_seconds,
+    )?;
+    let max_batch_sources = optional("maxBatchSources", defaults.max_batch_sources as u64)?;
+    let compaction_interval = optional(
+        "compactionIntervalSeconds",
+        defaults.compaction_interval_seconds,
+    )?;
+    let compaction_budget = optional(
+        "compactionBudgetSeconds",
+        defaults.compaction_budget_seconds,
+    )?;
+    let compaction_settled = optional(
+        "compactionSettledBatches",
+        defaults.compaction_settled_batches,
+    )?;
+    if !(1..=100_000).contains(&batch_size) {
         return Err(StoreError::Check("invalid batchSize".into()));
+    }
+    if !(1..=1_000).contains(&max_batch_sources) {
+        return Err(StoreError::Check("invalid maxBatchSources".into()));
     }
     if poll_ms < 100 {
         return Err(StoreError::Check("invalid pollMs".into()));
@@ -282,8 +302,12 @@ pub fn load_decoder_config(args: &[String]) -> Result<DecoderConfig, StoreError>
         raw_dir,
         data_dir,
         batch_size: batch_size as u64,
+        max_batch_sources: max_batch_sources as usize,
         poll_ms: poll_ms as u64,
-        checkpoint_interval_seconds: checkpoint_interval as u64,
+        checkpoint_interval_seconds: checkpoint_interval,
+        compaction_interval_seconds: compaction_interval,
+        compaction_budget_seconds: compaction_budget,
+        compaction_settled_batches: compaction_settled,
     })
 }
 

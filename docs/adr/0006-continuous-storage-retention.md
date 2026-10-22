@@ -136,3 +136,14 @@ its files joined to the deduplicated `decoded_transactions`, so any query, even 
 funding table, pays for the whole history and ran out of memory at 96 GB. The command now accepts
 `--slots <from>-<to>` and reads only the epoch partitions covering that range; every revision of a
 transaction shares its slot, so the scoped result equals the unscoped one for that range.
+
+## Settled groups (2026-10-22)
+
+The head rule assumed new batches always land at the head of a group. A backfill moves through an
+epoch in about an hour and never returns, so every epoch it left kept its last fewer-than-32 files
+at the head of each table's group for good: about 85 epochs times six tables, 12,500 files in the
+catalog on 2026-10-22 and a health warning that could not clear. A group whose newest batch is
+`compactionSettledBatches` (100) or more behind the decoder's latest is now settled, and its head
+run merges with two files like any run below the head. Precedence is unchanged: runs stay
+contiguous and the merged file keeps the run's highest batch id. The live tail's epoch keeps
+receiving batches and keeps the 32-file wait. `decoded_maintenance` reports `settledGroups`.

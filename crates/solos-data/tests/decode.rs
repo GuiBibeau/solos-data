@@ -150,11 +150,10 @@ fn decoder_consumes_raw_publications_once_across_restarts_and_rebases_the_raw_ca
     let catalog = serde_json::json!({ "at": "fixture", "files": [{ "path": "/old/root/staging/tx.parquet", "table_name": "transactions", "row_count": 1, "sha256": file_hash(&path).unwrap(), "created_at": "2026-10-04T03:00:00Z" }] });
     std::fs::write(raw_dir.join("catalog.json"), catalog.to_string()).unwrap();
     let config = DecoderConfig {
-        raw_dir: raw_dir.clone(),
-        data_dir: data_dir.clone(),
         batch_size: 100,
         poll_ms: 100,
         checkpoint_interval_seconds: 0,
+        ..DecoderConfig::new(raw_dir.clone(), data_dir.clone())
     };
     let stop = Arc::new(AtomicBool::new(false));
     run_decoder(&config, true, Arc::clone(&stop)).unwrap();
