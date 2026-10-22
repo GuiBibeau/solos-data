@@ -1,0 +1,6 @@
+{"ticker": "SYNTH-1", "candlesticks": [
+ {"end_period_ts": 1759348860, "open_interest": "2.00", "volume": "0.00",
+  "price": {"open": null, "high": null, "low": null, "close": null, "mean": null, "previous": "0.0500"},
+  "yes_ask": {"open": "0.2500", "high": "0.6100", "low": "0.0700", "close": "0.0700"},
+  "yes_bid": {"open": "0.0000", "high": "0.0000", "low": "0.0000", "close": "0.0000"}}
+]}

@@ -563,9 +563,51 @@ pub struct Kalshi {
     pub enabled: bool,
     /// API base (`/trade-api/v2`).
     pub base_url: String,
-    /// The curated series tickers.
+    /// Request pace on Kalshi's host. The Basic tier's published read budget is 200 tokens a
+    /// second at 10 tokens a request (20 requests a second); the default is half of that.
+    #[serde(default = "d_kalshi_rps")]
+    pub requests_per_second: f64,
+    /// First close day stored; the lane's `startDate` when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    /// Minutes one sync run may spend on Kalshi (0: no time bound).
+    #[serde(default = "d_kalshi_run_minutes")]
+    pub run_minutes: u64,
+    /// Requests one sync run may send to Kalshi (0: no request bound).
+    #[serde(default = "d_kalshi_max_requests")]
+    pub max_requests: u64,
+    /// The curated series and how much of each ladder is kept.
     #[serde(default)]
-    pub series: Vec<String>,
+    pub series: Vec<KalshiSeries>,
+}
+
+/// One curated Kalshi series.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KalshiSeries {
+    /// Series ticker (`KXBTCD`).
+    pub ticker: String,
+    /// What the ladder is on (`BTC`, `GOLD`, `SPX`, `FED`); informational, kept on every row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<String>,
+    /// `crypto`, `commodity`, `equity` or `macro`.
+    pub kind: String,
+    /// Candle interval in minutes: 1 or 60.
+    #[serde(default = "d_kalshi_interval")]
+    pub interval: u32,
+    /// Strike window around the causal centre, percent of the centre for a one-hour life
+    /// (scaled by the square root of the stored life in hours); 0 keeps every strike.
+    #[serde(default)]
+    pub window_pct: f64,
+    /// At most this many strikes per event, the nearest the centre (0: no cap).
+    #[serde(default)]
+    pub max_strikes: usize,
+    /// Hours of candles stored before each market's close.
+    #[serde(default = "d_kalshi_life")]
+    pub max_life_hours: i64,
+    /// Collect the trades of the kept markets that traded.
+    #[serde(default)]
+    pub trades: bool,
 }
 
 /// Phoenix's own market list, for the earnings dates.
@@ -679,6 +721,21 @@ fn d_reconcile_hours() -> i64 {
 fn d_elfa_credit_cap() -> i64 {
     100
 }
+fn d_kalshi_rps() -> f64 {
+    10.0
+}
+fn d_kalshi_run_minutes() -> u64 {
+    40
+}
+fn d_kalshi_max_requests() -> u64 {
+    24_000
+}
+fn d_kalshi_interval() -> u32 {
+    1
+}
+fn d_kalshi_life() -> i64 {
+    26
+}
 fn d_sec_rps() -> f64 {
     4.0
 }
@@ -748,6 +805,7 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
     if !(sec_rps > 0.0 && sec_rps <= 10.0) {
         return Err(StoreError::Check("Invalid sec.requestsPerSecond".into()));
     }
+    validate_kalshi(&config.sources.kalshi)?;
     let auto = &config.sources.elfa.auto;
     if auto.alerts.len() > auto.max_alerts {
         return Err(StoreError::Check(format!(
@@ -866,6 +924,38 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
     super::tardis::validate(&config.sources.tardis)
 }
 
+fn validate_kalshi(kalshi: &Kalshi) -> Result<(), StoreError> {
+    if !(kalshi.requests_per_second > 0.0 && kalshi.requests_per_second <= 20.0) {
+        return Err(StoreError::Check(
+            "Invalid kalshi.requestsPerSecond (Basic tier: at most 20)".into(),
+        ));
+    }
+    if kalshi
+        .start_date
+        .as_deref()
+        .is_some_and(|d| super::periods::parse_date(d).is_none())
+    {
+        return Err(StoreError::Check("Invalid kalshi.startDate".into()));
+    }
+    let mut tickers = std::collections::HashSet::new();
+    for series in &kalshi.series {
+        let ok = !series.ticker.trim().is_empty()
+            && tickers.insert(series.ticker.as_str())
+            && ["crypto", "commodity", "equity", "macro"].contains(&series.kind.as_str())
+            && [1, 60].contains(&series.interval)
+            && series.window_pct >= 0.0
+            && series.window_pct.is_finite()
+            && (1..=24 * 400).contains(&series.max_life_hours);
+        if !ok {
+            return Err(StoreError::Check(format!(
+                "Invalid kalshi series {}",
+                series.ticker
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_walk(name: &str, walk: &DumpWalk) -> Result<(), StoreError> {
     let kinds_ok = walk
         .kinds
@@ -943,7 +1033,19 @@ mod tests {
         assert!(auto.alerts.len() <= auto.max_alerts);
         assert_eq!(auto.expires_in, "720h");
         assert_eq!(config.sources.elfa.events_interval_seconds, 60);
-        assert!(config.sources.kalshi.series.contains(&"KXFED".to_owned()));
+        let kalshi = &config.sources.kalshi;
+        assert!(
+            kalshi
+                .series
+                .iter()
+                .any(|s| s.ticker == "KXBTCD" && s.interval == 1)
+        );
+        assert!(
+            kalshi
+                .series
+                .iter()
+                .any(|s| s.ticker == "KXFED" && s.kind == "macro")
+        );
         assert!(check_url("http://127.0.0.1:8080").is_ok());
         assert!(check_url("http://example.com").is_err());
     }

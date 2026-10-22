@@ -1,0 +1,12 @@
+{"cursor": "", "markets": [
+ {"ticker": "KXBTCD-26OCT2112-T81499.99", "event_ticker": "KXBTCD-26OCT2112", "title": "Synthetic fixture: BTC above?", "yes_sub_title": "$81,500 or above",
+  "status": "finalized", "result": "yes", "strike_type": "greater", "floor_strike": 81499.99,
+  "created_time": "2026-10-21T14:55:00Z", "open_time": "2026-10-21T15:00:00Z", "close_time": "2026-10-21T16:00:00Z",
+  "expiration_time": "2026-10-21T16:00:00Z", "settlement_ts": "2026-10-21T16:01:10Z", "expiration_value": "81620.55",
+  "settlement_value_dollars": "1.0000", "last_price_dollars": "0.9300", "volume_fp": "12.00", "open_interest_fp": "4.00"},
+ {"ticker": "KXBTCD-26OCT2112-T81599.99", "event_ticker": "KXBTCD-26OCT2112", "title": "Synthetic fixture: BTC above?", "yes_sub_title": "$81,600 or above",
+  "status": "finalized", "result": "yes", "strike_type": "greater", "floor_strike": 81599.99,
+  "created_time": "2026-10-21T14:55:00Z", "open_time": "2026-10-21T15:00:00Z", "close_time": "2026-10-21T16:00:00Z",
+  "expiration_time": "2026-10-21T16:00:00Z", "settlement_ts": "2026-10-21T16:01:10Z", "expiration_value": "81620.55",
+  "settlement_value_dollars": "1.0000", "last_price_dollars": "0.5500", "volume_fp": "0.00", "open_interest_fp": "0.00"}
+]}
