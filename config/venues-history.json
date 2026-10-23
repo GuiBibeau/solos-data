@@ -6,6 +6,10 @@
   "batchWindows": 16,
   "flushSeconds": 300,
   "flushRows": 200000,
+  "archive": {
+    "chunkSlots": 50000,
+    "parallel": 2
+  },
   "sources": [
     {
       "name": "jupiter",
@@ -13,7 +17,8 @@
       "windowSlots": 2000,
       "idlFallbacks": [
         "idl/history/jupiter-2025-08-19-359f00d0ab.json"
-      ]
+      ],
+      "via": "archive"
     },
     {
       "name": "flash",
@@ -31,12 +36,14 @@
         "idl/history/flash-2026-01-05-b468be8a42.json",
         "idl/history/flash-2025-11-26-79afaddbce.json",
         "idl/history/flash-2025-09-01-a46a930cbc.json"
-      ]
+      ],
+      "via": "archive"
     },
     {
       "name": "pyth",
       "top": 458492107,
-      "windowSlots": 20000
+      "windowSlots": 20000,
+      "via": "archive"
     }
   ]
 }

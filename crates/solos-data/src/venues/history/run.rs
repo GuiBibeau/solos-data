@@ -12,7 +12,7 @@
 //! each walk's cursor) is written after them, so a restart refetches at most the batches whose
 //! files were not registered.
 
-use super::config::{HistoryConfig, Kind, Source, floor_seconds};
+use super::config::{ArchiveConfig, HistoryConfig, Kind, Source, Via, floor_seconds};
 use super::floor::slot_at;
 use super::walker::{Cursor, Entry, Walker};
 use crate::augment::http::Http;
@@ -175,12 +175,82 @@ struct Batch {
     oldest_block_time: Option<i64>,
 }
 
+/// A source's loop state: the next slot down, the walks' last handed-out cursors, the walks.
+struct Member<'a> {
+    st: &'a SourceState,
+    next: i64,
+    committed: Vec<Cursor>,
+    walkers: Vec<Walker>,
+}
+
+impl Member<'_> {
+    /// Rebuild the walks from the committed cursors (after a failed batch).
+    fn rebuild(&mut self) {
+        let late = self.st.source.may_start_late;
+        self.walkers = self
+            .st
+            .source
+            .addresses
+            .iter()
+            .zip(&self.committed)
+            .map(|(a, c)| Walker::resume(a, c.clone()).allowing_end(late))
+            .collect();
+    }
+}
+
+/// The rows of a batch's transactions.
+fn rows_of(st: &SourceState, mut txs: Vec<Tx>, cycle: Cycle) -> Batch {
+    txs.sort_by_key(|t| std::cmp::Reverse(t.slot));
+    let mut out = Batch {
+        txs: txs.len() as u64,
+        oldest_block_time: txs.iter().filter_map(|t| t.block_time).min(),
+        cycle,
+        pyth: PythTx::default(),
+        rows: CycleRows::default(),
+        prices: Vec::new(),
+    };
+    match &st.source.kind {
+        Kind::Venue { store_transactions } => {
+            let program = &st.source.addresses[0];
+            for tx in &txs {
+                walk::to_rows(
+                    tx,
+                    program,
+                    &st.idl,
+                    *store_transactions,
+                    &mut out.cycle,
+                    &mut out.rows,
+                );
+            }
+        }
+        Kind::Pyth { feeds } => {
+            let accounts: HashSet<String> = st.source.addresses.iter().cloned().collect();
+            for tx in &txs {
+                let meta: Value = serde_json::from_str(&tx.meta_json).unwrap_or(Value::Null);
+                let at = TxMeta {
+                    signature: &tx.signature,
+                    slot: tx.slot,
+                    block_time: tx.block_time,
+                };
+                match pyth_tx::rows(&tx.tx_b64, &meta, &at, feeds, &accounts) {
+                    Ok((rows, counts)) => {
+                        out.prices.extend(rows);
+                        out.pyth.add(&counts);
+                    }
+                    Err(_) => out.cycle.unparsed += 1,
+                }
+            }
+        }
+    }
+    out
+}
+
 impl History {
     fn rpc(&self) -> &dyn Rpc {
         self.rpc.as_ref()
     }
 
-    /// Fetch `[lo, hi]` for a source; `walkers` advance only on success of their `take`.
+    /// Fetch `[lo, hi]` for an RPC source; `walkers` advance only on success of their `take`.
     async fn batch(
         &self,
         st: &SourceState,
@@ -235,47 +305,109 @@ impl History {
                     .filter(|t| seen.insert(t.signature.clone())),
             );
         }
-        txs.sort_by_key(|t| std::cmp::Reverse(t.slot));
-        let mut out = Batch {
-            txs: txs.len() as u64,
-            oldest_block_time: txs.iter().filter_map(|t| t.block_time).min(),
-            cycle,
-            pyth: PythTx::default(),
-            rows: CycleRows::default(),
-            prices: Vec::new(),
-        };
-        match &st.source.kind {
-            Kind::Venue { store_transactions } => {
-                let program = &st.source.addresses[0];
-                for tx in &txs {
-                    walk::to_rows(
-                        tx,
-                        program,
-                        &st.idl,
-                        *store_transactions,
-                        &mut out.cycle,
-                        &mut out.rows,
-                    );
-                }
+        Ok(rows_of(st, txs, cycle))
+    }
+
+    /// One archive batch for every member whose cursor reaches into `[lo, hi]`: the manifests
+    /// walk while the chunks stream; each member's listed signatures must be in the stream or
+    /// served by `getTransaction`, or the whole batch fails. `None` for a member below `lo`.
+    async fn archive_batch(
+        &self,
+        members: &mut [Member<'_>],
+        lo: i64,
+        hi: i64,
+        archive: &ArchiveConfig,
+    ) -> Result<Vec<Option<Batch>>, String> {
+        let rpc = self.rpc();
+        let mut addresses: Vec<String> = Vec::new();
+        let mut owner: Vec<usize> = Vec::new();
+        for (i, m) in members.iter().enumerate() {
+            if m.next >= lo {
+                addresses.extend(m.st.source.addresses.iter().cloned());
+                owner.extend(std::iter::repeat_n(i, m.st.source.addresses.len()));
             }
-            Kind::Pyth { feeds } => {
-                let accounts: HashSet<String> = st.source.addresses.iter().cloned().collect();
-                for tx in &txs {
-                    let meta: Value = serde_json::from_str(&tx.meta_json).unwrap_or(Value::Null);
-                    let at = TxMeta {
-                        signature: &tx.signature,
-                        slot: tx.slot,
-                        block_time: tx.block_time,
-                    };
-                    match pyth_tx::rows(&tx.tx_b64, &meta, &at, feeds, &accounts) {
-                        Ok((rows, counts)) => {
-                            out.prices.extend(rows);
-                            out.pyth.add(&counts);
-                        }
-                        Err(_) => out.cycle.unparsed += 1,
+        }
+        let chunks = windows(lo, hi, archive.chunk_slots);
+        let streams = futures_util::stream::iter(
+            chunks
+                .iter()
+                .map(|&(from, to)| super::archive::stream(from, to, &addresses)),
+        )
+        .buffered(archive.parallel)
+        .collect::<Vec<_>>();
+        let manifests = futures_util::future::join_all(members.iter_mut().map(|m| {
+            let top = m.next.min(hi);
+            let active = m.next >= lo;
+            async move {
+                if !active {
+                    return Ok(None);
+                }
+                let mut entries = Vec::new();
+                for walker in &mut m.walkers {
+                    entries.extend(walker.take(rpc, lo, top).await?);
+                }
+                Ok::<_, String>(Some(entries))
+            }
+        }));
+        let (streams, manifests) = tokio::join!(streams, manifests);
+        let mut by_member: Vec<Vec<Tx>> = vec![Vec::new(); members.len()];
+        let mut seen: Vec<HashSet<String>> = vec![HashSet::new(); members.len()];
+        for stream in streams {
+            for streamed in stream?.txs {
+                let mut targets: Vec<usize> = streamed.touches.iter().map(|&a| owner[a]).collect();
+                targets.dedup();
+                for i in targets {
+                    if streamed.tx.slot <= members[i].next
+                        && seen[i].insert(streamed.tx.signature.clone())
+                    {
+                        by_member[i].push(streamed.tx.clone());
                     }
                 }
             }
+        }
+        let mut out = Vec::with_capacity(members.len());
+        for ((m, manifest), (mut txs, have)) in members
+            .iter()
+            .zip(manifests)
+            .zip(by_member.into_iter().zip(seen))
+        {
+            let Some(entries) = manifest? else {
+                out.push(None);
+                continue;
+            };
+            let top = m.next.min(hi);
+            let listed = window_manifest(&entries, lo, top);
+            let mut cycle = Cycle {
+                from: lo,
+                to: top,
+                manifest: listed.ok.len() as u64,
+                failed: listed.failed,
+                bulk: txs.len() as u64,
+                ..Cycle::default()
+            };
+            cycle.unlisted = have.iter().filter(|s| !listed.ok.contains_key(*s)).count() as u64;
+            let missing: Vec<&String> = listed.ok.keys().filter(|s| !have.contains(*s)).collect();
+            let singles: Vec<Result<Option<Tx>, String>> =
+                futures_util::stream::iter(missing.into_iter().map(|s| walk::single(rpc, s)))
+                    .buffer_unordered(self.config.concurrency as usize)
+                    .collect()
+                    .await;
+            for single in singles {
+                match single? {
+                    Some(tx) => {
+                        cycle.single += 1;
+                        txs.push(tx);
+                    }
+                    None => cycle.missing += 1,
+                }
+            }
+            if cycle.missing > 0 {
+                return Err(format!(
+                    "{}: {} manifest signatures neither streamed nor served",
+                    m.st.source.name, cycle.missing
+                ));
+            }
+            out.push(Some(rows_of(m.st, txs, cycle)));
         }
         Ok(out)
     }
@@ -311,17 +443,16 @@ impl History {
         }
     }
 
-    async fn source_loop(&self, st: &SourceState) {
-        let Some(saved) = self.saved_cursor(st).await else {
-            return;
-        };
-        let name = st.source.name.clone();
-        let addresses = &st.source.addresses;
-        let mut next = saved
+    /// A member's state from its saved cursor; `None` when stopping.
+    async fn member<'a>(&self, st: &'a SourceState) -> Option<Member<'a>> {
+        let saved = self.saved_cursor(st).await?;
+        let next = saved
             .get("next")
             .and_then(Value::as_i64)
             .unwrap_or(st.source.top);
-        let mut committed: Vec<Cursor> = addresses
+        let committed: Vec<Cursor> = st
+            .source
+            .addresses
             .iter()
             .map(|a| cursor_of(saved.get("walkers").and_then(|w| w.get(a))))
             .collect();
@@ -331,90 +462,150 @@ impl History {
             stats.collected = Some(next);
             stats.done = next < self.floor;
         }
-        let rebuild = |cursors: &[Cursor]| -> Vec<Walker> {
-            addresses
-                .iter()
-                .zip(cursors)
-                .map(|(a, c)| Walker::resume(a, c.clone()).allowing_end(st.source.may_start_late))
-                .collect()
+        let mut member = Member {
+            st,
+            next,
+            committed,
+            walkers: Vec::new(),
         };
-        let mut walkers = rebuild(&committed);
+        member.rebuild();
+        Some(member)
+    }
+
+    /// Wait while the buffer holds twice a flush; the flush loop drains it.
+    async fn back_pressure(&self) {
+        while self.buffer.len() >= self.config.flush_rows.saturating_mul(2) && !self.ctx.stopping()
+        {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Hand a member's batch to the buffer with its cursor, and count it.
+    fn commit(&self, m: &mut Member<'_>, batch: Batch, lo: i64, started: Instant) {
+        let st = m.st;
+        let name = st.source.name.as_str();
+        let hi = batch.cycle.to;
+        m.committed = m.walkers.iter().map(Walker::cursor).collect();
+        let record = batch_record(&batch, lo, hi);
+        let sets = vec![
+            (store::BATCHES.dataset, vec![record]),
+            (store::TRANSACTIONS.dataset, batch.rows.transactions),
+            (store::EVENTS.dataset, batch.rows.events),
+            (store::INSTRUCTIONS.dataset, batch.rows.instructions),
+            (store::PRICES.dataset, batch.prices),
+        ];
+        let rows: u64 = sets.iter().map(|(_, r)| r.len() as u64).sum();
+        m.next = lo - 1;
+        let done = m.next < self.floor;
+        self.buffer.push_cycle(
+            name,
+            sets,
+            &cursor_key(name),
+            cursor_value(m.next, &st.source.addresses, &m.committed, done),
+        );
+        let mut stats = st.stats.lock().expect("history stats");
+        stats.collected = Some(m.next);
+        stats.batches += 1;
+        stats.error_streak = 0;
+        stats.done = done;
+        stats.txs += batch.txs;
+        stats.rows += rows;
+        stats.last_batch_at = Some(now());
+        add_cycle(&mut stats.totals, &batch.cycle);
+        stats.pyth.add(&batch.pyth);
+        if let Some(t) = batch.oldest_block_time {
+            stats.oldest_block_time = Some(stats.oldest_block_time.map_or(t, |o| o.min(t)));
+        }
+        drop(stats);
+        log(
+            "history_batch",
+            Obj::new()
+                .with("source", name)
+                .with("from", lo)
+                .with("to", hi)
+                .with("manifest", batch.cycle.manifest)
+                .with("single", batch.cycle.single)
+                .with("unlisted", batch.cycle.unlisted)
+                .with("txs", batch.txs)
+                .with("rows", rows)
+                .with("undecoded", batch.cycle.undecoded)
+                .with("unknown", batch.cycle.unknown)
+                .with("oldestBlockTime", batch.oldest_block_time)
+                .with("ms", started.elapsed().as_millis() as u64),
+        );
+        if done {
+            log(
+                "history_source_done",
+                Obj::new().with("source", name).with("floor", self.floor),
+            );
+        }
+    }
+
+    /// An RPC source, batch after batch down to the floor.
+    async fn source_loop(&self, st: &SourceState) {
+        let Some(mut m) = self.member(st).await else {
+            return;
+        };
         let span = st.source.window_slots * self.config.batch_windows as i64;
-        while !self.ctx.stopping() && next >= self.floor {
-            // Back-pressure: the flush loop drains the buffer before more is fetched.
-            while self.buffer.len() >= self.config.flush_rows.saturating_mul(2)
-                && !self.ctx.stopping()
-            {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
-            let hi = next;
+        while !self.ctx.stopping() && m.next >= self.floor {
+            self.back_pressure().await;
+            let hi = m.next;
             let lo = (hi - span + 1).max(self.floor);
             let started = Instant::now();
-            match self.batch(st, &mut walkers, lo, hi).await {
-                Ok(batch) => {
-                    committed = walkers.iter().map(Walker::cursor).collect();
-                    let record = batch_record(&batch, lo, hi);
-                    let sets = vec![
-                        (store::BATCHES.dataset, vec![record]),
-                        (store::TRANSACTIONS.dataset, batch.rows.transactions),
-                        (store::EVENTS.dataset, batch.rows.events),
-                        (store::INSTRUCTIONS.dataset, batch.rows.instructions),
-                        (store::PRICES.dataset, batch.prices),
-                    ];
-                    let rows: u64 = sets.iter().map(|(_, r)| r.len() as u64).sum();
-                    next = lo - 1;
-                    let done = next < self.floor;
-                    self.buffer.push_cycle(
-                        &name,
-                        sets,
-                        &cursor_key(&name),
-                        cursor_value(next, addresses, &committed, done),
-                    );
-                    let mut stats = st.stats.lock().expect("history stats");
-                    stats.collected = Some(next);
-                    stats.batches += 1;
-                    stats.error_streak = 0;
-                    stats.done = done;
-                    stats.txs += batch.txs;
-                    stats.rows += rows;
-                    stats.last_batch_at = Some(now());
-                    add_cycle(&mut stats.totals, &batch.cycle);
-                    stats.pyth.add(&batch.pyth);
-                    if let Some(t) = batch.oldest_block_time {
-                        stats.oldest_block_time =
-                            Some(stats.oldest_block_time.map_or(t, |o| o.min(t)));
-                    }
-                    drop(stats);
-                    log(
-                        "history_batch",
-                        Obj::new()
-                            .with("source", name.as_str())
-                            .with("from", lo)
-                            .with("to", hi)
-                            .with("manifest", batch.cycle.manifest)
-                            .with("txs", batch.txs)
-                            .with("rows", rows)
-                            .with("undecoded", batch.cycle.undecoded)
-                            .with("unknown", batch.cycle.unknown)
-                            .with("unlisted", batch.cycle.unlisted)
-                            .with("oldestBlockTime", batch.oldest_block_time)
-                            .with("ms", started.elapsed().as_millis() as u64),
-                    );
-                }
+            match self.batch(st, &mut m.walkers, lo, hi).await {
+                Ok(batch) => self.commit(&mut m, batch, lo, started),
                 Err(error) => {
                     self.record_error(st, &error);
-                    walkers = rebuild(&committed);
+                    m.rebuild();
                     pause(&self.ctx, RETRY_SECONDS).await;
                 }
             }
         }
-        if next < self.floor {
-            log(
-                "history_source_done",
-                Obj::new()
-                    .with("source", name.as_str())
-                    .with("floor", self.floor),
-            );
+    }
+
+    /// Every archive source together: one stream per range watches all their addresses.
+    async fn archive_loop(&self, group: Vec<&SourceState>, archive: ArchiveConfig) {
+        if group.is_empty() {
+            return;
+        }
+        let mut members = Vec::new();
+        for st in group {
+            let Some(m) = self.member(st).await else {
+                return;
+            };
+            members.push(m);
+        }
+        let span = archive.chunk_slots * archive.parallel as i64;
+        while !self.ctx.stopping() {
+            let Some(hi) = members
+                .iter()
+                .map(|m| m.next)
+                .filter(|n| *n >= self.floor)
+                .max()
+            else {
+                break;
+            };
+            self.back_pressure().await;
+            let lo = (hi - span + 1).max(self.floor);
+            let started = Instant::now();
+            match self.archive_batch(&mut members, lo, hi, &archive).await {
+                Ok(batches) => {
+                    for (m, batch) in members.iter_mut().zip(batches) {
+                        if let Some(batch) = batch {
+                            self.commit(m, batch, lo, started);
+                        }
+                    }
+                }
+                Err(error) => {
+                    for m in &mut members {
+                        if m.next >= lo {
+                            self.record_error(m.st, &error);
+                        }
+                        m.rebuild();
+                    }
+                    pause(&self.ctx, RETRY_SECONDS).await;
+                }
+            }
         }
     }
 
@@ -733,9 +924,30 @@ pub fn run(config: HistoryConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreErr
             .with("recovered", recovered),
     );
     runtime.block_on(async {
-        let loops =
-            futures_util::future::join_all(history.sources.iter().map(|s| history.source_loop(s)));
-        tokio::join!(loops, history.flush_loop(), history.status_loop());
+        let loops = futures_util::future::join_all(
+            history
+                .sources
+                .iter()
+                .filter(|s| s.source.via == Via::Rpc)
+                .map(|s| history.source_loop(s)),
+        );
+        let archived: Vec<&SourceState> = history
+            .sources
+            .iter()
+            .filter(|s| s.source.via == Via::Archive)
+            .collect();
+        let archive = history.config.archive.clone();
+        let archive_loop = async {
+            if let Some(archive) = archive {
+                history.archive_loop(archived, archive).await;
+            }
+        };
+        tokio::join!(
+            loops,
+            archive_loop,
+            history.flush_loop(),
+            history.status_loop()
+        );
     });
     let flushed = runtime.block_on(store::flush(&history.ctx, &history.buffer, now_ms()));
     history.add_flush(flushed);

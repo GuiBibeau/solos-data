@@ -29,6 +29,31 @@ pub struct SourceConfig {
     /// Pyth only: the feed symbols to walk (every feed of the venues config when empty).
     #[serde(default)]
     pub feeds: Vec<String>,
+    /// Where the transactions come from: `archive` (Old Faithful through Jetstreamer, one
+    /// stream for every archive source) or `rpc` (`getTransactionsForAddress` pages).
+    #[serde(default)]
+    pub via: Via,
+}
+
+/// Where a source's transactions come from; the manifest is always the RPC signature walk.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Via {
+    /// `getTransactionsForAddress` bulk pages per window.
+    #[default]
+    Rpc,
+    /// The Old Faithful archive (ADR-0008), streamed per range for all archive sources at once.
+    Archive,
+}
+
+/// The archive stream's settings.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveConfig {
+    /// Slots one stream covers.
+    pub chunk_slots: i64,
+    /// Streams in flight at once (consecutive chunks of one batch).
+    pub parallel: usize,
 }
 
 /// The whole file.
@@ -50,6 +75,9 @@ pub struct HistoryConfig {
     pub flush_seconds: u64,
     /// Rows that trigger an early flush; sources pause at twice this many.
     pub flush_rows: usize,
+    /// The archive stream, for sources with `via: archive`.
+    #[serde(default)]
+    pub archive: Option<ArchiveConfig>,
     /// The sources.
     pub sources: Vec<SourceConfig>,
     /// The directory relative paths resolve against.
@@ -86,8 +114,10 @@ pub struct Source {
     /// Whether an address may have no history down to the floor (a Pyth feed account created
     /// after it); a venue program must reach the floor.
     pub may_start_late: bool,
-    /// Slots per window.
+    /// Slots per window (RPC sources).
     pub window_slots: i64,
+    /// Where its transactions come from.
+    pub via: Via,
     /// Newest slot.
     pub top: i64,
     /// What it collects.
@@ -145,6 +175,20 @@ impl HistoryConfig {
             ));
         }
         floor_seconds(&config.floor_time)?;
+        let archived = config.sources.iter().any(|s| s.via == Via::Archive);
+        match &config.archive {
+            Some(a) if a.chunk_slots <= 0 || a.parallel == 0 => {
+                return Err(StoreError::Check(
+                    "archive chunkSlots and parallel must be positive".into(),
+                ));
+            }
+            None if archived => {
+                return Err(StoreError::Check(
+                    "a source reads the archive but no archive block is configured".into(),
+                ));
+            }
+            _ => {}
+        }
         Ok(config)
     }
 
@@ -183,6 +227,7 @@ impl HistoryConfig {
                     addresses: feeds.iter().map(|f| f.account.clone()).collect(),
                     may_start_late: true,
                     window_slots: source.window_slots,
+                    via: source.via,
                     top: source.top,
                     kind: Kind::Pyth { feeds },
                     idls: Vec::new(),
@@ -203,6 +248,7 @@ impl HistoryConfig {
                 addresses: vec![venue.program_id.clone()],
                 may_start_late: false,
                 window_slots: source.window_slots,
+                via: source.via,
                 top: source.top,
                 kind: Kind::Venue {
                     store_transactions: venue.store_transactions,
