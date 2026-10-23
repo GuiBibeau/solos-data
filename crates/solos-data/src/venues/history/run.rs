@@ -14,7 +14,7 @@
 
 use super::config::{ArchiveConfig, HistoryConfig, Kind, Source, Via, floor_seconds};
 use super::floor::slot_at;
-use super::walker::{Cursor, Entry, Walker};
+use super::walker::{Cursor, Entry, Walker, seed};
 use crate::augment::http::Http;
 use crate::augment::ledger::{self, Lane, get_progress, set_progress};
 use crate::augment::series::Ctx;
@@ -450,12 +450,33 @@ impl History {
             .get("next")
             .and_then(Value::as_i64)
             .unwrap_or(st.source.top);
-        let committed: Vec<Cursor> = st
+        let mut committed: Vec<Cursor> = st
             .source
             .addresses
             .iter()
             .map(|a| cursor_of(saved.get("walkers").and_then(|w| w.get(a))))
             .collect();
+        // A walk that has handed out nothing yet starts just above the source's top.
+        for (address, cursor) in st.source.addresses.iter().zip(&mut committed) {
+            if cursor.before.is_some() {
+                continue;
+            }
+            loop {
+                if self.ctx.stopping() {
+                    return None;
+                }
+                match seed(self.rpc(), address, next).await {
+                    Ok(seeded) => {
+                        *cursor = seeded;
+                        break;
+                    }
+                    Err(error) => {
+                        self.record_error(st, &format!("seed {address}: {error}"));
+                        pause(&self.ctx, RETRY_SECONDS).await;
+                    }
+                }
+            }
+        }
         {
             let mut stats = st.stats.lock().expect("history stats");
             stats.start_next = Some(next);

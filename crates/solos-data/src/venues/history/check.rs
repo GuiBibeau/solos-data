@@ -60,6 +60,15 @@ fn pyth_sql(source: &str) -> String {
     )
 }
 
+/// An integer that DuckDB may have rendered as a string (wide sums and counts).
+fn int(value: Option<&Value>) -> i64 {
+    match value {
+        Some(Value::Number(n)) => n.as_i64().unwrap_or(0),
+        Some(Value::String(s)) => s.parse().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 fn first(result: &Obj) -> Value {
     result
         .to_value()
@@ -87,21 +96,28 @@ pub fn check(root: &Path, sources: &[Source]) -> Result<Obj, StoreError> {
             }
             Err(error) => return Err(error),
         };
-        let compare = match &source.kind {
+        let sql = match &source.kind {
             Kind::Venue {
                 store_transactions: true,
-            } => first(&query_lanes(root, &[Lane::History], &venue_sql(name))?),
-            Kind::Venue { .. } => Value::Null,
-            Kind::Pyth { .. } => first(&query_lanes(root, &[Lane::History], &pyth_sql(name))?),
+            } => Some(venue_sql(name)),
+            Kind::Venue { .. } => None,
+            Kind::Pyth { .. } => Some(pyth_sql(name)),
         };
-        let holes = coverage
-            .get("gaps_or_overlaps")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
-        let mismatched = compare
-            .get("mismatched")
-            .and_then(Value::as_i64)
-            .unwrap_or(0);
+        let compare = match sql.map(|sql| query_lanes(root, &[Lane::History], &sql)) {
+            None => Value::Null,
+            Some(Ok(result)) => first(&result),
+            // No rows file yet: every batch must have stored nothing.
+            Some(Err(error)) if error.to_string().contains("does not exist") => {
+                let expected = ["txs", "prices"]
+                    .iter()
+                    .map(|k| int(coverage.get(*k)))
+                    .sum::<i64>();
+                serde_json::json!({ "stored": 0, "mismatched": i64::from(expected > 0) })
+            }
+            Some(Err(error)) => return Err(error),
+        };
+        let holes = int(coverage.get("gaps_or_overlaps"));
+        let mismatched = int(compare.get("mismatched"));
         let source_ok = holes == 0 && mismatched == 0;
         ok &= source_ok;
         out.set_obj(
@@ -113,4 +129,17 @@ pub fn check(root: &Path, sources: &[Source]) -> Result<Obj, StoreError> {
         );
     }
     Ok(Obj::new().with("ok", ok).with_obj("sources", out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counts_read_as_numbers_or_strings() {
+        assert_eq!(int(Some(&serde_json::json!(3))), 3);
+        assert_eq!(int(Some(&serde_json::json!("12345678901"))), 12_345_678_901);
+        assert_eq!(int(Some(&Value::Null)), 0);
+        assert_eq!(int(None), 0);
+    }
 }

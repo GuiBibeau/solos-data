@@ -34,6 +34,37 @@ pub struct Cursor {
     pub fallback: Option<String>,
 }
 
+/// A first walk's start: the two oldest signatures above `top` (from Helius's
+/// `getTransactionsForAddress` in `signatures` mode, which filters by slot), so the walk begins
+/// just above the stretch it needs instead of at the tip. Every row it lists above `top` is
+/// dropped by [`Walker::take`] anyway; with no signature above `top` the walk starts at the tip.
+///
+/// # Errors
+///
+/// RPC failure or an answer without a list.
+pub async fn seed(rpc: &dyn Rpc, address: &str, top: i64) -> Result<Cursor, String> {
+    let options = json!({
+        "transactionDetails": "signatures", "sortOrder": "asc", "limit": 2,
+        "commitment": "finalized", "filters": { "slot": { "gt": top }, "tokenAccounts": "none" }
+    });
+    let reply = call(rpc, "getTransactionsForAddress", json!([address, options]))
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(rows) = reply.result.get("data").and_then(Value::as_array) else {
+        return Err("getTransactionsForAddress answered no list".into());
+    };
+    let signature = |i: usize| {
+        rows.get(i)
+            .and_then(|r| r.get("signature"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    Ok(Cursor {
+        before: signature(0),
+        fallback: signature(1),
+    })
+}
+
 /// The walk.
 #[derive(Clone, Debug, Default)]
 pub struct Walker {

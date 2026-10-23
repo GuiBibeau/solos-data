@@ -1,7 +1,7 @@
 //! `solos-data health`: one read-only pass over the JSON snapshots the services already write
 //! (the raw collector's `status.json` and `catalog.json`, the decoder's `status.json` and
 //! `catalog.json`, the augment lanes' `status.json`, `status-capture.json` and
-//! `status-venues.json`) plus the free
+//! `status-venues.json`, `status-venues-history.json`) plus the free
 //! space of the data volume, judged against the thresholds of `config/health.json`. The result
 //! is written to `health.json` (atomically) and summarized in one `health` log line with its
 //! `warn` and `critical` lists. Two checks need a previous observation (backfill movement and
@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+mod history;
 mod lanes;
 mod venues;
 pub use lanes::{error_class, lane_progress, progress_record};
@@ -183,6 +184,8 @@ pub struct Inputs {
     pub capture_status: Snapshot,
     /// Augment `status-venues.json` (ADR-0012); absent while the lane has never run.
     pub venues_status: Snapshot,
+    /// Augment `status-venues-history.json` (ADR-0013); absent while the backfill never ran.
+    pub history_status: Snapshot,
     /// Free bytes on the data volume.
     pub disk_free_bytes: Option<u64>,
     /// The previous `health.json`.
@@ -289,6 +292,13 @@ pub fn evaluate(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>) -> Value {
         now,
         &mut f,
     );
+    let history = history::section(
+        inputs.history_status.value.as_ref(),
+        inputs.history_status.age_s,
+        t,
+        now,
+        &mut f,
+    );
     let disk = match inputs.disk_free_bytes {
         Some(free) => {
             let gb = free as f64 / 1e9;
@@ -323,6 +333,7 @@ pub fn evaluate(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>) -> Value {
         "augment": augment,
         "kalshi": kalshi,
         "venues": venues,
+        "venuesHistory": history,
         "disk": disk,
         "thresholds": t,
     })
@@ -568,6 +579,7 @@ pub fn run(paths: &Paths, t: &Thresholds) -> Result<Value, StoreError> {
         sync_status: read(paths.augment.join("status.json")),
         capture_status: read(paths.augment.join("status-capture.json")),
         venues_status: read(paths.augment.join("status-venues.json")),
+        history_status: read(paths.augment.join("status-venues-history.json")),
         disk_free_bytes: disk_free(paths.raw.parent().unwrap_or(&paths.raw)),
         previous: read(paths.out.clone()).value,
     };
@@ -635,6 +647,7 @@ mod tests {
                 40,
             ),
             venues_status: Snapshot::default(),
+            history_status: Snapshot::default(),
             disk_free_bytes: Some(3_000_000_000_000),
             previous: None,
         }
