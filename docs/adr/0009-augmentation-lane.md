@@ -685,9 +685,9 @@ asked in both.
   finishes its retries (at most five more requests and their backoff), which is the bound on
   the overshoot. The other sources of the hourly sync are unaffected. A day is written only once all its events are fetched, so a day cut short is redone
   by the next run. Progress is a JSON record per series in the ledger (`kalshi/<SERIES>`).
-- **Rate.** `requestsPerSecond` 6 on Kalshi's host. Half the Basic tier's published read budget
+- **Rate.** `requestsPerSecond` 4 on Kalshi's host. Half the Basic tier's published read budget
   (200 tokens a second at 10 tokens a read) would be 10, but 10 drew a `429` on about 9% of
-  requests (2026-10-23), so the rate was lowered. A `429` holds every request to the host for its
+  requests and 6 still drew 587 in one run (2026-10-23), so the rate was lowered twice. A `429` holds every request to the host for its
   `Retry-After` (else the client's exponential backoff) and is retried; the run's request and
   `429` counts are in `status.json` (`kalshi.requests`, `kalshi.rateLimited`).
 
@@ -754,7 +754,8 @@ The lane stores from 2025-10-01 (`startDate`), so `KXSOLD`/`KXSOLE`, `KXBNBD`/`K
 metals and the hourly WTI start later than that because they did not exist; `KXBRENTD` (Brent,
 2026-03-22) exists and is not in the list. At about 5,000 requests per stored day across the
 series (trades dominate: one page or more per kept market that traded), the backward walk needs
-roughly two million requests, about four days of hourly runs at the 24,000-request budget.
+roughly two million requests. At 4 requests a second a 40-minute run sends at most 9,600, so the
+walk takes at least about nine days of hourly runs, longer with retries and the gap between runs.
 
 ### Health
 
