@@ -876,6 +876,11 @@ async fn floor_slot(ctx: &Ctx, rpc: &dyn Rpc, floor_time: &str) -> Result<i64, S
 pub fn run(config: HistoryConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError> {
     let venues = config.venues()?;
     let sources = config.resolve(&venues)?;
+    if sources.iter().any(|s| s.via == Via::Archive) && !super::archive::available() {
+        return Err(StoreError::Check(
+            "a source reads the archive, but this binary was built without the archive feature (cargo build --features archive)".into(),
+        ));
+    }
     let costs = HistoryConfig::costs(&venues);
     let mut states = Vec::new();
     for source in sources {
@@ -970,10 +975,30 @@ pub fn run(config: HistoryConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreErr
             history.status_loop()
         );
     });
-    let flushed = runtime.block_on(store::flush(&history.ctx, &history.buffer, now_ms()));
-    history.add_flush(flushed);
-    let status = runtime.block_on(history.write_status(false))?;
+    // The final flush must drain the buffer: rows and cursors it keeps would die with the
+    // process, and a clean exit would leave the unit down short of the floor.
+    let mut drained = false;
+    for attempt in 0..5u64 {
+        let flushed = runtime.block_on(store::flush(&history.ctx, &history.buffer, now_ms()));
+        history.add_flush(flushed);
+        if flushed.errors == 0 && history.buffer.is_empty() {
+            drained = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(5 * (attempt + 1)));
+    }
+    let status = runtime.block_on(history.write_status(false));
     drop(runtime);
+    if !drained {
+        let History { ctx, .. } = history;
+        drop(ctx);
+        let store = thread.join(db);
+        store.close()?;
+        return Err(StoreError::Check(
+            "the final flush failed; buffered rows were not written and the cursors stay where the files end".into(),
+        ));
+    }
+    let status = status?;
     let History { ctx, .. } = history;
     drop(ctx);
     let store = thread.join(db);

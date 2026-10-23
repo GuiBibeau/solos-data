@@ -35,13 +35,16 @@ pub(super) fn section(
         f.warn
             .push("venues history stopped before the floor".into());
     }
+    let started = status.get("startedAt").and_then(Value::as_str);
     let mut out = serde_json::Map::new();
     for (name, source) in sources.into_iter().flatten() {
         let done = source.get("done").and_then(Value::as_bool) == Some(true);
         let streak = num(source.get("errorStreak")).unwrap_or(0);
+        // Before its first batch a source is measured from the run's start.
         let since = source
             .get("lastBatchAt")
             .and_then(Value::as_str)
+            .or(started)
             .and_then(parse_time)
             .map(|at| (now - at).num_minutes());
         if !done {
@@ -77,10 +80,11 @@ mod tests {
     fn a_stalled_or_failing_source_warns_and_a_finished_backfill_is_quiet() {
         let now = at("2026-10-23T12:00:00Z");
         let t = Thresholds::default();
-        let status = json!({ "running": true, "sources": {
+        let status = json!({ "running": true, "startedAt": "2026-10-23T09:30:00Z", "sources": {
             "jupiter": { "done": false, "errorStreak": 4, "lastBatchAt": "2026-10-23T11:59:00Z", "percent": 12.5 },
             "pyth": { "done": false, "errorStreak": 0, "lastBatchAt": "2026-10-23T09:00:00Z" },
-            "flash": { "done": true, "errorStreak": 12, "lastBatchAt": "2026-10-20T09:00:00Z" }
+            "flash": { "done": true, "errorStreak": 12, "lastBatchAt": "2026-10-20T09:00:00Z" },
+            "fresh": { "done": false, "errorStreak": 0 }
         }});
         let mut f = Findings::default();
         let out = section(Some(&status), Some(60), &t, now, &mut f);
@@ -88,6 +92,7 @@ mod tests {
         assert_eq!(
             f.warn,
             [
+                "venues history fresh: no batch for 150 min",
                 "venues history jupiter: 4 failed batches in a row",
                 "venues history pyth: no batch for 180 min"
             ]
