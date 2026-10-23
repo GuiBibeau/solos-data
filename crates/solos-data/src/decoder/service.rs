@@ -255,8 +255,34 @@ fn maintain(
         "checkpointSeconds",
         round(checkpointed_at.elapsed().as_secs_f64()),
     );
+    fields.set_obj("engineMemory", engine_memory(store));
     log("decoded_maintenance", fields);
     Ok(())
+}
+
+/// The storage engine's memory by tag (`duckdb_memory()`), in bytes, for the tags holding any:
+/// what fills the buffer when the decoder nears its memory limit.
+fn engine_memory(store: &Store) -> Obj {
+    let mut out = Obj::new();
+    let rows = store
+        .rows(
+            "SELECT tag, memory_usage_bytes AS bytes, temporary_storage_bytes AS spilled
+    FROM duckdb_memory() WHERE memory_usage_bytes>0 OR temporary_storage_bytes>0",
+            &[],
+        )
+        .unwrap_or_default();
+    for row in rows {
+        if let Some(tag) = row.str("tag") {
+            out.set(
+                tag,
+                serde_json::json!([
+                    row.int("bytes").unwrap_or(0),
+                    row.int("spilled").unwrap_or(0)
+                ]),
+            );
+        }
+    }
+    out
 }
 
 fn round(seconds: f64) -> f64 {

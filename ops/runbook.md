@@ -154,10 +154,13 @@ write-ahead log replay after a crash. Transactions in a batch decode in parallel
 published rows and the progress record are assembled in source order, so output is identical to
 the sequential decoder.
 The explicit checkpoint that used to follow every minute's compaction now runs every
-`checkpointIntervalSeconds` (`config/decoded.json`, default 900, 7,200 in the repository config):
+`checkpointIntervalSeconds` (`config/decoded.json`, default 900, 1,800 in the repository config):
 each one rewrites the `processed` index whatever the amount of change (570 to 700 seconds at 1.49
 billion rows on 2026-10-22), and the write-ahead log keeps committed batches durable in between.
-A longer interval means a longer log replay after a crash.
+A longer interval means a longer log replay after a crash, and the index changes made since the
+last checkpoint stay in the engine's memory: two hours at 40,000-transaction batches ran out of
+memory at a 200 GB limit on 2026-10-22 (ADR-0007). `decoded_maintenance` logs `engineMemory`
+(bytes and spilled bytes per DuckDB tag) to show what fills it.
 
 The other decoder settings in `config/decoded.json` (ADR-0007, 2026-10-22): `batchSize`
 (transactions per batch, at most 100,000) and `maxBatchSources` (raw files one batch may span; 1
