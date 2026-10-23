@@ -311,8 +311,8 @@ shared drive, and treat Kalshi-derived features as research-only (ADR-0009, "Kal
 kind, candle interval and how much of each ladder is kept (`windowPct`, `maxStrikes`,
 `maxLifeHours`, `trades`). Each sync lists the series' live contracts, stores every event that
 closed since the last run, then spends the rest of its budget (`runMinutes` 40, `maxRequests`
-24,000, at `requestsPerSecond` 6, under the Basic tier's read limit: 10 drew `429` on about 9% of
-requests) on the backward walk to
+24,000, at `requestsPerSecond` 4, under the Basic tier's read limit: 10 drew `429` on about 9% of
+requests and 6 still drew several hundred a run) on the backward walk to
 `startDate` (2025-10-01). Progress is in the ledger under `kalshi/<SERIES>`; a stopped run
 resumes there. Datasets: `kalshi_contracts` (every market's metadata), `kalshi_candles_1m` /
 `kalshi_candles_60m` (bid, ask and trade OHLC of the kept strikes), `kalshi_trades`, partitioned

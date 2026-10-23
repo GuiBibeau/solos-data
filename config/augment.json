@@ -380,7 +380,7 @@
     "kalshi": {
       "enabled": true,
       "baseUrl": "https://api.elections.kalshi.com/trade-api/v2",
-      "requestsPerSecond": 6.0,
+      "requestsPerSecond": 4.0,
       "startDate": "2025-10-01",
       "runMinutes": 40,
       "maxRequests": 24000,
