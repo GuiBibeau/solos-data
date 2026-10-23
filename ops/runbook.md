@@ -311,7 +311,8 @@ shared drive, and treat Kalshi-derived features as research-only (ADR-0009, "Kal
 kind, candle interval and how much of each ladder is kept (`windowPct`, `maxStrikes`,
 `maxLifeHours`, `trades`). Each sync lists the series' live contracts, stores every event that
 closed since the last run, then spends the rest of its budget (`runMinutes` 40, `maxRequests`
-24,000, at `requestsPerSecond` 10, half the Basic tier's read limit) on the backward walk to
+24,000, at `requestsPerSecond` 6, under the Basic tier's read limit: 10 drew `429` on about 9% of
+requests) on the backward walk to
 `startDate` (2025-10-01). Progress is in the ledger under `kalshi/<SERIES>`; a stopped run
 resumes there. Datasets: `kalshi_contracts` (every market's metadata), `kalshi_candles_1m` /
 `kalshi_candles_60m` (bid, ask and trade OHLC of the kept strikes), `kalshi_trades`, partitioned
@@ -370,6 +371,9 @@ SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment quer
 ```
 
 A one-symbol check: `augment sync --source okx --symbol SOL`.
+
+`sources.hyperliquidS3` ships disabled: with keys whose reads are denied, every run answers 403
+and marks the augment unit failed. Set `enabled` to `true` once the keys can read both buckets.
 
 Hyperliquid's S3 archive (`sources.hyperliquidS3`) is requester-pays: the AWS account whose keys
 sign the requests pays the transfer ($0.09/GB from `hyperliquid-archive`, $0.114/GB from
