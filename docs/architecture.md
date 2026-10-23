@@ -59,6 +59,11 @@ the program's instructions and its Anchor events decoded through the on-chain ID
 and market accounts are read every minute and Pyth price feed accounts every five seconds. Hour
 files go under the augment root with a ledger of their own (ADR-0012).
 
+`solos-data venues history run` fills the same tables back to 2025-10-01, newest first: one
+Old Faithful archive stream per slot range watches the programs and the Pyth feed accounts
+together, an RPC signature walk per address is the completeness check, and the files go to a tree
+and ledger of their own under the augment root (ADR-0013). Account state has no history.
+
 ## Read and move data
 
 `catalog.json` lists published files and their hashes. Query commands open those
@@ -82,7 +87,7 @@ records the missing checks, snapshots and reconstructed state.
 | `crates/phoenix-codec/` | Rust library and stdio binary around the official Phoenix event SDK |
 | `crates/solana-wire/` | Rust parser for legacy, v0 and v1 transaction envelopes |
 | `crates/solos-data/` | Rust `solos-data` binary: `collector` (RPC tail and backfill, Jetstreamer archive lane behind the `archive` feature), `decoder`, and `dev` tooling (`compare-decoded`, `crash-writer`) |
-| `crates/solos-data/src/venues/` | Other Solana perp venues and Pyth: IDL-driven Borsh decoding, forward transaction cycles, account polling (ADR-0012) |
+| `crates/solos-data/src/venues/` | Other Solana perp venues and Pyth: IDL-driven Borsh decoding, forward transaction cycles, account polling (ADR-0012); `history/`: the archive backfill and its check (ADR-0013) |
 | `tests/` | Offline fixtures and interruption/restart tests |
 | `config/` | Rates, batch sizes and default data paths |
 | `ops/` | Linux services and installation notes |

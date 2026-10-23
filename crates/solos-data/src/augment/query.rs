@@ -1,5 +1,5 @@
-//! Read-only SQL over the augment root: one view per (source, dataset) over the files of both
-//! lanes' catalogs in an independent in-memory DuckDB, so queries run while a sync or capture
+//! Read-only SQL over the augment root: one view per (source, dataset) over the files of every
+//! lane's catalog in an independent in-memory DuckDB, so queries run while a sync or capture
 //! writes.
 
 use crate::jsonout::Obj;
@@ -10,6 +10,15 @@ use std::path::Path;
 
 /// Run `sql` with views `<source>_<dataset>` over the catalogued files.
 pub fn query_augment(root: &Path, sql: &str) -> Result<Obj, StoreError> {
+    query_lanes(root, &super::ledger::Lane::ALL, sql)
+}
+
+/// Run `sql` with views over the files of `lanes`' catalogs only.
+pub fn query_lanes(
+    root: &Path,
+    lanes: &[super::ledger::Lane],
+    sql: &str,
+) -> Result<Obj, StoreError> {
     let head = sql.trim_start().to_lowercase();
     if !(head.starts_with("select")
         || head.starts_with("with")
@@ -20,15 +29,19 @@ pub fn query_augment(root: &Path, sql: &str) -> Result<Obj, StoreError> {
             "query must be read-only (SELECT, WITH, DESCRIBE or SHOW)".into(),
         ));
     }
-    let mut views: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for lane in super::ledger::Lane::ALL {
+    let mut views: BTreeMap<String, Vec<std::path::PathBuf>> = BTreeMap::new();
+    for &lane in lanes {
         let Ok(text) = std::fs::read_to_string(lane.catalog_path(root)) else {
             continue;
         };
         let catalog: Value =
             serde_json::from_str(&text).map_err(|e| StoreError::Check(e.to_string()))?;
+        let files_root = lane.files_root(root);
         for (view, paths) in view_paths(&catalog) {
-            views.entry(view).or_default().extend(paths);
+            views
+                .entry(view)
+                .or_default()
+                .extend(paths.into_iter().map(|p| files_root.join(p)));
         }
     }
     if views.is_empty() {
@@ -41,7 +54,7 @@ pub fn query_augment(root: &Path, sql: &str) -> Result<Obj, StoreError> {
     for (view, paths) in &views {
         let list: Vec<String> = paths
             .iter()
-            .map(|p| sql_string(&root.join(p).to_string_lossy()))
+            .map(|p| sql_string(&p.to_string_lossy()))
             .collect();
         conn.execute_batch(&format!(
             "CREATE VIEW {view} AS SELECT * FROM read_parquet([{}], union_by_name=true)",

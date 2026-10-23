@@ -75,6 +75,9 @@ pub struct Idl {
     events: HashMap<[u8; 8], (String, Value)>,
     accounts: HashMap<[u8; 8], (String, Value)>,
     instructions: HashMap<[u8; 8], String>,
+    /// Older IDLs of the same program, tried in order when this one does not decode an event or
+    /// name an instruction: history crosses program upgrades (ADR-0013).
+    fallbacks: Vec<Idl>,
 }
 
 fn disc_of(item: &Value, namespace: &str, name: &str) -> [u8; 8] {
@@ -168,6 +171,19 @@ impl Idl {
         Ok(idl)
     }
 
+    /// This IDL with `older` tried after it (and after the fallbacks it already has).
+    #[must_use]
+    pub fn with_fallback(mut self, older: Idl) -> Idl {
+        self.fallbacks.push(older);
+        self
+    }
+
+    /// Number of fallback IDLs.
+    #[must_use]
+    pub fn fallback_count(&self) -> usize {
+        self.fallbacks.len()
+    }
+
     /// The event name for a discriminator.
     #[must_use]
     pub fn event_name(&self, disc: &[u8]) -> Option<&str> {
@@ -179,7 +195,10 @@ impl Idl {
     #[must_use]
     pub fn instruction_name(&self, disc: &[u8]) -> Option<&str> {
         let key: [u8; 8] = disc.get(..8)?.try_into().ok()?;
-        self.instructions.get(&key).map(String::as_str)
+        self.instructions
+            .get(&key)
+            .map(String::as_str)
+            .or_else(|| self.fallbacks.iter().find_map(|f| f.instruction_name(disc)))
     }
 
     /// The account type name for a discriminator.
@@ -212,6 +231,24 @@ impl Idl {
     /// fields or the reason they did not decode. The payload must be consumed exactly.
     #[must_use]
     pub fn decode_event(&self, payload: &[u8]) -> Option<(String, Result<Value, DecodeError>)> {
+        let own = self.decode_event_own(payload);
+        if matches!(own, Some((_, Ok(_)))) || self.fallbacks.is_empty() {
+            return own;
+        }
+        // An older layout that consumes the payload exactly wins; otherwise the newest answer
+        // (this IDL's error, or the first fallback that knows the discriminator) stands.
+        let mut first = own;
+        for older in &self.fallbacks {
+            match older.decode_event(payload) {
+                Some((name, Ok(fields))) => return Some((name, Ok(fields))),
+                Some(other) if first.is_none() => first = Some(other),
+                _ => {}
+            }
+        }
+        first
+    }
+
+    fn decode_event_own(&self, payload: &[u8]) -> Option<(String, Result<Value, DecodeError>)> {
         let key: [u8; 8] = payload.get(..8)?.try_into().ok()?;
         let (name, ty) = self.events.get(&key)?;
         let mut reader = Reader {

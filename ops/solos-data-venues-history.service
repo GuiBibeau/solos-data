@@ -1,0 +1,36 @@
+[Unit]
+Description=solos-data venues history: Jupiter Perps, Flash Trade and Pyth back to 2025-10-01 from the Old Faithful archive (ADR-0013)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+# A checkout of its own and a binary of its own (built with the archive feature), so the running
+# services' checkout and binary are never touched.
+WorkingDirectory=%h/solos-data-venues-history
+# SOLANA_RPC_URL: the collector's provider, for the manifests only (about 1M credits in all).
+EnvironmentFile=%h/.config/solos-data/collector.env
+Environment=SOLOS_DATA_AUGMENT_DIR=%h/.local/share/solos-data/augment
+# collector.env sets SOLOS_DATA_DB_MEMORY (400GB) and JETSTREAMER_THREADS for the collector, and
+# an EnvironmentFile= wins over Environment=, so this unit's own values go on the command line.
+ExecStart=/usr/bin/env SOLOS_DATA_DB_MEMORY=32GB SOLOS_DATA_DB_THREADS=8 JETSTREAMER_THREADS=8 %h/.local/share/solos-data/bin/solos-data-venues-history venues history run --config config/venues-history.json
+Nice=15
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+CPUQuota=3200%
+MemoryHigh=80G
+MemoryMax=100G
+# A run that reached the floor exits 0 and stays down; a crash restarts and resumes.
+Restart=on-failure
+RestartSec=60
+TimeoutStopSec=180
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TasksMax=512
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

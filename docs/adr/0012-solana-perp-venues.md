@@ -105,6 +105,9 @@ are recorded in `config/venues.json` and in the status.
 
 ## History
 
+Superseded by ADR-0013 (history from the Old Faithful archive, RPC manifests); the analysis
+below is what it started from.
+
 Forward collection starts at the first run's finalized slot. History is a separate step. Two
 ways, measured against the forward costs below:
 

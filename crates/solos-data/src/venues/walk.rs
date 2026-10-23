@@ -266,6 +266,28 @@ pub async fn cycle(
 ) -> Result<(Cycle, CycleRows), String> {
     let (from, to) = window;
     let manifest = manifest(rpc, program, from, to).await?;
+    let (mut stats, txs) = fetch_listed(rpc, program, window, &manifest).await?;
+    let mut rows = CycleRows::default();
+    for tx in &txs {
+        to_rows(tx, program, idl, store_transactions, &mut stats, &mut rows);
+    }
+    Ok((stats, rows))
+}
+
+/// The successful transactions of `program` in `[from, to]` against a manifest of the window:
+/// the bulk pages, then every manifest signature they missed fetched alone. A bulk transaction
+/// the manifest does not list is kept and counted as `unlisted`.
+///
+/// # Errors
+///
+/// RPC failure, or a manifest signature neither path serves (nothing of the window is kept).
+pub async fn fetch_listed(
+    rpc: &dyn Rpc,
+    program: &str,
+    window: (i64, i64),
+    manifest: &Manifest,
+) -> Result<(Cycle, Vec<Tx>), String> {
+    let (from, to) = window;
     let mut txs = bulk(rpc, program, from, to).await?;
     let mut stats = Cycle {
         from,
@@ -292,11 +314,7 @@ pub async fn cycle(
     if stats.missing > 0 {
         return Err(format!("{} manifest signatures not served", stats.missing));
     }
-    let mut rows = CycleRows::default();
-    for tx in &txs {
-        to_rows(tx, program, idl, store_transactions, &mut stats, &mut rows);
-    }
-    Ok((stats, rows))
+    Ok((stats, txs))
 }
 
 /// The rows of one transaction.

@@ -31,11 +31,15 @@ pub enum Lane {
     /// `venues run` (ADR-0012): `venues/checkpoint.duckdb`, `catalog-venues.json`,
     /// `status-venues.json`, `staging-venues/`.
     Venues,
+    /// `venues history` (ADR-0013): `venues-history/checkpoint.duckdb`, its files under
+    /// `venues-history/tables/` (so the live venues lane's recovery never sees them),
+    /// `catalog-venues-history.json`, `status-venues-history.json`, `staging-venues-history/`.
+    History,
 }
 
 impl Lane {
     /// Every lane, sync first.
-    pub const ALL: [Lane; 3] = [Lane::Sync, Lane::Capture, Lane::Venues];
+    pub const ALL: [Lane; 4] = [Lane::Sync, Lane::Capture, Lane::Venues, Lane::History];
 
     /// The lane's name in logs and status.
     #[must_use]
@@ -44,6 +48,7 @@ impl Lane {
             Lane::Sync => "sync",
             Lane::Capture => "capture",
             Lane::Venues => "venues",
+            Lane::History => "venues-history",
         }
     }
 
@@ -55,6 +60,17 @@ impl Lane {
             Lane::Sync => root.to_path_buf(),
             Lane::Capture => root.join("capture"),
             Lane::Venues => root.join("venues"),
+            Lane::History => root.join("venues-history"),
+        }
+    }
+
+    /// The directory the lane's registered paths are relative to: the augment root, except for
+    /// the history lane, whose `tables/` tree is its own so no other lane's recovery walks it.
+    #[must_use]
+    pub fn files_root(self, root: &Path) -> PathBuf {
+        match self {
+            Lane::History => root.join("venues-history"),
+            _ => root.to_path_buf(),
         }
     }
 
@@ -65,6 +81,7 @@ impl Lane {
             Lane::Sync => root.join("catalog.json"),
             Lane::Capture => root.join("catalog-capture.json"),
             Lane::Venues => root.join("catalog-venues.json"),
+            Lane::History => root.join("catalog-venues-history.json"),
         }
     }
 
@@ -75,6 +92,7 @@ impl Lane {
             Lane::Sync => root.join("status.json"),
             Lane::Capture => root.join("status-capture.json"),
             Lane::Venues => root.join("status-venues.json"),
+            Lane::History => root.join("status-venues-history.json"),
         }
     }
 
@@ -85,6 +103,7 @@ impl Lane {
             Lane::Sync => root.join("staging"),
             Lane::Capture => root.join("staging-capture"),
             Lane::Venues => root.join("staging-venues"),
+            Lane::History => root.join("staging-venues-history"),
         }
     }
 }
@@ -249,10 +268,11 @@ pub fn read_statuses(root: &Path) -> Obj {
 /// first run and are left alone.
 pub fn recover(store: &mut Store, root: &Path, lane: Lane) -> Result<u64, StoreError> {
     let rows = store.rows("SELECT path FROM files", &[])?;
+    let files_root = lane.files_root(root);
     let registered: std::collections::HashSet<PathBuf> = rows
         .iter()
         .filter_map(|row| row.str("path"))
-        .map(|p| root.join(p))
+        .map(|p| files_root.join(p))
         .collect();
     let mut dirs: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     for path in &registered {

@@ -1,0 +1,49 @@
+{
+  "venuesConfig": "venues.json",
+  "floorTime": "2025-10-01T00:00:00Z",
+  "creditsPerSecond": 25,
+  "concurrency": 16,
+  "batchWindows": 16,
+  "flushSeconds": 300,
+  "flushRows": 200000,
+  "archive": {
+    "chunkSlots": 50000,
+    "parallel": 4
+  },
+  "sources": [
+    {
+      "name": "jupiter",
+      "top": 458492106,
+      "windowSlots": 2000,
+      "idlFallbacks": [
+        "idl/history/jupiter-2025-08-19-359f00d0ab.json"
+      ],
+      "via": "archive"
+    },
+    {
+      "name": "flash",
+      "top": 458492107,
+      "windowSlots": 10000,
+      "idlFallbacks": [
+        "idl/history/flash-2026-05-05-6548699271.json",
+        "idl/history/flash-2026-03-31-55687a7e79.json",
+        "idl/history/flash-2026-03-24-008fb72202.json",
+        "idl/history/flash-2026-03-13-5a5401e0e4.json",
+        "idl/history/flash-2026-02-28-d54a046c17.json",
+        "idl/history/flash-2026-02-24-e9c0ca7402.json",
+        "idl/history/flash-2026-02-10-adefcf26ed.json",
+        "idl/history/flash-2026-01-24-ea3aba9a9a.json",
+        "idl/history/flash-2026-01-05-b468be8a42.json",
+        "idl/history/flash-2025-11-26-79afaddbce.json",
+        "idl/history/flash-2025-09-01-a46a930cbc.json"
+      ],
+      "via": "archive"
+    },
+    {
+      "name": "pyth",
+      "top": 458492107,
+      "windowSlots": 20000,
+      "via": "archive"
+    }
+  ]
+}
