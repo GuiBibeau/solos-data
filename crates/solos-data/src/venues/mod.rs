@@ -5,8 +5,10 @@
 pub mod accounts;
 pub mod config;
 pub mod events;
+pub mod history;
 pub mod idl;
 pub mod pyth;
+pub mod pyth_tx;
 pub mod rpc;
 pub mod run;
 pub mod store;

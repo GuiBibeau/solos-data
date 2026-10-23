@@ -13,8 +13,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// The methods the lane calls.
-pub const METHODS: [&str; 7] = [
+pub const METHODS: [&str; 9] = [
     "getSlot",
+    "getBlocks",
+    "getBlockTime",
     "getAccountInfo",
     "getSignaturesForAddress",
     "getTransactionsForAddress",
@@ -55,6 +57,53 @@ pub fn provider(
     // SIGTERM ends waits and retries at once; the interrupted cycle is retried after a restart.
     provider.shutdown = stop;
     Ok(Arc::new(provider))
+}
+
+/// A provider whose limiter spends credits rather than requests: each method weighs its price in
+/// `costs` (1 when unpriced), and `credits_per_second` is the budget. The history backfill
+/// (ADR-0013) runs on it, so its bulk pages (10 credits) and manifest pages (1) share one budget.
+///
+/// # Errors
+///
+/// When `SOLANA_RPC_URL` is unset or the embedded collector defaults do not parse.
+pub fn credit_provider(
+    credits_per_second: f64,
+    costs: &BTreeMap<String, f64>,
+    concurrency: u32,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Arc<Provider>, StoreError> {
+    let mut config: Config = serde_json::from_str(include_str!("../../../../config/phoenix.json"))
+        .map_err(|e| StoreError::Check(e.to_string()))?;
+    config.cu_weights = weights(costs);
+    config.cu_per_second = credits_per_second * f64::from(WEIGHT);
+    config.utilization = 1.0;
+    let limiter = Arc::new(Limiter::new(
+        config.cu_per_second,
+        0.0,
+        Lanes {
+            tail: 1,
+            backfill: concurrency.max(1),
+        },
+    ));
+    let url = crate::collector::config::provider_url()?;
+    let mut provider = Provider::new(url, config, limiter);
+    provider.shutdown = stop;
+    Ok(Arc::new(provider))
+}
+
+/// Limiter weights: a method's credits times [`WEIGHT`], at least 1.
+#[must_use]
+pub fn weights(costs: &BTreeMap<String, f64>) -> BTreeMap<String, u32> {
+    METHODS
+        .iter()
+        .map(|m| {
+            let cost = costs.get(*m).copied().unwrap_or(1.0);
+            let weight = (cost * f64::from(WEIGHT))
+                .round()
+                .clamp(1.0, f64::from(u32::MAX));
+            ((*m).to_owned(), weight as u32)
+        })
+        .collect()
 }
 
 /// Call `method` on the lane's (backfill) limiter lane.
@@ -100,5 +149,10 @@ mod tests {
         ]
         .into();
         assert!((credits(&counters, &costs) - (10.0 + 20.0 + 30.0)).abs() < 1e-9);
+        let w = weights(&costs);
+        assert_eq!(
+            (w["getSlot"], w["getTransactionsForAddress"], w["getBlocks"]),
+            (10, 100, 10)
+        );
     }
 }

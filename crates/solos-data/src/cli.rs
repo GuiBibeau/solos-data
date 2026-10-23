@@ -63,6 +63,7 @@ fn venues(args: &[String]) -> i32 {
             Ok(0)
         }),
         "idl" => venues_idl(args),
+        "history" => venues_history(&args[1..]),
         "status" => crate::venues::config::load(flag(args, "--config")).and_then(|config| {
             let path = crate::augment::ledger::Lane::Venues.status_path(&config.data_dir);
             print!("{}", std::fs::read_to_string(path)?);
@@ -78,6 +79,7 @@ fn venues(args: &[String]) -> i32 {
                             .with("run", "collect Jupiter Perps and Flash Trade transactions, events and state, and Pyth prices, until SIGTERM (ADR-0012)")
                             .with("status", "print status-venues.json")
                             .with("idl", "--address <program IDL account> --out <file>: fetch and inflate a program's on-chain Anchor IDL")
+                            .with("history", "run | estimate | check | status --config config/venues-history.json: the backfill to the floor, newest first (ADR-0013)")
                     )
                     .with("config", "--config config/venues.json; SOLOS_DATA_AUGMENT_DIR overrides dataDir; SOLANA_RPC_URL is the provider")
                     .with("query", "the tables join the augment views: solos-data augment query --sql ... (jupiter_events, flash_instructions, pyth_prices, ...)")
@@ -94,6 +96,65 @@ fn venues(args: &[String]) -> i32 {
                 Obj::new().with("error", safe_error(&error.to_string())),
             );
             1
+        }
+    }
+}
+
+/// `venues history <run|estimate|check|status>` (ADR-0013).
+fn venues_history(args: &[String]) -> Result<i32, StoreError> {
+    let config = crate::venues::history::config::load(flag(args, "--config"))?;
+    match args.first().map(String::as_str).unwrap_or("help") {
+        "run" => {
+            let status = crate::venues::history::run::run(config, stop_flag()?)?;
+            println!("{}", status.to_json());
+            Ok(0)
+        }
+        "estimate" => {
+            let points = flag(args, "--points")
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(3);
+            let rpc = crate::venues::rpc::provider(5.0, 2, stop_flag()?)?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            let out = runtime
+                .block_on(crate::venues::history::estimate::estimate(
+                    rpc.as_ref(),
+                    &config,
+                    points,
+                ))
+                .map_err(StoreError::Check)?;
+            println!("{}", out.to_json());
+            Ok(0)
+        }
+        "check" => {
+            let venues = config.venues()?;
+            let sources = config.resolve(&venues)?;
+            let out = crate::venues::history::check::check(&venues.data_dir, &sources)?;
+            let ok = out.get("ok").and_then(Value::as_bool) == Some(true);
+            println!("{}", out.to_json());
+            Ok(if ok { 0 } else { 2 })
+        }
+        "status" => {
+            let venues = config.venues()?;
+            let path = crate::augment::ledger::Lane::History.status_path(&venues.data_dir);
+            print!("{}", std::fs::read_to_string(path)?);
+            Ok(0)
+        }
+        _ => {
+            println!(
+                "{}",
+                Obj::new()
+                    .with_obj(
+                        "commands",
+                        Obj::new()
+                            .with("run", "collect the history to floorTime, newest first, until done or SIGTERM")
+                            .with("estimate", "[--points N]: sample each address's transaction density and the credits the run would spend")
+                            .with("check", "compare the files with each batch's manifest counts; exit 2 on a mismatch or a hole")
+                            .with("status", "print status-venues-history.json")
+                    )
+                    .with("config", "--config config/venues-history.json (default)")
+                    .to_json()
+            );
+            Ok(0)
         }
     }
 }

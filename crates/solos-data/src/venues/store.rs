@@ -128,12 +128,50 @@ pub const PRICES: Table = Table {
         ("verification", "VARCHAR"),
         ("price_f", "DOUBLE"),
         ("conf_f", "DOUBLE"),
+        // History rows (ADR-0013) name the transaction and shard that posted the update; the
+        // live poll reads the account and leaves both null.
+        ("signature", "VARCHAR"),
+        ("shard", "INTEGER"),
     ],
     time: ("publish_time", false),
 };
 
+/// History batches (ADR-0013): what each batch's manifest listed and what it stored, for
+/// `venues history check`. Partitioned by the hour the batch was collected.
+pub const BATCHES: Table = Table {
+    dataset: "batches",
+    key: "from_slot",
+    columns: &[
+        ("from_slot", "BIGINT"),
+        ("to_slot", "BIGINT"),
+        ("manifest", "BIGINT"),
+        ("failed", "BIGINT"),
+        ("bulk", "BIGINT"),
+        ("single", "BIGINT"),
+        ("unlisted", "BIGINT"),
+        ("txs", "BIGINT"),
+        ("events", "BIGINT"),
+        ("undecoded", "BIGINT"),
+        ("unknown", "BIGINT"),
+        ("instructions", "BIGINT"),
+        ("unparsed", "BIGINT"),
+        ("prices", "BIGINT"),
+        ("pyth_applied", "BIGINT"),
+        ("oldest_block_time", "BIGINT"),
+        ("at_ms", "BIGINT"),
+    ],
+    time: ("at_ms", true),
+};
+
 /// Every table.
-pub const TABLES: [&Table; 5] = [&TRANSACTIONS, &EVENTS, &INSTRUCTIONS, &ACCOUNTS, &PRICES];
+pub const TABLES: [&Table; 6] = [
+    &TRANSACTIONS,
+    &EVENTS,
+    &INSTRUCTIONS,
+    &ACCOUNTS,
+    &PRICES,
+    &BATCHES,
+];
 
 fn table(dataset: &str) -> Option<&'static Table> {
     TABLES.into_iter().find(|t| t.dataset == dataset)
@@ -366,7 +404,7 @@ async fn write_hour(
         complete: now_ms >= end_ms.saturating_add(3_600_000),
     };
     let sql = select(table, &staged);
-    let root = ctx.root.clone();
+    let root = ctx.lane.files_root(&ctx.root);
     let result = ctx
         .db
         .run(move |store| {
