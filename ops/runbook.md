@@ -371,6 +371,11 @@ SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment quer
 
 A one-symbol check: `augment sync --source okx --symbol SOL`.
 
+`sources.hyperliquidS3` ships disabled (2026-10-23): the operator's AWS organization denies
+`s3:GetObject` on the requester-pays buckets through a service control policy, so every run
+answered 403 and marked the augment unit failed. Set `enabled` back to `true` once the policy
+simulator allows the reads.
+
 Hyperliquid's S3 archive (`sources.hyperliquidS3`) is requester-pays: the AWS account whose keys
 sign the requests pays the transfer ($0.09/GB from `hyperliquid-archive`, $0.114/GB from
 `hl-mainnet-node-data`). Without keys the source logs `augment_source_disabled` and sends

@@ -380,7 +380,7 @@
     "kalshi": {
       "enabled": true,
       "baseUrl": "https://api.elections.kalshi.com/trade-api/v2",
-      "requestsPerSecond": 10.0,
+      "requestsPerSecond": 6.0,
       "startDate": "2025-10-01",
       "runMinutes": 40,
       "maxRequests": 24000,
@@ -774,7 +774,7 @@
       }
     },
     "hyperliquidS3": {
-      "enabled": true,
+      "enabled": false,
       "archiveUrl": "https://hyperliquid-archive.s3.us-east-1.amazonaws.com",
       "archiveRegion": "us-east-1",
       "nodeUrl": "https://hl-mainnet-node-data.s3.ap-northeast-1.amazonaws.com",
