@@ -8,7 +8,7 @@
   "flushRows": 200000,
   "archive": {
     "chunkSlots": 50000,
-    "parallel": 2
+    "parallel": 4
   },
   "sources": [
     {

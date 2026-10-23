@@ -529,6 +529,43 @@ A restart resumes from the stored cursor; a window flushed but not yet recorded 
 and merged. To start over, stop the unit and delete `venues/` and `tables/{jupiter,flash,pyth}` under
 the augment root together.
 
+### Venues history (ADR-0013)
+
+`solos-data venues history run --config config/venues-history.json` collects the same tables
+from the slot before the live lane's first window back to `floorTime` (2025-10-01), newest first.
+Transactions come from the Old Faithful archive (one Jetstreamer stream per range for all three
+sources); the manifests come from the RPC (about 1M credits for the window). Files go under
+`<augment root>/venues-history/tables/`, with its own ledger, `catalog-venues-history.json` and
+`status-venues-history.json`; `augment query` views span both lanes. It needs a binary built with
+the archive feature (the libclang recipe under "Tests"), installed under its own name beside a
+checkout of its own, so the running services keep theirs:
+
+```sh
+git clone https://github.com/GuiBibeau/solos-data.git ~/solos-data-venues-history
+cd ~/solos-data-venues-history
+LIBCLANG_PATH=$HOME/.local/lib LLVM_CONFIG_PATH=/usr/bin/llvm-config-19 \
+  nice cargo build --release -p solos-data --features archive
+install -m 0755 target/release/solos-data ~/.local/share/solos-data/bin/solos-data-venues-history
+cp ops/solos-data-venues-history.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now solos-data-venues-history.service
+journalctl --user -u solos-data-venues-history.service -o cat | grep -E '"event":"history_(batch|error|source_done)"' | tail
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment \
+  ~/.local/share/solos-data/bin/solos-data-venues-history venues history status | python3 -m json.tool | head -80
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment \
+  ~/.local/share/solos-data/bin/solos-data-venues-history venues history check
+```
+
+Per source the status has `cursor` (next slot down), `percent`, `slotsPerHour`, `etaHours`,
+`oldestBlockTime`, the manifest and decode totals, the Pyth update counts and the error streak.
+`check` compares the files with each batch's counts and the batches' slot coverage, from the
+catalog only, while the unit runs; it exits 2 on a mismatch. `estimate [--points N]` samples each
+address's transaction density and the credits an RPC-only run would spend. The unit is capped at
+100 GB and 32 CPUs; `chunkSlots` and `parallel` in the config set the stream size. A crash
+resumes from the recorded cursors and refetches what was buffered; a finished run exits 0 and stays
+down. To start over, stop the unit and delete `venues-history/` and the two history JSON files
+under the augment root.
+
 ## Dataset health
 
 `solos-data health` reads the JSON snapshots the services already write (raw `status.json` and
