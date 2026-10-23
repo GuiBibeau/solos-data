@@ -754,7 +754,8 @@ The lane stores from 2025-10-01 (`startDate`), so `KXSOLD`/`KXSOLE`, `KXBNBD`/`K
 metals and the hourly WTI start later than that because they did not exist; `KXBRENTD` (Brent,
 2026-03-22) exists and is not in the list. At about 5,000 requests per stored day across the
 series (trades dominate: one page or more per kept market that traded), the backward walk needs
-roughly two million requests, about four days of hourly runs at the 24,000-request budget.
+roughly two million requests. At 4 requests a second a 40-minute run sends at most 9,600, so the
+walk takes at least about nine days of hourly runs, longer with retries and the gap between runs.
 
 ### Health
 
