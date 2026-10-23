@@ -685,8 +685,9 @@ asked in both.
   finishes its retries (at most five more requests and their backoff), which is the bound on
   the overshoot. The other sources of the hourly sync are unaffected. A day is written only once all its events are fetched, so a day cut short is redone
   by the next run. Progress is a JSON record per series in the ledger (`kalshi/<SERIES>`).
-- **Rate.** `requestsPerSecond` 10 on Kalshi's host, half the Basic tier's published read budget
-  (200 tokens a second at 10 tokens a read). A `429` holds every request to the host for its
+- **Rate.** `requestsPerSecond` 6 on Kalshi's host. Half the Basic tier's published read budget
+  (200 tokens a second at 10 tokens a read) would be 10, but 10 drew a `429` on about 9% of
+  requests (2026-10-23), so the rate was lowered. A `429` holds every request to the host for its
   `Retry-After` (else the client's exponential backoff) and is retried; the run's request and
   `429` counts are in `status.json` (`kalshi.requests`, `kalshi.rateLimited`).
 
