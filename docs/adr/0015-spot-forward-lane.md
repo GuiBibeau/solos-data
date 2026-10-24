@@ -85,8 +85,9 @@ with the seam met: the history's newest batch ends at 460,511,999.
 - **Cost at the tip: about 220,000 to 240,000 credits a day**: one per block (about 216,000
   slots a day), one `getBlocks` and the manifest walks per batch (19 `getTransactionsForAddress`
   seeds at 10 and about 200 `getSignaturesForAddress` pages for a 1,000-slot window, about 400
-  credits, 24 batches a day), and a `getSlot` per 30-second wait. That is an eighth of the 2M-a-day budget the
-  venues lane was held to. The status reports `creditsPerDayAtTip` from the lane's own counters.
+  credits, 24 batches a day), and a `getSlot` per 30-second wait. That is an eighth of the
+  2M-a-day budget the venues lane was held to. The status reports `creditsPerDayAtTip` from the
+  lane's own counters.
 - **Transfer: about 120 to 140 GB a day on the wire** (gzip; 4.3 times less than the JSON), about
   0.55 TB a day of JSON decoded.
 - **Catch-up.** About 31 to 35 slots a second at 24 in flight, so the backlog from 460,512,000
