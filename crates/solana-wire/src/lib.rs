@@ -105,6 +105,31 @@ impl Wire {
             .collect()
     }
 
+    /// Static account keys in message order, as raw 32-byte keys.
+    #[must_use]
+    pub fn static_account_bytes(&self) -> Vec<[u8; 32]> {
+        self.transaction
+            .message
+            .static_account_keys()
+            .iter()
+            .map(|key| key.to_bytes())
+            .collect()
+    }
+
+    /// How many signatures the transaction carries: its first that many static keys signed it.
+    #[must_use]
+    pub fn signer_count(&self) -> usize {
+        self.transaction.signatures.len()
+    }
+
+    /// The raw 64-byte transaction signature (the fee payer's).
+    #[must_use]
+    pub fn signature_bytes(&self) -> [u8; 64] {
+        let mut out = [0u8; 64];
+        out.copy_from_slice(self.transaction.signatures[0].as_ref());
+        out
+    }
+
     /// Top-level compiled instructions in message order. Account and program indices refer to the
     /// list [`resolve_accounts`] builds.
     #[must_use]

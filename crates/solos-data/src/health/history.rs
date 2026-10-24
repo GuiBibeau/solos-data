@@ -1,7 +1,8 @@
-//! The venues history backfill (ADR-0013) as `status-venues-history.json` reports it: the file's
-//! age while it runs, and per source its run of failed batches and how long since its last batch
-//! while it has not reached the floor. Optional: no status file means no finding; a finished
-//! backfill (every source done) is reported, not judged.
+//! A history backfill as its status file reports it (`status-venues-history.json`, ADR-0013;
+//! `status-spot-history.json`, ADR-0014): the file's age while it runs, and per source its run of
+//! failed batches and how long since its last batch while it has not reached the floor.
+//! Optional: no status file means no finding; a finished backfill (every source done) is
+//! reported, not judged. `label` names the backfill in the findings.
 
 use super::{Findings, Thresholds, num, parse_time};
 use chrono::{DateTime, Utc};
@@ -9,6 +10,7 @@ use serde_json::{Value, json};
 
 /// Judge the history status; `Null` when the backfill has never run.
 pub(super) fn section(
+    label: &str,
     status: Option<&Value>,
     age_s: Option<i64>,
     t: &Thresholds,
@@ -26,14 +28,10 @@ pub(super) fn section(
             .all(|v| v.get("done").and_then(Value::as_bool) == Some(true))
     });
     if !all_done && age / 60 >= t.venues_status_warn_minutes {
-        f.warn.push(format!(
-            "venues history status-venues-history.json {} min old",
-            age / 60
-        ));
+        f.warn.push(format!("{label} status {} min old", age / 60));
     }
     if !all_done && !running {
-        f.warn
-            .push("venues history stopped before the floor".into());
+        f.warn.push(format!("{label} stopped before the floor"));
     }
     let started = status.get("startedAt").and_then(Value::as_str);
     let mut out = serde_json::Map::new();
@@ -53,11 +51,11 @@ pub(super) fn section(
                 (t.error_streak_warn - 1) as f64,
                 (t.error_streak_critical - 1) as f64,
                 true,
-                &format!("venues history {name}: {streak} failed batches in a row"),
+                &format!("{label} {name}: {streak} failed batches in a row"),
             );
             if running && since.is_some_and(|m| m >= t.backfill_stall_minutes) {
                 f.warn.push(format!(
-                    "venues history {name}: no batch for {} min",
+                    "{label} {name}: no batch for {} min",
                     since.unwrap_or(0)
                 ));
             }
@@ -87,7 +85,7 @@ mod tests {
             "fresh": { "done": false, "errorStreak": 0 }
         }});
         let mut f = Findings::default();
-        let out = section(Some(&status), Some(60), &t, now, &mut f);
+        let out = section("venues history", Some(&status), Some(60), &t, now, &mut f);
         assert_eq!(out["sources"]["jupiter"]["percent"], 12.5);
         assert_eq!(
             f.warn,
@@ -100,8 +98,18 @@ mod tests {
         assert!(f.critical.is_empty());
         let finished = json!({ "running": false, "sources": { "jupiter": { "done": true } } });
         let mut f = Findings::default();
-        section(Some(&finished), Some(86_400), &t, now, &mut f);
+        section(
+            "venues history",
+            Some(&finished),
+            Some(86_400),
+            &t,
+            now,
+            &mut f,
+        );
         assert!(f.warn.is_empty() && f.critical.is_empty());
-        assert_eq!(section(None, None, &t, now, &mut f), Value::Null);
+        assert_eq!(
+            section("spot history", None, None, &t, now, &mut f),
+            Value::Null
+        );
     }
 }

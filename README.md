@@ -26,7 +26,7 @@ tables; those are rebuilt from the raw files (ADR-0010).
 | Decoding | In-repo `phoenix-codec` and `solana-wire` crates |
 | Storage | Parquet with ZSTD, partitioned by epoch |
 | Queries | DuckDB 1.4.5 (bundled), SQL over the Parquet files |
-| Context data | Binance, Hyperliquid, Bybit, Deribit, DefiLlama, SEC EDGAR, Polymarket, Kalshi, Fear & Greed, Elfa; on Solana, Jupiter Perps, Flash Trade and Pyth prices (ADR-0012) |
+| Context data | Binance, Hyperliquid, Bybit, Deribit, DefiLlama, SEC EDGAR, Polymarket, Kalshi, Fear & Greed, Elfa; on Solana, Jupiter Perps, Flash Trade and Pyth prices (ADR-0012), and spot DEX swaps across Raydium, Orca, Meteora, pump.fun, PancakeSwap and the proprietary AMMs (ADR-0014) |
 | Operations | systemd services and timers, a health check every 15 minutes, Docker Compose for local runs |
 | Backup | rclone to Cloudflare R2, nightly |
 | CI | GitHub Actions: fmt, clippy, tests |

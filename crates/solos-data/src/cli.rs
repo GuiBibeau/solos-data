@@ -23,13 +23,22 @@ pub fn main(args: &[String]) -> i32 {
         "dev" => dev(&args[1..]),
         "health" => health(&args[1..]),
         "venues" => venues(&args[1..]),
+        "spot" => spot(&args[1..]),
         _ => {
             println!(
                 "{}",
                 Obj::new()
                     .with(
                         "groups",
-                        json!(["collector", "decoder", "augment", "venues", "health", "dev"])
+                        json!([
+                            "collector",
+                            "decoder",
+                            "augment",
+                            "venues",
+                            "spot",
+                            "health",
+                            "dev"
+                        ])
                     )
                     .to_json()
             );
@@ -49,6 +58,108 @@ pub fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
 
 fn has(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
+}
+
+// ---------------------------------------------------------------------------------------------
+// spot
+
+fn spot(args: &[String]) -> i32 {
+    let command = args.first().map(String::as_str).unwrap_or("help");
+    let result = match command {
+        "trial" => spot_trial(args),
+        "run" => crate::spot::config::load(flag(args, "--config")).and_then(|config| {
+            let status = crate::spot::run::run(config, stop_flag()?)?;
+            println!("{}", status.to_json());
+            Ok(0)
+        }),
+        "check" => crate::spot::config::load(flag(args, "--config")).and_then(|config| {
+            let out = crate::spot::check::check(&config.data_dir)?;
+            let ok = out.get("ok").and_then(Value::as_bool) == Some(true);
+            println!("{}", out.to_json());
+            Ok(if ok { 0 } else { 2 })
+        }),
+        "status" => crate::spot::config::load(flag(args, "--config")).and_then(|config| {
+            let path = crate::augment::ledger::Lane::Spot.status_path(&config.data_dir);
+            print!("{}", std::fs::read_to_string(path)?);
+            Ok(0)
+        }),
+        _ => {
+            println!(
+                "{}",
+                Obj::new()
+                    .with_obj(
+                        "commands",
+                        Obj::new()
+                            .with("run", "collect spot swaps and liquidity from top to floorTime, newest first, until done or SIGTERM (ADR-0014)")
+                            .with("check", "compare the files with each batch's counts, block lists and manifests; exit 2 on a mismatch or a hole")
+                            .with("status", "print status-spot-history.json")
+                            .with("trial", "--from <slot> --to <slot> [--out dir] [--chunk 10000] [--parallel 2] [--capture N] [--programs a,b]: stream a range into a scratch directory and report rows, bytes, coverage, time and memory")
+                    )
+                    .with("config", "--config config/spot-history.json (default); SOLOS_DATA_AUGMENT_DIR overrides dataDir; SOLANA_RPC_URL is the provider")
+                    .with("query", "the tables join the augment views: solos-data augment query --sql ... (spot_swaps, spot_liquidity, spot_batches)")
+                    .to_json()
+            );
+            Ok(0)
+        }
+    };
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            log(
+                "spot_fatal",
+                Obj::new().with("error", safe_error(&error.to_string())),
+            );
+            1
+        }
+    }
+}
+
+fn programs_flag(args: &[String]) -> Result<crate::spot::dex::Programs, StoreError> {
+    let Some(list) = flag(args, "--programs") else {
+        return Ok(crate::spot::dex::Programs::all());
+    };
+    let mut out = Vec::new();
+    for name in list.split(',').filter(|n| !n.is_empty()) {
+        out.push(
+            crate::spot::dex::Dex::from_name(name)
+                .ok_or_else(|| StoreError::Check(format!("unknown program {name}")))?,
+        );
+    }
+    Ok(crate::spot::dex::Programs::new(out))
+}
+
+fn spot_trial(args: &[String]) -> Result<i32, StoreError> {
+    let number = |name: &str, default: u64| {
+        flag(args, name)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(default)
+    };
+    let (Some(from), Some(to)) = (
+        flag(args, "--from").and_then(|v| v.parse::<u64>().ok()),
+        flag(args, "--to").and_then(|v| v.parse::<u64>().ok()),
+    ) else {
+        return Err(StoreError::Check(
+            "trial requires --from and --to slots".into(),
+        ));
+    };
+    if to < from {
+        return Err(StoreError::Check("--to is below --from".into()));
+    }
+    let out = PathBuf::from(flag(args, "--out").unwrap_or("spot-trial"));
+    let programs = programs_flag(args)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let report = runtime
+        .block_on(crate::spot::trial::trial(
+            (from, to),
+            number("--chunk", 10_000),
+            usize::try_from(number("--parallel", 2)).unwrap_or(2),
+            &out,
+            usize::try_from(number("--capture", 0)).unwrap_or(0),
+            &programs,
+        ))
+        .map_err(StoreError::Check)?;
+    println!("{}", report.to_json());
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------------------------
