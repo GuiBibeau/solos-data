@@ -442,6 +442,14 @@ impl History {
     /// A member's state from its saved cursor; `None` when stopping.
     async fn member<'a>(&self, st: &'a SourceState) -> Option<Member<'a>> {
         let saved = self.saved_cursor(st).await?;
+        // The last batch survives restarts (its cursor carries the time), so health measures
+        // durable progress, not this process's uptime.
+        if let Some(at) = saved.get("updatedAt").and_then(Value::as_str) {
+            let mut stats = st.stats.lock().expect("history stats");
+            if stats.last_batch_at.is_none() {
+                stats.last_batch_at = Some(at.to_owned());
+            }
+        }
         let next = saved
             .get("next")
             .and_then(Value::as_i64)

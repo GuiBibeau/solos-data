@@ -712,7 +712,16 @@ pub fn run(config: SpotConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError>
             started_at: now(),
             started: Instant::now(),
             start_next: next,
-            totals: Totals::default(),
+            totals: Totals {
+                // The last batch survives restarts (the cursor is written with it), so health
+                // measures durable progress, not this process's uptime.
+                last_batch_at: saved
+                    .as_ref()
+                    .and_then(|v| v.get("updatedAt"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                ..Totals::default()
+            },
             config,
         };
         spot.status(next, done, true)?;

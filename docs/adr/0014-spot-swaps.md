@@ -215,6 +215,8 @@ ranges beside it.
 - **Batches stop at epoch starts**, so each call reads one epoch's files and a failure names one.
 - **Health.** A history source with no batch for 60 minutes warns and for 180 minutes is
   critical (`historyStallWarnMinutes`, `historyStallCriticalMinutes`), on top of the status age.
+  The last batch's time comes back from the cursor record after a restart, so a process the
+  watchdog restarts every 20 minutes still reads as stalled.
 - **Diagnostics.** `SOLOS_DATA_ARCHIVE_LOG=info` (or `debug`) forwards Jetstreamer's own log as
   `archive_log` lines; that is how the reward type was found.
 
