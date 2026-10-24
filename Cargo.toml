@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/phoenix-codec", "crates/solana-wire", "crates/solos-data"]
+# Patched third-party crates (vendor/jetstreamer-firehose: ADR-0014, "Stalls"), not members.
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.1.0"

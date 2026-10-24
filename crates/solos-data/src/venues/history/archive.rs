@@ -168,6 +168,11 @@ mod enabled {
             });
         let threads = per_stream.max(1).saturating_mul(streams.max(1) as u64);
         let range = u64::try_from(from).unwrap_or(0)..u64::try_from(to + 1).unwrap_or(0);
+        let retries = Arc::new(crate::stall::Retries::new(
+            "venues-history",
+            crate::stall::SLOT_ATTEMPTS,
+        ));
+        let (on_error, stop, shutdown) = crate::stall::on_error(Arc::clone(&retries));
         let turn = crate::stall::firehose_turn().await;
         let outcome = firehose(
             threads,
@@ -187,11 +192,7 @@ mod enabled {
                     jetstreamer_firehose::firehose::RewardsData,
                 >,
             >,
-            None::<
-                jetstreamer_firehose::firehose::HandlerFn<
-                    jetstreamer_firehose::firehose::FirehoseErrorContext,
-                >,
-            >,
+            Some(on_error),
             None::<
                 jetstreamer_firehose::firehose::StatsTracking<
                     jetstreamer_firehose::firehose::HandlerFn<
@@ -199,10 +200,13 @@ mod enabled {
                     >,
                 >,
             >,
-            None,
+            Some(shutdown),
         )
         .await;
-        drop(turn);
+        drop((turn, stop));
+        if let Some(stuck) = retries.stuck() {
+            return Err(stuck);
+        }
         if let Err((error, slot)) = outcome {
             return Err(crate::jsonout::safe_error(&format!(
                 "archive stream failed at slot {slot}: {error:?}"

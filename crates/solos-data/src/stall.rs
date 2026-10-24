@@ -1,20 +1,24 @@
 //! Hang-proofing for the lanes that stream the Old Faithful archive (ADR-0014, "Stalls").
 //!
-//! Jetstreamer keeps its thread bookkeeping (activity stamps, finished threads, stream starts)
-//! in process-wide statics keyed by thread index, and resets them at the start of every
-//! `firehose` call. Two calls in flight in one process read each other's stamps: a thread that
-//! finished its range asks an index the other call has started, but this call has not spawned
-//! yet, for half of its work, and waits for an answer that never comes; the waiting thread goes
-//! idle, and an idle thread holds back the spawn of the rest, so neither moves again. That is
-//! how the spot history stopped on 2026-10-24 at the batch crossing epochs 1064 and 1065, with
-//! every task parked and nothing on the network. So one process runs one `firehose` call at a
-//! time ([`firehose_turn`]), with the threads its streams would have had.
+//! On 2026-10-24 the spot history stopped for five hours at the batch that crossed into epoch
+//! 1065: the first block of that epoch carries reward entries of a type Jetstreamer did not know,
+//! its thread failed on the block, backed off and retried it forever, and Jetstreamer reports a
+//! retry only through `log` and an optional error callback, neither of which the lanes used. The
+//! process looked alive and wrote nothing. The vendored Jetstreamer now skips such entries
+//! (`vendor/jetstreamer-firehose`); this module makes the next unknown failure loud and bounded:
 //!
-//! And a process whose lane stops making progress exits, so `Restart=on-failure` brings it
-//! back: [`bump`] marks progress (a block streamed, an RPC answer, a batch written), and
-//! [`spawn`] starts a watchdog thread that exits the process with [`STALL_EXIT`] once nothing
-//! moved for the configured time. A retry inside the process would not do: the stuck call's
-//! tasks and Jetstreamer's statics would outlive it.
+//! - [`Retries`]: every firehose error is logged (`archive_retry`), and a slot that fails
+//!   [`SLOT_ATTEMPTS`] times stops the call, so the batch fails with the error, is counted in
+//!   the status and is retried whole.
+//! - [`spawn`]: a watchdog thread exits the process with [`STALL_EXIT`] when nothing moved for
+//!   the configured time ([`bump`] marks progress: a block streamed, an RPC answer, a batch
+//!   written), so `Restart=on-failure` brings it back from a hang nothing else catches.
+//! - [`firehose_turn`]: one `firehose` call at a time per process. Jetstreamer keeps its thread
+//!   bookkeeping (activity stamps, finished threads, stream starts, recycle requests) in
+//!   process-wide statics keyed by thread index and resets them at the start of each call, so
+//!   two calls in flight read and clear each other's state. A batch is one call with the
+//!   threads its streams would have had.
+//! - [`archive_log`]: `SOLOS_DATA_ARCHIVE_LOG=info` forwards Jetstreamer's own log.
 
 use crate::jsonout::{Obj, log};
 use std::sync::OnceLock;
@@ -102,6 +106,76 @@ pub fn spawn(lane: &'static str, event: &'static str, stall: Duration) {
     }
 }
 
+/// Attempts at one slot after which a `firehose` call is stopped (Jetstreamer backs off 1, 2,
+/// 4, 8, 16 and then 32 s between attempts: about four minutes).
+pub const SLOT_ATTEMPTS: u32 = 12;
+
+/// The failures of one `firehose` call, by slot.
+#[derive(Debug)]
+pub struct Retries {
+    lane: &'static str,
+    limit: u32,
+    state: std::sync::Mutex<RetryState>,
+}
+
+#[derive(Debug, Default)]
+struct RetryState {
+    by_slot: std::collections::HashMap<u64, u32>,
+    stuck: Option<(u64, u32, String)>,
+}
+
+impl Retries {
+    /// No failures yet; `lane` names the logs.
+    #[must_use]
+    pub fn new(lane: &'static str, limit: u32) -> Retries {
+        Retries {
+            lane,
+            limit: limit.max(1),
+            state: std::sync::Mutex::new(RetryState::default()),
+        }
+    }
+
+    /// Record a failure at `slot` and log it; true once the slot has failed `limit` times (the
+    /// caller then stops the call).
+    pub fn record(&self, thread: usize, slot: u64, error: &str) -> bool {
+        let error = crate::jsonout::safe_error(error);
+        let mut state = self.state.lock().expect("retries");
+        let attempts = {
+            let n = state.by_slot.entry(slot).or_default();
+            *n += 1;
+            *n
+        };
+        let give_up = attempts >= self.limit;
+        if give_up && state.stuck.is_none() {
+            state.stuck = Some((slot, attempts, error.clone()));
+        }
+        drop(state);
+        log(
+            if give_up {
+                "archive_stuck"
+            } else {
+                "archive_retry"
+            },
+            Obj::new()
+                .with("lane", self.lane)
+                .with("thread", thread)
+                .with("slot", slot)
+                .with("attempts", attempts)
+                .with("error", error),
+        );
+        give_up
+    }
+
+    /// The slot that made the call stop, as an error for the batch.
+    #[must_use]
+    pub fn stuck(&self) -> Option<String> {
+        let state = self.state.lock().expect("retries");
+        state.stuck.as_ref().map(|(slot, attempts, error)| {
+            format!("archive stream stopped: slot {slot} failed {attempts} times: {error}")
+        })
+    }
+}
+
 /// Wait for this process's turn to run a Jetstreamer `firehose` call; hold the guard for the
 /// whole call.
 pub async fn firehose_turn() -> tokio::sync::MutexGuard<'static, ()> {
@@ -117,6 +191,37 @@ pub async fn firehose_turn() -> tokio::sync::MutexGuard<'static, ()> {
 pub fn archive_log() {
     #[cfg(feature = "archive")]
     enabled::init();
+}
+
+/// The error callback and shutdown signal of one `firehose` call: each error goes to
+/// `retries`, and the call is shut down once a slot has failed too often (the caller then
+/// reads [`Retries::stuck`]). Keep the returned sender alive for the whole call: dropping every
+/// sender also shuts it down.
+#[cfg(feature = "archive")]
+#[must_use]
+pub fn on_error(
+    retries: std::sync::Arc<Retries>,
+) -> (
+    impl jetstreamer_firehose::firehose::Handler<jetstreamer_firehose::firehose::FirehoseErrorContext>,
+    tokio::sync::broadcast::Sender<()>,
+    tokio::sync::broadcast::Receiver<()>,
+) {
+    use futures_util::FutureExt;
+    let (stop, signal) = tokio::sync::broadcast::channel::<()>(4);
+    let sender = stop.clone();
+    let handler =
+        move |thread: usize, error: jetstreamer_firehose::firehose::FirehoseErrorContext| {
+            let retries = std::sync::Arc::clone(&retries);
+            let stop = sender.clone();
+            async move {
+                if retries.record(thread, error.slot, &error.error_message) {
+                    let _ = stop.send(());
+                }
+                Ok(())
+            }
+            .boxed()
+        };
+    (handler, stop, signal)
 }
 
 #[cfg(feature = "archive")]
@@ -171,6 +276,25 @@ mod tests {
         // The counter moved: the clock starts again.
         assert_eq!(watch.look(6, t0 + Duration::from_secs(12)).as_secs(), 0);
         assert_eq!(watch.look(6, t0 + Duration::from_secs(40)).as_secs(), 28);
+    }
+
+    #[test]
+    fn a_slot_that_keeps_failing_stops_the_call() {
+        let retries = Retries::new("test", 3);
+        assert!(!retries.record(0, 10, "timeout"));
+        // Another slot has its own count.
+        assert!(!retries.record(1, 11, "timeout"));
+        assert!(!retries.record(0, 10, "decode rewards (slot 10): unsupported reward type 5"));
+        assert_eq!(retries.stuck(), None);
+        assert!(retries.record(0, 10, "decode rewards (slot 10): unsupported reward type 5"));
+        assert_eq!(
+            retries.stuck().unwrap(),
+            "archive stream stopped: slot 10 failed 3 times: decode rewards (slot 10): unsupported reward type 5"
+        );
+        // URLs never reach the logs or the status.
+        let retries = Retries::new("test", 1);
+        assert!(retries.record(0, 5, "GET https://mirror.example/x?key=secret failed"));
+        assert!(!retries.stuck().unwrap().contains("secret"));
     }
 
     #[test]

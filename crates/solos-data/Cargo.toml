@@ -38,7 +38,8 @@ hmac = "0.12"
 lz4 = "1.28"
 # The Elfa Auto event stream is read through reqwest's `bytes_stream`.
 futures-util = "0.3"
-jetstreamer-firehose = { git = "https://github.com/anza-xyz/jetstreamer", rev = "048d2cd", optional = true }
+# Jetstreamer 048d2cd, vendored with one patch: reward entries of unknown type are skipped (ADR-0014).
+jetstreamer-firehose = { path = "../../vendor/jetstreamer-firehose", optional = true }
 solana-transaction-status = { version = "=4.2.2", optional = true }
 wincode = { version = "0.5", optional = true }
 # Jetstreamer reports retries and stalls through `log`; `SOLOS_DATA_ARCHIVE_LOG` forwards them.
