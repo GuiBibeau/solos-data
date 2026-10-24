@@ -33,13 +33,18 @@ pub const fn available() -> bool {
     cfg!(feature = "archive")
 }
 
-/// Stream `[from, to]` watching `addresses`.
+/// Stream `[from, to]` watching `addresses`, with `streams` times the configured threads.
 ///
 /// # Errors
 ///
 /// Always: this binary was built without the `archive` feature.
 #[cfg(not(feature = "archive"))]
-pub async fn stream(_from: i64, _to: i64, _addresses: &[String]) -> Result<Stream, String> {
+pub async fn stream(
+    _from: i64,
+    _to: i64,
+    _streams: usize,
+    _addresses: &[String],
+) -> Result<Stream, String> {
     Err("archive unavailable: this binary was built without the archive feature".into())
 }
 
@@ -67,12 +72,18 @@ mod enabled {
         Box::new(std::io::Error::other(e.to_string()))
     }
 
-    /// Stream `[from, to]` watching `addresses`.
+    /// Stream `[from, to]` watching `addresses`, in one `firehose` call with `streams` times
+    /// `JETSTREAMER_THREADS` threads (one call at a time per process: [`crate::stall`]).
     ///
     /// # Errors
     ///
     /// A stream failure (the range is then retried whole by the caller).
-    pub async fn stream(from: i64, to: i64, addresses: &[String]) -> Result<Stream, String> {
+    pub async fn stream(
+        from: i64,
+        to: i64,
+        streams: usize,
+        addresses: &[String],
+    ) -> Result<Stream, String> {
         let watched: Arc<HashMap<[u8; 32], usize>> = Arc::new(
             addresses
                 .iter()
@@ -134,6 +145,7 @@ mod enabled {
         let on_block = move |_thread: usize, block: BlockData| {
             let collected = Arc::clone(&c_block);
             async move {
+                crate::stall::bump();
                 if let BlockData::Block {
                     slot, block_time, ..
                 } = block
@@ -148,13 +160,15 @@ mod enabled {
             }
             .boxed()
         };
-        let threads = std::env::var("JETSTREAMER_THREADS")
+        let per_stream = std::env::var("JETSTREAMER_THREADS")
             .ok()
             .and_then(|t| t.parse::<u64>().ok())
             .unwrap_or_else(|| {
                 jetstreamer_firehose::system::optimal_firehose_thread_count() as u64
             });
+        let threads = per_stream.max(1).saturating_mul(streams.max(1) as u64);
         let range = u64::try_from(from).unwrap_or(0)..u64::try_from(to + 1).unwrap_or(0);
+        let turn = crate::stall::firehose_turn().await;
         let outcome = firehose(
             threads,
             false,
@@ -188,6 +202,7 @@ mod enabled {
             None,
         )
         .await;
+        drop(turn);
         if let Err((error, slot)) = outcome {
             return Err(crate::jsonout::safe_error(&format!(
                 "archive stream failed at slot {slot}: {error:?}"

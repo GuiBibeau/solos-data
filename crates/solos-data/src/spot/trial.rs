@@ -12,7 +12,6 @@ use super::tx::from_rpc;
 use super::write::{Names, connection, copy_to, load_liquidity, load_swaps};
 use crate::jsonout::Obj;
 use crate::store::sql_string;
-use futures_util::StreamExt;
 use serde_json::{Value, json};
 use std::path::Path;
 use std::time::Instant;
@@ -42,7 +41,9 @@ pub fn peak_rss() -> Option<u64> {
     Some(kb * 1024)
 }
 
-/// Stream `[from, to]` in chunks of `chunk` slots, `parallel` at a time.
+/// Stream `[from, to]` in one archive call with `parallel` times `JETSTREAMER_THREADS`
+/// threads. Not one call per chunk: two `firehose` calls in flight in one process share
+/// Jetstreamer's thread bookkeeping and can wait on each other forever ([`crate::stall`]).
 ///
 /// # Errors
 ///
@@ -50,33 +51,11 @@ pub fn peak_rss() -> Option<u64> {
 pub async fn stream_range(
     from: u64,
     to: u64,
-    chunk: u64,
     parallel: usize,
     programs: &Programs,
     options: &Options,
 ) -> Result<Stream, String> {
-    let chunks = windows(from, to, chunk.max(1));
-    let results: Vec<Result<Stream, String>> = futures_util::stream::iter(
-        chunks
-            .iter()
-            .map(|&(a, b)| archive::stream(a, b, programs, options)),
-    )
-    .buffered(parallel.max(1))
-    .collect()
-    .await;
-    let mut out = Stream {
-        rows: Rows::new(),
-        ..Stream::default()
-    };
-    for result in results {
-        let s = result?;
-        out.rows.append(s.rows);
-        out.blocks.extend(s.blocks);
-        out.delivered.extend(s.delivered);
-        out.sampled.extend(s.sampled);
-        out.captured.extend(s.captured);
-    }
-    Ok(out)
+    archive::stream(from, to, parallel, programs, options).await
 }
 
 fn fixtures(stream: &Stream, programs: &Programs) -> (Vec<Value>, u64) {
@@ -149,7 +128,6 @@ fn per_program(rows: &Rows) -> Obj {
 /// A stream, DuckDB or file failure.
 pub async fn trial(
     range: (u64, u64),
-    chunk: u64,
     parallel: usize,
     out_dir: &Path,
     capture: usize,
@@ -162,7 +140,7 @@ pub async fn trial(
         windows: Vec::new(),
         capture,
     };
-    let stream = stream_range(from, to, chunk, parallel, programs, &options).await?;
+    let stream = stream_range(from, to, parallel, programs, &options).await?;
     let stream_s = started.elapsed().as_secs_f64();
     let mismatched_blocks = stream
         .blocks

@@ -9821,6 +9821,7 @@ dependencies = [
  "hex",
  "hmac 0.12.1",
  "jetstreamer-firehose",
+ "log",
  "lz4",
  "nix 0.30.1",
  "phoenix-codec",

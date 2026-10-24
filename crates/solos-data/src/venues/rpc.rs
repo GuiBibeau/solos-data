@@ -106,13 +106,16 @@ pub fn weights(costs: &BTreeMap<String, f64>) -> BTreeMap<String, u32> {
         .collect()
 }
 
-/// Call `method` on the lane's (backfill) limiter lane.
+/// Call `method` on the lane's (backfill) limiter lane; the answer counts as progress.
 ///
 /// # Errors
 ///
 /// The provider's failure after its retries.
 pub async fn call(rpc: &dyn Rpc, method: &str, params: Value) -> Result<RpcResponse, RpcFailure> {
-    rpc.call(method, params, Lane::Backfill).await
+    let reply = rpc.call(method, params, Lane::Backfill).await;
+    // An answer, good or bad, is progress for the stall watchdog (`crate::stall`).
+    crate::stall::bump();
+    reply
 }
 
 /// Credits a set of request counters cost: `backfill_<method>_requests` counters times the

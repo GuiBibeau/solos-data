@@ -37,10 +37,19 @@ pub struct SpotConfig {
     /// DuckDB memory for writing a batch's files.
     #[serde(default = "writer_memory")]
     pub writer_memory: String,
+    /// Minutes without progress (no block streamed, no RPC answer, no batch written) after
+    /// which the process exits with [`crate::stall::STALL_EXIT`] for its unit to restart it; 0
+    /// disables the watchdog.
+    #[serde(default = "stall_minutes")]
+    pub stall_minutes: u64,
 }
 
 fn writer_memory() -> String {
     "16GB".into()
+}
+
+fn stall_minutes() -> u64 {
+    20
 }
 
 impl SpotConfig {

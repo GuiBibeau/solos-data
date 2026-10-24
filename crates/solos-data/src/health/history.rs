@@ -53,11 +53,16 @@ pub(super) fn section(
                 true,
                 &format!("{label} {name}: {streak} failed batches in a row"),
             );
-            if running && since.is_some_and(|m| m >= t.backfill_stall_minutes) {
-                f.warn.push(format!(
-                    "{label} {name}: no batch for {} min",
-                    since.unwrap_or(0)
-                ));
+            // The status is written after each batch, so a hung process also leaves it old:
+            // measured from the last batch either way.
+            if running && let Some(minutes) = since {
+                f.grade(
+                    minutes as f64,
+                    (t.history_stall_warn_minutes - 1) as f64,
+                    (t.history_stall_critical_minutes - 1) as f64,
+                    true,
+                    &format!("{label} {name}: no batch for {minutes} min"),
+                );
             }
         }
         out.insert(
@@ -91,11 +96,23 @@ mod tests {
             f.warn,
             [
                 "venues history fresh: no batch for 150 min",
-                "venues history jupiter: 4 failed batches in a row",
-                "venues history pyth: no batch for 180 min"
+                "venues history jupiter: 4 failed batches in a row"
             ]
         );
-        assert!(f.critical.is_empty());
+        // Three hours without a batch is critical: a hang or a restart loop.
+        assert_eq!(f.critical, ["venues history pyth: no batch for 180 min"]);
+        // An hour warns.
+        let hung = json!({ "running": true, "sources": {
+            "spot": { "done": false, "errorStreak": 0, "lastBatchAt": "2026-10-23T11:00:00Z" } } });
+        let mut f = Findings::default();
+        section("spot history", Some(&hung), Some(3_600), &t, now, &mut f);
+        assert_eq!(
+            f.warn,
+            [
+                "spot history status 60 min old",
+                "spot history spot: no batch for 60 min"
+            ]
+        );
         let finished = json!({ "running": false, "sources": { "jupiter": { "done": true } } });
         let mut f = Findings::default();
         section(
