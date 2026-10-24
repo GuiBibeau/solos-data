@@ -90,7 +90,7 @@ done
 # Augment: snapshot its catalogs first, then the whole tree (files that grow are rewritten in
 # place on the box, so compare checksums; unchanged files are never re-uploaded).
 mkdir -p "$work/augment-meta"
-for f in catalog.json catalog-capture.json catalog-venues.json catalog-venues-history.json catalog-spot-history.json status.json status-capture.json status-venues.json status-venues-history.json status-spot-history.json; do
+for f in catalog.json catalog-capture.json catalog-venues.json catalog-venues-history.json catalog-spot-history.json catalog-spot.json status.json status-capture.json status-venues.json status-venues-history.json status-spot-history.json status-spot.json; do
   if [ -f "$augment/$f" ]; then cp "$augment/$f" "$work/augment-meta/$f"; fi
 done
 # The Tardis.dev files and the exchange tick dumps are not uploaded (below), so the uploaded
@@ -98,8 +98,8 @@ done
 # The tick dumps (Binance aggTrades and bookDepth, Bybit and OKX trades; ADR-0009, exchange
 # dumps) are free to download again from the venues and are hundreds of GB.
 # The venues history catalog (ADR-0013) lists paths under venues-history/, its own file tree;
-# the spot catalog (ADR-0014) under spot-history/.
-for f in catalog.json catalog-capture.json catalog-venues.json catalog-venues-history.json catalog-spot-history.json; do
+# the spot catalogs under spot-history/ (ADR-0014) and spot/ (the forward lane, ADR-0015).
+for f in catalog.json catalog-capture.json catalog-venues.json catalog-venues-history.json catalog-spot-history.json catalog-spot.json; do
   if [ -f "$work/augment-meta/$f" ]; then
     if jq '.files |= map(select(.source != "tardis" and ((.source + "/" + .dataset) | IN("binance/aggTrades", "binance/bookDepth", "bybit/trades", "okx/trades") | not)))' "$work/augment-meta/$f" > "$work/augment-meta/$f.tmp"; then
       mv "$work/augment-meta/$f.tmp" "$work/augment-meta/$f"
@@ -115,12 +115,16 @@ run_step augment-files 1 copy "$augment" "$dest/augment" --checksum --fast-list 
   --filter '- /catalog*.json' --filter '- /status*.json' --filter '- /tables/tardis/**' \
   --filter '- /tables/binance/aggTrades/**' --filter '- /tables/binance/bookDepth/**' \
   --filter '- /tables/bybit/trades/**' --filter '- /tables/okx/trades/**' \
-  --filter '- /spot-history/**' || true
+  --filter '- /spot-history/**' --filter '- /spot/**' || true
 
-# Spot swaps (ADR-0014): hundreds of GB of batch files written once under their slot range, so
-# they are compared by size, not checksummed every night.
+# Spot swaps (ADR-0014, ADR-0015): hundreds of GB of batch files written once under their slot
+# range, so they are compared by size, not checksummed every night.
 if [ -d "$augment/spot-history/tables" ]; then
   run_step spot-files 1 copy "$augment/spot-history/tables" "$dest/augment/spot-history/tables" \
+    --size-only --fast-list --filter '- *.tmp' || true
+fi
+if [ -d "$augment/spot/tables" ]; then
+  run_step spot-live-files 1 copy "$augment/spot/tables" "$dest/augment/spot/tables" \
     --size-only --fast-list --filter '- *.tmp' || true
 fi
 

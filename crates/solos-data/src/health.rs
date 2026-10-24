@@ -1,7 +1,8 @@
 //! `solos-data health`: one read-only pass over the JSON snapshots the services already write
 //! (the raw collector's `status.json` and `catalog.json`, the decoder's `status.json` and
 //! `catalog.json`, the augment lanes' `status.json`, `status-capture.json` and
-//! `status-venues.json`, `status-venues-history.json`, `status-spot-history.json`) plus the free
+//! `status-venues.json`, `status-venues-history.json`, `status-spot-history.json`,
+//! `status-spot.json`) plus the free
 //! space of the data volume, judged against the thresholds of `config/health.json`. The result
 //! is written to `health.json` (atomically) and summarized in one `health` log line with its
 //! `warn` and `critical` lists. Two checks need a previous observation (backfill movement and
@@ -20,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 mod history;
 mod lanes;
+mod spot;
 mod venues;
 pub use lanes::{error_class, lane_progress, progress_record};
 
@@ -75,6 +77,9 @@ pub struct Thresholds {
     /// ... and for this long is critical, minutes (the lanes' own watchdog restarts a process
     /// that stops moving after 20, so this is a restart loop or a hang the watchdog misses).
     pub history_stall_critical_minutes: i64,
+    /// The forward spot lane more slots than this behind the finalized slot warns (ADR-0015;
+    /// three 9,000-slot batches, about three hours).
+    pub spot_lag_warn_slots: i64,
     /// A venue more slots than this behind the finalized slot warns.
     pub venues_lag_warn_slots: i64,
     /// ... and more than this is critical.
@@ -110,6 +115,7 @@ impl Default for Thresholds {
             venues_status_warn_minutes: 15,
             history_stall_warn_minutes: 60,
             history_stall_critical_minutes: 180,
+            spot_lag_warn_slots: 27_000,
             venues_lag_warn_slots: 3_000,
             venues_lag_critical_slots: 9_000,
             disk_free_warn_gb: 500,
@@ -195,6 +201,8 @@ pub struct Inputs {
     pub history_status: Snapshot,
     /// Augment `status-spot-history.json` (ADR-0014); absent while the backfill never ran.
     pub spot_status: Snapshot,
+    /// Augment `status-spot.json` (ADR-0015); absent while the forward lane never ran.
+    pub spot_live_status: Snapshot,
     /// Free bytes on the data volume.
     pub disk_free_bytes: Option<u64>,
     /// The previous `health.json`.
@@ -317,6 +325,13 @@ pub fn evaluate(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>) -> Value {
         now,
         &mut f,
     );
+    let spot_live = spot::section(
+        inputs.spot_live_status.value.as_ref(),
+        inputs.spot_live_status.age_s,
+        t,
+        now,
+        &mut f,
+    );
     let disk = match inputs.disk_free_bytes {
         Some(free) => {
             let gb = free as f64 / 1e9;
@@ -353,6 +368,7 @@ pub fn evaluate(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>) -> Value {
         "venues": venues,
         "venuesHistory": history,
         "spotHistory": spot,
+        "spot": spot_live,
         "disk": disk,
         "thresholds": t,
     })
@@ -600,6 +616,7 @@ pub fn run(paths: &Paths, t: &Thresholds) -> Result<Value, StoreError> {
         venues_status: read(paths.augment.join("status-venues.json")),
         history_status: read(paths.augment.join("status-venues-history.json")),
         spot_status: read(paths.augment.join("status-spot-history.json")),
+        spot_live_status: read(paths.augment.join("status-spot.json")),
         disk_free_bytes: disk_free(paths.raw.parent().unwrap_or(&paths.raw)),
         previous: read(paths.out.clone()).value,
     };
@@ -669,6 +686,7 @@ mod tests {
             venues_status: Snapshot::default(),
             history_status: Snapshot::default(),
             spot_status: Snapshot::default(),
+            spot_live_status: Snapshot::default(),
             disk_free_bytes: Some(3_000_000_000_000),
             previous: None,
         }

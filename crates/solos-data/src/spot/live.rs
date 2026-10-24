@@ -23,11 +23,11 @@ use crate::collector::rpc::{Provider, Rpc};
 use crate::db::Db;
 use crate::jsonout::{Obj, log, now, safe_error};
 use crate::store::StoreError;
-use crate::venues::rpc::{credit_provider, credits};
+use crate::venues::rpc::{credit_provider_over, credits};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Seconds a failed batch waits before its retry.
@@ -41,6 +41,50 @@ pub const LIVE: Target = Target {
     lane: Lane::SpotLive,
     cursor_key: CURSOR_KEY,
 };
+
+/// The lane's provider: the collector's provider code over a gzip transport (a block is about
+/// 3 MB of JSON), with its own credit limiter; and the transport's count of bytes on the wire.
+///
+/// # Errors
+///
+/// When `SOLANA_RPC_URL` is unset.
+pub fn provider(
+    config: &LiveConfig,
+    stop: Arc<AtomicBool>,
+) -> Result<(Arc<Provider>, Arc<AtomicU64>), StoreError> {
+    let transport = crate::collector::rpc::GzipTransport::new();
+    let wire = Arc::clone(&transport.wire_bytes);
+    let rpc = credit_provider_over(
+        config.credits_per_second,
+        &config.credit_costs,
+        config.concurrency,
+        stop,
+        Box::new(transport),
+    )?;
+    Ok((rpc, wire))
+}
+
+/// Credits a day at the tip from what a range of `slots` slots spent: the per-block calls
+/// (`getBlock`, `getBlocks`, `getSlot`) scale with the slots; the manifest walks
+/// (`getSignaturesForAddress`, the `getTransactionsForAddress` seeds) are paid once per batch
+/// for a `manifestSlots` window, so they scale with the `window` the range walked.
+#[must_use]
+pub fn credits_per_day(counters: &Value, config: &LiveConfig, slots: u64, window: u64) -> f64 {
+    let all = credits(counters, &config.credit_costs);
+    let walks: f64 = ["getSignaturesForAddress", "getTransactionsForAddress"]
+        .iter()
+        .map(|m| {
+            counters
+                .get(format!("backfill_{m}_requests"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+                * config.credit_costs.get(*m).copied().unwrap_or(1.0)
+        })
+        .sum();
+    let blocks = all - walks;
+    let per_batch_walks = walks * config.manifest_slots as f64 / window.max(1) as f64;
+    (blocks / slots.max(1) as f64 + per_batch_walks / config.batch_slots as f64) * SLOTS_PER_DAY
+}
 
 /// The last slot of the batch starting at `lo`: `batch` slots, but not past the end of `lo`'s
 /// epoch.
@@ -83,6 +127,7 @@ struct Live {
     started_at: String,
     started: Instant,
     finalized: Option<u64>,
+    wire: Arc<AtomicU64>,
     totals: Totals,
 }
 
@@ -254,6 +299,7 @@ impl Live {
         }
         let counters = self.rpc.counters().to_value();
         let spent = credits(&counters, &self.config.credit_costs);
+        let wire = self.wire.load(Ordering::Relaxed);
         let per_slot = |total: f64| (t.slots > 0).then(|| total / t.slots as f64);
         let source = Obj::new()
             .with("start", self.config.start)
@@ -300,15 +346,15 @@ impl Live {
                     .with("creditsPerSecond", self.config.credits_per_second)
                     .with("credits", spent)
                     .with("responseBytes", t.bytes)
+                    .with("wireBytes", wire)
                     .with("creditsPerSlot", per_slot(spent))
-                    .with("bytesPerSlot", per_slot(t.bytes as f64))
                     .with(
                         "creditsPerDayAtTip",
                         per_slot(spent).map(|c| (c * SLOTS_PER_DAY).round()),
                     )
                     .with(
-                        "bytesPerDayAtTip",
-                        per_slot(t.bytes as f64).map(|b| (b * SLOTS_PER_DAY).round()),
+                        "wireBytesPerDayAtTip",
+                        per_slot(wire as f64).map(|b| (b * SLOTS_PER_DAY).round()),
                     )
                     .with("hours", hours)
                     .with("counters", counters),
@@ -331,12 +377,7 @@ pub fn run(config: LiveConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError>
     let recovered = ledger::recover(&mut store, &root, Lane::SpotLive)?;
     let (db, thread) = Db::spawn(store);
     let result = (|| {
-        let rpc = credit_provider(
-            config.credits_per_second,
-            &config.credit_costs,
-            config.concurrency,
-            Arc::clone(&stop),
-        )?;
+        let (rpc, wire) = provider(&config, Arc::clone(&stop))?;
         let runtime = tokio::runtime::Runtime::new()?;
         let saved = runtime.block_on(db.run(|s| get_progress(s, CURSOR_KEY)))?;
         let mut next = match saved
@@ -373,6 +414,7 @@ pub fn run(config: LiveConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError>
             started_at: now(),
             started: Instant::now(),
             finalized: None,
+            wire,
             totals: Totals::default(),
             config,
         };
@@ -443,7 +485,12 @@ pub fn run(config: LiveConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError>
 /// # Errors
 ///
 /// An RPC failure or a failed check.
-pub async fn trial(rpc: &Provider, config: &LiveConfig, range: (u64, u64)) -> Result<Obj, String> {
+pub async fn trial(
+    rpc: &Provider,
+    wire: &AtomicU64,
+    config: &LiveConfig,
+    range: (u64, u64),
+) -> Result<Obj, String> {
     let programs = config.programs().map_err(|e| e.to_string())?;
     let started = Instant::now();
     let (done, fetched) = batch(rpc, &programs, config, range).await?;
@@ -451,6 +498,8 @@ pub async fn trial(rpc: &Provider, config: &LiveConfig, range: (u64, u64)) -> Re
     let counters = rpc.counters().to_value();
     let spent = credits(&counters, &config.credit_costs);
     let slots = (range.1 - range.0 + 1) as f64;
+    let wire = wire.load(Ordering::Relaxed);
+    let window = done.window.1 - done.window.0 + 1;
     let rows = &done.stream.rows;
     let mut per_program = Obj::new();
     for dex in ALL {
@@ -489,14 +538,15 @@ pub async fn trial(rpc: &Provider, config: &LiveConfig, range: (u64, u64)) -> Re
         .with("seconds", seconds)
         .with("slotsPerSecond", slots / seconds.max(1e-9))
         .with("responseBytes", fetched.bytes)
+        .with("wireBytes", wire)
         .with("credits", spent)
         .with(
             "creditsPerDayAtTip",
-            (spent / slots * SLOTS_PER_DAY).round(),
+            credits_per_day(&counters, config, range.1 - range.0 + 1, window).round(),
         )
         .with(
-            "bytesPerDayAtTip",
-            (fetched.bytes as f64 / slots * SLOTS_PER_DAY).round(),
+            "wireBytesPerDayAtTip",
+            (wire as f64 / slots * SLOTS_PER_DAY).round(),
         )
         .with("counters", counters))
 }
@@ -504,6 +554,27 @@ pub async fn trial(rpc: &Provider, config: &LiveConfig, range: (u64, u64)) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_day_at_the_tip_pays_blocks_per_slot_and_walks_per_batch() {
+        let config = LiveConfig::parse(
+            r#"{"dataDir": "x", "start": 1, "batchSlots": 9000, "manifestSlots": 1000,
+                "creditsPerSecond": 10, "concurrency": 4,
+                "creditCosts": {"getBlock": 1, "getSlot": 1, "getSignaturesForAddress": 1,
+                                "getTransactionsForAddress": 10}}"#,
+        )
+        .unwrap();
+        // 300 slots: 300 blocks and one getSlot; 100 manifest pages and 19 seeds over a
+        // 300-slot window.
+        let counters = json!({ "backfill_getBlock_requests": 300, "backfill_getSlot_requests": 1,
+            "backfill_getSignaturesForAddress_requests": 100,
+            "backfill_getTransactionsForAddress_requests": 19 });
+        let per_day = credits_per_day(&counters, &config, 300, 300);
+        // Blocks: 301 per 300 slots; walks: 290 credits over a 300-slot window, so 966.7 for a
+        // 1,000-slot window, once per 9,000-slot batch (24 a day).
+        let expected = 301.0 / 300.0 * SLOTS_PER_DAY + 290.0 * 1000.0 / 300.0 * 24.0;
+        assert!((per_day - expected).abs() < 1e-6, "{per_day} {expected}");
+    }
 
     #[test]
     fn a_batch_ends_at_its_size_or_its_epoch() {

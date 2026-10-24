@@ -1,0 +1,36 @@
+[Unit]
+Description=solos-data spot: Raydium, Orca, Meteora, pump.fun, PancakeSwap and the proprietary AMMs, swaps and liquidity from the spot history's top forward, from finalized blocks over RPC (ADR-0015)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=%h/solos-data
+# SOLANA_RPC_URL: the collector's provider; the lane has its own credit limiter (about 0.22M
+# credits a day at the tip, ADR-0015).
+EnvironmentFile=%h/.config/solos-data/collector.env
+Environment=SOLOS_DATA_AUGMENT_DIR=%h/.local/share/solos-data/augment
+# collector.env sets the DuckDB limits for the collector, and an EnvironmentFile= wins over
+# Environment=, so the ledger's limits go on the command line. The batch writer's DuckDB memory
+# is `writerMemory` in the config.
+ExecStart=/usr/bin/env SOLOS_DATA_DB_MEMORY=2GB SOLOS_DATA_DB_THREADS=4 %h/.local/share/solos-data/bin/solos-data spot live run --config config/spot-live.json
+Nice=15
+IOSchedulingClass=idle
+CPUQuota=800%
+MemoryHigh=12G
+MemoryMax=16G
+# A live lane never finishes: any exit restarts it from its cursor, the stall watchdog's
+# (code 75) included.
+Restart=always
+RestartSec=60
+TimeoutStopSec=180
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+TasksMax=256
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

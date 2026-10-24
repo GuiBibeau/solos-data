@@ -167,12 +167,7 @@ fn spot_live_trial(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(300)
         .max(1);
-    let rpc = crate::venues::rpc::credit_provider(
-        config.credits_per_second,
-        &config.credit_costs,
-        config.concurrency,
-        stop_flag()?,
-    )?;
+    let (rpc, wire) = crate::spot::live::provider(config, stop_flag()?)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let from = match flag(args, "--from").and_then(|v| v.parse::<u64>().ok()) {
         Some(from) => from,
@@ -188,6 +183,7 @@ fn spot_live_trial(
     let report = runtime
         .block_on(crate::spot::live::trial(
             &rpc,
+            &wire,
             config,
             (from, from + slots - 1),
         ))
