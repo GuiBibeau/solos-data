@@ -4,8 +4,8 @@
   "programs": [],
   "batchSlots": 9000,
   "manifestSlots": 1000,
-  "creditsPerSecond": 40,
-  "concurrency": 16,
+  "creditsPerSecond": 60,
+  "concurrency": 24,
   "creditCosts": {
     "getSlot": 1,
     "getBlock": 1,

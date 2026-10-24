@@ -627,6 +627,40 @@ command line the ledger's (`collector.env` sets the collector's). A crash resume
 recorded cursor and rewrites the batch in flight; a finished run exits 0 and stays down. To start
 over, stop the unit and delete `spot-history/` and the two spot JSON files under the augment root.
 
+### Spot forward lane (ADR-0015)
+
+`solos-data spot live run --config config/spot-live.json` collects the same tables from
+`start` (460,512,000, the history's `top` plus one) forward, one 9,000-slot batch (about an hour)
+at a time once it is finalized, from `getBlock` over the collector's provider: about 240,000
+credits and 130 GB on the wire a day at the tip. Each batch passes the history's checks (every
+listed block fetched, every manifest signature of a 1,000-slot window fetched) before its files
+are written under `<augment root>/spot/tables/spot/`, with its own ledger, `catalog-spot.json`
+and `status-spot.json`. It runs in the services' binary (no `archive` feature):
+
+```sh
+cp ops/solos-data-spot.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now solos-data-spot.service
+journalctl --user -u solos-data-spot.service -o cat | grep -E '"event":"spot_live_(batch|error|stalled)"' | tail
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment \
+  ~/.local/share/solos-data/bin/solos-data spot live status | python3 -m json.tool | head -60
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment \
+  ~/.local/share/solos-data/bin/solos-data spot live check
+```
+
+The status has `sources.spot` (`cursor`, `finalized`, `lagSlots`, totals, error streak), the
+programs and gaps as in the history, and `rpc` with the credits and bytes spent and
+`creditsPerDayAtTip` and `wireBytesPerDayAtTip` measured from the batches. `spot live check`
+checks the batches and files like `spot check` and the seam: the lane's first batch starts at
+`start` and the history's newest batch ends on the slot before (`seam.meets`). `spot live trial
+[--slots 300] [--from <slot>]` fetches and decodes a range as a batch would, writes nothing, and
+reports rows, bytes, time and credits with the daily cost at the tip.
+
+The unit is capped at 16 GB, 8 CPUs, nice 15 and idle IO; `concurrency` sets the `getBlock`
+calls in flight and `creditsPerSecond` the lane's limiter. A crash or the stall watchdog (no
+progress for `stallMinutes`) restarts it from its cursor. To start over, stop the unit and delete
+`spot/` and the two JSON files (`catalog-spot.json`, `status-spot.json`) under the augment root.
+
 ## Dataset health
 
 `solos-data health` reads the JSON snapshots the services already write (raw `status.json` and
@@ -645,6 +679,7 @@ of `config/health.json`; a field left out keeps its default.
 | backfill progress | raw `status.json` `backfill.next` against the previous `health.json` | unchanged for 120 min (not when `phase` is `complete`) | |
 | tail progress | raw `status.json` `watermark.completedAt` (written with every published tail chunk), only while the tail is enabled (`lanes.tail.enabled`) | not advanced for 15 min | not advanced for 60 min |
 | checkpoint maintenance | raw `status.json` `maintenance.at` (written by every storage maintenance pass); the `maintenance` lane's error streak is judged with the lanes below | > 15 min old, or no pass recorded | > 60 min old |
+| spot forward lane | augment `status-spot.json` (ADR-0015), only when it exists | file > 15 min old, stopped, lag > 27,000 slots (`spotLagWarnSlots`), no batch for 60 min while two batches are due, 3 failed batches in a row | no batch for 180 min while two batches are due, 10 failed batches in a row |
 | venues lane | augment `status-venues.json` (ADR-0012), only when it exists | file > 15 min old, a venue's last cycle > 15 min ago, lag > 3,000 slots, 3 failed cycles in a row, no Pyth poll | lag > 9,000 slots, 10 failed cycles in a row |
 | history backfills | augment `status-venues-history.json` (ADR-0013) and `status-spot-history.json` (ADR-0014), only when they exist and until every source is done | file > 15 min old, stopped before the floor, no batch for 60 min (`historyStallWarnMinutes`), 3 failed batches in a row | no batch for 180 min (`historyStallCriticalMinutes`), 10 failed batches in a row |
 | lane error streaks | raw `status.json` `lanes.{tail,backfill,maintenance}`: consecutive `collector_error`s with no chunk published in between (the lane's progress marker unchanged), last error < 30 min old | 3 in a row | 10 in a row; the finding names the lane and the error class (`oom`, `constraint`, `rollback_failed`, `rpc`, `other`) |
