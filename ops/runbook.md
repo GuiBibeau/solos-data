@@ -566,6 +566,56 @@ resumes from the recorded cursors and refetches what was buffered; a finished ru
 down. To start over, stop the unit and delete `venues-history/` and the two history JSON files
 under the augment root.
 
+### Spot history (ADR-0014)
+
+`solos-data spot run --config config/spot-history.json` records every pool-level trade (`swaps`)
+and liquidity change (`liquidity`) of the Solana spot DEXs from `top` (460,511,999, the archive's
+newest epoch on 2026-10-23) back to 2025-10-01, newest first, one 200,000-slot batch at a time:
+Raydium AMM v4, CLMM, CPMM and LaunchLab, Orca Whirlpool, Meteora DLMM, DAMM v1 and v2 and DBC,
+PumpSwap and the pump.fun curves from their events; PancakeSwap's CLMM and the proprietary AMMs
+(HumidiFi, Tessera V, ZeroFi, AlphaQ, SolFi, SolFi V2, GoonFi) from their token transfers. The
+archive stream is decoded as it arrives; a batch is written only when the archive gave every block
+`getBlocks` lists with all its transactions and every successful signature of each program's
+manifest over a 1,000-slot sample window. Files go under `<augment root>/spot-history/tables/spot/`
+with their own ledger, `catalog-spot-history.json` and `status-spot-history.json`; `augment query`
+reads them as `spot_swaps`, `spot_liquidity` and `spot_batches`. About 420 GB, 1.5 to 3 days and
+0.3M credits for the window (ADR-0014). Like the venues history it needs the `archive`-feature
+binary under its own name and a checkout of its own:
+
+```sh
+git clone https://github.com/GuiBibeau/solos-data.git ~/solos-data-spot
+cd ~/solos-data-spot
+LIBCLANG_PATH=$HOME/.local/lib LLVM_CONFIG_PATH=/usr/bin/llvm-config-19 \
+  nice cargo build --release -p solos-data --features archive
+install -m 0755 target/release/solos-data ~/.local/share/solos-data/bin/solos-data-spot-history
+cp ops/solos-data-spot-history.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now solos-data-spot-history.service
+journalctl --user -u solos-data-spot-history.service -o cat | grep -E '"event":"spot_(batch|error|done)"' | tail
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment \
+  ~/.local/share/solos-data/bin/solos-data-spot-history spot status | python3 -m json.tool | head -60
+SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment \
+  ~/.local/share/solos-data/bin/solos-data-spot-history spot check
+```
+
+The status has `sources.spot` (`cursor`, `percent`, `slotsPerHour`, `etaHours`,
+`oldestBlockTime`, totals, error streak), `programs` (per program: transactions, swap
+instructions, swaps, liquidity rows and the gaps `missingEvent`, `undecoded`, `unresolved`),
+`gaps` by program and instruction, and the credits spent. `spot check` compares the files with
+each batch's counts and the batches' coverage from the catalog only, while the unit runs; it exits
+2 on a mismatch. `spot trial --from <slot> --to <slot> [--chunk 10000] [--parallel 2]
+[--capture N]` streams a range into a scratch directory (`--out`) and reports rows, coverage,
+bytes, distinct pools and tokens, time and memory; `--capture` writes real transactions in the
+RPC shape for `tests/data/spot-fixtures.json`. After a decoder change,
+`SOLOS_DATA_REFRESH_SPOT_FIXTURES=1 cargo test --test spot` rewrites the fixtures' expected rows
+and a trial with `--capture` shows the archive path still agrees (`fixtureMismatches` 0).
+
+The unit is capped at 100 GB, 32 CPUs, nice 15 and idle IO; a batch peaks at about 42 GB.
+`chunkSlots` and `parallel` set the batch, `writerMemory` the batch writer's DuckDB, and the
+command line the ledger's (`collector.env` sets the collector's). A crash resumes from the
+recorded cursor and rewrites the batch in flight; a finished run exits 0 and stays down. To start
+over, stop the unit and delete `spot-history/` and the two spot JSON files under the augment root.
+
 ## Dataset health
 
 `solos-data health` reads the JSON snapshots the services already write (raw `status.json` and
@@ -585,6 +635,7 @@ of `config/health.json`; a field left out keeps its default.
 | tail progress | raw `status.json` `watermark.completedAt` (written with every published tail chunk), only while the tail is enabled (`lanes.tail.enabled`) | not advanced for 15 min | not advanced for 60 min |
 | checkpoint maintenance | raw `status.json` `maintenance.at` (written by every storage maintenance pass); the `maintenance` lane's error streak is judged with the lanes below | > 15 min old, or no pass recorded | > 60 min old |
 | venues lane | augment `status-venues.json` (ADR-0012), only when it exists | file > 15 min old, a venue's last cycle > 15 min ago, lag > 3,000 slots, 3 failed cycles in a row, no Pyth poll | lag > 9,000 slots, 10 failed cycles in a row |
+| history backfills | augment `status-venues-history.json` (ADR-0013) and `status-spot-history.json` (ADR-0014), only when they exist and until every source is done | file > 15 min old, stopped before the floor, no batch for 120 min, 3 failed batches in a row | 10 failed batches in a row |
 | lane error streaks | raw `status.json` `lanes.{tail,backfill,maintenance}`: consecutive `collector_error`s with no chunk published in between (the lane's progress marker unchanged), last error < 30 min old | 3 in a row | 10 in a row; the finding names the lane and the error class (`oom`, `constraint`, `rollback_failed`, `rpc`, `other`) |
 | augment sync | `status.json` age and `sources.*.errors` | > 150 min old, or errors in the last run | |
 | augment capture | `status-capture.json` age and the lanes' `errors` | > 10 min old, errors grown since the previous check, the Elfa credit guard tripped, the last Elfa hourly cycle > 150 min ago | |

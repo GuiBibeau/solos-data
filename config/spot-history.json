@@ -1,0 +1,20 @@
+{
+  "dataDir": "data/augment",
+  "floorTime": "2025-10-01T00:00:00Z",
+  "top": 460511999,
+  "programs": [],
+  "chunkSlots": 50000,
+  "parallel": 4,
+  "manifestSlots": 1000,
+  "creditsPerSecond": 50,
+  "concurrency": 16,
+  "creditCosts": {
+    "getSlot": 1,
+    "getBlocks": 1,
+    "getBlockTime": 1,
+    "getSignaturesForAddress": 1,
+    "getTransactionsForAddress": 10,
+    "getTransaction": 1
+  },
+  "writerMemory": "32GB"
+}

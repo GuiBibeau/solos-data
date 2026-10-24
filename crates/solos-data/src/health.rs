@@ -1,7 +1,7 @@
 //! `solos-data health`: one read-only pass over the JSON snapshots the services already write
 //! (the raw collector's `status.json` and `catalog.json`, the decoder's `status.json` and
 //! `catalog.json`, the augment lanes' `status.json`, `status-capture.json` and
-//! `status-venues.json`, `status-venues-history.json`) plus the free
+//! `status-venues.json`, `status-venues-history.json`, `status-spot-history.json`) plus the free
 //! space of the data volume, judged against the thresholds of `config/health.json`. The result
 //! is written to `health.json` (atomically) and summarized in one `health` log line with its
 //! `warn` and `critical` lists. Two checks need a previous observation (backfill movement and
@@ -186,6 +186,8 @@ pub struct Inputs {
     pub venues_status: Snapshot,
     /// Augment `status-venues-history.json` (ADR-0013); absent while the backfill never ran.
     pub history_status: Snapshot,
+    /// Augment `status-spot-history.json` (ADR-0014); absent while the backfill never ran.
+    pub spot_status: Snapshot,
     /// Free bytes on the data volume.
     pub disk_free_bytes: Option<u64>,
     /// The previous `health.json`.
@@ -293,8 +295,17 @@ pub fn evaluate(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>) -> Value {
         &mut f,
     );
     let history = history::section(
+        "venues history",
         inputs.history_status.value.as_ref(),
         inputs.history_status.age_s,
+        t,
+        now,
+        &mut f,
+    );
+    let spot = history::section(
+        "spot history",
+        inputs.spot_status.value.as_ref(),
+        inputs.spot_status.age_s,
         t,
         now,
         &mut f,
@@ -334,6 +345,7 @@ pub fn evaluate(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>) -> Value {
         "kalshi": kalshi,
         "venues": venues,
         "venuesHistory": history,
+        "spotHistory": spot,
         "disk": disk,
         "thresholds": t,
     })
@@ -580,6 +592,7 @@ pub fn run(paths: &Paths, t: &Thresholds) -> Result<Value, StoreError> {
         capture_status: read(paths.augment.join("status-capture.json")),
         venues_status: read(paths.augment.join("status-venues.json")),
         history_status: read(paths.augment.join("status-venues-history.json")),
+        spot_status: read(paths.augment.join("status-spot-history.json")),
         disk_free_bytes: disk_free(paths.raw.parent().unwrap_or(&paths.raw)),
         previous: read(paths.out.clone()).value,
     };
@@ -648,6 +661,7 @@ mod tests {
             ),
             venues_status: Snapshot::default(),
             history_status: Snapshot::default(),
+            spot_status: Snapshot::default(),
             disk_free_bytes: Some(3_000_000_000_000),
             previous: None,
         }

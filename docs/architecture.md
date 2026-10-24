@@ -64,6 +64,16 @@ Old Faithful archive stream per slot range watches the programs and the Pyth fee
 together, an RPC signature walk per address is the completeness check, and the files go to a tree
 and ledger of their own under the augment root (ADR-0013). Account state has no history.
 
+## Spot DEX swaps
+
+`solos-data spot run` records every pool-level trade and liquidity change of the Solana spot
+DEXs (Raydium, Orca, Meteora, pump.fun, PancakeSwap and the proprietary AMMs) from the archive's
+newest epoch back to 2025-10-01, newest first. The archive stream is decoded as it arrives, from
+each program's events or, for programs that emit none, from the token transfers of each
+invocation; a batch is kept only when the archive gave every block the RPC lists with all its
+transactions and every signature of a sampled program manifest. The files go to a tree and ledger
+of their own under the augment root (ADR-0014).
+
 ## Read and move data
 
 `catalog.json` lists published files and their hashes. Query commands open those
@@ -88,6 +98,7 @@ records the missing checks, snapshots and reconstructed state.
 | `crates/solana-wire/` | Rust parser for legacy, v0 and v1 transaction envelopes |
 | `crates/solos-data/` | Rust `solos-data` binary: `collector` (RPC tail and backfill, Jetstreamer archive lane behind the `archive` feature), `decoder`, and `dev` tooling (`compare-decoded`, `crash-writer`) |
 | `crates/solos-data/src/venues/` | Other Solana perp venues and Pyth: IDL-driven Borsh decoding, forward transaction cycles, account polling (ADR-0012); `history/`: the archive backfill and its check (ADR-0013) |
+| `crates/solos-data/src/spot/` | Spot DEX swaps from the archive: per-program decoders (`dex/`), event attribution (`frames.rs`), the batch run, its checks and trials (ADR-0014) |
 | `tests/` | Offline fixtures and interruption/restart tests |
 | `config/` | Rates, batch sizes and default data paths |
 | `ops/` | Linux services and installation notes |

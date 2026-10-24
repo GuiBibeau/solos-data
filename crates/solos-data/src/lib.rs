@@ -14,5 +14,6 @@ pub mod health;
 pub mod jsonout;
 pub mod lease;
 pub mod repack;
+pub mod spot;
 pub mod store;
 pub mod venues;
