@@ -12,9 +12,10 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// The methods the lane calls.
-pub const METHODS: [&str; 9] = [
+/// The methods the RPC lanes call (venues, their history, and the spot lanes).
+pub const METHODS: [&str; 10] = [
     "getSlot",
+    "getBlock",
     "getBlocks",
     "getBlockTime",
     "getAccountInfo",

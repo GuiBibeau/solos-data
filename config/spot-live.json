@@ -1,0 +1,21 @@
+{
+  "dataDir": "data/augment",
+  "start": 460512000,
+  "programs": [],
+  "batchSlots": 9000,
+  "manifestSlots": 1000,
+  "creditsPerSecond": 40,
+  "concurrency": 16,
+  "creditCosts": {
+    "getSlot": 1,
+    "getBlock": 1,
+    "getBlocks": 1,
+    "getBlockTime": 1,
+    "getSignaturesForAddress": 1,
+    "getTransactionsForAddress": 10,
+    "getTransaction": 1
+  },
+  "writerMemory": "8GB",
+  "cycleSeconds": 30,
+  "stallMinutes": 20
+}

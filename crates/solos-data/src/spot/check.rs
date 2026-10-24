@@ -1,5 +1,5 @@
-//! `spot check` (ADR-0014): the spot lane's files against its own `batches` rows, from the
-//! catalog only (never the running lane's ledger). The batches must tile one slot range with no
+//! `spot check` (ADR-0014) and `spot live check` (ADR-0015): a spot lane's files against its
+//! own `batches` rows, from the catalog only (never the running lane's ledger). The batches must tile one slot range with no
 //! hole or overlap; every batch must have streamed exactly the blocks the RPC listed and missed
 //! no manifest signature; and each batch's `swaps` and `liquidity` files must hold the rows the
 //! batch counted, in the catalog and on disk (Parquet metadata). Read-only.
@@ -32,14 +32,65 @@ pub fn period(from: i64, to: i64) -> String {
     format!("{from:010}-{to:010}")
 }
 
-/// Check the lane; `ok` is false on any hole, overlap or mismatch.
+/// Check the history lane; `ok` is false on any hole, overlap or mismatch.
 ///
 /// # Errors
 ///
 /// No spot catalog, or a query failure.
 pub fn check(root: &Path) -> Result<Obj, StoreError> {
-    let text = std::fs::read_to_string(Lane::Spot.catalog_path(root))
-        .map_err(|e| StoreError::Check(format!("no spot catalog: {e}")))?;
+    check_lane(root, Lane::Spot)
+}
+
+/// Check the forward lane (ADR-0015) like the history, and the seam between them: the forward
+/// lane's first batch must start on the slot after the history's newest batch ends, so no slot
+/// is missing or collected twice. Without a history catalog the seam is reported as unknown.
+///
+/// # Errors
+///
+/// No forward-lane catalog, or a query failure.
+pub fn check_live(root: &Path, start: u64) -> Result<Obj, StoreError> {
+    let mut out = check_lane(root, Lane::SpotLive)?;
+    let live_from = out.get("from").and_then(Value::as_i64);
+    let history_to = newest_to(root, Lane::Spot);
+    let start = i64::try_from(start).unwrap_or(i64::MAX);
+    let starts_right = live_from.is_none_or(|from| from == start);
+    let meets = match (history_to, live_from) {
+        (Some(to), Some(from)) => Some(to + 1 == from),
+        _ => None,
+    };
+    let seam_ok = starts_right && meets != Some(false);
+    let ok = out.get("ok").and_then(Value::as_bool) == Some(true) && seam_ok;
+    out.set("ok", ok);
+    out.set(
+        "seam",
+        json!({ "start": start, "liveFrom": live_from, "historyTo": history_to,
+                "meets": meets, "ok": seam_ok }),
+    );
+    Ok(out)
+}
+
+/// The last slot of a lane's newest batch, from its catalog's `batches` file names; `None`
+/// without a catalog or batches.
+#[must_use]
+pub fn newest_to(root: &Path, lane: Lane) -> Option<i64> {
+    let text = std::fs::read_to_string(lane.catalog_path(root)).ok()?;
+    let catalog: Value = serde_json::from_str(&text).ok()?;
+    catalog["files"]
+        .as_array()?
+        .iter()
+        .filter(|f| f["dataset"] == "batches")
+        .filter_map(|f| f["period"].as_str()?.split_once('-')?.1.parse::<i64>().ok())
+        .max()
+}
+
+/// Check one spot lane's batches and files.
+///
+/// # Errors
+///
+/// No catalog, or a query failure.
+pub fn check_lane(root: &Path, lane: Lane) -> Result<Obj, StoreError> {
+    let text = std::fs::read_to_string(lane.catalog_path(root))
+        .map_err(|e| StoreError::Check(format!("no {} catalog: {e}", lane.name())))?;
     let catalog: Value =
         serde_json::from_str(&text).map_err(|e| StoreError::Check(e.to_string()))?;
     let mut files: HashMap<(String, String), (String, i64)> = HashMap::new();
@@ -59,12 +110,12 @@ pub fn check(root: &Path) -> Result<Obj, StoreError> {
     if files.is_empty() {
         return Ok(Obj::new().with("ok", true).with("batches", 0));
     }
-    let result = query_lanes(root, &[Lane::Spot], BATCHES)?;
+    let result = query_lanes(root, &[lane], BATCHES)?;
     let rows = result.to_value()["rows"]
         .as_array()
         .cloned()
         .unwrap_or_default();
-    let files_root = Lane::Spot.files_root(root);
+    let files_root = lane.files_root(root);
     let conn = memory_connection("4", "2GB")?;
     let mut holes = Vec::new();
     let mut bad_blocks = Vec::new();
