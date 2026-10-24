@@ -52,7 +52,8 @@ pub enum Via {
 pub struct ArchiveConfig {
     /// Slots one stream covers.
     pub chunk_slots: i64,
-    /// Streams in flight at once (consecutive chunks of one batch).
+    /// Streams per batch: a batch is `chunkSlots × parallel` slots, streamed in one archive
+    /// call with `parallel` times `JETSTREAMER_THREADS` threads (`crate::stall`).
     pub parallel: usize,
 }
 
@@ -80,6 +81,10 @@ pub struct HistoryConfig {
     pub archive: Option<ArchiveConfig>,
     /// The sources.
     pub sources: Vec<SourceConfig>,
+    /// Minutes without progress (no block streamed, no RPC answer) after which the process
+    /// exits with [`crate::stall::STALL_EXIT`] for its unit to restart it; 0 disables it.
+    #[serde(default = "stall_minutes")]
+    pub stall_minutes: u64,
     /// The directory relative paths resolve against.
     #[serde(skip)]
     pub config_dir: PathBuf,
@@ -87,6 +92,10 @@ pub struct HistoryConfig {
 
 fn yes() -> bool {
     true
+}
+
+fn stall_minutes() -> u64 {
+    20
 }
 
 /// What a source collects.

@@ -68,6 +68,8 @@ accounts and carried 17,739 updates), which is why the RPC route below costs so 
 - **Transactions from the archive** (ADR-0008's Jetstreamer machinery, the `archive` feature).
   Every archive source shares one stream per range: chunks of `chunkSlots` (50,000), `parallel`
   (4) in flight, watching all addresses of all sources at once, so each epoch is downloaded once.
+  Since 2026-10-24 a batch is one Jetstreamer call with `parallel` times the threads, with bounded
+  retries and a stall watchdog (ADR-0014, "Stalls").
   A streamed transaction goes to every source whose addresses it names (static keys or loaded
   through a lookup table); failed ones are dropped. `via: rpc` per source switches it to
   `getTransactionsForAddress` bulk pages per `windowSlots` window instead (the forward cycle run
@@ -89,8 +91,10 @@ accounts and carried 17,739 updates), which is why the RPC route below costs so 
   the batch's count. Exit 2 on any mismatch.
 - **Health.** `solos-data health` reads `status-venues-history.json` when present: the file's age
   and a stop before the floor warn, each unfinished source's failed-batch streak follows the error
-  streak thresholds, and no batch for `backfillStallMinutes` warns. A finished backfill is
-  reported, not judged. The nightly backup copies the tables and snapshots the catalog and status.
+  streak thresholds, and no batch for `historyStallWarnMinutes` (60) warns and for
+  `historyStallCriticalMinutes` (180) is critical (until 2026-10-24: `backfillStallMinutes`, 120,
+  warn only). A finished backfill is reported, not judged. The nightly backup copies the tables
+  and snapshots the catalog and status.
 
 ## Estimates (measured 2026-10-23)
 

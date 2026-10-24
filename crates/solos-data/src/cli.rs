@@ -15,6 +15,7 @@ use std::sync::Arc;
 /// Run the CLI and return the process exit code.
 #[must_use]
 pub fn main(args: &[String]) -> i32 {
+    crate::stall::archive_log();
     let group = args.first().map(String::as_str).unwrap_or("help");
     match group {
         "decoder" => decoder(&args[1..]),
@@ -93,7 +94,7 @@ fn spot(args: &[String]) -> i32 {
                             .with("run", "collect spot swaps and liquidity from top to floorTime, newest first, until done or SIGTERM (ADR-0014)")
                             .with("check", "compare the files with each batch's counts, block lists and manifests; exit 2 on a mismatch or a hole")
                             .with("status", "print status-spot-history.json")
-                            .with("trial", "--from <slot> --to <slot> [--out dir] [--chunk 10000] [--parallel 2] [--capture N] [--programs a,b]: stream a range into a scratch directory and report rows, bytes, coverage, time and memory")
+                            .with("trial", "--from <slot> --to <slot> [--out dir] [--parallel 2 (times JETSTREAMER_THREADS threads)] [--capture N] [--programs a,b]: stream a range into a scratch directory and report rows, bytes, coverage, time and memory")
                     )
                     .with("config", "--config config/spot-history.json (default); SOLOS_DATA_AUGMENT_DIR overrides dataDir; SOLANA_RPC_URL is the provider")
                     .with("query", "the tables join the augment views: solos-data augment query --sql ... (spot_swaps, spot_liquidity, spot_batches)")
@@ -151,7 +152,6 @@ fn spot_trial(args: &[String]) -> Result<i32, StoreError> {
     let report = runtime
         .block_on(crate::spot::trial::trial(
             (from, to),
-            number("--chunk", 10_000),
             usize::try_from(number("--parallel", 2)).unwrap_or(2),
             &out,
             usize::try_from(number("--capture", 0)).unwrap_or(0),

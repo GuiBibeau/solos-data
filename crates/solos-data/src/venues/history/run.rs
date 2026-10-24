@@ -327,14 +327,10 @@ impl History {
                 owner.extend(std::iter::repeat_n(i, m.st.source.addresses.len()));
             }
         }
-        let chunks = windows(lo, hi, archive.chunk_slots);
-        let streams = futures_util::stream::iter(
-            chunks
-                .iter()
-                .map(|&(from, to)| super::archive::stream(from, to, &addresses)),
-        )
-        .buffered(archive.parallel)
-        .collect::<Vec<_>>();
+        // One archive call for the batch with `parallel` times the threads: two calls in flight
+        // in one process can wait on each other forever (`crate::stall`).
+        let streams =
+            async { vec![super::archive::stream(lo, hi, archive.parallel, &addresses).await] };
         let manifests = futures_util::future::join_all(members.iter_mut().map(|m| {
             let top = m.next.min(hi);
             let active = m.next >= lo;
@@ -446,6 +442,14 @@ impl History {
     /// A member's state from its saved cursor; `None` when stopping.
     async fn member<'a>(&self, st: &'a SourceState) -> Option<Member<'a>> {
         let saved = self.saved_cursor(st).await?;
+        // The last batch survives restarts (its cursor carries the time), so health measures
+        // durable progress, not this process's uptime.
+        if let Some(at) = saved.get("updatedAt").and_then(Value::as_str) {
+            let mut stats = st.stats.lock().expect("history stats");
+            if stats.last_batch_at.is_none() {
+                stats.last_batch_at = Some(at.to_owned());
+            }
+        }
         let next = saved
             .get("next")
             .and_then(Value::as_i64)
@@ -948,6 +952,11 @@ pub fn run(config: HistoryConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreErr
             .with("floorSlot", floor)
             .with("creditsPerSecond", history.config.credits_per_second)
             .with("recovered", recovered),
+    );
+    crate::stall::spawn(
+        "venues-history",
+        "history_stalled",
+        Duration::from_secs(history.config.stall_minutes.saturating_mul(60)),
     );
     runtime.block_on(async {
         let loops = futures_util::future::join_all(

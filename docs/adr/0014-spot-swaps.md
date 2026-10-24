@@ -99,7 +99,9 @@ account has no balance entry).
   reads them as `spot_swaps`, `spot_liquidity` and `spot_batches`.
 - **Newest first, one batch at a time**: `chunkSlots` (50,000) × `parallel` (4) slots, from `top`
   (460,511,999, the last slot of epoch 1065, the newest epoch the archive served on 2026-10-23) to
-  the slot of `floorTime` (2025-10-01T00:00Z, 370,364,680), resolved once and recorded.
+  the slot of `floorTime` (2025-10-01T00:00Z, 370,364,680), resolved once and recorded. A batch
+  stops at its epoch's first slot, so it reads one epoch's files (see "Stalls" below); it is
+  streamed in one Jetstreamer call with `parallel` × `JETSTREAMER_THREADS` threads.
 - **Decoded in the stream.** Each Jetstreamer thread turns every successful transaction that names
   a program (static key or loaded through a lookup table) into rows as it arrives; only rows are
   held. Each invocation's events are found in execution order: self-CPI events belong to their
@@ -131,8 +133,8 @@ account has no balance entry).
   transactions in the RPC shape for the tests, re-decoded through the RPC path to prove both paths
   give the same rows.
 - **Health and backup.** `solos-data health` judges `status-spot-history.json` like the venues
-  history (age, stop before the floor, failed-batch streak, no batch for `backfillStallMinutes`);
-  a finished run is reported, not judged. The nightly backup copies `spot-history/tables` comparing
+  history (age, stop before the floor, failed-batch streak, no batch for an hour, critical after
+  three); a finished run is reported, not judged. The nightly backup copies `spot-history/tables` comparing
   sizes (files are written once under their slot range) and snapshots the catalog and status.
 - **No filter.** The whole set fits the budget the user set (1.5 TB of Parquet, 10 days): every
   pool and every token is kept.
@@ -177,3 +179,46 @@ Known gaps in the trials, all counted per batch: a few hundredths of a percent o
 row is kept). The run needs the `archive`-feature binary; the live services' binary is not
 replaced, so `solos-data health` judges the spot status and the backup copies its tables once the
 services' checkout and binary are next updated.
+
+## Stalls (2026-10-24)
+
+The run stopped for five hours at its fifth batch, slots 460,012,000 to 460,111,999, and again at
+the same batch after a restart: the unit stayed active with no CPU, no batch and no error, and
+health did not see it (the services' binary did not judge the spot status yet). The batch was the
+first to reach an epoch's first block. From epoch 1064 the first block of an epoch (459,648,000
+and 460,080,004; not 1062's or 1063's) carries reward entries of protobuf type 6, which
+Jetstreamer 048d2cd and its upstream `main` (ce2f367) reject ("unsupported reward type 5" after
+its off-by-one). Rewards are decoded whenever the block callback is set, which the lane needs for
+block times and transaction counts, so the thread failed the block, backed off and retried it
+forever; Jetstreamer reports retries only through `log` and an error callback, neither of which
+was wired. Trials on scratch roots reproduced it on any range holding such a block (10,000 slots
+across 460,080,000, and 460,080,000 to 460,111,999 alone) with one call or two, and not on the
+ranges beside it.
+
+- **Jetstreamer is vendored** (`vendor/jetstreamer-firehose`, 048d2cd with one change): a reward
+  entry of a type it does not know is skipped instead of failing the block. The lanes never read
+  rewards. Back to the git dependency once upstream handles the type.
+- **Bounded retries.** Every Jetstreamer error goes to an error callback that logs it
+  (`archive_retry`, URLs redacted); a slot that fails 12 times (about four minutes of its
+  backoff) shuts the call down (`archive_stuck`), so the batch fails with that error, counts in the
+  status's error streak and is retried whole after 30 s.
+- **Watchdog.** `stallMinutes` (20) without progress (a block streamed, an RPC answer, a batch
+  written) exits the process with code 75 (`spot_stalled`, `history_stalled`), so
+  `Restart=on-failure` restarts it from its cursor. A retry inside the process would not do: a
+  stuck call's tasks outlive it.
+- **One call at a time.** Jetstreamer keeps per-thread bookkeeping (activity stamps, finished
+  threads, stream starts, recycle requests) in process-wide statics keyed by thread index and
+  resets them at the start of each call, so the `parallel` calls of a batch read and cleared each
+  other's state. A batch is now one call with `parallel` times the threads; a process-wide turn
+  keeps any two calls from overlapping. This was not the cause of the stall, which one call
+  reproduced too.
+- **Batches stop at epoch starts**, so each call reads one epoch's files and a failure names one.
+- **Health.** A history source with no batch for 60 minutes warns and for 180 minutes is
+  critical (`historyStallWarnMinutes`, `historyStallCriticalMinutes`), on top of the status age.
+  The last batch's time comes back from the cursor record after a restart, so a process the
+  watchdog restarts every 20 minutes still reads as stalled.
+- **Diagnostics.** `SOLOS_DATA_ARCHIVE_LOG=info` (or `debug`) forwards Jetstreamer's own log as
+  `archive_log` lines; that is how the reward type was found.
+
+The venues history (ADR-0013) shares the stream code and gets the same changes in its next build;
+its run is below epoch 1062 and never meets such a block.

@@ -70,6 +70,11 @@ pub struct Thresholds {
     /// The venues lane's `status-venues.json` (written every minute) or a venue's last cycle
     /// older than this warns, minutes (ADR-0012).
     pub venues_status_warn_minutes: i64,
+    /// A history backfill (venues, spot) running with no batch for this long warns, minutes.
+    pub history_stall_warn_minutes: i64,
+    /// ... and for this long is critical, minutes (the lanes' own watchdog restarts a process
+    /// that stops moving after 20, so this is a restart loop or a hang the watchdog misses).
+    pub history_stall_critical_minutes: i64,
     /// A venue more slots than this behind the finalized slot warns.
     pub venues_lag_warn_slots: i64,
     /// ... and more than this is critical.
@@ -103,6 +108,8 @@ impl Default for Thresholds {
             kalshi_stall_minutes: d_kalshi_stall(),
             kalshi_throttle_warn: d_kalshi_throttle(),
             venues_status_warn_minutes: 15,
+            history_stall_warn_minutes: 60,
+            history_stall_critical_minutes: 180,
             venues_lag_warn_slots: 3_000,
             venues_lag_critical_slots: 9_000,
             disk_free_warn_gb: 500,

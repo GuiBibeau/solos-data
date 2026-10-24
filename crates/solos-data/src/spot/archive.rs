@@ -69,7 +69,7 @@ pub const fn available() -> bool {
     cfg!(feature = "archive")
 }
 
-/// Stream `[from, to]`.
+/// Stream `[from, to]` with `streams` times the configured threads.
 ///
 /// # Errors
 ///
@@ -78,6 +78,7 @@ pub const fn available() -> bool {
 pub async fn stream(
     _from: u64,
     _to: u64,
+    _streams: usize,
     _programs: &Programs,
     _options: &Options,
 ) -> Result<Stream, String> {
@@ -317,7 +318,8 @@ mod enabled {
         Ok(())
     }
 
-    /// Stream `[from, to]`.
+    /// Stream `[from, to]` in one `firehose` call with `streams` times `JETSTREAMER_THREADS`
+    /// threads (one call at a time per process: [`crate::stall`]).
     ///
     /// # Errors
     ///
@@ -325,15 +327,17 @@ mod enabled {
     pub async fn stream(
         from: u64,
         to: u64,
+        streams: usize,
         programs: &Programs,
         options: &Options,
     ) -> Result<Stream, String> {
-        let threads = std::env::var("JETSTREAMER_THREADS")
+        let per_stream = std::env::var("JETSTREAMER_THREADS")
             .ok()
             .and_then(|t| t.parse::<u64>().ok())
             .unwrap_or_else(|| {
                 jetstreamer_firehose::system::optimal_firehose_thread_count() as u64
             });
+        let threads = per_stream.max(1).saturating_mul(streams.max(1) as u64);
         let locals: Arc<Vec<Mutex<Local>>> = Arc::new(
             (0..threads.max(1) as usize + 1)
                 .map(|_| Mutex::new(Local::default()))
@@ -359,6 +363,7 @@ mod enabled {
         let on_block = move |thread: usize, block: BlockData| {
             let locals = Arc::clone(&l_block);
             async move {
+                crate::stall::bump();
                 if let BlockData::Block {
                     slot,
                     block_time,
@@ -379,6 +384,12 @@ mod enabled {
             }
             .boxed()
         };
+        let retries = Arc::new(crate::stall::Retries::new(
+            "spot",
+            crate::stall::SLOT_ATTEMPTS,
+        ));
+        let (on_error, stop, shutdown) = crate::stall::on_error(Arc::clone(&retries));
+        let turn = crate::stall::firehose_turn().await;
         let outcome = firehose(
             threads,
             false,
@@ -397,11 +408,7 @@ mod enabled {
                     jetstreamer_firehose::firehose::RewardsData,
                 >,
             >,
-            None::<
-                jetstreamer_firehose::firehose::HandlerFn<
-                    jetstreamer_firehose::firehose::FirehoseErrorContext,
-                >,
-            >,
+            Some(on_error),
             None::<
                 jetstreamer_firehose::firehose::StatsTracking<
                     jetstreamer_firehose::firehose::HandlerFn<
@@ -409,9 +416,13 @@ mod enabled {
                     >,
                 >,
             >,
-            None,
+            Some(shutdown),
         )
         .await;
+        drop((turn, stop));
+        if let Some(stuck) = retries.stuck() {
+            return Err(stuck);
+        }
         if let Err((error, slot)) = outcome {
             return Err(crate::jsonout::safe_error(&format!(
                 "archive stream failed at slot {slot}: {error:?}"

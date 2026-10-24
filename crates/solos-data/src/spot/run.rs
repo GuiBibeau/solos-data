@@ -39,6 +39,18 @@ pub const CURSOR_KEY: &str = "spot/cursor";
 /// The floor record.
 pub const FLOOR_KEY: &str = "spot/floor";
 
+/// Slots per epoch.
+pub const EPOCH_SLOTS: u64 = 432_000;
+
+/// The first slot of the batch ending at `hi`: `batch` slots, but not below the floor nor
+/// below the first slot of `hi`'s epoch, so one archive call reads one epoch's files.
+#[must_use]
+pub fn batch_lo(hi: u64, batch: u64, floor: u64) -> u64 {
+    hi.saturating_sub(batch.max(1) - 1)
+        .max(floor)
+        .max(hi / EPOCH_SLOTS * EPOCH_SLOTS)
+}
+
 /// The manifest window of a batch: `size` slots at an offset that varies with the batch, so
 /// the samples spread over the whole history instead of always the top of a batch.
 #[must_use]
@@ -267,14 +279,7 @@ impl Spot {
             capture: 0,
         };
         let rpc: &dyn Rpc = self.rpc.as_ref();
-        let stream = stream_range(
-            lo,
-            hi,
-            self.config.chunk_slots,
-            self.config.parallel,
-            &self.programs,
-            &options,
-        );
+        let stream = stream_range(lo, hi, self.config.parallel, &self.programs, &options);
         let blocks = produced_blocks(rpc, lo, hi);
         let manifests = futures_util::future::join_all(
             self.programs
@@ -333,6 +338,7 @@ impl Spot {
                     .with("files", retired),
             );
         }
+        crate::stall::bump();
         let rows = &done.stream.rows;
         let t = &mut self.totals;
         t.batches += 1;
@@ -706,16 +712,28 @@ pub fn run(config: SpotConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError>
             started_at: now(),
             started: Instant::now(),
             start_next: next,
-            totals: Totals::default(),
+            totals: Totals {
+                // The last batch survives restarts (the cursor is written with it), so health
+                // measures durable progress, not this process's uptime.
+                last_batch_at: saved
+                    .as_ref()
+                    .and_then(|v| v.get("updatedAt"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                ..Totals::default()
+            },
             config,
         };
         spot.status(next, done, true)?;
+        crate::stall::spawn(
+            "spot-history",
+            "spot_stalled",
+            Duration::from_secs(spot.config.stall_minutes.saturating_mul(60)),
+        );
         let mut last_status = Instant::now();
         while !done && !spot.stopping() {
             let hi = next;
-            let lo = hi
-                .saturating_sub(spot.config.batch_slots() - 1)
-                .max(spot.floor);
+            let lo = batch_lo(hi, spot.config.batch_slots(), spot.floor);
             match runtime.block_on(spot.batch(lo, hi)) {
                 Ok(batch) => match spot.commit(lo, hi, batch) {
                     Ok(()) => {
@@ -755,6 +773,21 @@ pub fn run(config: SpotConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError>
 mod tests {
     use super::*;
     use crate::spot::archive::Block;
+
+    #[test]
+    fn a_batch_stops_at_its_epoch_start_and_the_floor() {
+        // Inside epoch 1065: a whole batch.
+        assert_eq!(batch_lo(460_211_999, 100_000, 370_364_680), 460_112_000);
+        // The batch that hung on 2026-10-24 crossed into epoch 1064 at 460,080,000: it now
+        // stops there, and the next one starts below it, so the batches still tile the range.
+        assert_eq!(batch_lo(460_111_999, 100_000, 370_364_680), 460_080_000);
+        assert_eq!(batch_lo(460_079_999, 100_000, 370_364_680), 459_980_000);
+        assert_eq!(460_080_000 % EPOCH_SLOTS, 0);
+        // A batch ending on an epoch's first slot is that one slot.
+        assert_eq!(batch_lo(460_080_000, 100_000, 0), 460_080_000);
+        // The floor wins.
+        assert_eq!(batch_lo(370_400_000, 100_000, 370_364_680), 370_364_680);
+    }
 
     #[test]
     fn a_manifest_window_stays_inside_its_batch() {
