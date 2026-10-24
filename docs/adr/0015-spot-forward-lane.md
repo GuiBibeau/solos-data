@@ -82,20 +82,20 @@ and none missing. It spent 18,204 credits (1.011 a slot, so 218,000 a day at the
 10.7 GB on the wire for 45.5 GB of JSON (128 GB a day at the tip). `spot live check` passed,
 with the seam met: the history's newest batch ends at 460,511,999.
 
-- **Cost at the tip: about 220,000 to 240,000 credits a day**: one per block (about 216,000 slots a day),
-  one `getBlocks` and the manifest walks per batch (19 `getTransactionsForAddress` seeds at 10
-  and about 200 `getSignaturesForAddress` pages for a 1,000-slot window, about 400 credits, 24
-  batches a day), and a `getSlot` per 30-second wait. That is an eighth of the 2M-a-day budget the
+- **Cost at the tip: about 220,000 to 240,000 credits a day**: one per block (about 216,000
+  slots a day), one `getBlocks` and the manifest walks per batch (19 `getTransactionsForAddress`
+  seeds at 10 and about 200 `getSignaturesForAddress` pages for a 1,000-slot window, about 400
+  credits, 24 batches a day), and a `getSlot` per 30-second wait. That is an eighth of the 2M-a-day budget the
   venues lane was held to. The status reports `creditsPerDayAtTip` from the lane's own counters.
-- **Transfer: about 120 to 140 GB a day on the wire** (gzip; 4.4 times less than the JSON), about
-  0.6 TB a day of JSON decoded. The box parses it in a fraction of one core at the tip.
+- **Transfer: about 120 to 140 GB a day on the wire** (gzip; 4.3 times less than the JSON), about
+  0.55 TB a day of JSON decoded.
 - **Catch-up.** About 31 to 35 slots a second at 24 in flight, so the backlog from 460,512,000
   (about 2.5 slots a second accrue) clears at about 30 slots a second net: about 9 to 10 hours
   for a million slots.
 - **Rows.** On the same 300 slots the RPC route gave the archive's transactions, blocks and
   liquidity rows and one swap fewer (22,436 against 22,437). The provider's logs end with
-  `Log truncated` on 72 transactions whose archive logs are whole (the archive's validators keep
-  longer logs than the 10 KB default), and a Raydium CLMM swap whose `emit!` event was cut is
+  `Log truncated` on 72 transactions whose archive logs are whole (the archive's source keeps
+  longer logs than the provider serves), and a Raydium CLMM swap whose `emit!` event was cut is
   counted `missing_event`, as ADR-0014 counts every such gap. In the scratch run 8,928 of 7.3M
   logs (0.12 %) were cut, and about 105 swaps of 1.6M (Orca, Raydium CLMM, CPMM and AMM v4,
   Meteora DAMM v1, the programs read from `emit!` logs) lost their event: about 1 in 15,000.
@@ -106,8 +106,8 @@ with the seam met: the history's newest batch ends at 460,511,999.
 
 The archive is not used for this lane's slots. Epochs it publishes later could replace the RPC
 batches (exact logs, no credits), at the cost of a second source for the same slots and a
-replacement step; at about 1 swap in 15,000 the gain is small, and the gaps are counted per batch and
-program. The lane can be pointed at the archive later without changing its tables.
+replacement step; at about 1 swap in 15,000 the gain is small, and the gaps are counted per
+batch and program. The lane can be pointed at the archive later without changing its tables.
 
 ## Consequences
 
