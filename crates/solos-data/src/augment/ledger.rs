@@ -39,16 +39,21 @@ pub enum Lane {
     /// `spot-history/tables/`, `catalog-spot-history.json`, `status-spot-history.json`,
     /// `staging-spot-history/`.
     Spot,
+    /// `spot live run` (ADR-0015), the spot tables from the history's top forward:
+    /// `spot/checkpoint.duckdb`, its files under `spot/tables/`, `catalog-spot.json`,
+    /// `status-spot.json`, `staging-spot/`.
+    SpotLive,
 }
 
 impl Lane {
     /// Every lane, sync first.
-    pub const ALL: [Lane; 5] = [
+    pub const ALL: [Lane; 6] = [
         Lane::Sync,
         Lane::Capture,
         Lane::Venues,
         Lane::History,
         Lane::Spot,
+        Lane::SpotLive,
     ];
 
     /// The lane's name in logs and status.
@@ -60,6 +65,7 @@ impl Lane {
             Lane::Venues => "venues",
             Lane::History => "venues-history",
             Lane::Spot => "spot-history",
+            Lane::SpotLive => "spot",
         }
     }
 
@@ -73,17 +79,19 @@ impl Lane {
             Lane::Venues => root.join("venues"),
             Lane::History => root.join("venues-history"),
             Lane::Spot => root.join("spot-history"),
+            Lane::SpotLive => root.join("spot"),
         }
     }
 
     /// The directory the lane's registered paths are relative to: the augment root, except for
-    /// the history lanes, whose `tables/` trees are their own so no other lane's recovery walks
-    /// them.
+    /// the history and spot lanes, whose `tables/` trees are their own so no other lane's
+    /// recovery walks them.
     #[must_use]
     pub fn files_root(self, root: &Path) -> PathBuf {
         match self {
             Lane::History => root.join("venues-history"),
             Lane::Spot => root.join("spot-history"),
+            Lane::SpotLive => root.join("spot"),
             _ => root.to_path_buf(),
         }
     }
@@ -97,6 +105,7 @@ impl Lane {
             Lane::Venues => root.join("catalog-venues.json"),
             Lane::History => root.join("catalog-venues-history.json"),
             Lane::Spot => root.join("catalog-spot-history.json"),
+            Lane::SpotLive => root.join("catalog-spot.json"),
         }
     }
 
@@ -109,6 +118,7 @@ impl Lane {
             Lane::Venues => root.join("status-venues.json"),
             Lane::History => root.join("status-venues-history.json"),
             Lane::Spot => root.join("status-spot-history.json"),
+            Lane::SpotLive => root.join("status-spot.json"),
         }
     }
 
@@ -121,6 +131,7 @@ impl Lane {
             Lane::Venues => root.join("staging-venues"),
             Lane::History => root.join("staging-venues-history"),
             Lane::Spot => root.join("staging-spot-history"),
+            Lane::SpotLive => root.join("staging-spot"),
         }
     }
 }

@@ -3,13 +3,16 @@
 //! bonding curves), PancakeSwap's CLMM and the proprietary AMMs (HumidiFi, Tessera V, ZeroFi,
 //! AlphaQ, SolFi, SolFi V2, GoonFi): one row per pool-level trade and per liquidity change, read
 //! from each program's own events (or, for programs that emit none, its token transfers) while the
-//! archive streams, into Parquet under the augment root.
+//! archive streams, into Parquet under the augment root; and from the history's top forward,
+//! the same tables from the RPC's blocks (`spot live`, ADR-0015).
 
 pub mod archive;
+pub mod blocks;
 pub mod check;
 pub mod config;
 pub mod dex;
 pub mod frames;
+pub mod live;
 pub mod rows;
 pub mod run;
 pub mod trial;

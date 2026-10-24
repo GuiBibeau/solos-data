@@ -3,7 +3,7 @@
 line='{"event":"health_services"'
 for unit in solos-data-phoenix.service solos-data-phoenix-decoder.service \
   solos-data-augment-capture.service solos-data-venues.service solos-data-augment.timer solos-data-health.timer \
-  solos-data-backup.timer solos-data-spot-history.service; do
+  solos-data-backup.timer solos-data-spot-history.service solos-data-spot.service; do
   state=$(systemctl --user is-active "$unit" 2>/dev/null)
   line="$line,\"${unit}\":\"${state:-unknown}\""
 done

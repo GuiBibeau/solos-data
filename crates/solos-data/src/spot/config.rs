@@ -1,5 +1,6 @@
 //! `config/spot-history.json` (ADR-0014): the spot backfill's window, programs, stream size,
-//! manifest sample and RPC budget.
+//! manifest sample and RPC budget; `config/spot-live.json` (ADR-0015): the forward lane's start,
+//! batch, manifest sample and RPC budget.
 
 use super::dex::{Dex, Programs};
 use crate::store::StoreError;
@@ -83,19 +84,7 @@ impl SpotConfig {
     ///
     /// A name that is not a spot program.
     pub fn programs(&self) -> Result<Programs, StoreError> {
-        if self.programs.is_empty() {
-            return Ok(Programs::all());
-        }
-        let mut out = Vec::new();
-        for name in &self.programs {
-            out.push(
-                Dex::from_name(name)
-                    .ok_or_else(|| StoreError::Check(format!("unknown spot program {name}")))?,
-            );
-        }
-        out.sort_unstable();
-        out.dedup();
-        Ok(Programs::new(out))
+        programs_of(&self.programs)
     }
 
     /// Slots of one batch.
@@ -103,6 +92,117 @@ impl SpotConfig {
     pub fn batch_slots(&self) -> u64 {
         self.chunk_slots.saturating_mul(self.parallel as u64)
     }
+}
+
+/// Programs by table name; every program when the list is empty.
+///
+/// # Errors
+///
+/// A name that is not a spot program.
+pub fn programs_of(names: &[String]) -> Result<Programs, StoreError> {
+    if names.is_empty() {
+        return Ok(Programs::all());
+    }
+    let mut out = Vec::new();
+    for name in names {
+        out.push(
+            Dex::from_name(name)
+                .ok_or_else(|| StoreError::Check(format!("unknown spot program {name}")))?,
+        );
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(Programs::new(out))
+}
+
+/// `config/spot-live.json`: the forward lane (ADR-0015).
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveConfig {
+    /// The augment root (`SOLOS_DATA_AUGMENT_DIR` overrides it).
+    pub data_dir: PathBuf,
+    /// The first slot collected: the history's `top` plus one, so the two lanes meet with no
+    /// gap and no slot twice.
+    pub start: u64,
+    /// Programs by table name; every program when empty.
+    #[serde(default)]
+    pub programs: Vec<String>,
+    /// Slots of one batch (and of its files); a batch never crosses an epoch boundary.
+    pub batch_slots: u64,
+    /// Slots of each batch whose signatures are checked against each program's RPC manifest.
+    pub manifest_slots: u64,
+    /// Helius credits a second the lane may spend.
+    pub credits_per_second: f64,
+    /// Requests in flight (`getBlock` calls of a batch).
+    pub concurrency: u32,
+    /// Credits per request by method.
+    #[serde(default)]
+    pub credit_costs: BTreeMap<String, f64>,
+    /// DuckDB memory for writing a batch's files.
+    #[serde(default = "writer_memory")]
+    pub writer_memory: String,
+    /// Seconds between looks at the finalized slot while the next batch is not finalized yet.
+    #[serde(default = "cycle_seconds")]
+    pub cycle_seconds: u64,
+    /// Minutes without progress after which the process exits for its unit to restart it
+    /// ([`crate::stall`]); 0 disables the watchdog.
+    #[serde(default = "stall_minutes")]
+    pub stall_minutes: u64,
+}
+
+fn cycle_seconds() -> u64 {
+    30
+}
+
+impl LiveConfig {
+    /// Parse a document.
+    ///
+    /// # Errors
+    ///
+    /// Invalid JSON, an unknown program or values out of range.
+    pub fn parse(text: &str) -> Result<LiveConfig, StoreError> {
+        let config: LiveConfig = serde_json::from_str(text)
+            .map_err(|e| StoreError::Check(format!("spot live config: {e}")))?;
+        if config.start == 0
+            || config.batch_slots == 0
+            || config.manifest_slots == 0
+            || config.manifest_slots > config.batch_slots
+            || config.concurrency == 0
+            || config.cycle_seconds == 0
+            || !(0.1..=10_000.0).contains(&config.credits_per_second)
+        {
+            return Err(StoreError::Check(
+                "start, batchSlots, manifestSlots (at most batchSlots), concurrency, cycleSeconds and creditsPerSecond must be positive".into(),
+            ));
+        }
+        programs_of(&config.programs)?;
+        Ok(config)
+    }
+
+    /// The programs the lane reads.
+    ///
+    /// # Errors
+    ///
+    /// A name that is not a spot program.
+    pub fn programs(&self) -> Result<Programs, StoreError> {
+        programs_of(&self.programs)
+    }
+}
+
+/// Load `path` (default `config/spot-live.json`); `SOLOS_DATA_AUGMENT_DIR` overrides `dataDir`.
+///
+/// # Errors
+///
+/// Unreadable or invalid file.
+pub fn load_live(path: Option<&str>) -> Result<LiveConfig, StoreError> {
+    let path = Path::new(path.unwrap_or("config/spot-live.json"));
+    let mut config = LiveConfig::parse(&std::fs::read_to_string(path)?)?;
+    if let Ok(dir) = std::env::var("SOLOS_DATA_AUGMENT_DIR")
+        && !dir.is_empty()
+    {
+        config.data_dir = PathBuf::from(dir);
+    }
+    Ok(config)
 }
 
 /// Load `path` (default `config/spot-history.json`); `SOLOS_DATA_AUGMENT_DIR` overrides
@@ -137,6 +237,21 @@ mod tests {
         assert_eq!(
             crate::venues::history::config::floor_seconds(&config.floor_time).unwrap(),
             1_759_276_800
+        );
+        let live = load_live(Some(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../config/spot-live.json"
+        )))
+        .unwrap();
+        // The forward lane starts where the history's range ends.
+        assert_eq!(live.start, config.top as u64 + 1);
+        assert_eq!(live.programs().unwrap().list(), super::super::dex::ALL);
+        assert!(
+            LiveConfig::parse(
+                r#"{"dataDir": "x", "start": 5, "batchSlots": 10, "manifestSlots": 20,
+                "creditsPerSecond": 1, "concurrency": 1}"#
+            )
+            .is_err()
         );
         let bad = r#"{"dataDir": "x", "floorTime": "2025-10-01T00:00:00Z", "top": 5,
             "programs": ["nope"], "chunkSlots": 1, "parallel": 1, "manifestSlots": 1,

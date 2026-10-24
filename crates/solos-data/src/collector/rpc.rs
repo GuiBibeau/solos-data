@@ -120,6 +120,87 @@ impl Transport for ReqwestTransport {
     }
 }
 
+/// A `reqwest` transport (30 s timeout) that asks for gzip and inflates it, for answers of
+/// megabytes (the spot lane's `getBlock`, ADR-0015); it counts the bytes on the wire.
+pub struct GzipTransport {
+    client: reqwest::Client,
+    /// Bytes received on the wire, compressed or not.
+    pub wire_bytes: Arc<AtomicU64>,
+}
+
+impl Default for GzipTransport {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GzipTransport {
+    /// New client.
+    #[must_use]
+    pub fn new() -> Self {
+        GzipTransport {
+            client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("http client"),
+            wire_bytes: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+/// A body as text: inflated when `gzip`, as sent otherwise.
+///
+/// # Errors
+///
+/// A gzip body that does not inflate, or a body that is not UTF-8.
+pub fn body_text(bytes: &[u8], gzip: bool) -> Result<String, String> {
+    if !gzip {
+        return String::from_utf8(bytes.to_vec()).map_err(|e| e.to_string());
+    }
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(bytes), &mut text)
+        .map_err(|e| format!("gzip body: {e}"))?;
+    Ok(text)
+}
+
+impl Transport for GzipTransport {
+    fn post<'a>(
+        &'a self,
+        url: &'a str,
+        body: String,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpReply, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .post(url)
+                .header("content-type", "application/json")
+                .header("accept-encoding", "gzip")
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?;
+            let status = response.status().as_u16();
+            let header = |name: &str| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
+            let retry_after = header("retry-after");
+            let gzip = header("content-encoding").is_some_and(|e| e.eq_ignore_ascii_case("gzip"));
+            let bytes = response.bytes().await.map_err(|e| e.to_string())?;
+            self.wire_bytes
+                .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+            Ok(HttpReply {
+                status,
+                retry_after,
+                body: body_text(&bytes, gzip)?,
+            })
+        })
+    }
+}
+
 /// Counters as the TypeScript provider kept them, in first-seen order.
 #[derive(Default)]
 pub struct Counters {

@@ -68,6 +68,7 @@ fn spot(args: &[String]) -> i32 {
     let command = args.first().map(String::as_str).unwrap_or("help");
     let result = match command {
         "trial" => spot_trial(args),
+        "live" => spot_live(&args[1..]),
         "run" => crate::spot::config::load(flag(args, "--config")).and_then(|config| {
             let status = crate::spot::run::run(config, stop_flag()?)?;
             println!("{}", status.to_json());
@@ -95,6 +96,7 @@ fn spot(args: &[String]) -> i32 {
                             .with("check", "compare the files with each batch's counts, block lists and manifests; exit 2 on a mismatch or a hole")
                             .with("status", "print status-spot-history.json")
                             .with("trial", "--from <slot> --to <slot> [--out dir] [--parallel 2 (times JETSTREAMER_THREADS threads)] [--capture N] [--programs a,b]: stream a range into a scratch directory and report rows, bytes, coverage, time and memory")
+                            .with("live", "run | check | status | trial --config config/spot-live.json: the same tables from the history's top forward, from the RPC's blocks (ADR-0015)")
                     )
                     .with("config", "--config config/spot-history.json (default); SOLOS_DATA_AUGMENT_DIR overrides dataDir; SOLANA_RPC_URL is the provider")
                     .with("query", "the tables join the augment views: solos-data augment query --sql ... (spot_swaps, spot_liquidity, spot_batches)")
@@ -113,6 +115,81 @@ fn spot(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+fn spot_live(args: &[String]) -> Result<i32, StoreError> {
+    let command = args.first().map(String::as_str).unwrap_or("help");
+    let config = || crate::spot::config::load_live(flag(args, "--config"));
+    match command {
+        "run" => {
+            let status = crate::spot::live::run(config()?, stop_flag()?)?;
+            println!("{}", status.to_json());
+            Ok(0)
+        }
+        "check" => {
+            let config = config()?;
+            let out = crate::spot::check::check_live(&config.data_dir, config.start)?;
+            let ok = out.get("ok").and_then(Value::as_bool) == Some(true);
+            println!("{}", out.to_json());
+            Ok(if ok { 0 } else { 2 })
+        }
+        "status" => {
+            let path = crate::augment::ledger::Lane::SpotLive.status_path(&config()?.data_dir);
+            print!("{}", std::fs::read_to_string(path)?);
+            Ok(0)
+        }
+        "trial" => spot_live_trial(args, &config()?),
+        _ => {
+            println!(
+                "{}",
+                Obj::new()
+                    .with_obj(
+                        "commands",
+                        Obj::new()
+                            .with("run", "collect spot swaps and liquidity from `start` (the history's top plus one) forward, one finalized batch at a time, until SIGTERM (ADR-0015)")
+                            .with("check", "compare the files with each batch's counts, block lists and manifests, and the seam with the history; exit 2 on a mismatch, a hole or a gap")
+                            .with("status", "print status-spot.json")
+                            .with("trial", "[--slots 300] [--from <slot>]: fetch and decode a range as a batch would (newest finalized slots by default), write nothing, and report rows, bytes, time and credits, with the daily cost at the tip")
+                    )
+                    .with("config", "--config config/spot-live.json (default); SOLOS_DATA_AUGMENT_DIR overrides dataDir; SOLANA_RPC_URL is the provider")
+                    .to_json()
+            );
+            Ok(0)
+        }
+    }
+}
+
+fn spot_live_trial(
+    args: &[String],
+    config: &crate::spot::config::LiveConfig,
+) -> Result<i32, StoreError> {
+    let slots = flag(args, "--slots")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300)
+        .max(1);
+    let (rpc, wire) = crate::spot::live::provider(config, stop_flag()?)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let from = match flag(args, "--from").and_then(|v| v.parse::<u64>().ok()) {
+        Some(from) => from,
+        None => {
+            let finalized = runtime
+                .block_on(crate::venues::walk::finalized_slot(rpc.as_ref()))
+                .map_err(StoreError::Check)?;
+            u64::try_from(finalized)
+                .unwrap_or(0)
+                .saturating_sub(slots - 1)
+        }
+    };
+    let report = runtime
+        .block_on(crate::spot::live::trial(
+            &rpc,
+            &wire,
+            config,
+            (from, from + slots - 1),
+        ))
+        .map_err(StoreError::Check)?;
+    println!("{}", report.to_json());
+    Ok(0)
 }
 
 fn programs_flag(args: &[String]) -> Result<crate::spot::dex::Programs, StoreError> {

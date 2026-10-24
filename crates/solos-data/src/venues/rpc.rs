@@ -12,9 +12,10 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// The methods the lane calls.
-pub const METHODS: [&str; 9] = [
+/// The methods the RPC lanes call (venues, their history, and the spot lanes).
+pub const METHODS: [&str; 10] = [
     "getSlot",
+    "getBlock",
     "getBlocks",
     "getBlockTime",
     "getAccountInfo",
@@ -87,6 +88,37 @@ pub fn credit_provider(
     ));
     let url = crate::collector::config::provider_url()?;
     let mut provider = Provider::new(url, config, limiter);
+    provider.shutdown = stop;
+    Ok(Arc::new(provider))
+}
+
+/// [`credit_provider`] over `transport` (the spot lane's gzip transport, ADR-0015).
+///
+/// # Errors
+///
+/// When `SOLANA_RPC_URL` is unset or the embedded collector defaults do not parse.
+pub fn credit_provider_over(
+    credits_per_second: f64,
+    costs: &BTreeMap<String, f64>,
+    concurrency: u32,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    transport: Box<dyn crate::collector::rpc::Transport>,
+) -> Result<Arc<Provider>, StoreError> {
+    let mut config: Config = serde_json::from_str(include_str!("../../../../config/phoenix.json"))
+        .map_err(|e| StoreError::Check(e.to_string()))?;
+    config.cu_weights = weights(costs);
+    config.cu_per_second = credits_per_second * f64::from(WEIGHT);
+    config.utilization = 1.0;
+    let limiter = Arc::new(Limiter::new(
+        config.cu_per_second,
+        0.0,
+        Lanes {
+            tail: 1,
+            backfill: concurrency.max(1),
+        },
+    ));
+    let url = crate::collector::config::provider_url()?;
+    let mut provider = Provider::with_transport(url, config, limiter, transport);
     provider.shutdown = stop;
     Ok(Arc::new(provider))
 }

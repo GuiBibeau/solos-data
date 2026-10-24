@@ -9,6 +9,7 @@
     "backfillStallMinutes": 120,
     "historyStallWarnMinutes": 60,
     "historyStallCriticalMinutes": 180,
+    "spotLagWarnSlots": 27000,
     "tailStaleWarnMinutes": 15,
     "tailStaleCriticalMinutes": 60,
     "errorStreakWarn": 3,

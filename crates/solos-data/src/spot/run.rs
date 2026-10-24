@@ -137,7 +137,45 @@ pub fn compare(entries: &[Entry], streamed: &HashSet<&str>) -> Manifest {
     }
 }
 
-async fn produced_blocks(rpc: &dyn Rpc, lo: u64, hi: u64) -> Result<Vec<u64>, String> {
+/// Compare each program's manifest over `window` with the signatures the stream sampled there.
+///
+/// # Errors
+///
+/// A walk that failed, or a listed successful signature the stream lacks.
+pub fn compare_manifests(
+    stream: &Stream,
+    manifests: Vec<(Dex, Result<Vec<Entry>, String>)>,
+    window: (u64, u64),
+) -> Result<Vec<(Dex, Manifest)>, String> {
+    let mut by_dex: HashMap<Dex, HashSet<&str>> = HashMap::new();
+    for (dex, _, signature) in &stream.sampled {
+        by_dex.entry(*dex).or_default().insert(signature.as_str());
+    }
+    let empty = HashSet::new();
+    let mut compared = Vec::new();
+    for (dex, entries) in manifests {
+        let m = compare(&entries?, by_dex.get(&dex).unwrap_or(&empty));
+        if m.missing > 0 {
+            return Err(format!(
+                "{}: {} of {} manifest signatures in slots {}..={} were not streamed",
+                dex.name(),
+                m.missing,
+                m.listed,
+                window.0,
+                window.1
+            ));
+        }
+        compared.push((dex, m));
+    }
+    Ok(compared)
+}
+
+/// The produced blocks of `[lo, hi]` from `getBlocks`.
+///
+/// # Errors
+///
+/// RPC failure or an answer without a list.
+pub async fn produced_blocks(rpc: &dyn Rpc, lo: u64, hi: u64) -> Result<Vec<u64>, String> {
     let mut out = Vec::new();
     let mut from = lo;
     while from <= hi {
@@ -158,7 +196,12 @@ async fn produced_blocks(rpc: &dyn Rpc, lo: u64, hi: u64) -> Result<Vec<u64>, St
     Ok(out)
 }
 
-async fn manifest(rpc: &dyn Rpc, dex: Dex, window: (u64, u64)) -> Result<Vec<Entry>, String> {
+/// One program's successful and failed signatures in `window`, walked down from just above it.
+///
+/// # Errors
+///
+/// RPC failure or a walk that cannot reach the window.
+pub async fn manifest(rpc: &dyn Rpc, dex: Dex, window: (u64, u64)) -> Result<Vec<Entry>, String> {
     let (lo, hi) = (
         i64::try_from(window.0).unwrap_or(i64::MAX),
         i64::try_from(window.1).unwrap_or(i64::MAX),
@@ -290,27 +333,7 @@ impl Spot {
         let (stream, listed, manifests) = tokio::join!(stream, blocks, manifests);
         let stream = stream?;
         let blocks = check_blocks(&stream, &listed?)?;
-        let mut by_dex: HashMap<Dex, HashSet<&str>> = HashMap::new();
-        for (dex, _, signature) in &stream.sampled {
-            by_dex.entry(*dex).or_default().insert(signature.as_str());
-        }
-        let empty = HashSet::new();
-        let mut compared = Vec::new();
-        for (dex, entries) in manifests {
-            let m = compare(&entries?, by_dex.get(&dex).unwrap_or(&empty));
-            if m.missing > 0 {
-                return Err(format!(
-                    "{}: {} of {} manifest signatures in slots {}..={} were not streamed",
-                    dex.name(),
-                    m.missing,
-                    m.listed,
-                    window.0,
-                    window.1
-                ));
-            }
-            compared.push((dex, m));
-        }
-        drop(by_dex);
+        let compared = compare_manifests(&stream, manifests, window)?;
         Ok(Done {
             stream,
             blocks,
@@ -527,8 +550,23 @@ fn batch_rows(done: &Done) -> Vec<(String, Counts, Manifest)> {
     out
 }
 
-/// Register a batch's files (retiring overlapping ones first) and, with the last, its cursor;
-/// returns the files retired.
+/// Where a spot lane keeps its batches: its ledger lane (files root, catalog) and cursor record.
+#[derive(Clone, Copy, Debug)]
+pub struct Target {
+    /// The ledger lane.
+    pub lane: Lane,
+    /// The cursor record.
+    pub cursor_key: &'static str,
+}
+
+/// The history's batches.
+pub const HISTORY: Target = Target {
+    lane: Lane::Spot,
+    cursor_key: CURSOR_KEY,
+};
+
+/// Register a history batch's files (retiring overlapping ones first) and, with the last, its
+/// cursor; returns the files retired.
 ///
 /// # Errors
 ///
@@ -541,15 +579,33 @@ pub fn register_batch(
     files: &[FileRecord],
     cursor: &Value,
 ) -> Result<u64, StoreError> {
-    let retired = retire_overlapping(store, &Lane::Spot.files_root(root), lo, hi)?;
+    register_batch_to(HISTORY, store, root, (lo, hi), files, cursor)
+}
+
+/// Register a batch's files under `target` (retiring overlapping ones first) and, with the
+/// last, its cursor; returns the files retired.
+///
+/// # Errors
+///
+/// A ledger failure.
+pub fn register_batch_to(
+    target: Target,
+    store: &mut crate::store::Store,
+    root: &std::path::Path,
+    range: (u64, u64),
+    files: &[FileRecord],
+    cursor: &Value,
+) -> Result<u64, StoreError> {
+    let (lo, hi) = range;
+    let retired = retire_overlapping(store, &target.lane.files_root(root), lo, hi)?;
     for (i, file) in files.iter().enumerate() {
-        let progress = (i + 1 == files.len()).then_some((CURSOR_KEY, cursor));
+        let progress = (i + 1 == files.len()).then_some((target.cursor_key, cursor));
         register(store, file, progress)?;
     }
     Ok(retired)
 }
 
-/// Write the batch's three files under the lane's tree.
+/// Write a history batch's three files under the lane's tree.
 ///
 /// # Errors
 ///
@@ -561,7 +617,23 @@ pub fn write_batch(
     hi: u64,
     done: &Done,
 ) -> Result<Vec<FileRecord>, StoreError> {
-    let files_root = Lane::Spot.files_root(root);
+    write_batch_to(Lane::Spot, writer_memory, root, (lo, hi), done)
+}
+
+/// Write a batch's three files under `lane`'s tree.
+///
+/// # Errors
+///
+/// A DuckDB or file failure.
+pub fn write_batch_to(
+    lane: Lane,
+    writer_memory: &str,
+    root: &std::path::Path,
+    range: (u64, u64),
+    done: &Done,
+) -> Result<Vec<FileRecord>, StoreError> {
+    let (lo, hi) = range;
+    let files_root = lane.files_root(root);
     let conn = connection("8", writer_memory)?;
     let blocks = &done.stream.blocks;
     let time = |slot: u64| blocks.get(&slot).and_then(|b| b.time);
