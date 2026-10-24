@@ -65,3 +65,7 @@ dashmap = "6"
 once_cell = "1"
 url = { version = "2", default-features = false }
 libc = "0"
+
+# The upstream `s3-backend` feature and its AWS dependencies are not vendored.
+[lints.rust]
+unexpected_cfgs = "allow"

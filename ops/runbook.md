@@ -603,12 +603,23 @@ The status has `sources.spot` (`cursor`, `percent`, `slotsPerHour`, `etaHours`,
 instructions, swaps, liquidity rows and the gaps `missingEvent`, `undecoded`, `unresolved`),
 `gaps` by program and instruction, and the credits spent. `spot check` compares the files with
 each batch's counts and the batches' coverage from the catalog only, while the unit runs; it exits
-2 on a mismatch. `spot trial --from <slot> --to <slot> [--chunk 10000] [--parallel 2]
+2 on a mismatch. `spot trial --from <slot> --to <slot> [--parallel 2]
 [--capture N]` streams a range into a scratch directory (`--out`) and reports rows, coverage,
 bytes, distinct pools and tokens, time and memory; `--capture` writes real transactions in the
 RPC shape for `tests/data/spot-fixtures.json`. After a decoder change,
 `SOLOS_DATA_REFRESH_SPOT_FIXTURES=1 cargo test --test spot` rewrites the fixtures' expected rows
 and a trial with `--capture` shows the archive path still agrees (`fixtureMismatches` 0).
+
+Stalls (ADR-0014, "Stalls"): every Jetstreamer error is logged as `archive_retry`; a slot that
+fails 12 times stops the call (`archive_stuck`) and the batch is retried whole after 30 s. With no
+progress for `stallMinutes` (20) the process logs `spot_stalled` (`history_stalled` for the venues
+history) and exits 75, and the unit restarts it from its cursor. To see what Jetstreamer is doing,
+run a trial with `SOLOS_DATA_ARCHIVE_LOG=info` (or `debug`): its log comes out as `archive_log`
+lines.
+
+```sh
+journalctl --user -u solos-data-spot-history.service -o cat | grep -E '"event":"(archive_(retry|stuck)|spot_stalled)"' | tail
+```
 
 The unit is capped at 100 GB, 32 CPUs, nice 15 and idle IO; a batch peaks at about 42 GB.
 `chunkSlots` and `parallel` set the batch, `writerMemory` the batch writer's DuckDB, and the
@@ -635,7 +646,7 @@ of `config/health.json`; a field left out keeps its default.
 | tail progress | raw `status.json` `watermark.completedAt` (written with every published tail chunk), only while the tail is enabled (`lanes.tail.enabled`) | not advanced for 15 min | not advanced for 60 min |
 | checkpoint maintenance | raw `status.json` `maintenance.at` (written by every storage maintenance pass); the `maintenance` lane's error streak is judged with the lanes below | > 15 min old, or no pass recorded | > 60 min old |
 | venues lane | augment `status-venues.json` (ADR-0012), only when it exists | file > 15 min old, a venue's last cycle > 15 min ago, lag > 3,000 slots, 3 failed cycles in a row, no Pyth poll | lag > 9,000 slots, 10 failed cycles in a row |
-| history backfills | augment `status-venues-history.json` (ADR-0013) and `status-spot-history.json` (ADR-0014), only when they exist and until every source is done | file > 15 min old, stopped before the floor, no batch for 120 min, 3 failed batches in a row | 10 failed batches in a row |
+| history backfills | augment `status-venues-history.json` (ADR-0013) and `status-spot-history.json` (ADR-0014), only when they exist and until every source is done | file > 15 min old, stopped before the floor, no batch for 60 min (`historyStallWarnMinutes`), 3 failed batches in a row | no batch for 180 min (`historyStallCriticalMinutes`), 10 failed batches in a row |
 | lane error streaks | raw `status.json` `lanes.{tail,backfill,maintenance}`: consecutive `collector_error`s with no chunk published in between (the lane's progress marker unchanged), last error < 30 min old | 3 in a row | 10 in a row; the finding names the lane and the error class (`oom`, `constraint`, `rollback_failed`, `rpc`, `other`) |
 | augment sync | `status.json` age and `sources.*.errors` | > 150 min old, or errors in the last run | |
 | augment capture | `status-capture.json` age and the lanes' `errors` | > 10 min old, errors grown since the previous check, the Elfa credit guard tripped, the last Elfa hourly cycle > 150 min ago | |

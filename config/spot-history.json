@@ -16,5 +16,6 @@
     "getTransactionsForAddress": 10,
     "getTransaction": 1
   },
-  "writerMemory": "32GB"
+  "writerMemory": "32GB",
+  "stallMinutes": 20
 }
