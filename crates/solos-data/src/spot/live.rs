@@ -415,7 +415,16 @@ pub fn run(config: LiveConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError>
             started: Instant::now(),
             finalized: None,
             wire,
-            totals: Totals::default(),
+            totals: Totals {
+                // The last batch survives restarts (the cursor is written with it), so health
+                // measures durable progress, not this process's uptime.
+                last_batch_at: saved
+                    .as_ref()
+                    .and_then(|v| v.get("updatedAt"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                ..Totals::default()
+            },
             config,
         };
         live.status(next, true)?;
@@ -424,27 +433,37 @@ pub fn run(config: LiveConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError>
             "spot_live_stalled",
             Duration::from_secs(live.config.stall_minutes.saturating_mul(60)),
         );
-        let mut last_status = Instant::now();
+        let mut last_status: Option<Instant> = None;
+        let provider = Arc::clone(&live.rpc);
+        let rpc: &dyn Rpc = provider.as_ref();
         while !live.stopping() {
-            let rpc: &dyn Rpc = live.rpc.as_ref();
             let finalized = match runtime.block_on(crate::venues::walk::finalized_slot(rpc)) {
-                Ok(slot) => u64::try_from(slot).unwrap_or(0),
+                Ok(slot) => Some(u64::try_from(slot).unwrap_or(0)),
                 Err(error) => {
                     live.record_error(&error);
-                    runtime.block_on(live.pause(RETRY_SECONDS));
-                    continue;
+                    None
                 }
             };
-            live.finalized = Some(finalized);
+            if finalized.is_some() {
+                live.finalized = finalized;
+            }
             let hi = batch_hi(next, live.config.batch_slots);
-            if hi > finalized {
-                if last_status.elapsed() >= Duration::from_secs(60) {
-                    if let Err(error) = live.status(next, true) {
-                        live.record_error(&error.to_string());
-                    }
-                    last_status = Instant::now();
+            let due = finalized.is_some_and(|f| hi <= f);
+            // The status goes out before a batch (a batch can take minutes) and at least every
+            // minute otherwise, failures included, so health sees the lag and the error streak.
+            if due || last_status.is_none_or(|at| at.elapsed() >= Duration::from_secs(60)) {
+                if let Err(error) = live.status(next, true) {
+                    live.record_error(&error.to_string());
                 }
-                runtime.block_on(live.pause(live.config.cycle_seconds));
+                last_status = Some(Instant::now());
+            }
+            if !due {
+                let wait = if finalized.is_some() {
+                    live.config.cycle_seconds
+                } else {
+                    RETRY_SECONDS
+                };
+                runtime.block_on(live.pause(wait));
                 continue;
             }
             let outcome = runtime.block_on(batch(rpc, &live.programs, &live.config, (next, hi)));
@@ -456,18 +475,13 @@ pub fn run(config: LiveConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError>
                         runtime.block_on(live.pause(RETRY_SECONDS));
                     }
                 },
+                // A batch cut short by SIGTERM is not a failure; it is redone after the restart.
+                Err(_) if live.stopping() => {}
                 Err(error) => {
                     live.record_error(&error);
                     runtime.block_on(live.pause(RETRY_SECONDS));
                 }
             }
-            if let Err(error) = live.status(next, true) {
-                log(
-                    "spot_live_status_error",
-                    Obj::new().with("error", safe_error(&error.to_string())),
-                );
-            }
-            last_status = Instant::now();
         }
         live.status(next, false)
     })();
