@@ -414,6 +414,11 @@ reaches 12 months back) and `budgetGb` to what the root may hold. The licence ke
 the box: the R2 backup skips `tables/tardis/`, and no Tardis-derived data goes to Modal, GitHub or
 another provider without written terms (ADR-0009).
 
+Elfa is switched off (`sources.elfa.enabled` and `elfa.auto.enabled` are `false`, 2026-10-25, at the
+operator's request): the capture lane runs the Hyperliquid captures only and spends no Elfa
+credits. The Auto alerts were cancelled once with the Elfa API, because the lane never cancels
+alerts on its own. The history already collected stays on disk.
+
 `solos-data augment capture --config config/augment.json` is the long-running lane for what
 cannot be fetched later: Hyperliquid 1-minute candles every thirty minutes, Hyperliquid asset
 contexts (funding, open interest, mark/oracle/mid prices) every minute, Elfa events every
