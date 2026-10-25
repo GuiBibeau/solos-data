@@ -1027,8 +1027,10 @@ mod tests {
                 .all(|s| s.sec_cik.is_none() || s.kind == "equity")
         );
         assert!(config.sources.polymarket.events.len() >= 10);
+        // Elfa is switched off at the operator's request (2026-10-25); the alert definitions stay.
+        assert!(!config.sources.elfa.enabled);
         let auto = &config.sources.elfa.auto;
-        assert!(auto.enabled);
+        assert!(!auto.enabled);
         assert_eq!(auto.alerts.len(), 7);
         assert!(auto.alerts.len() <= auto.max_alerts);
         assert_eq!(auto.expires_in, "720h");
