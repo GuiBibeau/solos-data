@@ -106,7 +106,7 @@
       }
     },
     "elfa": {
-      "enabled": true,
+      "enabled": false,
       "baseUrl": "https://api.elfa.ai",
       "intervalSeconds": 3600,
       "requestsPerMinute": 60,
@@ -114,7 +114,7 @@
       "eventsPagesPerPoll": 2,
       "creditCapPerMonth": 1000,
       "auto": {
-        "enabled": true,
+        "enabled": false,
         "maxAlerts": 8,
         "creditBudgetPerMonth": 60,
         "expiresIn": "720h",
