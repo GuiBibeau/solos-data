@@ -367,6 +367,7 @@ of `config/health.json`; a field left out keeps its default.
 | lane error streaks | raw `status.json` `lanes.{tail,backfill}`: consecutive `collector_error`s with no chunk published in between (the lane's progress marker unchanged), last error < 30 min old | 3 in a row | 10 in a row; the finding names the lane and the error class (`oom`, `constraint`, `rollback_failed`, `rpc`, `other`) |
 | augment sync | `status.json` age and `sources.*.errors` | > 150 min old, or errors in the last run | |
 | augment capture | `status-capture.json` age and the lanes' `errors` | > 10 min old, errors grown since the previous check, the Elfa credit guard tripped, the last Elfa hourly cycle > 150 min ago | |
+| state snapshots (only when `SOLOS_DATA_STATE_DIR`'s `status.json` exists and says `running`) | snapshot `status.json` age, `lanes.books.lastAt`, `lanes.traders.lastAt`, lane errors | status > 5 min old, last book read > 5 min ago, last trader scan > 45 min ago, errors grown since the previous check | status > 30 min old, last book read > 30 min ago |
 | disk free | `statvfs` of the raw root's parent | < 500 GB | < 100 GB |
 
 The timer runs it every fifteen minutes; its `ExecStartPost` logs one `health_services` line
