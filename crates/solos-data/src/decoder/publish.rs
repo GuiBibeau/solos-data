@@ -3,7 +3,8 @@
 //! port of `decode/publish.ts`.
 
 use super::normalize::Rows;
-use super::schema::{TABLES, VERSION, definition, type_map};
+use super::parquet::copy_statement;
+use super::schema::{TABLES, VERSION, definition, sort_columns, type_map};
 use crate::fsutil::{create_dir_all_durable, file_hash, sync_path, write_durable};
 use crate::jsonout::{Obj, now};
 use crate::store::{Store, StoreError, sql_string};
@@ -88,11 +89,10 @@ pub fn publish_sources(
                 create_dir_all_durable(parent)?;
             }
             let tmp = crate::fsutil::tmp_path(&path);
-            store.exec_batch(&format!(
-                "COPY (SELECT * FROM {table} WHERE slot // 432000={epoch}
-          ORDER BY slot, signature) TO {} (FORMAT PARQUET, COMPRESSION ZSTD)",
-                sql_string(&tmp.to_string_lossy())
-            ))?;
+            let order = sort_columns(table);
+            let select =
+                format!("SELECT * FROM {table} WHERE slot // 432000={epoch} ORDER BY {order}");
+            store.exec_batch(&copy_statement(&select, &tmp))?;
             sync_path(&tmp)?;
             std::fs::rename(&tmp, &path)?;
             if let Some(parent) = path.parent() {

@@ -904,7 +904,10 @@ codec/schema version. [Table details](../docs/decoded-tables.md) cover read-only
 ## Verify changes
 
 With Rust 1.96 installed, run `cargo test --workspace`. Tests are offline and need no
-credentials. The archive lane compiles with `cargo build --features archive -p solos-data`,
+credentials. The decoded golden-day digest is `tests/data/golden-day.sha256`. After a decoder
+or writer change that should move it,
+`SOLOS_DATA_REFRESH_GOLDEN_DAY=1 cargo test --test golden_day` rewrites that file. The test
+decodes `tests/data/phoenix-events.json` in two fresh temp directories and does not seal. The archive lane compiles with `cargo build --features archive -p solos-data`,
 which needs clang and cmake. The `clang-sys` build script wants an unversioned `libclang.so`
 and `llvm-config`; a Debian box with only `libclang1-19` and `llvm-19-dev` builds with
 `ln -s /usr/lib/llvm-19/lib/libclang-19.so.19 ~/.local/lib/libclang.so` once, then

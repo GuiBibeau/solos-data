@@ -4,8 +4,9 @@
 //! only the newest prefix of a group and needed 32 files inside 500k rows, which an `events`
 //! file of 20–50k rows can never satisfy, so the table never compacted.
 
+use super::parquet::copy_statement;
 use super::publish::write_catalog;
-use super::schema::key_column;
+use super::schema::{key_column, sort_columns};
 use crate::fsutil::{file_hash, sync_path, tmp_path};
 use crate::jsonout::{Obj, now};
 use crate::store::{Store, StoreError, sql_string};
@@ -235,10 +236,8 @@ fn merge(store: &mut Store, table: &str, epoch: &str, files: &[Obj]) -> Result<(
         std::fs::create_dir_all(parent)?;
     }
     let tmp = tmp_path(&path);
-    store.exec_batch(&format!(
-        "COPY ({query} ORDER BY slot,signature) TO {} (FORMAT PARQUET,COMPRESSION ZSTD)",
-        sql_string(&tmp.to_string_lossy())
-    ))?;
+    let order = sort_columns(table);
+    store.exec_batch(&copy_statement(&format!("{query} ORDER BY {order}"), &tmp))?;
     sync_path(&tmp)?;
     std::fs::rename(&tmp, &path)?;
     if let Some(parent) = path.parent() {

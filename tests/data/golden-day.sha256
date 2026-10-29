@@ -1,0 +1,4 @@
+# Canonical content digest of tests/data/phoenix-events.json decoded by the pinned writer.
+# Excludes decoded_at and Parquet created_by. Not a file SHA-256.
+# Refresh: SOLOS_DATA_REFRESH_GOLDEN_DAY=1 cargo test --test golden_day
+63c06f73d2691e6d8bea9cb45a44505403002cc47fe2c001e376b095b889315d
