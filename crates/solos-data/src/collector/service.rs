@@ -467,6 +467,8 @@ mod tests {
             ),
             ("Constraint Error: Duplicate key \"signature: x\"", None),
             ("getBlock failed (code 429)", None),
+            ("No space left on device", None),
+            ("fsync failed: injected", Some("fsync")),
             ("archive does not match checkpoint rows", None),
         ];
         for (message, class) in cases {

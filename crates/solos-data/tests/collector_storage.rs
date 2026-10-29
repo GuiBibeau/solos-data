@@ -447,10 +447,12 @@ async fn offline_checkpoint_repack_preserves_every_row_cursor_view_and_primary_k
     f.exec("INSERT INTO published_ranges VALUES (10,10)");
     let store = f.thread.take().unwrap().join(f.db.clone());
     store.close().unwrap();
+    let lock = solos_data::store::acquire_lock(&f.root).unwrap();
     assert_eq!(
-        repack_checkpoint(&f.root).unwrap().get("ok"),
+        repack_checkpoint(&f.root, &lock).unwrap().get("ok"),
         Some(&Value::Bool(true))
     );
+    drop(lock);
     // The way back: the closed original, still readable, beside the rewritten file.
     let previous = f.root.join(solos_data::repack::PREVIOUS);
     let conn = duckdb::Connection::open(&previous).unwrap();

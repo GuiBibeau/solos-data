@@ -18,6 +18,8 @@ pub fn error_class(message: &str) -> &'static str {
         "rollback_failed"
     } else if m.contains("out of memory") {
         "oom"
+    } else if m.contains("fsync failed") {
+        "fsync"
     } else if m.contains("constraint error") || m.contains("duplicate key") {
         "constraint"
     } else if m.contains("(code ") || m.contains("timed out") || m.contains("timeout") {
@@ -321,6 +323,7 @@ mod tests {
         assert_eq!(error_class(DUPLICATE), "constraint");
         assert_eq!(error_class("RPC getSlot failed (code 429)"), "rpc");
         assert_eq!(error_class("Invalid bulk transaction page"), "other");
+        assert_eq!(error_class("fsync failed: injected"), "fsync");
     }
 
     /// The raw `status.json` 30 minutes into the incident, as this change's collector writes it.

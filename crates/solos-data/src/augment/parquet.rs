@@ -4,7 +4,7 @@
 //! and deleted once converted.
 
 use super::ledger::FileRecord;
-use crate::fsutil::{file_hash, sync_path, tmp_path};
+use crate::fsutil::{create_dir_all_durable, file_hash, sync_path, tmp_path};
 use crate::store::{Store, StoreError, sql_string};
 use std::path::{Path, PathBuf};
 
@@ -69,7 +69,7 @@ pub fn write_parquet(
     let relative = target.relative_path();
     let path = root.join(&relative);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_durable(parent)?;
     }
     let tmp = tmp_path(&path);
     store.exec_batch(&format!(

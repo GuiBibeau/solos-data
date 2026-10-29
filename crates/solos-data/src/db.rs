@@ -32,6 +32,9 @@ pub fn fatal_class(message: &str) -> Option<&'static str> {
         Some("commit_failed")
     } else if m.contains("out of memory") {
         Some("oom")
+    } else if m.contains("fsync failed") {
+        // A failed fsync is not retried: the lane exits and the process restarts from W (ADR-0016).
+        Some("fsync")
     } else {
         None
     }

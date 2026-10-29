@@ -8,7 +8,7 @@
 use super::rows::{Liquidity, Swap};
 use super::tx::{Key, b58};
 use crate::augment::ledger::FileRecord;
-use crate::fsutil::{file_hash, sync_path, tmp_path};
+use crate::fsutil::{create_dir_all_durable, file_hash, sync_path, tmp_path};
 use crate::store::{StoreError, memory_connection, sql_string};
 use duckdb::{Connection, params};
 use std::collections::HashMap;
@@ -166,7 +166,7 @@ pub fn copy_to(
 ) -> Result<FileRecord, StoreError> {
     let path = root.join(relative);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        create_dir_all_durable(parent)?;
     }
     let tmp = tmp_path(&path);
     conn.execute_batch(&format!(

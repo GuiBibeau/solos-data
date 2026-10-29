@@ -4,15 +4,18 @@
 
 use crate::fsutil::sync_path;
 use crate::jsonout::Obj;
-use crate::store::{StoreError, memory_connection, query_rows, query_scalar, sql_string};
+use crate::store::{DbLock, StoreError, memory_connection, query_rows, query_scalar, sql_string};
 use duckdb::Connection;
 use std::path::Path;
 
 /// The previous checkpoint after a rewrite, kept until the next one.
 pub const PREVIOUS: &str = "checkpoint.prev.duckdb";
 
-/// Rewrite `<root>/checkpoint.duckdb`. The writer must be closed.
-pub fn repack_checkpoint(root: &Path) -> Result<Obj, StoreError> {
+/// Rewrite `<root>/checkpoint.duckdb`. `lock` is the advisory lock the caller already holds
+/// (CLI `repack` takes it; [`crate::store::Store::while_closed`] passes the store's lock). The
+/// database connection must be closed. This function does not lock again.
+pub fn repack_checkpoint(root: &Path, lock: &DbLock) -> Result<Obj, StoreError> {
+    lock.prove_held();
     let source = root.join("checkpoint.duckdb");
     let candidate = root.join("checkpoint.repack.duckdb");
     let bytes_before = std::fs::metadata(&source)?.len();
