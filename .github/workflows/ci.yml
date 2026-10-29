@@ -23,9 +23,10 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 
-# Three jobs in parallel; the wall clock is the slowest one. `cargo clippy` (check, dev profile)
+# Four jobs in parallel; the wall clock is the slowest one. `cargo clippy` (check, dev profile)
 # and `cargo test` (test profile) resolve different libduckdb-sys build-script units, so a shared
 # target/ would still compile DuckDB twice: each Rust job keeps its own cache instead.
+# `archive-check` compiles DuckDB plus RocksDB, protobuf and the agave crates, and keeps its own.
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -97,3 +98,36 @@ jobs:
         run: npm run verify
       - name: Prune DuckDB objects before caching
         run: find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete
+
+  # The archive feature (Jetstreamer, the agave crates, RocksDB) is otherwise compiled only by
+  # the image build. Bindgen needs libclang. RocksDB, DuckDB and protobuf are C++: `clang` as
+  # `c++` fails that configure (no libstdc++), so the job pins gcc/g++. `cargo clippy` would
+  # compile the same graph again with clippy-driver, and incremental compilation is off, so
+  # this job only type-checks.
+  archive-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CC: gcc
+      CXX: g++
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: 1.96.0
+      - name: Install archive build dependencies
+        run: |
+          sudo DEBIAN_FRONTEND=noninteractive apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang cmake libclang-dev pkg-config g++
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        id: cache
+      - name: Record rust-cache
+        run: echo "rust-cache hit=${{ steps.cache.outputs.cache-hit }}"
+      - run: cargo check -p solos-data --features archive --locked
+      # The static libraries already contain these objects. The build scripts rerun only when
+      # their inputs change, so nothing reads the .o files again.
+      - name: Prune native objects before caching
+        run: |
+          find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete
+          find target -path '*/build/librocksdb-sys-*/out/*' -name '*.o' -delete
+          find target -path '*/build/protobuf-src-*/out/*' -name '*.o' -delete
