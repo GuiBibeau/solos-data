@@ -2,7 +2,7 @@
 //! bounds and the lane checkpoint in one transaction. A port of `writer.ts` and
 //! `storage-space.ts`.
 
-use crate::fsutil::{file_hash, sync_path, tmp_path};
+use crate::fsutil::{create_dir_all_durable, file_hash, manifest_path, sync_path, tmp_path};
 use crate::jsonout::{Obj, now};
 use crate::store::{Store, StoreError, sql_string};
 use serde_json::Value;
@@ -31,24 +31,26 @@ pub fn require_storage_space(root: &Path) -> Result<(), StoreError> {
 
 /// Remove `.tmp` files and unregistered Parquet under `root`.
 pub fn recover_files(store: &mut Store, root: &Path) -> Result<(), StoreError> {
-    let registered: std::collections::HashSet<String> = store
+    let registered: std::collections::HashSet<std::path::PathBuf> = store
         .rows("SELECT path FROM files", &[])?
         .iter()
-        .filter_map(|r| r.str("path").map(str::to_owned))
+        .filter_map(|r| r.str("path"))
+        .map(|path| manifest_path(root, Path::new(path)))
         .collect();
     fn visit(
+        root: &Path,
         directory: &Path,
-        registered: &std::collections::HashSet<String>,
+        registered: &std::collections::HashSet<std::path::PathBuf>,
     ) -> std::io::Result<()> {
         for entry in std::fs::read_dir(directory)? {
             let path = entry?.path();
             if path.is_dir() {
-                visit(&path, registered)?;
+                visit(root, &path, registered)?;
             } else {
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
                 if name.ends_with(".tmp")
                     || (name.ends_with(".parquet")
-                        && !registered.contains(&path.to_string_lossy().into_owned()))
+                        && !registered.contains(&manifest_path(root, &path)))
                 {
                     std::fs::remove_file(&path)?;
                 }
@@ -56,7 +58,7 @@ pub fn recover_files(store: &mut Store, root: &Path) -> Result<(), StoreError> {
         }
         Ok(())
     }
-    visit(root, &registered)?;
+    visit(root, root, &registered)?;
     Ok(())
 }
 
@@ -96,7 +98,7 @@ pub fn publish_range(
                 .join("staging")
                 .join(table)
                 .join(format!("epoch={epoch}"));
-            std::fs::create_dir_all(&directory)?;
+            create_dir_all_durable(&directory)?;
             let path = directory.join(format!("{from}-{to}-{}.parquet", uuid::Uuid::new_v4()));
             let projection = if table == "rpc_pages" {
                 "page_id AS signature, * EXCLUDE(page_id)"

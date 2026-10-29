@@ -10,28 +10,38 @@ crash-safety tests cite, and the lock that enforces the first rule.
 ## Single owner
 
 `Store::open` and `Store::open_read_only` take a non-blocking exclusive `flock` on
-`<root>/checkpoint.duckdb.lock` before DuckDB opens `<root>/checkpoint.duckdb`. The lock file is
-mode `0600` and stays on disk after unlock. A second process fails with `StoreError::AlreadyOwned`
-and does not open the database. The `Store` drops the connection first and the lock second. If the
-process is killed, the kernel releases the flock; the next open can acquire it. That is process
-death, not power loss.
+`<root>/checkpoint.duckdb.lock` before DuckDB opens `<root>/checkpoint.duckdb`. A newly created
+lock file is mode `0600`; an existing one is not chmodded. After the lock is held, the
+descriptor's inode is compared with the path, and a mismatch is retried. The file stays on disk
+after unlock. A second process fails with `StoreError::AlreadyOwned` and does not open the
+database. The `Store` drops the connection first and the lock second. If the process is killed,
+the kernel releases the flock; the next open can acquire it. That is process death, not power
+loss.
 
 Each checkpoint directory has its own lock file, so the collector, the decoder, and an augment
 lane can run as separate processes on separate databases. Two opens of the same database cannot.
+A second `flock` of the same file conflicts inside one process too, so code that already holds
+the lock must pass that `DbLock` through instead of locking again.
 
-`repack_checkpoint` attaches the database file directly and does not take this lock. Its comment
-says the writer must already be closed. That path is outside `Store::open`.
+`repack_checkpoint` takes `&DbLock`. The CLI `decoder repack` and `collector repack` paths call
+`acquire_lock` and pass it. `Store::while_closed` already holds the lock, closes the connection,
+and passes that same lock into the job; the in-service checkpoint rewrite uses that path and does
+not lock again. If reopening the checkpoint afterwards fails, the store is marked unusable and
+later calls fail instead of writing to the in-memory placeholder.
 
 ## Commit order
 
 Collector publication is `validate_range` and `assert_publishable`, then `publish_range`
 (`collector/pipeline.rs` for the tail watermark `W`, `collector/history.rs` for the `backfill`
-cursor). `publish_range` is the same sequence in the Rust writer and in `src/writer.ts`.
+cursor). The TypeScript `src/writer.ts` still uses `mkdir` and does not fsync newly created
+ancestors; this sequence is the Rust writer.
 
 1. Range validation runs on the checkpoint rows. On failure the function returns before any file
    is written, and the watermark is not advanced.
-2. For each non-empty table and epoch in the range, `COPY` the rows to a `.tmp` sibling of the
-   final Parquet path.
+2. For each non-empty table and epoch in the range, create the epoch directory with
+   `create_dir_all_durable`. Each newly created directory's parent is fsynced, including ancestors
+   that did not exist (`staging/`, `staging/<table>/`). Directories that already exist are not
+   fsynced again. Then `COPY` the rows to a `.tmp` sibling of the final Parquet path.
 3. fsync that temporary file (`sync_path`).
 4. Rename it onto the final path.
 5. fsync the parent directory of that path (the `epoch=…` directory that received the rename).
@@ -41,12 +51,18 @@ cursor). `publish_range` is the same sequence in the Rust writer and in `src/wri
    the checkpoint (`kv` key `W` on the tail, `backfill` on the historical lane). The watermark
    moves only in this transaction, after steps 2–6 for every file in the batch.
 
+A failed fsync (step 2's parent, step 3, or step 5) is fatal. The error message starts with
+`fsync failed`. `fatal_class` returns `fsync`, the lane does not record a retry, and the process
+exits so the supervisor restarts it from `W`. The same rule applies to every `sync_path` and to
+the fsync inside `write_durable`.
+
+The decoder (`decoder/publish.rs`), augment (`augment/parquet.rs`), spot (`spot/write.rs`) and raw
+compactor (`collector/compactor.rs`) create their output directories with `create_dir_all_durable`
+and use the same file steps (temporary file, fsync, rename, fsync the parent).
+
 A crash after step 4 and before step 7 leaves a Parquet file that `files` does not list. The next
 process's `recover_files` deletes unregistered `.parquet` and `.tmp` files. The watermark does not
-include that range. Calling `recover_files` again deletes nothing further.
-
-The decoder, augment, and spot writers use the same file steps (temporary file, fsync, rename,
-fsync the parent) and then a transaction that records their own progress. The sequence above is
+include that range. Calling `recover_files` again deletes nothing further. The sequence above is
 the one tests cite for the collector watermark.
 
 ## Gaps
@@ -57,21 +73,18 @@ directory, range-check, then advance the watermark." The code was not changed to
 - The range check is step 1, before any durable write. It is not repeated after step 5. The check
   between the directory fsync and the watermark is the exported row count (step 6). The hash is
   stored in that step, not compared to a previous hash.
-- Step 5 fsyncs the file's parent directory. It does not fsync ancestor directories that
-  `create_dir_all` just created (`staging/`, `staging/<table>/`). A new epoch directory's own
-  directory entry is not fsynced.
 - Step 7 does not fsync the DuckDB file after `COMMIT`. Watermark durability is DuckDB's commit.
 - `catalog.json` is written later, by status and maintenance, and is not part of step 7. A restart
   trusts the committed `files` rows. The catalog can lag.
-- `recover_files` removes unregistered Parquet and `.tmp` files. It does not remove a registered
-  file whose bounds sit above the watermark, and publication names are unique, so a later chunk
-  does not overwrite that file. The restart predicate does not trust those files. Deleting them
-  is not implemented.
 
 ## Restart predicate
 
-`restart::restart_predicate` checks the committed manifest. Every active `files` row whose
-`file_bounds.slot_to` is absent or at or below `W.slot` must exist, parse, and match `row_count`
-and `sha256`. A row with `slot_to` above `W` is an orphan and is not read. When `W` has not been
-recorded, every active file is checked. The predicate does not delete orphans and does not advance
-a watermark.
+`restart::restart_predicate` checks the committed manifest. An active `files` row whose
+`file_bounds.slot_to` is greater than `W.slot` is a violation (`AboveWatermark`): `W` and the file
+rows commit in one transaction, so that row cannot be legitimate. Every other active row must
+exist, match `sha256`, parse, and match `row_count`. The hash is compared before the file is
+parsed, so a same-size bit flip is a hash mismatch. When `W` has not been recorded, every active
+file is checked. Parquet that `files` does not list is still an orphan. `recover_files` deletes
+those, matching paths with `manifest_path` (relative paths join the root, then symlinks are
+resolved) so a relative registration or a symlinked data directory is not deleted. The predicate
+does not delete files and does not advance a watermark.

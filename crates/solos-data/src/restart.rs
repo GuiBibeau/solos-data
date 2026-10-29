@@ -1,15 +1,15 @@
 //! Restart predicate for the collector checkpoint (ADR-0016).
 //!
 //! Every active partition at or below the tail watermark must exist, parse as Parquet, and match
-//! the `files` row count and SHA-256. A partition whose `file_bounds.slot_to` sits strictly above
-//! the watermark is an orphan: this check does not read it. Parquet the `files` table does not
-//! list is also an orphan; startup `recover_files` deletes those, and this check does not trust
-//! them either.
+//! the `files` row count and SHA-256. `W` and the file rows commit in one transaction, so an active
+//! file whose `file_bounds.slot_to` sits strictly above `W` is a violation. Parquet the `files`
+//! table does not list is an orphan: startup `recover_files` deletes those, and this check does
+//! not read them.
 
-use crate::fsutil::{file_hash, resolve};
+use crate::fsutil::{file_hash, manifest_path};
 use crate::jsonout::safe_error;
 use crate::store::{Store, StoreError, query_rows, sql_string};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// One partition the restart predicate trusts.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,6 +62,19 @@ pub enum RestartError {
         /// SHA-256 of the bytes on disk.
         actual: String,
     },
+    /// An active file is registered past the tail watermark. That cannot commit legitimately:
+    /// `W` and the file rows are one transaction.
+    #[error(
+        "registered partition above the watermark: {path}: slot_to {slot_to}, watermark {watermark}"
+    )]
+    AboveWatermark {
+        /// Manifest path.
+        path: PathBuf,
+        /// `file_bounds.slot_to`.
+        slot_to: i64,
+        /// Tail watermark slot.
+        watermark: i64,
+    },
 }
 
 /// The tail watermark slot (`kv` key `W`, field `slot`), when that record exists.
@@ -73,36 +86,36 @@ pub fn tail_watermark(store: &Store) -> Result<Option<i64>, StoreError> {
 
 /// Active `files` rows at or below `watermark`.
 ///
-/// `watermark == None` means `W` has not been recorded: every active file is covered, because
-/// nothing places it above a watermark. A row with no `file_bounds` is covered for the same
-/// reason. `slot_to` equal to the watermark is covered. `slot_to` greater than the watermark is
-/// omitted and not read.
+/// `watermark == None` means `W` has not been recorded, so every active file is covered. A row
+/// with no `file_bounds` is covered. `slot_to` equal to the watermark is covered. `slot_to`
+/// greater than the watermark is [`RestartError::AboveWatermark`].
 pub fn covered_partitions(
     store: &Store,
     watermark: Option<i64>,
-) -> Result<Vec<CoveredPartition>, StoreError> {
-    let sql = match watermark {
-        Some(_) => {
-            "SELECT f.path, f.row_count, f.sha256, b.slot_to
-             FROM files f LEFT JOIN file_bounds b ON b.path = f.path
-             WHERE f.status = 'active' AND (b.slot_to IS NULL OR b.slot_to <= ?)
-             ORDER BY f.path"
-        }
-        None => {
-            "SELECT f.path, f.row_count, f.sha256
-             FROM files f WHERE f.status = 'active' ORDER BY f.path"
-        }
-    };
-    let rows = match watermark {
-        Some(slot) => store.rows(sql, &[&slot])?,
-        None => store.rows(sql, &[])?,
-    };
+) -> Result<Vec<CoveredPartition>, RestartError> {
+    let rows = store.rows(
+        "SELECT f.path, f.row_count, f.sha256, b.slot_to
+         FROM files f LEFT JOIN file_bounds b ON b.path = f.path
+         WHERE f.status = 'active'
+         ORDER BY f.path",
+        &[],
+    )?;
     let mut covered = Vec::with_capacity(rows.len());
     for row in rows {
         let stored = row.str("path").unwrap_or("");
+        let path = manifest_path(&store.root, std::path::Path::new(stored));
+        if let (Some(mark), Some(slot_to)) = (watermark, row.int("slot_to"))
+            && slot_to > mark
+        {
+            return Err(RestartError::AboveWatermark {
+                path,
+                slot_to,
+                watermark: mark,
+            });
+        }
         let row_count = row.int("row_count").unwrap_or(0);
         covered.push(CoveredPartition {
-            path: resolve(&store.root, Path::new(stored)),
+            path,
             row_count: u64::try_from(row_count).unwrap_or(0),
             sha256: row.str("sha256").unwrap_or("").to_owned(),
         });
@@ -112,8 +125,9 @@ pub fn covered_partitions(
 
 /// Check one covered list against the filesystem. The first failure is returned.
 ///
-/// `conn` is only used to parse Parquet (`read_parquet`). Orphans are not in `covered` and are
-/// not opened.
+/// The hash is compared before the file is parsed, so a same-size bit flip is
+/// [`RestartError::Hash`] even when the parquet checksum would also reject the file. `conn` parses
+/// Parquet (`read_parquet`) only after the hash matches. Unregistered files are not in `covered`.
 pub fn check_covered(
     conn: &duckdb::Connection,
     covered: &[CoveredPartition],
@@ -122,6 +136,17 @@ pub fn check_covered(
         if !partition.path.is_file() {
             return Err(RestartError::Missing {
                 path: partition.path.clone(),
+            });
+        }
+        let hash = file_hash(&partition.path).map_err(|error| RestartError::Parse {
+            path: partition.path.clone(),
+            message: safe_error(&error.to_string()),
+        })?;
+        if hash != partition.sha256 {
+            return Err(RestartError::Hash {
+                path: partition.path.clone(),
+                expected: partition.sha256.clone(),
+                actual: hash,
             });
         }
         let sql = format!(
@@ -143,17 +168,6 @@ pub fn check_covered(
                 path: partition.path.clone(),
                 expected: partition.row_count,
                 actual,
-            });
-        }
-        let hash = file_hash(&partition.path).map_err(|error| RestartError::Parse {
-            path: partition.path.clone(),
-            message: safe_error(&error.to_string()),
-        })?;
-        if hash != partition.sha256 {
-            return Err(RestartError::Hash {
-                path: partition.path.clone(),
-                expected: partition.sha256.clone(),
-                actual: hash,
             });
         }
     }

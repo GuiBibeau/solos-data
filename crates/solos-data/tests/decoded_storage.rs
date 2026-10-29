@@ -193,7 +193,9 @@ fn offline_checkpoint_repack_preserves_every_row_cursor_and_primary_key() {
         .set("cursor", &serde_json::json!({ "next": 9 }))
         .unwrap();
     store.close().unwrap();
-    let report = repack_checkpoint(&root).unwrap();
+    let lock = solos_data::store::acquire_lock(&root).unwrap();
+    let report = repack_checkpoint(&root, &lock).unwrap();
+    drop(lock);
     assert_eq!(report.get("ok"), Some(&Value::Bool(true)));
     let mut store = Store::open(&root, schema_static()).unwrap();
     assert_eq!(

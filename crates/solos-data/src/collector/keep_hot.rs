@@ -159,7 +159,7 @@ pub fn repack_keep_hot(
     }
     super::writer::require_storage_space(&root)?;
     store.exec_batch("CHECKPOINT")?;
-    let rewrite = store.while_closed(|root| rewrite(root, &plan))?;
+    let rewrite = store.while_closed(|root, _lock| rewrite(root, &plan))?;
     report.extend(rewrite);
     report.set("seconds", started.elapsed().as_secs_f64());
     store.set("checkpoint-repack", &report.to_value())?;

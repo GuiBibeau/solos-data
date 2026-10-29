@@ -594,9 +594,10 @@ fn decoder_command(command: &str, args: &[String]) -> Result<(), StoreError> {
             Ok(())
         }
         "repack" => {
+            let lock = crate::store::acquire_lock(&config.data_dir)?;
             println!(
                 "{}",
-                crate::repack::repack_checkpoint(&config.data_dir)?.to_json()
+                crate::repack::repack_checkpoint(&config.data_dir, &lock)?.to_json()
             );
             Ok(())
         }
@@ -786,9 +787,10 @@ fn collector_command(command: &str, args: &[String]) -> Result<(), StoreError> {
         config.data_dir = config.data_dir.join("probe");
     }
     if command == "repack" && !has(args, "--keep-hot") {
+        let lock = crate::store::acquire_lock(&config.data_dir)?;
         println!(
             "{}",
-            crate::repack::repack_checkpoint(&config.data_dir)?.to_json()
+            crate::repack::repack_checkpoint(&config.data_dir, &lock)?.to_json()
         );
         return Ok(());
     }

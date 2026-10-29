@@ -4,7 +4,7 @@
 
 use super::normalize::Rows;
 use super::schema::{TABLES, VERSION, definition, type_map};
-use crate::fsutil::{file_hash, sync_path, write_durable};
+use crate::fsutil::{create_dir_all_durable, file_hash, sync_path, write_durable};
 use crate::jsonout::{Obj, now};
 use crate::store::{Store, StoreError, sql_string};
 use serde_json::Value;
@@ -85,7 +85,7 @@ pub fn publish_sources(
             let relative = format!("tables/{table}/epoch={epoch}/{batch:012}.parquet");
             let path = store.root.join(&relative);
             if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
+                create_dir_all_durable(parent)?;
             }
             let tmp = crate::fsutil::tmp_path(&path);
             store.exec_batch(&format!(

@@ -7,7 +7,7 @@ use duckdb::types::{TimeUnit, Value as DbValue};
 use duckdb::{Config, Connection, ToSql, params_from_iter};
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// An owned SQL parameter that crosses the writer-thread channel.
@@ -111,33 +111,74 @@ pub enum StoreError {
 
 /// Exclusive `flock` on `checkpoint.duckdb.lock`. Drop releases it. The kernel releases it if the
 /// process is killed. [`Store`] drops the connection first, then this lock.
-struct DbLock {
-    /// Held for the lock. Never read; the descriptor is the lock.
-    #[allow(dead_code)]
+///
+/// Pass a borrow into work that must run while the checkpoint is closed (`repack_checkpoint`).
+/// Taking a second lock on the same file conflicts, including from this process.
+pub struct DbLock {
     file: nix::fcntl::Flock<File>,
+}
+
+impl DbLock {
+    /// The caller holds this lock for the duration of the borrow.
+    pub fn prove_held(&self) {
+        let _ = &self.file;
+    }
 }
 
 fn lock_path(root: &Path) -> PathBuf {
     root.join("checkpoint.duckdb.lock")
 }
 
-/// Non-blocking exclusive lock. The file is created mode `0600` and left in place after unlock.
-fn acquire_lock(root: &Path) -> Result<DbLock, StoreError> {
-    let path = lock_path(root);
-    let mut options = OpenOptions::new();
-    options.read(true).write(true).create(true);
-    options.mode(0o600);
-    let file = options.open(&path)?;
-    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-        Ok(file) => Ok(DbLock { file }),
-        Err((_, errno))
-            if errno == nix::errno::Errno::EWOULDBLOCK || errno == nix::errno::Errno::EAGAIN =>
-        {
-            Err(StoreError::AlreadyOwned { path })
+fn open_lock_file(path: &Path) -> Result<File, StoreError> {
+    let mut created = OpenOptions::new();
+    created.read(true).write(true).create_new(true);
+    created.mode(0o600);
+    match created.open(path) {
+        Ok(file) => {
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            Ok(file)
         }
-        Err((_, errno)) => Err(StoreError::Io(std::io::Error::from(errno))),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(OpenOptions::new().read(true).write(true).open(path)?)
+        }
+        Err(error) => Err(error.into()),
     }
+}
+
+fn same_inode(file: &File, path: &Path) -> bool {
+    let Ok(fd_meta) = file.metadata() else {
+        return false;
+    };
+    let Ok(path_meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    fd_meta.dev() == path_meta.dev() && fd_meta.ino() == path_meta.ino()
+}
+
+/// Non-blocking exclusive lock. A newly created file is mode `0600`; an existing file is not
+/// chmodded. After the lock is held, the descriptor's inode must still be the path's inode.
+pub fn acquire_lock(root: &Path) -> Result<DbLock, StoreError> {
+    let path = lock_path(root);
+    for _ in 0..3 {
+        let file = open_lock_file(&path)?;
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(file) => {
+                if same_inode(&file, &path) {
+                    return Ok(DbLock { file });
+                }
+            }
+            Err((_, errno))
+                if errno == nix::errno::Errno::EWOULDBLOCK
+                    || errno == nix::errno::Errno::EAGAIN =>
+            {
+                return Err(StoreError::AlreadyOwned { path });
+            }
+            Err((_, errno)) => return Err(StoreError::Io(std::io::Error::from(errno))),
+        }
+    }
+    Err(StoreError::Check(
+        "checkpoint lock file was replaced".into(),
+    ))
 }
 
 /// `Err(StoreError::Check(..))` with a formatted message.
@@ -155,6 +196,9 @@ pub struct Store {
     /// Advisory lock. [`Store::close`] releases it after the connection; other paths drop it with
     /// the struct, after `conn`.
     lock: DbLock,
+    /// Set when reopening the checkpoint after [`Store::while_closed`] fails. Later calls fail
+    /// instead of using the in-memory placeholder.
+    unusable: Option<String>,
     /// Data root that holds `checkpoint.duckdb`.
     pub root: PathBuf,
     ddl: &'static str,
@@ -202,6 +246,7 @@ impl Store {
         let mut store = Store {
             conn,
             lock,
+            unusable: None,
             root: root.to_path_buf(),
             ddl,
             timings: Vec::new(),
@@ -220,10 +265,18 @@ impl Store {
         Ok(Store {
             conn,
             lock,
+            unusable: None,
             root: root.to_path_buf(),
             ddl: "",
             timings: Vec::new(),
         })
+    }
+
+    fn ensure_usable(&self) -> Result<(), StoreError> {
+        if let Some(reason) = &self.unusable {
+            return Err(StoreError::Check(format!("checkpoint unusable: {reason}")));
+        }
+        Ok(())
     }
 
     /// The raw connection, for `COPY`, appenders and attached databases.
@@ -234,6 +287,7 @@ impl Store {
 
     /// Run several statements.
     pub fn exec_batch(&mut self, sql: &str) -> Result<(), StoreError> {
+        self.ensure_usable()?;
         let started = std::time::Instant::now();
         let result = self.conn.execute_batch(sql);
         self.record(sql, started);
@@ -242,6 +296,7 @@ impl Store {
 
     /// Run one statement with parameters; returns the changed row count.
     pub fn exec(&mut self, sql: &str, params: &[&dyn ToSql]) -> Result<usize, StoreError> {
+        self.ensure_usable()?;
         let started = std::time::Instant::now();
         let result = self.conn.execute(sql, params_from_iter(params.iter()));
         self.record(sql, started);
@@ -250,6 +305,7 @@ impl Store {
 
     /// Query rows as ordered JSON objects.
     pub fn rows(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<Obj>, StoreError> {
+        self.ensure_usable()?;
         query_rows(&self.conn, sql, params)
     }
 
@@ -308,19 +364,32 @@ impl Store {
         obj
     }
 
-    /// Close the connection, then run `job` on the closed root, then reopen with the same schema.
+    /// Close the connection, then run `job` with the lock this store already holds, then reopen
+    /// with the same schema. `job` must not lock the checkpoint again.
     pub fn while_closed<T>(
         &mut self,
-        job: impl FnOnce(&Path) -> Result<T, StoreError>,
+        job: impl FnOnce(&Path, &DbLock) -> Result<T, StoreError>,
     ) -> Result<T, StoreError> {
+        self.ensure_usable()?;
         let placeholder = Connection::open_in_memory()?;
         let conn = std::mem::replace(&mut self.conn, placeholder);
         conn.close().map_err(|(_, error)| error)?;
-        let result = job(&self.root);
-        let reopened =
-            Connection::open_with_flags(self.root.join("checkpoint.duckdb"), config(false)?)?;
+        let result = job(&self.root, &self.lock);
+        let reopened = match Connection::open_with_flags(
+            self.root.join("checkpoint.duckdb"),
+            config(false)?,
+        ) {
+            Ok(conn) => conn,
+            Err(error) => {
+                self.unusable = Some(error.to_string());
+                return Err(error.into());
+            }
+        };
         self.conn = reopened;
-        self.exec_batch(self.ddl)?;
+        if let Err(error) = self.exec_batch(self.ddl) {
+            self.unusable = Some(error.to_string());
+            return Err(error);
+        }
         result
     }
 
@@ -588,6 +657,29 @@ mod tests {
             r#"{"big":"1","small":2,"flag":true,"text":"x"}"#
         );
         assert!(store.timings().get("INSERT:kv").is_some());
+        store.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_reopen_marks_the_store_unusable() {
+        let root = tempdir();
+        let mut store = Store::open(
+            &root,
+            "CREATE TABLE IF NOT EXISTS kv(name VARCHAR PRIMARY KEY, value JSON);",
+        )
+        .unwrap();
+        let error = store.while_closed(|root, lock| {
+            lock.prove_held();
+            let path = root.join("checkpoint.duckdb");
+            std::fs::remove_file(&path)?;
+            std::fs::create_dir(&path)?;
+            Ok(())
+        });
+        let message = error.unwrap_err().to_string();
+        assert!(!message.is_empty());
+        let again = store.rows("SELECT 1", &[]).unwrap_err().to_string();
+        assert!(again.contains("unusable"), "{again}");
         store.close().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }

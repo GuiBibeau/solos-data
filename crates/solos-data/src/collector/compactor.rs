@@ -2,7 +2,7 @@
 //! 250k rows and 256 MiB, keeping revision precedence. A port of `compactor.ts`.
 
 use super::catalog::write_catalog;
-use crate::fsutil::{file_hash, sync_path, tmp_path};
+use crate::fsutil::{create_dir_all_durable, file_hash, sync_path, tmp_path};
 use crate::jsonout::now;
 use crate::store::{Store, StoreError, sql_string};
 use std::path::Path;
@@ -54,7 +54,7 @@ pub fn compact(store: &mut Store, root: &Path) -> Result<(), StoreError> {
             .join(&table)
             .join(format!("epoch={epoch}"))
             .join("open");
-        std::fs::create_dir_all(&directory)?;
+        create_dir_all_durable(&directory)?;
         let path = directory.join(format!("compact-{}.parquet", uuid::Uuid::new_v4()));
         let tmp = tmp_path(&path);
         store.exec_batch(&format!(

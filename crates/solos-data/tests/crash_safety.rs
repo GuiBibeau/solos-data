@@ -6,8 +6,8 @@
 
 use serde_json::json;
 use solos_data::collector::schema::SCHEMA;
-use solos_data::collector::writer::recover_files;
-use solos_data::fsutil::{file_hash, tmp_path};
+use solos_data::collector::writer::{Checkpoint, publish_range, recover_files};
+use solos_data::fsutil::{file_hash, manifest_path, tmp_path};
 use solos_data::restart::{RestartError, restart_predicate, tail_watermark};
 use solos_data::store::{Store, StoreError, sql_string};
 use std::fs::OpenOptions;
@@ -191,14 +191,6 @@ fn restart_predicate_is_green_on_a_clean_temp_run_and_red_when_a_covered_partiti
         publish_partition(&mut store, &covered, 100, 100);
         publish_partition(&mut store, &above, 200, 210);
         std::fs::copy(&covered, &unregistered).unwrap();
-        // Registered, but strictly above W: an orphan, not trusted.
-        OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(&above)
-            .unwrap()
-            .set_len(0)
-            .unwrap();
         store
             .set(
                 "W",
@@ -210,11 +202,36 @@ fn restart_predicate_is_green_on_a_clean_temp_run_and_red_when_a_covered_partiti
 
     let mut store = open_collector(&root.0);
     assert_eq!(tail_watermark(&store).unwrap(), Some(100));
+    // W and the file rows commit together, so a registered file above W is not an orphan.
+    match predicate(&store).unwrap_err() {
+        RestartError::AboveWatermark {
+            path,
+            slot_to,
+            watermark,
+        } => {
+            assert_eq!(path, manifest_path(&root.0, &above));
+            assert_eq!(slot_to, 210);
+            assert_eq!(watermark, 100);
+        }
+        other => panic!("a file above W must fail the predicate, got {other}"),
+    }
+    std::fs::remove_file(&above).unwrap();
+    store
+        .exec(
+            "DELETE FROM files WHERE path=?",
+            &[&above.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+    store
+        .exec(
+            "DELETE FROM file_bounds WHERE path=?",
+            &[&above.to_string_lossy().into_owned()],
+        )
+        .unwrap();
     predicate(&store).unwrap();
     recover_files(&mut store, &root.0).unwrap();
     assert!(!unregistered.exists());
-    assert!(above.exists());
-    assert_eq!(std::fs::metadata(&above).unwrap().len(), 0);
+    assert!(covered.exists());
     predicate(&store).unwrap();
     recover_files(&mut store, &root.0).unwrap();
     predicate(&store).unwrap();
@@ -223,7 +240,7 @@ fn restart_predicate_is_green_on_a_clean_temp_run_and_red_when_a_covered_partiti
     std::fs::remove_file(&covered).unwrap();
     let store = open_collector(&root.0);
     match predicate(&store).unwrap_err() {
-        RestartError::Missing { path } => assert_eq!(path, covered),
+        RestartError::Missing { path } => assert_eq!(path, manifest_path(&root.0, &covered)),
         other => panic!("delete must fail the predicate, got {other}"),
     }
     store.close().unwrap();
@@ -254,8 +271,148 @@ fn restart_predicate_is_green_on_a_clean_temp_run_and_red_when_a_covered_partiti
     match predicate(&store).unwrap_err() {
         RestartError::Parse { path, .. }
         | RestartError::RowCount { path, .. }
-        | RestartError::Hash { path, .. } => assert_eq!(path, truncated),
+        | RestartError::Hash { path, .. } => {
+            assert_eq!(path, manifest_path(&truncated_root.0, &truncated));
+        }
         other => panic!("truncate must fail the predicate, got {other}"),
     }
+    store.close().unwrap();
+}
+
+fn insert_transaction(store: &mut Store, signature: &str, slot: i64) {
+    store
+        .exec_batch(&format!(
+            "INSERT INTO transactions VALUES ('{signature}', {slot}, {slot}, NULL, NULL, 'null', 5000, 10, 'AA==', '{{}}', '{{}}', 'tail', 'fixture', '2026-10-04T00:00:00Z', NULL)"
+        ))
+        .unwrap();
+}
+
+fn publish_watermark(store: &mut Store, root: &Path, slot: i64) {
+    publish_range(
+        store,
+        root,
+        slot,
+        slot,
+        Some(Checkpoint {
+            key: "W".into(),
+            value: json!({
+                "signature": "sig",
+                "slot": slot,
+                "completedAt": "2026-10-29T00:00:00Z"
+            }),
+            cycle_id: None,
+        }),
+    )
+    .unwrap();
+}
+
+#[test]
+fn restart_predicate_passes_a_publish_range_and_fails_when_that_partition_is_deleted() {
+    let root = TempDir::new("publish-range");
+    let mut store = open_collector(&root.0);
+    insert_transaction(&mut store, "sig", 100);
+    publish_watermark(&mut store, &root.0, 100);
+    assert_eq!(tail_watermark(&store).unwrap(), Some(100));
+    predicate(&store).unwrap();
+    let path = store
+        .rows("SELECT path FROM files WHERE status='active'", &[])
+        .unwrap()[0]
+        .str("path")
+        .unwrap()
+        .to_owned();
+    store.close().unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let store = open_collector(&root.0);
+    match predicate(&store).unwrap_err() {
+        RestartError::Missing { path: missing } => {
+            assert_eq!(missing, manifest_path(&root.0, Path::new(&path)));
+        }
+        other => panic!("deleting a publish_range partition must fail, got {other}"),
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn a_same_size_bit_flip_of_a_published_partition_is_a_hash_mismatch() {
+    let root = TempDir::new("bit-flip");
+    let mut store = open_collector(&root.0);
+    insert_transaction(&mut store, "sig", 100);
+    publish_watermark(&mut store, &root.0, 100);
+    predicate(&store).unwrap();
+    let path = store
+        .rows("SELECT path FROM files WHERE status='active'", &[])
+        .unwrap()[0]
+        .str("path")
+        .unwrap()
+        .to_owned();
+    let mut bytes = std::fs::read(&path).unwrap();
+    let index = bytes.len() / 2;
+    bytes[index] ^= 0x01;
+    assert_eq!(
+        u64::try_from(bytes.len()).unwrap(),
+        std::fs::metadata(&path).unwrap().len()
+    );
+    std::fs::write(&path, &bytes).unwrap();
+    match predicate(&store).unwrap_err() {
+        RestartError::Hash {
+            path: got,
+            expected,
+            actual,
+        } => {
+            assert_eq!(got, manifest_path(&root.0, Path::new(&path)));
+            assert_ne!(expected, actual);
+        }
+        other => panic!("a same-size bit flip must be a hash mismatch, got {other}"),
+    }
+    store.close().unwrap();
+}
+
+#[test]
+fn recover_files_keeps_registered_files_through_a_symlink_and_a_relative_path() {
+    let real = TempDir::new("recover-real");
+    let link = std::env::temp_dir().join(format!("solos-recover-link-{}", uuid::Uuid::new_v4()));
+    std::os::unix::fs::symlink(&real.0, &link).unwrap();
+    let mut store = open_collector(&link);
+    let relative = real.0.join("staging/rel.parquet");
+    let absolute = real.0.join("staging/abs.parquet");
+    let orphan = real.0.join("staging/orphan.parquet");
+    std::fs::create_dir_all(relative.parent().unwrap()).unwrap();
+    std::fs::write(&relative, b"relative").unwrap();
+    std::fs::write(&absolute, b"absolute").unwrap();
+    std::fs::write(&orphan, b"orphan").unwrap();
+    let absolute_path = absolute.to_string_lossy().into_owned();
+    let count = 1i64;
+    let hash = "hash";
+    for path in ["staging/rel.parquet", absolute_path.as_str()] {
+        store
+            .exec(
+                "INSERT INTO files VALUES (?, 'transactions', 0, ?, ?, 't', 'active')",
+                &[&path, &count, &hash],
+            )
+            .unwrap();
+    }
+    recover_files(&mut store, &link).unwrap();
+    assert!(relative.exists(), "relative registration must survive");
+    assert!(absolute.exists(), "absolute registration must survive");
+    assert!(!orphan.exists(), "unregistered parquet is removed");
+    recover_files(&mut store, &link).unwrap();
+    assert!(relative.exists());
+    store.close().unwrap();
+    let _ = std::fs::remove_file(&link);
+}
+
+#[test]
+fn offline_repack_holds_the_checkpoint_lock() {
+    let root = TempDir::new("repack-lock");
+    let mut store = open_collector(&root.0);
+    store.set("k", &json!({"a": 1})).unwrap();
+    store.close().unwrap();
+    let lock = solos_data::store::acquire_lock(&root.0).unwrap();
+    assert_already_owned(&root.0, Store::open(&root.0, SCHEMA));
+    let report = solos_data::repack::repack_checkpoint(&root.0, &lock).unwrap();
+    assert_eq!(report.get("ok"), Some(&json!(true)));
+    drop(lock);
+    let store = open_collector(&root.0);
+    assert_eq!(store.get("k").unwrap(), Some(json!({"a": 1})));
     store.close().unwrap();
 }

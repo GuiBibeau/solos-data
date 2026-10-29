@@ -9,8 +9,8 @@ use collector_common::*;
 use serde_json::json;
 use solos_data::collector::lanes::Lanes;
 use solos_data::collector::retention::prune_published;
-use solos_data::collector::service::{FatalHook, lane_error};
-use solos_data::collector::writer::publish_range;
+use solos_data::collector::service::{FatalHook, fatal_class, lane_error};
+use solos_data::collector::writer::{Checkpoint, publish_range};
 use solos_data::store::StoreError;
 use std::sync::{Arc, Mutex};
 
@@ -211,5 +211,51 @@ async fn an_unguarded_writer_keeps_running_after_errors() {
     insert_tx(&f, "after", 10);
     assert!(f.db.poisoned().is_none());
     assert_eq!(f.scalar("SELECT count(*) AS n FROM transactions"), "1");
+    f.close();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_fsync_failure_ends_the_lane_and_does_not_retry() {
+    let f = Fixture::new();
+    insert_tx(&f, "sig", 100);
+    let root = f.root.clone();
+    let error =
+        f.db.run_blocking(move |store| {
+            solos_data::fsutil::inject_fsync_failure(true);
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    solos_data::fsutil::inject_fsync_failure(false);
+                }
+            }
+            let _clear = Clear;
+            publish_range(
+                store,
+                &root,
+                100,
+                100,
+                Some(Checkpoint {
+                    key: "W".into(),
+                    value: json!({
+                        "signature": "sig",
+                        "slot": 100,
+                        "completedAt": "2026-10-29T00:00:00Z"
+                    }),
+                    cycle_id: None,
+                }),
+            )
+        })
+        .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("fsync failed"), "{message}");
+    assert_eq!(fatal_class(&message), Some("fsync"));
+    let lanes = Lanes::new(true, true);
+    let (hook, calls) = recorder();
+    assert!(lane_error(&f.db, "fixture", &lanes, "tail", &error, &hook).await);
+    assert_eq!(*calls.lock().unwrap(), vec![("tail".to_owned(), "fsync")]);
+    // Fatal: nothing is written for a retry, and the watermark stays where it was.
+    assert_eq!(f.scalar("SELECT count(*) AS n FROM errors"), "0");
+    assert_eq!(f.scalar("SELECT count(*) AS n FROM published_ranges"), "0");
+    assert!(f.get("W").is_none());
     f.close();
 }
