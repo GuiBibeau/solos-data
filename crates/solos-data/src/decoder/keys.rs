@@ -13,6 +13,34 @@ fn reject(table: &str, key: &str, value: &str) -> StoreError {
     StoreError::Check(format!("duplicate {key} {value} in {table}"))
 }
 
+/// Refuse a repeated `(primary key, batch_id)` in `relation`.
+///
+/// `relation` is a `SELECT` of `key` and `batch_id` over compactor inputs before `QUALIFY`.
+/// Two files that share a key and a batch would otherwise collapse by filename.
+///
+/// # Errors
+///
+/// A duplicate, or the query fails.
+pub fn assert_key_batch_unique(
+    store: &Store,
+    table: &str,
+    relation: &str,
+) -> Result<(), StoreError> {
+    let key = key_column(table);
+    let sql = format!(
+        "SELECT key, batch_id FROM ({relation}) AS inputs GROUP BY key, batch_id HAVING count(*) > 1 ORDER BY key LIMIT 1"
+    );
+    let rows = store.rows(&sql, &[])?;
+    if let Some(row) = rows.first() {
+        return Err(StoreError::Check(format!(
+            "duplicate {key} {} in {table} batch {}",
+            row.str("key").unwrap_or(""),
+            row.int("batch_id").unwrap_or(0)
+        )));
+    }
+    Ok(())
+}
+
 /// Refuse a repeated primary key in `relation` (`events`, or `(SELECT ...) AS keyed`).
 ///
 /// # Errors

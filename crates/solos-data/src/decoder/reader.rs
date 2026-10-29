@@ -1,6 +1,7 @@
 //! Read-only SQL over the registered decoded Parquet, with the latest revision of every row. A
 //! port of `decode/reader.ts`.
 
+use super::parquet::require_connection_duckdb;
 use super::schema::{TABLES, definition, key_column};
 use super::source::source_path;
 use crate::jsonout::Obj;
@@ -33,7 +34,21 @@ pub fn query_decoded_slots(
         Some(_) => return Err(StoreError::Check("slot range must be from<=to".into())),
         None => None,
     };
-    with_read_lease(root, || read_decoded(root, sql, epochs.as_ref()))
+    with_read_lease(root, || {
+        read_decoded(root, std::slice::from_ref(&sql), epochs.as_ref(), false).map(|mut out| {
+            out.pop()
+                .unwrap_or_else(|| Obj::new().with_rows("rows", Vec::new()))
+        })
+    })
+}
+
+/// Several statements against one snapshot: one lease, one catalog read, one connection.
+///
+/// # Errors
+///
+/// A statement is not a single `SELECT`/`WITH`, or the catalog or a file cannot be read.
+pub fn query_decoded_many(root: &Path, statements: &[&str]) -> Result<Vec<Obj>, StoreError> {
+    with_read_lease(root, || read_decoded(root, statements, None, true))
 }
 
 /// The epoch a published path belongs to, when its directory says so.
@@ -46,11 +61,7 @@ fn path_epoch(path: &str) -> Option<i64> {
     digits.parse().ok()
 }
 
-fn read_decoded(
-    root: &Path,
-    sql: &str,
-    epochs: Option<&std::ops::RangeInclusive<i64>>,
-) -> Result<Obj, StoreError> {
+fn accept_select(sql: &str) -> Result<(), StoreError> {
     let head = sql.trim_start().to_lowercase();
     let is_select = ["select", "with"].iter().any(|kw| {
         head.starts_with(kw)
@@ -61,10 +72,25 @@ fn read_decoded(
             "query accepts one SELECT or WITH statement".into(),
         ));
     }
+    Ok(())
+}
+
+fn read_decoded(
+    root: &Path,
+    statements: &[&str],
+    epochs: Option<&std::ops::RangeInclusive<i64>>,
+    check_version: bool,
+) -> Result<Vec<Obj>, StoreError> {
+    for sql in statements {
+        accept_select(sql)?;
+    }
     let catalog: Value = serde_json::from_str(&std::fs::read_to_string(root.join("catalog.json"))?)
         .map_err(|e| StoreError::Check(e.to_string()))?;
     let memory = std::env::var("SOLOS_DATA_QUERY_MEMORY").unwrap_or_else(|_| "4GB".into());
     let conn = memory_connection("4", &memory)?;
+    if check_version {
+        require_connection_duckdb(&conn)?;
+    }
     let files: Vec<Value> = catalog
         .get("files")
         .and_then(Value::as_array)
@@ -134,28 +160,34 @@ fn read_decoded(
         };
         conn.execute_batch(&format!("CREATE VIEW {table} AS SELECT p.* EXCLUDE(batch_id) FROM {relation} QUALIFY row_number() OVER(PARTITION BY p.{key} ORDER BY p.batch_id DESC)=1"))?;
     }
-    let rows = query_rows(&conn, sql, &[])?;
-    Ok(Obj::new()
-        .with(
-            "catalogAt",
-            catalog.get("at").cloned().unwrap_or(Value::Null),
-        )
-        .with(
-            "epochs",
-            epochs.map_or(Value::Null, |range| {
-                Value::Array(vec![Value::from(*range.start()), Value::from(*range.end())])
-            }),
-        )
-        .with(
-            "decoderVersion",
-            catalog
-                .get("decoderVersion")
-                .cloned()
-                .unwrap_or(Value::Null),
-        )
-        .with(
-            "acceptance",
-            catalog.get("acceptance").cloned().unwrap_or(Value::Null),
-        )
-        .with_rows("rows", rows))
+    let mut out = Vec::with_capacity(statements.len());
+    for sql in statements {
+        let rows = query_rows(&conn, sql, &[])?;
+        out.push(
+            Obj::new()
+                .with(
+                    "catalogAt",
+                    catalog.get("at").cloned().unwrap_or(Value::Null),
+                )
+                .with(
+                    "epochs",
+                    epochs.map_or(Value::Null, |range| {
+                        Value::Array(vec![Value::from(*range.start()), Value::from(*range.end())])
+                    }),
+                )
+                .with(
+                    "decoderVersion",
+                    catalog
+                        .get("decoderVersion")
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                )
+                .with(
+                    "acceptance",
+                    catalog.get("acceptance").cloned().unwrap_or(Value::Null),
+                )
+                .with_rows("rows", rows),
+        );
+    }
+    Ok(out)
 }

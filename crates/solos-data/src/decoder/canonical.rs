@@ -65,7 +65,7 @@ pub(crate) fn put_field(buf: &mut Vec<u8>, field: &Field) -> Result<(), String> 
         }
         Field::Decimal(value) => {
             buf.push(DECIMAL);
-            put_bytes(buf, canonical_decimal(value).as_bytes())?;
+            put_bytes(buf, canonical_decimal(value)?.as_bytes())?;
         }
         Field::Text(value) => {
             buf.push(TEXT);
@@ -105,31 +105,39 @@ pub(crate) fn put_row(
             continue;
         }
         let value = row.get(name).unwrap_or(&Value::Null);
-        put_field(buf, &typed_field(ty, value)?)?;
+        put_field(buf, &typed_field(name, ty, value)?)?;
     }
     Ok(())
 }
 
-fn typed_field(ty: &str, value: &Value) -> Result<Field, String> {
+fn typed_field(column: &str, ty: &str, value: &Value) -> Result<Field, String> {
     if value.is_null() {
         return Ok(Field::Null);
     }
+    let bad = |detail: String| format!("column {column} type {ty}: {detail}");
     match ty {
         "BOOLEAN" => Ok(Field::Bool(
-            value.as_bool().ok_or_else(|| "boolean column".to_owned())?,
+            value
+                .as_bool()
+                .ok_or_else(|| bad("value is not a boolean".into()))?,
         )),
         "TINYINT" | "SMALLINT" | "INTEGER" | "BIGINT" | "HUGEINT" => {
-            Ok(Field::Int(parse_i128(value)?))
+            Ok(Field::Int(parse_i128(value).map_err(bad)?))
         }
         "UTINYINT" | "USMALLINT" | "UINTEGER" | "UBIGINT" | "UHUGEINT" => {
-            Ok(Field::Uint(parse_u128(value)?))
+            Ok(Field::Uint(parse_u128(value).map_err(bad)?))
         }
         "FLOAT" | "REAL" | "DOUBLE" => {
-            let number = value.as_f64().ok_or_else(|| "float column".to_owned())?;
+            let number = value
+                .as_f64()
+                .ok_or_else(|| bad("value is not a float".into()))?;
             Ok(Field::Float(number))
         }
-        "DECIMAL" => Ok(Field::Decimal(canonical_decimal(&value_text(value)))),
-        _ => Ok(Field::Text(value_text(value))),
+        "DECIMAL" => Ok(Field::Decimal(
+            canonical_decimal(&value_text(value)).map_err(bad)?,
+        )),
+        "VARCHAR" => Ok(Field::Text(value_text(value))),
+        _ => Err(format!("column {column} type {ty} has no digest encoding")),
     }
 }
 
@@ -164,23 +172,88 @@ fn parse_u128(value: &Value) -> Result<u128, String> {
     }
 }
 
-/// `1.00` and `01.0` and `-0` become `1` and `0`. The sign is kept only when the value is not zero.
-pub(crate) fn canonical_decimal(raw: &str) -> String {
-    let neg = raw.starts_with('-');
-    let raw = raw.trim_start_matches(['+', '-']).trim();
-    let (int, frac) = raw.split_once('.').unwrap_or((raw, ""));
-    let int = int.trim_start_matches('0');
-    let int = if int.is_empty() { "0" } else { int };
-    let frac = frac.trim_end_matches('0');
-    let body = if frac.is_empty() {
-        int.to_owned()
+/// One rendering of a finite decimal, including an exponent (`1.5e2` is `150`).
+///
+/// Leading zeros, trailing fractional zeros and the sign of zero are dropped. `NaN` and
+/// infinities are rejected: they have no digit form.
+///
+/// # Errors
+///
+/// The text is not a finite decimal.
+pub(crate) fn canonical_decimal(raw: &str) -> Result<String, String> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err("empty decimal".into());
+    }
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("nan") || lower.contains("inf") {
+        return Err(format!("decimal {text} is not finite"));
+    }
+    let (neg, rest) = match text.as_bytes().first() {
+        Some(b'+') => (false, &text[1..]),
+        Some(b'-') => (true, &text[1..]),
+        _ => (false, text),
+    };
+    let (mantissa, exp_text) = match rest.rfind(['e', 'E']) {
+        Some(index) if index > 0 => (&rest[..index], Some(&rest[index + 1..])),
+        Some(_) => return Err(format!("decimal {text}")),
+        None => (rest, None),
+    };
+    let exp: i32 = match exp_text {
+        None => 0,
+        Some(token) => {
+            if token.is_empty() || token == "+" || token == "-" {
+                return Err(format!("decimal {text}"));
+            }
+            token
+                .parse()
+                .map_err(|_| format!("decimal exponent {token}"))?
+        }
+    };
+    if exp.unsigned_abs() > 10_000 {
+        return Err(format!("decimal exponent {exp} is out of range"));
+    }
+    let (int_digits, frac_digits) = match mantissa.split_once('.') {
+        Some((int, frac)) => (int, frac),
+        None => (mantissa, ""),
+    };
+    if int_digits.is_empty() && frac_digits.is_empty() {
+        return Err(format!("decimal {text}"));
+    }
+    if !int_digits.bytes().all(|b| b.is_ascii_digit())
+        || !frac_digits.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(format!("decimal {text}"));
+    }
+    let mut digits: Vec<u8> = int_digits.bytes().chain(frac_digits.bytes()).collect();
+    let mut point = i32::try_from(int_digits.len()).map_err(|_| format!("decimal {text}"))? + exp;
+    while digits.first() == Some(&b'0') {
+        digits.remove(0);
+        point -= 1;
+    }
+    if digits.is_empty() {
+        return Ok("0".into());
+    }
+    while digits.len() as i32 > point && digits.last() == Some(&b'0') {
+        digits.pop();
+    }
+    let body = if point <= 0 {
+        let zeros = "0".repeat(usize::try_from(-point).unwrap_or(0));
+        let text = String::from_utf8(digits).map_err(|_| "decimal digits".to_owned())?;
+        format!("0.{zeros}{text}")
+    } else if point as usize >= digits.len() {
+        let zeros = "0".repeat(point as usize - digits.len());
+        let text = String::from_utf8(digits).map_err(|_| "decimal digits".to_owned())?;
+        format!("{text}{zeros}")
     } else {
-        format!("{int}.{frac}")
+        let split = point as usize;
+        let text = String::from_utf8(digits).map_err(|_| "decimal digits".to_owned())?;
+        format!("{}.{}", &text[..split], &text[split..])
     };
     if neg && body != "0" {
-        format!("-{body}")
+        Ok(format!("-{body}"))
     } else {
-        body
+        Ok(body)
     }
 }
 
@@ -212,12 +285,25 @@ mod tests {
             digest(&[Field::Null]),
             digest(&[Field::Text(String::new())])
         );
-        assert_eq!(canonical_decimal("1.00"), "1");
-        assert_eq!(canonical_decimal("01.10"), "1.1");
-        assert_eq!(canonical_decimal("-0.0"), "0");
+        assert_eq!(canonical_decimal("1.00").unwrap(), "1");
+        assert_eq!(canonical_decimal("01.10").unwrap(), "1.1");
+        assert_eq!(canonical_decimal("-0.0").unwrap(), "0");
+        assert_eq!(canonical_decimal("1.5e2").unwrap(), "150");
+        assert_eq!(canonical_decimal("1.5E-1").unwrap(), "0.15");
+        assert_eq!(canonical_decimal("1e-3").unwrap(), "0.001");
+        assert_eq!(canonical_decimal("+2.50e1").unwrap(), "25");
+        assert_eq!(canonical_decimal("100").unwrap(), "100");
+        assert!(canonical_decimal("NaN").is_err());
+        assert!(canonical_decimal("-nan").is_err());
+        assert!(canonical_decimal("+Infinity").is_err());
+        assert!(canonical_decimal("1e").is_err());
         assert_eq!(
             digest(&[Field::Decimal("1.00".into())]),
             digest(&[Field::Decimal("01".into())])
+        );
+        assert_eq!(
+            digest(&[Field::Decimal("1.5e2".into())]),
+            digest(&[Field::Decimal("150".into())])
         );
         assert_ne!(digest(&[Field::Float(0.0)]), digest(&[Field::Float(-0.0)]));
         assert_ne!(digest(&[Field::Int(1)]), digest(&[Field::Text("1".into())]));
@@ -251,5 +337,22 @@ mod tests {
         put_schema(&mut original, "events", &[("a".into(), "VARCHAR".into())]).unwrap();
         assert_ne!(left, right);
         assert_ne!(original, retyped);
+    }
+
+    #[test]
+    fn an_unknown_type_names_the_column_and_is_not_encoded_as_text() {
+        let mut buf = Vec::new();
+        for (column, ty) in [
+            ("amount", "DECIMAL(10,2)"),
+            ("ts", "TIMESTAMP"),
+            ("flags", "LIST"),
+            ("body", "STRUCT"),
+        ] {
+            let row = crate::jsonout::Obj::new().with(column, "1.5");
+            let err = put_row(&mut buf, &[(column.into(), ty.into())], &row).unwrap_err();
+            assert!(err.contains(column), "{err}");
+            assert!(err.contains(ty), "{err}");
+            assert!(err.contains("no digest encoding"), "{err}");
+        }
     }
 }

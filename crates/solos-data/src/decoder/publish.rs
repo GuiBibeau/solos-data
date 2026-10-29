@@ -4,7 +4,7 @@
 
 use super::keys::assert_relation_keys_unique;
 use super::normalize::Rows;
-use super::parquet::copy_statement;
+use super::parquet::{copy_statement, require_store_duckdb};
 use super::schema::{TABLES, VERSION, definition, sort_columns, type_map};
 use crate::fsutil::{create_dir_all_durable, file_hash, sync_path, write_durable};
 use crate::jsonout::{Obj, now};
@@ -64,6 +64,8 @@ pub fn publish_sources(
             .or_else(|| v.as_i64())
             .unwrap_or(0)
     }) + 1;
+    // The COPY below writes Parquet with the pinned 1.4.5 settings.
+    require_store_duckdb(store)?;
     // Files are durable before the transaction that registers them and progress.
     let mut files: Vec<Published> = Vec::new();
     for table in TABLES {

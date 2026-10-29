@@ -54,7 +54,7 @@ from being mistaken for complete acceptance. Checkmarks require recorded evidenc
 - [ ] Partition state/version/seal transitions, target-size compaction, explicit versioned
   corrections and safe garbage collection. V1–V7 required before sealing.
 - [x] Golden day hash: the checked-in Phoenix fixture decodes to one content digest in two
-  fresh roots ([ADR-0016](../adr/0016-deterministic-parquet-digest.md)).
+  fresh roots ([ADR-0017](../adr/0017-deterministic-parquet-digest.md)).
 - [ ] Full 24-hour outage, five random SIGKILL tests across fetch/compaction/sealing,
   new-market and upgrade fixtures, seven-day p99 freshness evidence.
 - [ ] Optional V8 live-recorder reconciliation after locating the independent recorder.

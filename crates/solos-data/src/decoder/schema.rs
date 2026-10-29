@@ -134,16 +134,6 @@ pub fn column_pairs(table: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Columns of one table in definition order, without the wall-clock `decoded_at`.
-#[must_use]
-pub fn digest_projection(table: &str) -> String {
-    column_pairs(table)
-        .into_iter()
-        .filter_map(|(name, _)| (name != "decoded_at").then_some(name))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,12 +152,19 @@ mod tests {
     }
 
     #[test]
-    fn digest_projection_drops_the_wall_clock_and_the_sort_is_total() {
-        let transactions = digest_projection("decoded_transactions");
-        assert!(!transactions.contains("decoded_at"));
-        assert!(transactions.contains("signature"));
+    fn the_sort_key_includes_the_primary_key() {
+        let names: Vec<String> = column_pairs("decoded_transactions")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names.iter().any(|name| name == "decoded_at"));
+        assert!(names.iter().any(|name| name == "signature"));
         assert_eq!(sort_columns("decoded_transactions"), "slot, signature");
-        assert!(digest_projection("events").contains("event_ordinal"));
+        assert!(
+            column_pairs("events")
+                .iter()
+                .any(|(name, _)| name == "event_ordinal")
+        );
         assert!(sort_columns("events").ends_with("event_id"));
         assert!(sort_columns("decode_errors").ends_with("error_id"));
         for table in TABLES {

@@ -1,4 +1,4 @@
-# ADR-0016: Golden day hash is a content digest
+# ADR-0017: Golden day hash is a content digest
 
 Status: accepted, October 29, 2026. Closes the golden-day-hash item in
 [docs/issues/001](../issues/001-phoenix-acceptance.md).
@@ -76,6 +76,14 @@ A production replay is still not byte-identical to a sealed file: `decoded_at` i
 clock on every write, and `created_by` changes when the DuckDB build changes. Compare replays
 with the content digest. The golden fixture is the exception, because its clock is fixed and
 its file hashes are committed for this DuckDB build.
+
+Production `decoded_at` is taken once per batch in the decoder service, not once per row. Every
+row published from that batch shares the instant. The golden fixture replaces the batch clock
+with `2026-10-04T00:00:00.000Z`.
+
+The digest reads every registered row into JSON before encoding it. That is enough for the
+fixture day. It is not acceptable for a production day: streaming the digest, so the day is not
+held as JSON, has to land before this digest runs on production days.
 
 The digest encoding changed when the schema and the length-prefixed fields replaced the earlier
 JSON concatenation (`63c06f73d2691e6d8bea9cb45a44505403002cc47fe2c001e376b095b889315d`). The

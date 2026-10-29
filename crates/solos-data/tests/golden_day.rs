@@ -1,4 +1,4 @@
-//! Golden day hash of the checked-in Phoenix fixture (ADR-0016).
+//! Golden day hash of the checked-in Phoenix fixture (ADR-0017).
 //!
 //! Decodes `tests/data/phoenix-events.json` through the real decoder into a fresh temp directory
 //! with a fixed `decoded_at`. Two fresh directories must share the content digest and every
