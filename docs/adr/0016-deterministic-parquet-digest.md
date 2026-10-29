@@ -29,18 +29,32 @@ disk are the bytes that were registered. That check is integrity, not replay.
 
 Pin the decoded writer to DuckDB 1.4.5's defaults, written out so a later default cannot move
 them: ZSTD at level 3, row groups of 122880, Parquet V1, bloom filters on. `ROW_GROUP_SIZE_BYTES`
-stays unset, which in 1.4.5 means unlimited while insertion order is preserved. Sort each table
-by a total key: `slot, signature` for transactions, plus `instruction_path` and `event_ordinal`
-(or `error_id`) for the other tables.
+stays unset, which in 1.4.5 means unlimited while insertion order is preserved.
 
-Hash a canonical content digest, not the file bytes. The digest reads the registered files the
-way the reader does (latest revision of each key), projects columns in definition order,
-drops `decoded_at`, sorts by that same key, and SHA-256s the rows. Footer `created_by` and the
-catalog clocks never enter it. The committed value is `tests/data/golden-day.sha256`, from
-`tests/data/phoenix-events.json` decoded in a temp directory.
+Sort each table by a key that ends in its primary key: `signature`, `event_id`, or `error_id`.
+`event_id` is `signature/instruction_path/event_ordinal` and a base58 signature contains no `/`,
+so the key is one event. The publisher and the digest refuse a second row with that key in the
+same batch. A repeated key is not hashed: the order of a tie is not a function of the rows, and
+the refusal is the no-duplicate-primary-key check. A later batch may carry a revised row; the
+reader still keeps the newest.
 
-`SOLOS_DATA_REFRESH_GOLDEN_DAY=1 cargo test --test golden_day` rewrites the digest after a
-decoder or writer change that should move it. The test does not seal a partition.
+`files.sha256` stays the SHA-256 of the file bytes. That is the bit-rot check (V7): the bytes
+on disk are the bytes that were registered. It is not the equivalence check.
+
+The equivalence check is a content digest. It hashes, in order, the schema (column name, type,
+and order, including `decoded_at`) and the reader rows. Every field is a tag. Variable-length
+payloads are a big-endian `u32` length plus bytes. `NULL` is its own tag. Integers are 16-byte
+big-endian. Floats are IEEE-754 bits. Decimals are one normalized digit string. `decoded_at`
+keeps its schema slot and is an omitted tag, not the clock. Joined strings are not hashed.
+Footer `created_by` is not read.
+
+The golden fixture sets `decoded_at` to `2026-10-04T00:00:00.000Z` and compares both the digest
+and every registered file's SHA-256. On this DuckDB build the file hashes catch a writer-option
+change that would leave the rows, and therefore the digest, unchanged. Production does not set
+the fixture clock. The committed record is `tests/data/golden-day.sha256`.
+
+`SOLOS_DATA_REFRESH_GOLDEN_DAY=1 cargo test --test golden_day` rewrites that file after a
+decoder or writer change that should move either hash. The test does not seal a partition.
 
 The raw collector, the spot writer and the augment writer are unchanged. The TypeScript decoder
 is the pre-cutover writer and is unchanged. The supervised writer after ADR-0007 is the Rust
@@ -53,12 +67,16 @@ test writes the same rows with the pinned clause and with `FORMAT PARQUET, COMPR
 and requires equal SHA-256s. The same test shows two writes of fixed rows are byte-identical.
 
 The decoder inserts events in instruction-path and ordinal order. On DuckDB 1.4.5, `ORDER BY
-slot, signature` keeps that order for a tie, so adding the total key does not move those rows
-and does not change their file bytes. A tie inserted out of that order does move: the same
-writer produced different SHA-256s for `(ordinal 2, ordinal 1)` sorted only by `slot, signature`
-versus the total key. Already-sealed files are not rewritten and not re-sealed. Their
-registered SHA-256 remains the hash of the bytes that were written.
+slot, signature` keeps that order for a tie, so adding the primary key does not move those rows
+when they were already unique and in key order. A tie inserted out of that order does move.
+Already-sealed files are not rewritten and not re-sealed. Their registered SHA-256 remains the
+hash of the bytes that were written.
 
-A replay of a sealed file is still not byte-identical to it. `decoded_at` is a new wall clock
-on every write (that was already true), and `created_by` changes when the DuckDB build changes.
-Compare replays with the content digest.
+A production replay is still not byte-identical to a sealed file: `decoded_at` is a new wall
+clock on every write, and `created_by` changes when the DuckDB build changes. Compare replays
+with the content digest. The golden fixture is the exception, because its clock is fixed and
+its file hashes are committed for this DuckDB build.
+
+The digest encoding changed when the schema and the length-prefixed fields replaced the earlier
+JSON concatenation (`63c06f73d2691e6d8bea9cb45a44505403002cc47fe2c001e376b095b889315d`). The
+committed golden file was refreshed with the new digest and the file hashes.

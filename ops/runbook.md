@@ -904,8 +904,9 @@ codec/schema version. [Table details](../docs/decoded-tables.md) cover read-only
 ## Verify changes
 
 With Rust 1.96 installed, run `cargo test --workspace`. Tests are offline and need no
-credentials. The decoded golden-day digest is `tests/data/golden-day.sha256`. After a decoder
-or writer change that should move it,
+credentials. The decoded golden-day record is `tests/data/golden-day.sha256`: a content digest and the
+`files.sha256` of each registered Parquet file, from a fixture whose `decoded_at` is fixed.
+After a decoder or writer change that should move either hash,
 `SOLOS_DATA_REFRESH_GOLDEN_DAY=1 cargo test --test golden_day` rewrites that file. The test
 decodes `tests/data/phoenix-events.json` in two fresh temp directories and does not seal. The archive lane compiles with `cargo build --features archive -p solos-data`,
 which needs clang and cmake. The `clang-sys` build script wants an unversioned `libclang.so`

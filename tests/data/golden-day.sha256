@@ -1,4 +1,16 @@
-# Canonical content digest of tests/data/phoenix-events.json decoded by the pinned writer.
-# Excludes decoded_at and Parquet created_by. Not a file SHA-256.
-# Refresh: SOLOS_DATA_REFRESH_GOLDEN_DAY=1 cargo test --test golden_day
-63c06f73d2691e6d8bea9cb45a44505403002cc47fe2c001e376b095b889315d
+# Content digest v2 and pinned DuckDB 1.4.5 file hashes of tests/data/phoenix-events.json.
+# decoded_at is fixed at 2026-10-04T00:00:00.000Z. The digest omits that value and created_by.
+# files.sha256 is the raw file hash. Refresh: SOLOS_DATA_REFRESH_GOLDEN_DAY=1 cargo test --test golden_day
+digest 7b3df686e0a3904d3269c0082b7316a627f8418e9b17977bdc64ef887c9fe0c5
+file tables/decoded_transactions/epoch=981/000000000001.parquet 6b7e237cc35d0a4432aa5004c542861ca06422bfbef0cb0058b08975f3684339
+file tables/decoded_transactions/epoch=988/000000000001.parquet e1bc2a720c776246585117bec117ec5bbc92b9beddd976e6138d9255323e0e29
+file tables/decoded_transactions/epoch=991/000000000001.parquet 1b96646231a0947b537a48a74f805176488f366029b3a570436bbebe6b19ff0b
+file tables/decoded_transactions/epoch=993/000000000001.parquet 14b8a4596d30148344af716ee79bed62f48f91db2f82d909df6b9aa60af6e1aa
+file tables/events/epoch=981/000000000001.parquet 030ea73e1a273ecccfcfe1d3b41edaa2179b3784f821ece415653745f265e4b5
+file tables/events/epoch=988/000000000001.parquet 5a0dea8a3c3ea47154685c7ea63ab8cccaed02714e86bc2f6dfd8077f9eaea5f
+file tables/events/epoch=991/000000000001.parquet 5d28e8d434cc508fde663e2ffc177638480e860f58b690193714035f3f22ec92
+file tables/events/epoch=993/000000000001.parquet 935cc2839b377d217494cf25adad6a1dd9c0ab4c8ba2fd2d1defdac77d33d429
+file tables/fills/epoch=993/000000000001.parquet de7f8ed7c7071e69215f2d6cda74f257b35bcd7382458b86c76b43ed45a569dc
+file tables/funding_events/epoch=981/000000000001.parquet fa126be5909d13b4ebb1309c20ee4fd67159f5453b527aa9e2630ab79f0be03d
+file tables/funding_events/epoch=993/000000000001.parquet 1bf623439e7297dca8f99e168bfae14fe19e02b098292e83e60efb283eae368f
+file tables/order_events/epoch=993/000000000001.parquet 2ab0924517f944ab771ea2fd4d0b35aec57b093da3b73e7485934d4b27dff9b7

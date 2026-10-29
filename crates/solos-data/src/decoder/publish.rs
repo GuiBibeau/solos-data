@@ -2,6 +2,7 @@
 //! registering the files, the processed revisions, the source offset and the batch number. A
 //! port of `decode/publish.ts`.
 
+use super::keys::assert_relation_keys_unique;
 use super::normalize::Rows;
 use super::parquet::copy_statement;
 use super::schema::{TABLES, VERSION, definition, sort_columns, type_map};
@@ -77,6 +78,7 @@ pub fn publish_sources(
         let payload =
             serde_json::to_string(table_rows).map_err(|e| StoreError::Check(e.to_string()))?;
         store.exec(&format!("INSERT INTO {table} SELECT unnest(json_transform(?::JSON, ?::JSON), recursive:=true)"), &[&payload, &type_map(table)])?;
+        assert_relation_keys_unique(store, table, table)?;
         let epochs = store.rows(
             &format!("SELECT DISTINCT slot // 432000 AS epoch FROM {table}"),
             &[],

@@ -143,13 +143,27 @@ fn coalesce<'a>(values: impl IntoIterator<Item = Option<&'a Value>>) -> Value {
         .unwrap_or(Value::Null)
 }
 
-/// Build the rows of one transaction. `Err` means an event's slot context disagrees with the
-/// transaction, which the service turns into a validation quarantine.
+/// Build the rows of one transaction, stamping `decoded_at` with the wall clock.
+///
+/// `Err` means an event's slot context disagrees with the transaction, which the service turns
+/// into a validation quarantine.
 pub fn normalize(
     tx: &RawTransaction,
     hash: &str,
     groups: &[DecodedGroup],
     source_file: &str,
+) -> Result<Rows, String> {
+    normalize_at(tx, hash, groups, source_file, &now())
+}
+
+/// [`normalize`] with an explicit `decoded_at`. The golden fixture passes a fixed clock so the
+/// Parquet bytes can be compared; production passes [`now`].
+pub fn normalize_at(
+    tx: &RawTransaction,
+    hash: &str,
+    groups: &[DecodedGroup],
+    source_file: &str,
+    decoded_at: &str,
 ) -> Result<Rows, String> {
     let mut rows = Rows::default();
     let meta: Value = tx
@@ -347,7 +361,7 @@ pub fn normalize(
             .with("event_count", event_count)
             .with("error_count", errors)
             .with("source_file", source_file)
-            .with("decoded_at", now())
+            .with("decoded_at", decoded_at)
             .with("decoder_version", VERSION),
     );
     Ok(rows)

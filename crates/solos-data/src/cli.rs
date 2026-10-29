@@ -557,6 +557,7 @@ pub fn load_decoder_config(args: &[String]) -> Result<DecoderConfig, StoreError>
         compaction_interval_seconds: compaction_interval,
         compaction_budget_seconds: compaction_budget,
         compaction_settled_batches: compaction_settled,
+        decoded_at: None,
     })
 }
 

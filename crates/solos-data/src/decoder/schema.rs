@@ -108,25 +108,38 @@ pub fn key_column(table: &str) -> &'static str {
 
 /// Total order for a published file and for the content digest.
 ///
-/// `slot, signature` alone ties every event of one transaction, and DuckDB's sort does not keep
-/// input order for ties. `instruction_path` is the dotted stack path (`0`, `0.1`) and
-/// `event_ordinal` numbers events inside that instruction.
+/// Each list ends with the table's primary key ([`key_column`]). That key is unique per batch:
+/// `signature` once per transaction, `event_id` (`signature/instruction_path/event_ordinal`, and
+/// a base58 signature has no `/`) once per event, `error_id` once per decode error. The publisher
+/// and the digest refuse a second row. A sort that ends in a unique key is a total order, so the
+/// digest does not depend on how a tie would have been broken.
 #[must_use]
 pub fn sort_columns(table: &str) -> &'static str {
     match table {
         "decoded_transactions" => "slot, signature",
         "decode_errors" => "slot, signature, instruction_path, error_id",
-        _ => "slot, signature, instruction_path, event_ordinal",
+        _ => "slot, signature, instruction_path, event_ordinal, event_id",
     }
+}
+
+/// Column name and type in definition order, including `decoded_at`.
+#[must_use]
+pub fn column_pairs(table: &str) -> Vec<(String, String)> {
+    definition(table)
+        .split(',')
+        .filter_map(|column| {
+            let mut parts = column.split_whitespace();
+            Some((parts.next()?.to_owned(), parts.next()?.to_owned()))
+        })
+        .collect()
 }
 
 /// Columns of one table in definition order, without the wall-clock `decoded_at`.
 #[must_use]
 pub fn digest_projection(table: &str) -> String {
-    definition(table)
-        .split(',')
-        .filter_map(|column| column.split_whitespace().next())
-        .filter(|name| *name != "decoded_at")
+    column_pairs(table)
+        .into_iter()
+        .filter_map(|(name, _)| (name != "decoded_at").then_some(name))
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -155,7 +168,16 @@ mod tests {
         assert!(transactions.contains("signature"));
         assert_eq!(sort_columns("decoded_transactions"), "slot, signature");
         assert!(digest_projection("events").contains("event_ordinal"));
-        assert!(sort_columns("events").contains("event_ordinal"));
-        assert!(sort_columns("decode_errors").contains("error_id"));
+        assert!(sort_columns("events").ends_with("event_id"));
+        assert!(sort_columns("decode_errors").ends_with("error_id"));
+        for table in TABLES {
+            let key = key_column(table);
+            assert!(
+                sort_columns(table)
+                    .split(',')
+                    .any(|column| column.trim() == key),
+                "{table} sort does not include {key}"
+            );
+        }
     }
 }
