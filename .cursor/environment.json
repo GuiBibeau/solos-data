@@ -1,0 +1,4 @@
+{
+  "name": "solos-data",
+  "install": "bash scripts/cloud-setup.sh"
+}
