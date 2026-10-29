@@ -6,6 +6,8 @@ use crate::jsonout::Obj;
 use duckdb::types::{TimeUnit, Value as DbValue};
 use duckdb::{Config, Connection, ToSql, params_from_iter};
 use serde_json::Value;
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// An owned SQL parameter that crosses the writer-thread channel.
@@ -96,6 +98,46 @@ pub enum StoreError {
     /// A domain check failed; the text is the TypeScript error message.
     #[error("{0}")]
     Check(String),
+    /// Another process holds the advisory lock beside this checkpoint.
+    ///
+    /// Taken in [`Store::open`] and [`Store::open_read_only`] before DuckDB is opened, so the
+    /// second owner fails here and never opens the database. ADR-0016.
+    #[error("checkpoint already owned ({path})")]
+    AlreadyOwned {
+        /// `checkpoint.duckdb.lock`, beside `checkpoint.duckdb`.
+        path: PathBuf,
+    },
+}
+
+/// Exclusive `flock` on `checkpoint.duckdb.lock`. Drop releases it. The kernel releases it if the
+/// process is killed. [`Store`] drops the connection first, then this lock.
+struct DbLock {
+    /// Held for the lock. Never read; the descriptor is the lock.
+    #[allow(dead_code)]
+    file: nix::fcntl::Flock<File>,
+}
+
+fn lock_path(root: &Path) -> PathBuf {
+    root.join("checkpoint.duckdb.lock")
+}
+
+/// Non-blocking exclusive lock. The file is created mode `0600` and left in place after unlock.
+fn acquire_lock(root: &Path) -> Result<DbLock, StoreError> {
+    let path = lock_path(root);
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    options.mode(0o600);
+    let file = options.open(&path)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(file) => Ok(DbLock { file }),
+        Err((_, errno))
+            if errno == nix::errno::Errno::EWOULDBLOCK || errno == nix::errno::Errno::EAGAIN =>
+        {
+            Err(StoreError::AlreadyOwned { path })
+        }
+        Err((_, errno)) => Err(StoreError::Io(std::io::Error::from(errno))),
+    }
 }
 
 /// `Err(StoreError::Check(..))` with a formatted message.
@@ -105,8 +147,14 @@ macro_rules! check_fail {
 }
 
 /// One checkpoint database.
+///
+/// `conn` is declared before `lock` so it is dropped first (struct fields drop in declaration
+/// order). The advisory lock stays held until the database connection is closed.
 pub struct Store {
     conn: Connection,
+    /// Advisory lock. [`Store::close`] releases it after the connection; other paths drop it with
+    /// the struct, after `conn`.
+    lock: DbLock,
     /// Data root that holds `checkpoint.duckdb`.
     pub root: PathBuf,
     ddl: &'static str,
@@ -144,11 +192,16 @@ pub fn memory_connection(threads: &str, memory_limit: &str) -> Result<Connection
 
 impl Store {
     /// Open (creating the directory) and apply the schema.
+    ///
+    /// Takes the advisory lock beside the database before DuckDB opens it. A second process gets
+    /// [`StoreError::AlreadyOwned`] and does not open the file.
     pub fn open(root: &Path, ddl: &'static str) -> Result<Self, StoreError> {
         std::fs::create_dir_all(root)?;
+        let lock = acquire_lock(root)?;
         let conn = Connection::open_with_flags(root.join("checkpoint.duckdb"), config(false)?)?;
         let mut store = Store {
             conn,
+            lock,
             root: root.to_path_buf(),
             ddl,
             timings: Vec::new(),
@@ -158,10 +211,15 @@ impl Store {
     }
 
     /// Open read-only without applying the schema; for preflight and read-only tools.
+    ///
+    /// Takes the same exclusive lock as [`Store::open`]. One process owns the checkpoint, including
+    /// a read-only opener.
     pub fn open_read_only(root: &Path) -> Result<Self, StoreError> {
+        let lock = acquire_lock(root)?;
         let conn = Connection::open_with_flags(root.join("checkpoint.duckdb"), config(true)?)?;
         Ok(Store {
             conn,
+            lock,
             root: root.to_path_buf(),
             ddl: "",
             timings: Vec::new(),
@@ -266,9 +324,12 @@ impl Store {
         result
     }
 
-    /// Close explicitly.
+    /// Close explicitly. The database connection closes before the advisory lock is released.
     pub fn close(self) -> Result<(), StoreError> {
-        self.conn.close().map_err(|(_, error)| error)?;
+        let Store { conn, lock, .. } = self;
+        let result = conn.close().map_err(|(_, error)| error);
+        drop(lock);
+        result?;
         Ok(())
     }
 
