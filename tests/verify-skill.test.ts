@@ -16,6 +16,7 @@ test('verify-solos-data doctor detects every journey-redirecting or credential e
     'SOLOS_DATA_CONFIG',
     'SOLOS_DATA_AUGMENT_DIR',
     'SOLOS_DATA_DB_CHECKPOINT',
+    'SOLOS_DATA_FAILPOINT_MARKER',
     'SOLANA_RPC_URL',
     'HELIUS_RPC_ENDPOINT',
     'PROVIDER_URL',
@@ -48,6 +49,7 @@ test('verify-solos-data subprocess env is an allowlist, proven by a real child p
     SOLOS_DATA_CONFIG: '/real/config.json',
     SOLOS_DATA_AUGMENT_DIR: '/real/augment',
     SOLOS_DATA_DB_CHECKPOINT: '1GB',
+    SOLOS_DATA_FAILPOINT_MARKER: '/tmp/failpoint-marker',
     SOLANA_RPC_URL: 'https://secret.example',
     SOME_RPC_ENDPOINT: 'https://secret.example',
     PROVIDER_URL: 'https://secret.example',
@@ -74,6 +76,7 @@ test('verify-solos-data subprocess env is an allowlist, proven by a real child p
     assert.doesNotMatch(name, /^SOLOS_DATA_|_RPC_|_API_KEY$|^JETSTREAMER_/, `${name} must not survive`);
   }
   assert.ok(!names.includes('PROVIDER_URL'), 'PROVIDER_URL must not survive');
+  assert.ok(!names.includes('SOLOS_DATA_FAILPOINT_MARKER'), 'SOLOS_DATA_FAILPOINT_MARKER must not survive');
   assert.ok(!names.includes('CC'), 'CC must not survive the allowlist');
   assert.ok(!names.includes('NODE_OPTIONS'), 'NODE_OPTIONS must not survive');
 });

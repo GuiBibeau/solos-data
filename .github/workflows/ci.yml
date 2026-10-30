@@ -123,6 +123,10 @@ jobs:
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --locked
+      # Seed the cache with the dev-profile binary the verify-skill job drives. `cargo test`
+      # resolves libduckdb-sys's build script in test mode and `cargo build` in build mode, so
+      # without this line the skill would recompile DuckDB's C++ even after restoring this cache.
+      - run: cargo build --locked --bin solos-data
       # The npm suite runs on every push to main, and on a pull request that touches its inputs:
       # the TypeScript sources and tests, their config, the npm manifests, and the codec it spawns.
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
@@ -159,8 +163,9 @@ jobs:
         run: find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete
 
   # The offline verification skill drives the real binary through its golden fixtures. It
-  # builds the same dev profile as the test job, so warm runs reuse those cached objects and
-  # the journeys themselves run in seconds: the job stays well under five minutes warm.
+  # restores the same cache the test job saves (`shared-key: test`), including the dev-profile
+  # binary and libduckdb-sys objects built there, so warm runs skip the Rust build entirely and
+  # the journeys finish in seconds. It never saves: the test job owns the cache.
   verify-skill:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -173,9 +178,13 @@ jobs:
         with:
           node-version: 24
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        id: cache
+        with:
+          shared-key: test
+          save-if: false
+      - name: Record rust-cache
+        run: echo "rust-cache hit=${{ steps.cache.outputs.cache-hit }}"
       - run: node .cursor/skills/verify-solos-data/run.mjs
-      - name: Prune DuckDB objects before caching
-        run: find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete
 
   # The archive feature (Jetstreamer, the agave crates, RocksDB) is otherwise compiled only by
   # the image build. Bindgen needs libclang. RocksDB, DuckDB and protobuf are C++: `clang` as

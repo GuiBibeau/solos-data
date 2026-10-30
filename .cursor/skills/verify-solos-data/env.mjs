@@ -18,8 +18,15 @@ const ALLOWED_NAMES = new Set(['PATH', 'HOME', 'TMPDIR', 'LANG']);
 // the skill sets to the repository's target/ directory) and rustup needs RUSTUP_*.
 const ALLOWED_PREFIXES = ['CARGO_', 'RUSTUP_'];
 
+// Failpoint env vars (#72/#73). They already fall under the `SOLOS_DATA_` prefix below, but they
+// are named here explicitly so a future allowlist widening can never leak them into a subprocess.
+const FAILPOINT_ENV_NAMES = new Set(['SOLOS_DATA_FAILPOINT_MARKER']);
+
 function allowed(name) {
-  return ALLOWED_NAMES.has(name) || ALLOWED_PREFIXES.some((prefix) => name.startsWith(prefix));
+  return (
+    !FAILPOINT_ENV_NAMES.has(name) &&
+    (ALLOWED_NAMES.has(name) || ALLOWED_PREFIXES.some((prefix) => name.startsWith(prefix)))
+  );
 }
 
 // A name that could redirect a journey or leak a credential. Used by the doctor and by the
@@ -30,7 +37,10 @@ const DANGEROUS = /^SOLOS_DATA_|(^|_)RPC_(URL|ENDPOINT|HOST)$|^PROVIDER_URL$|_AP
 export function dangerousEnvNames(env) {
   const names = Object.keys(env ?? {});
   return names.filter(
-    (name) => env[name] !== undefined && env[name] !== '' && DANGEROUS.test(name),
+    (name) =>
+      env[name] !== undefined &&
+      env[name] !== '' &&
+      (DANGEROUS.test(name) || FAILPOINT_ENV_NAMES.has(name)),
   );
 }
 
