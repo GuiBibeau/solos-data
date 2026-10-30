@@ -1201,21 +1201,37 @@ fn failpoint_writer_cmd(_args: &[String]) -> i32 {
 }
 
 /// `dev publish-fixture` (issue #61): generate a deterministic fixture source and publish it,
-/// printing one progress line per file. The random-kill harness SIGKILLs this process at a
-/// seeded offset of that output. Only the `failpoints` feature builds it, like
-/// `failpoint-writer`: release builds refuse rather than advancing a watermark anywhere.
+/// printing one progress line per publication step. The random-kill harness SIGKILLs this process
+/// at a seeded offset of that output; `--recover-only` only runs the production startup recovery
+/// and exits. Only the `failpoints` feature builds it, like `failpoint-writer`: release builds
+/// refuse rather than advancing a watermark anywhere.
 #[cfg(feature = "failpoints")]
 fn publish_fixture_cmd(args: &[String]) -> i32 {
-    let (Some(root), Some(from), Some(to)) = (
-        flag(args, "--root"),
-        flag(args, "--from").and_then(|v| v.parse::<i64>().ok()),
-        flag(args, "--to").and_then(|v| v.parse::<i64>().ok()),
-    ) else {
+    let Some(root) = flag(args, "--root") else {
         return 1;
     };
-    match crate::dev::publish_fixture(&PathBuf::from(root), from, to) {
+    let recover_only = args.iter().any(|arg| arg == "--recover-only");
+    let from = flag(args, "--from").and_then(|v| v.parse::<i64>().ok());
+    let to = flag(args, "--to").and_then(|v| v.parse::<i64>().ok());
+    if !recover_only && (from.is_none() || to.is_none()) {
+        return 1;
+    }
+    match crate::dev::publish_fixture(
+        &PathBuf::from(root),
+        from.unwrap_or(0),
+        to.unwrap_or(0),
+        recover_only,
+    ) {
         Ok(()) => 0,
-        Err(_) => 1,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                Obj::new()
+                    .with("error", safe_error(&error.to_string()))
+                    .to_json()
+            );
+            1
+        }
     }
 }
 
@@ -1290,7 +1306,7 @@ fn dev(args: &[String]) -> i32 {
             );
             #[cfg(feature = "failpoints")]
             commands.push(
-                "publish-fixture --root <root> --from <slot> --to <slot> (test fixture, issue #61)",
+                "publish-fixture --root <root> --from <slot> --to <slot> [--recover-only] (test fixture, issue #61)",
             );
             println!("{}", Obj::new().with("commands", commands).to_json());
             return 0;

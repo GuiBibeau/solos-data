@@ -149,13 +149,24 @@ pub fn crash_writer(root: &Path) -> Result<(), StoreError> {
 
 /// Test fixture for the random-kill loop (issue #61): generate a deterministic fixture source —
 /// one row per raw table at one slot per epoch inside `[from, to]` — and publish the range,
-/// printing one progress line per published file (after its range check and hash, before the
-/// watermark commit) and `published` at the end. `INSERT OR IGNORE` makes a re-run after a kill
-/// idempotent. Only compiled with the `failpoints` feature, like [`failpoint_writer`], because
-/// it advances the tail watermark into any root it is given.
+/// printing one progress line per publication step and `published` at the end. `INSERT OR IGNORE`
+/// makes a re-run after a kill idempotent. With `recover_only`, it only runs the production
+/// startup recovery ([`crate::collector::service::recover_startup`]) and exits, so the harness's
+/// restart exercises the real recovery path. Only compiled with the `failpoints` feature, like
+/// [`failpoint_writer`], because it advances the tail watermark into any root it is given.
 #[cfg(feature = "failpoints")]
-pub fn publish_fixture(root: &Path, from: i64, to: i64) -> Result<(), StoreError> {
+pub fn publish_fixture(
+    root: &Path,
+    from: i64,
+    to: i64,
+    recover_only: bool,
+) -> Result<(), StoreError> {
     let mut store = crate::store::Store::open(root, crate::collector::schema::SCHEMA)?;
+    if recover_only {
+        crate::collector::service::recover_startup(&mut store, root)?;
+        store.close()?;
+        return Ok(());
+    }
     // One row per raw table at one slot per epoch inside `[from, to]`, so a multi-epoch range
     // writes several files per table without inserting millions of rows.
     let epoch_size = 432_000i64;
@@ -199,8 +210,17 @@ pub fn publish_fixture(root: &Path, from: i64, to: i64) -> Result<(), StoreError
             value: watermark,
             cycle_id: None,
         }),
-        &mut |table, epoch| println!("file {table} epoch={epoch}"),
+        &mut |progress: crate::collector::writer::Progress| match progress.stage {
+            crate::collector::writer::ProgressStage::Commit => println!("commit"),
+            _ => println!(
+                "{} {} epoch={}",
+                progress.stage.label(),
+                progress.table,
+                progress.epoch
+            ),
+        },
     )?;
+    println!("committed");
     store.close()?;
     println!("published");
     Ok(())

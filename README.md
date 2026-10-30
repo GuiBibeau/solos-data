@@ -100,9 +100,10 @@ collected data is stored separately.
 Two offline loops kill the real binary and check the restart predicate (ADR-0016).
 The matrix (`cargo test --test failpoints`) kills at seven named publication points;
 the nightly loop (`cargo test --test nightly_random_kill -- --ignored --nocapture`,
-ADR-0018) kills at a seeded random point over 200-500 iterations and asserts the
+ADR-0019) kills at a seeded random point over 200-500 iterations and asserts the
 byte-identical re-run. Each iteration logs its seed; replay one with:
 
 ```sh
-SOLOS_DATA_NIGHTLY_SEED=<seed> cargo test --test nightly_random_kill -- --ignored --nocapture
+SOLOS_DATA_NIGHTLY_SEED=<seed> SOLOS_DATA_NIGHTLY_KILL=bytes SOLOS_DATA_NIGHTLY_EPOCHS=4 \
+  SOLOS_DATA_NIGHTLY_MAX_DELAY_MS=<ms> cargo test --test nightly_random_kill -- --ignored --nocapture
 ```

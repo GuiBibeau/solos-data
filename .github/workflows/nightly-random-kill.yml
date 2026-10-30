@@ -14,9 +14,9 @@ on:
         default: '200'
         type: string
       seed:
-        description: 'Starting seed (each iteration logs its own seed)'
+        description: 'Starting seed (empty runs the full loop; a seed replays one iteration)'
         required: false
-        default: '0'
+        default: ''
         type: string
       kill:
         description: 'Kill trigger: bytes (default, deterministic) or delay'
@@ -29,7 +29,8 @@ permissions:
 
 concurrency:
   group: nightly-random-kill
-  cancel-in-progress: true
+  # A nightly run must finish so its failure artifacts are uploaded; do not cancel it in flight.
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -51,11 +52,30 @@ jobs:
         with:
           toolchain: 1.96.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: test
+          save-if: false
+      - name: Validate iterations input
+        env:
+          ITERATIONS: ${{ github.event.inputs.iterations || '200' }}
+        run: |
+          if ! [[ "$ITERATIONS" =~ ^[0-9]+$ ]] || (( ITERATIONS < 200 || ITERATIONS > 500 )); then
+            echo "iterations must be between 200 and 500, got '$ITERATIONS'" >&2
+            exit 1
+          fi
       - name: Run the nightly random-kill loop
         env:
           SOLOS_DATA_NIGHTLY_ITERATIONS: ${{ github.event.inputs.iterations || '200' }}
-          SOLOS_DATA_NIGHTLY_SEED: ${{ github.event.inputs.seed || '0' }}
+          # Empty means "run the full loop"; a non-empty value replays that one seed.
+          SOLOS_DATA_NIGHTLY_SEED: ${{ github.event.inputs.seed || '' }}
           SOLOS_DATA_NIGHTLY_KILL: ${{ github.event.inputs.kill || 'bytes' }}
-        run: cargo test --test nightly_random_kill -- --ignored --nocapture
-      - name: Prune DuckDB objects before caching
-        run: find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete
+        run: cargo test --locked --test nightly_random_kill -- --ignored --nocapture
+      - name: Upload failure artifacts (seed, logs and root)
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nightly-random-kill-failure
+          # The harness keeps the failing iteration's root (with harness.log) under /tmp on panic.
+          path: /tmp/solos-nightly-*
+          if-no-files-found: ignore
+          retention-days: 7
