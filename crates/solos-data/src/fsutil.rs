@@ -2,25 +2,13 @@
 //! directories, and the write-tmp-fsync-rename pattern every published artefact uses.
 
 use sha2::{Digest, Sha256};
-use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-thread_local! {
-    /// When set, the next `sync_all` on this thread fails. Tests inject a fatal fsync; production
-    /// never sets it.
-    static FAIL_FSYNC: Cell<bool> = const { Cell::new(false) };
-}
-
-/// Fail `sync_all` on this thread until cleared. For tests. A lane that hits the failure must
-/// exit and restart from the watermark, not retry it (ADR-0016).
-pub fn inject_fsync_failure(fail: bool) {
-    FAIL_FSYNC.with(|flag| flag.set(fail));
-}
-
 fn sync_handle(file: &File) -> io::Result<()> {
-    if FAIL_FSYNC.with(|flag| flag.get()) {
+    #[cfg(feature = "failpoints")]
+    if crate::failpoints::fsync_fails() {
         return Err(io::Error::other("fsync failed: injected"));
     }
     file.sync_all()
@@ -55,36 +43,43 @@ pub fn sync_path(path: &Path) -> io::Result<()> {
 }
 
 /// Create `path` and every missing ancestor. Each newly created directory's parent is fsynced, so
-/// the new directory entry itself is durable. Directories that already exist are left alone.
+/// the new directory entry itself is durable. The parent of the last existing ancestor is also
+/// fsynced: a previous run may have created that ancestor and crashed before fsyncing its parent,
+/// so a re-run repairs it (ADR-0016).
 pub fn create_dir_all_durable(path: &Path) -> io::Result<()> {
     let mut missing = Vec::new();
     let mut cursor = path.to_path_buf();
-    loop {
+    let existing_parent = loop {
         if cursor.as_os_str().is_empty() {
-            break;
+            break None;
         }
         if cursor.try_exists()? {
-            break;
+            break parent_dir(&cursor);
         }
         let parent = parent_dir(&cursor);
         missing.push(cursor);
         match parent {
             Some(parent) => cursor = parent,
-            None => break,
+            None => break None,
         }
-    }
+    };
     for dir in missing.iter().rev() {
         match std::fs::create_dir(dir) {
-            Ok(()) => {
-                let parent = dir.parent();
-                let parent = parent.filter(|parent| !parent.as_os_str().is_empty());
-                sync_path(parent.unwrap_or(Path::new(".")))?;
-            }
+            Ok(()) => sync_dir_parent(dir)?,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }
+    if let Some(parent) = existing_parent {
+        sync_path(&parent)?;
+    }
     Ok(())
+}
+
+/// fsync the parent of `dir`, so `dir`'s own directory entry is durable.
+fn sync_dir_parent(dir: &Path) -> io::Result<()> {
+    let parent = dir.parent().filter(|parent| !parent.as_os_str().is_empty());
+    sync_path(parent.unwrap_or(Path::new(".")))
 }
 
 fn parent_dir(path: &Path) -> Option<std::path::PathBuf> {
@@ -201,11 +196,28 @@ mod tests {
         create_dir_all_durable(&nested).unwrap();
         create_dir_all_durable(&nested).unwrap();
         assert!(nested.is_dir());
-        inject_fsync_failure(true);
+        crate::failpoints::inject_fsync_failure(true);
         let failed = create_dir_all_durable(&root.join("new/child"));
-        inject_fsync_failure(false);
+        crate::failpoints::inject_fsync_failure(false);
         let message = failed.unwrap_err().to_string();
         assert!(message.contains("fsync failed"), "{message}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_rerun_fsyncs_the_parent_of_the_last_existing_ancestor() {
+        let root = std::env::temp_dir().join(format!("solos-mkdir-{}", uuid::Uuid::new_v4()));
+        let nested = root.join("staging/transactions/epoch=0");
+        // Simulate a crash after `epoch=0` was created but before its parent was fsynced: the
+        // directory exists, its entry is not durable. A re-run must fsync that parent.
+        std::fs::create_dir_all(&nested).unwrap();
+        crate::failpoints::inject_fsync_failure(true);
+        let rerun = create_dir_all_durable(&nested);
+        crate::failpoints::inject_fsync_failure(false);
+        let message = rerun.unwrap_err().to_string();
+        assert!(message.contains("fsync failed"), "{message}");
+        // Once the fsync succeeds, the re-run is idempotent.
+        create_dir_all_durable(&nested).unwrap();
         let _ = std::fs::remove_dir_all(root);
     }
 }

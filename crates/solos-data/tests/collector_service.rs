@@ -221,11 +221,11 @@ async fn an_fsync_failure_ends_the_lane_and_does_not_retry() {
     let root = f.root.clone();
     let error =
         f.db.run_blocking(move |store| {
-            solos_data::fsutil::inject_fsync_failure(true);
+            solos_data::failpoints::inject_fsync_failure(true);
             struct Clear;
             impl Drop for Clear {
                 fn drop(&mut self) {
-                    solos_data::fsutil::inject_fsync_failure(false);
+                    solos_data::failpoints::inject_fsync_failure(false);
                 }
             }
             let _clear = Clear;

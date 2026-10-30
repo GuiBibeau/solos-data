@@ -16,6 +16,7 @@ pub const PREVIOUS: &str = "checkpoint.prev.duckdb";
 /// database connection must be closed. This function does not lock again.
 pub fn repack_checkpoint(root: &Path, lock: &DbLock) -> Result<Obj, StoreError> {
     lock.prove_held();
+    lock.assert_root(root)?;
     let source = root.join("checkpoint.duckdb");
     let candidate = root.join("checkpoint.repack.duckdb");
     let bytes_before = std::fs::metadata(&source)?.len();

@@ -9837,6 +9837,7 @@ dependencies = [
  "solana-storage-proto",
  "solana-transaction-status",
  "solana-wire",
+ "solos-data",
  "thiserror 2.0.21",
  "tokio",
  "uuid",
