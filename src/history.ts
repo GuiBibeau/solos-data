@@ -79,8 +79,3 @@ export async function backfillStep(provider: Provider, store: Store, config: Con
     timingSeconds: next.timingSeconds, durationSeconds: (performance.now() - started) / 1000 });
   return next;
 }
-
-export async function backfill(provider: Provider, store: Store, config: Config, programData: string) {
-  while ((await backfillStep(provider, store, config, programData)).phase !== 'complete') {}
-  log('backfill_collection_complete', { direction: 'newest-first', independentValidation: 'pending' });
-}

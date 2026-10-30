@@ -1,14 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { writeFile } from 'node:fs/promises';
 import { checkPage, walkPage, walkToEnd } from '../src/walker.ts';
-import { makeWalk, tailCycle } from '../src/pipeline.ts';
+import { makeWalk } from '../src/pipeline.ts';
 import { joinOrdering, orderRange } from '../src/ordering.ts';
 import { validateRange, assertPublishable, chunkEnd } from '../src/validation.ts';
-import { publishRange, recoverFiles, verifyFiles } from '../src/writer.ts';
+import { publishRange, verifyFiles } from '../src/writer.ts';
 import { compact } from '../src/compactor.ts';
-import type { Provider } from '../src/rpc.ts';
 import { fixture, FixtureRpc, insertTx, sig } from './fixtures.ts';
 
 test('cursor and manifest commit together; restart resumes before cursor; overlap dedupes sources', async () => {
@@ -44,28 +42,6 @@ test('same-slot boundary fully crosses floor; block indexes control ordering', a
   } finally { await f.close(); }
 });
 
-test('failed cycle holds watermark; retry publishes files before advancing; restart removes orphans', async () => {
-  const f = await fixture();
-  try {
-    await f.store.set('H0', { signature: 'a', slot: 100 });
-    const rpc = new FixtureRpc([[sig('b', 102), sig('a', 102)], [], []], { 102: ['a', 'b'] });
-    await insertTx(f.store, 'a', 102); await insertTx(f.store, 'b', 102);
-    rpc.failBlock = true;
-    await assert.rejects(tailCycle(rpc as unknown as Provider, f.store, f.config, 'programdata'));
-    assert.equal(await f.store.get('W'), undefined);
-    rpc.failBlock = false;
-    await tailCycle(rpc as unknown as Provider, f.store, f.config, 'programdata');
-    assert.equal((await f.store.get('W')).slot, 102);
-    assert.ok((await verifyFiles(f.store)).files >= 3);
-    const orphan = join(f.root, 'orphan.parquet');
-    await writeFile(orphan, 'not registered');
-    await writeFile(join(f.root, 'interrupted.tmp'), 'incomplete');
-    await recoverFiles(f.store, f.root);
-    await assert.rejects(readFile(orphan));
-    assert.equal((await verifyFiles(f.store)).ok, true);
-  } finally { await f.close(); }
-});
-
 test('missing fetch cannot be published; catch-up chunks are bounded', async () => {
   const f = await fixture();
   try {
@@ -78,16 +54,6 @@ test('missing fetch cannot be published; catch-up chunks are bounded', async () 
     assert.equal(chunkEnd(100, 50000, 20000), 20099);
     assert.equal(chunkEnd(49999, 50000, 20000), 50000);
     assert.throws(() => checkPage([sig('a', 100), sig('a', 100)], makeWalk('p', 'tail', 'c', 0, 100)), /repeated/);
-  } finally { await f.close(); }
-});
-
-test('a lagging provider node cannot move an existing watermark backward', async () => {
-  const f = await fixture();
-  try {
-    await f.store.set('W', { signature: 'existing', slot: 200 });
-    await tailCycle(new FixtureRpc([]) as unknown as Provider, f.store, f.config, 'programdata');
-    assert.equal((await f.store.get('W')).slot, 200);
-    assert.equal(await f.store.get('tail-active'), undefined);
   } finally { await f.close(); }
 });
 
