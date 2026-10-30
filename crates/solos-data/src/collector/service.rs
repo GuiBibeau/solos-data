@@ -12,8 +12,9 @@ use super::status::write_status;
 use super::writer::recover_files;
 use crate::db::Db;
 use crate::jsonout::{Obj, log, now, safe_error};
-use crate::store::StoreError;
+use crate::store::{Store, StoreError};
 use serde_json::{Value, json};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -45,6 +46,14 @@ pub fn exit_on_fatal() -> FatalHook {
         let _ = std::io::stderr().flush();
         std::process::exit(FATAL_EXIT_CODE);
     })
+}
+
+/// Startup recovery shared by the production service and the dev fixtures: remove `.tmp` files
+/// and unregistered Parquet left by an interrupted publication. [`run_with`] runs this on every
+/// start; the random-kill loop's `dev publish-fixture --recover-only` restart runs the same
+/// function, so the loop guards this recovery rather than re-implementing it in the harness.
+pub fn recover_startup(store: &mut Store, data_dir: &Path) -> Result<(), StoreError> {
+    recover_files(store, data_dir)
 }
 
 /// Record a lane's error and count it in its streak. A fatal error (see [`fatal_class`]) skips
@@ -168,7 +177,8 @@ pub async fn run_with(
 ) -> Result<(), StoreError> {
     db.guard_fatal();
     let data_dir = config.data_dir.clone();
-    db.run(move |store| recover_files(store, &data_dir)).await?;
+    db.run(move |store| recover_startup(store, &data_dir))
+        .await?;
     confirm_mainnet(provider.as_ref()).await?;
     let http = reqwest::Client::new();
     let exchange: Arc<std::sync::Mutex<Exchange>> = Arc::new(std::sync::Mutex::new(
