@@ -147,6 +147,65 @@ pub fn crash_writer(root: &Path) -> Result<(), StoreError> {
     }
 }
 
+/// Test fixture for the random-kill loop (issue #61): generate a deterministic fixture source —
+/// one row per raw table at one slot per epoch inside `[from, to]` — and publish the range,
+/// printing one progress line per published file (after its range check and hash, before the
+/// watermark commit) and `published` at the end. `INSERT OR IGNORE` makes a re-run after a kill
+/// idempotent. Only compiled with the `failpoints` feature, like [`failpoint_writer`], because
+/// it advances the tail watermark into any root it is given.
+#[cfg(feature = "failpoints")]
+pub fn publish_fixture(root: &Path, from: i64, to: i64) -> Result<(), StoreError> {
+    let mut store = crate::store::Store::open(root, crate::collector::schema::SCHEMA)?;
+    // One row per raw table at one slot per epoch inside `[from, to]`, so a multi-epoch range
+    // writes several files per table without inserting millions of rows.
+    let epoch_size = 432_000i64;
+    let mut slots = Vec::new();
+    for epoch in from.div_euclid(epoch_size)..=to.div_euclid(epoch_size) {
+        let slot = (epoch * epoch_size + 100).clamp(from, to);
+        if slots.last() != Some(&slot) {
+            slots.push(slot);
+        }
+    }
+    for slot in slots {
+        let signature = format!("fixture-{slot}");
+        store.exec_batch(&format!(
+            "INSERT OR IGNORE INTO signatures VALUES ('{signature}', {slot}, {slot}, 'null', [], 'tail', 'fixture', '2026-10-04T00:00:00Z')"
+        ))?;
+        store.exec_batch(&format!(
+            "INSERT OR IGNORE INTO transactions VALUES ('{signature}', {slot}, {slot}, NULL, NULL, 'null', 5000, 10, 'AA==', '{{}}', '{{}}', 'tail', 'fixture', '2026-10-04T00:00:00Z', NULL)"
+        ))?;
+        store.exec_batch(&format!(
+            "INSERT OR IGNORE INTO slot_order VALUES ('{signature}', {slot}, 0, 1)"
+        ))?;
+        store.exec_batch(&format!(
+            "INSERT OR IGNORE INTO program_versions VALUES ('{signature}', {slot}, 'fixture', '2026-10-04T00:00:00Z')"
+        ))?;
+        store.exec_batch(&format!(
+            "INSERT OR IGNORE INTO rpc_pages VALUES ('page-{slot}', 'getTransaction', 'fixture', '{{}}', '2026-10-04T00:00:00Z', {slot})"
+        ))?;
+    }
+    let watermark = serde_json::json!({
+        "signature": "",
+        "slot": to,
+        "completedAt": crate::jsonout::now(),
+    });
+    crate::collector::writer::publish_range_with(
+        &mut store,
+        root,
+        from,
+        to,
+        Some(crate::collector::writer::Checkpoint {
+            key: "W".into(),
+            value: watermark,
+            cycle_id: None,
+        }),
+        &mut |table, epoch| println!("file {table} epoch={epoch}"),
+    )?;
+    store.close()?;
+    println!("published");
+    Ok(())
+}
+
 /// Test fixture for the crash-safety matrix (issue #56): publish `[from, to]` once with the
 /// named kill point armed. When the point fires the process aborts; otherwise the range and its
 /// watermark commit normally and the command prints `published`. Only compiled with the

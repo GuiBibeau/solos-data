@@ -1200,6 +1200,39 @@ fn failpoint_writer_cmd(_args: &[String]) -> i32 {
     1
 }
 
+/// `dev publish-fixture` (issue #61): generate a deterministic fixture source and publish it,
+/// printing one progress line per file. The random-kill harness SIGKILLs this process at a
+/// seeded offset of that output. Only the `failpoints` feature builds it, like
+/// `failpoint-writer`: release builds refuse rather than advancing a watermark anywhere.
+#[cfg(feature = "failpoints")]
+fn publish_fixture_cmd(args: &[String]) -> i32 {
+    let (Some(root), Some(from), Some(to)) = (
+        flag(args, "--root"),
+        flag(args, "--from").and_then(|v| v.parse::<i64>().ok()),
+        flag(args, "--to").and_then(|v| v.parse::<i64>().ok()),
+    ) else {
+        return 1;
+    };
+    match crate::dev::publish_fixture(&PathBuf::from(root), from, to) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[cfg(not(feature = "failpoints"))]
+fn publish_fixture_cmd(_args: &[String]) -> i32 {
+    eprintln!(
+        "{}",
+        Obj::new()
+            .with(
+                "error",
+                "publish-fixture is a test fixture and needs the failpoints feature"
+            )
+            .to_json()
+    );
+    1
+}
+
 fn dev(args: &[String]) -> i32 {
     let command = args.first().map(String::as_str).unwrap_or("help");
     let result = match command {
@@ -1244,6 +1277,7 @@ fn dev(args: &[String]) -> i32 {
             };
         }
         "failpoint-writer" => return failpoint_writer_cmd(args),
+        "publish-fixture" => return publish_fixture_cmd(args),
         _ => {
             let mut commands = vec![
                 "compare-decoded --left <root> --right <root>",
@@ -1253,6 +1287,10 @@ fn dev(args: &[String]) -> i32 {
             #[cfg(feature = "failpoints")]
             commands.push(
                 "failpoint-writer --root <root> --failpoint <name> [--from <slot> --to <slot>] (test fixture)",
+            );
+            #[cfg(feature = "failpoints")]
+            commands.push(
+                "publish-fixture --root <root> --from <slot> --to <slot> (test fixture, issue #61)",
             );
             println!("{}", Obj::new().with("commands", commands).to_json());
             return 0;
