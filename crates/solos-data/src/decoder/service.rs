@@ -2,9 +2,10 @@
 //! maintenance on its own clocks, write `status.json`. A port of `decode/service.ts` with the
 //! codec linked instead of spawned.
 
+use super::codec::{SCHEDULE, Upgrade, codec_version_for};
 use super::compact::{CompactionPolicy, compact_decoded_with};
 use super::extract::extract_groups;
-use super::normalize::{Rows, normalize_at, quarantine};
+use super::normalize::{Rows, normalize_at_version, quarantine};
 use super::publish::{SourceProgress, publish_sources, recover, write_catalog};
 use super::schema::{VERSION, schema_static};
 use super::source::{NextSource, SourceRow, attach_previous, pending_sources, read_source_rows};
@@ -51,6 +52,9 @@ pub struct DecoderConfig {
     /// sets a fixed instant so two fresh roots can compare `files.sha256`. Production leaves it
     /// unset; a fixed clock is not a way to rewrite sealed partitions.
     pub decoded_at: Option<String>,
+    /// Codec version boundaries (first slot, version). Defaults to the production
+    /// [`SCHEDULE`]; the codec audit test supplies one with a program-upgrade boundary.
+    pub codec_schedule: Vec<Upgrade>,
 }
 
 impl DecoderConfig {
@@ -68,6 +72,7 @@ impl DecoderConfig {
             compaction_budget_seconds: COMPACTION_BUDGET.as_secs(),
             compaction_settled_batches: 100,
             decoded_at: None,
+            codec_schedule: SCHEDULE.to_vec(),
         }
     }
 }
@@ -171,7 +176,7 @@ pub fn run_decoder(
         let read_seconds = started.elapsed().as_secs_f64();
         let decoded_at = Instant::now();
         let row_clock = config.decoded_at.clone().unwrap_or_else(now);
-        let (rows, seen) = decode_rows(&parts, &row_clock)?;
+        let (rows, seen) = decode_rows(&parts, &row_clock, &config.codec_schedule)?;
         let decode_seconds = decoded_at.elapsed().as_secs_f64();
         let known: HashSet<String> = parts
             .iter()
@@ -319,9 +324,25 @@ struct Outcome {
 }
 
 /// Decode and normalize one source row; pure, so rows decode in parallel.
-fn decode_row(row: &SourceRow, created_at: &str, source_hash: &str, row_clock: &str) -> Outcome {
+fn decode_row(
+    row: &SourceRow,
+    created_at: &str,
+    source_hash: &str,
+    row_clock: &str,
+    schedule: &[Upgrade],
+) -> Outcome {
     let tx = &row.tx;
-    let hash = tx.content_hash();
+    let slot = match tx.slot_i64() {
+        Ok(slot) => slot,
+        Err(error) => {
+            return Outcome {
+                seen: None,
+                rows: Some(Err(error)),
+            };
+        }
+    };
+    let version = codec_version_for(schedule, slot);
+    let hash = tx.content_hash_with_version(version);
     if let Some(previous_at) = &row.previous_at
         && !previous_at.is_empty()
         && previous_at.as_str() > created_at
@@ -349,19 +370,21 @@ fn decode_row(row: &SourceRow, created_at: &str, source_hash: &str, row_clock: &
             tx.tx_b64.as_deref().unwrap_or(""),
         )]
     });
-    let normalized = normalize_at(tx, &hash, &decoded, source_hash, row_clock).or_else(|_| {
-        normalize_at(
-            tx,
-            &hash,
-            &[quarantine(
-                "validation",
-                "event context validation failed",
-                tx.tx_b64.as_deref().unwrap_or(""),
-            )],
-            source_hash,
-            row_clock,
-        )
-    });
+    let normalized = normalize_at_version(tx, &hash, &decoded, source_hash, row_clock, version)
+        .or_else(|_| {
+            normalize_at_version(
+                tx,
+                &hash,
+                &[quarantine(
+                    "validation",
+                    "event context validation failed",
+                    tx.tx_b64.as_deref().unwrap_or(""),
+                )],
+                source_hash,
+                row_clock,
+                version,
+            )
+        });
     Outcome {
         seen,
         rows: Some(normalized),
@@ -384,7 +407,11 @@ fn decode_threads() -> usize {
 
 /// Decode a batch in parallel, then assemble `(rows, seen per part)` in source order so the
 /// published tables and the progress records are identical to the sequential loop.
-fn decode_rows(parts: &[Part], row_clock: &str) -> Result<(Rows, Vec<Seen>), StoreError> {
+fn decode_rows(
+    parts: &[Part],
+    row_clock: &str,
+    schedule: &[Upgrade],
+) -> Result<(Rows, Vec<Seen>), StoreError> {
     let items: Vec<(&SourceRow, &str, &str)> = parts
         .iter()
         .flat_map(|part| {
@@ -401,7 +428,9 @@ fn decode_rows(parts: &[Part], row_clock: &str) -> Result<(Rows, Vec<Seen>), Sto
             .map(|part| {
                 scope.spawn(move || {
                     part.iter()
-                        .map(|(row, created_at, hash)| decode_row(row, created_at, hash, row_clock))
+                        .map(|(row, created_at, hash)| {
+                            decode_row(row, created_at, hash, row_clock, schedule)
+                        })
                         .collect::<Vec<Outcome>>()
                 })
             })

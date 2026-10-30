@@ -58,6 +58,10 @@ fail = { version = "0.5.1", features = ["failpoints"], optional = true }
 [dev-dependencies]
 # Enable `failpoints` for every test target without turning it on in release builds.
 solos-data = { path = ".", features = ["failpoints"] }
+# Test-only pins: borsh re-serializes decoded events for the codec-audit layout check, and toml
+# reads Cargo.lock so the schema VERSION is tied to the resolved phoenix-rise-events version.
+borsh = "1.7"
+toml = "0.5"
 
 [features]
 default = []

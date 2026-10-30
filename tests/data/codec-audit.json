@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-06-26T16:49:28.308399Z",
+  "source": {
+    "kind": "phoenixRiseCapturedTransactions",
+    "programId": "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih",
+    "note": "Synthetic audit fixture (issue #58). Both transactions are existing captures copied from tests/data/phoenix-events.json (signatures 7wrxAgETB5LX... and 35BixDuj5FXJ...), not new wire data. The upgrade boundary slot 428000000 and the pre-upgrade version 0.6.11 are invented for the exercise, and the per-slot version is only a stamp: the same linked phoenix-rise-events 0.6.12 codec decodes both sides. No provider URLs."
+  },
+  "upgrade": {
+    "slot": 428000000,
+    "preVersion": "phoenix-rise-events-0.6.11/schema-1",
+    "postVersion": "phoenix-rise-events-0.6.12/schema-1"
+  },
+  "transactions": [
+    {
+      "signature": "7wrxAgETB5LXMSr6AxmC6PCkevev7xu4Qrob2bhvqGSHUCtJpzVUXoRTUewwvCqseFLvsQHTiDWCNf15FmKaKAh",
+      "slot": 424149650,
+      "transactionIndex": null,
+      "blockTime": 1780538693,
+      "eventsCount": 7,
+      "eventVariants": [
+        "LiquidationTransfer",
+        "LiquidationTransferSummary",
+        "PnL",
+        "SlotContext",
+        "TraderFundingSettled"
+      ],
+      "instructions": [
+        {
+          "programId": "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih",
+          "stackPath": [
+            1
+          ],
+          "dataBase64": "OdrXRK4XzH8BAAAAAAAAAAAAAAAoAAAAAAAAAAA="
+        },
+        {
+          "programId": "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih",
+          "stackPath": [
+            1,
+            0
+          ],
+          "dataBase64": "9weGy7VHmUcAAAAABwAAABEATQBlAGUAZQBrAF0A"
+        },
+        {
+          "programId": "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih",
+          "stackPath": [
+            1,
+            1
+          ],
+          "dataBase64": "jebW8gnRz6oAAAAABwAAAABF3SBqAAAAAJICSBkAAAAAElxBQ6ZH1COfkgUp7aM/2S+GBaGd7NOwXHDSp7cqWp0IU09MAAAAAAAAAAAAAAAAAAAAAADA8Pf//////9QLAAAAAAAAlQR9AAAAAAAlXEFDpkfUI5+SBSntoz/ZL4YFoZ3s07BccNKntypanQgAAAAAU09MAAAAAAAAAAAAAAAAAAAAAAAAAAAAwPD3//////8wAAAAAAAAADAAAAAAAAAAG1+e/f////8bX579/////yVcQUOmR9Qjn5IFKe2jP9kvhgWhnezTsFxw0qe3KlqdCAAAAABTT0wAAAAAAAAAAAAAAAAATJuc//////8AAAAAAAAAADAAAAAAAAAACAAAAAAAAAAbX579/////y9lmv//////JeKxSp/IV6XFbG035qv0wbterZZWNDfzNP+O+6j5Hd9iAAAAAFNPTAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAoAAAAAAAAAAAAAAAAAAAAoF5n/v////8fXEFDpkfUI5+SBSntoz/ZL4YFoZ3s07BccNKntypanQjisUqfyFelxWxtN+ar9MG7Xq2WVjQ38zT/jvuo+R3fYgAAAAAAAAAAKAAAAAAAAACgXmf+/////2QATJuc//////8AAAAAAAAAAB5cQUOmR9Qjn5IFKe2jP9kvhgWhnezTsFxw0qe3KlqdCOKxSp/IV6XFbG035qv0wbterZZWNDfzNP+O+6j5Hd9iAQAAANqcm///////cv4AAAAAAABy/gAAAAAAAA=="
+        }
+      ],
+      "expected": {
+        "instructions": [
+          {
+            "instructionTagHex": "0x7fcc17ae44d7da39",
+            "stackPath": [
+              1
+            ],
+            "eventsCount": 7,
+            "eventVariants": [
+              "LiquidationTransfer",
+              "LiquidationTransferSummary",
+              "PnL",
+              "SlotContext",
+              "TraderFundingSettled"
+            ],
+            "eventLayout": [
+              {
+                "variant": "LiquidationTransfer",
+                "size": 107
+              },
+              {
+                "variant": "LiquidationTransferSummary",
+                "size": 93
+              },
+              {
+                "variant": "PnL",
+                "size": 101
+              },
+              {
+                "variant": "SlotContext",
+                "size": 17
+              },
+              {
+                "variant": "TraderFundingSettled",
+                "size": 77
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "signature": "35BixDuj5FXJiCeuPsbabZffB4FDrgjqnhZEnGvsxEYpve8QaFvKcmCbc4VwJaUpaxrvcTuRzusNXj7TogASDecG",
+      "slot": 428391572,
+      "transactionIndex": null,
+      "blockTime": 1782224375,
+      "eventsCount": 3,
+      "eventVariants": [
+        "Header",
+        "MarketAdded",
+        "SlotContext"
+      ],
+      "instructions": [
+        {
+          "programId": "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih",
+          "stackPath": [
+            1
+          ],
+          "dataBase64": "KYm5fkWL/jdBTUQAAAAAAAAAAAAAAAAA0G5XAAAAAAAKAAAAAAAAABAnAAAAAAAAuHJXAAAAAAABAAAAAAAAABAnAAAAAAAAoHZXAAAAAAABAAAAAAAAABAnAAAAAAAAiHpXAAAAAAABAAAAAAAAABAnAAAAAAAAAAEKAAAAAAAAAANeAQAAMgAAABAnAAAAAAAAZAAAAAAAAACIE9AH6ANMHZCyCAAAAAAAoIYBAAAAAABkAAAAAAAAACChBwAAAAAAyAAAAAAAAABAQg8AAAAAACwBAAAAAAAAgJaYAAAAAACQAQAAAAAAANBuVwAAAAAAdwEAAAAAAAA8CgAAAAAAADwKAAAAAAAAZAAAAAAAAABkAAAAAAAAAGQAAAAAAAAAAAAAAPQBAQoKAAUBgFEBAAAAAAABEA4AAAAAAAABsAQAAAAAAADoAwAAAAAAAA=="
+        },
+        {
+          "programId": "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih",
+          "stackPath": [
+            1,
+            3
+          ],
+          "dataBase64": "9weGy7VHmUcAAAAAAwAAABEAawABAA=="
+        },
+        {
+          "programId": "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih",
+          "stackPath": [
+            1,
+            4
+          ],
+          "dataBase64": "jebW8gnRz6oAAAAAAwAAAAD3lTpqAAAAAJS8iBkAAAAAAQEAAAAAAAAAlLyIGQAAAABBTUQAAAAAAAAAAAAAAAAALQAAAAoAAAADBulgjWBs2MehO1BMbI64Ll/9mT7UBNlF55IND05CVqIvAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAY"
+        }
+      ],
+      "expected": {
+        "instructions": [
+          {
+            "instructionTagHex": "0x37fe8b457eb98929",
+            "stackPath": [
+              1
+            ],
+            "eventsCount": 3,
+            "eventVariants": [
+              "Header",
+              "MarketAdded",
+              "SlotContext"
+            ],
+            "eventLayout": [
+              {
+                "variant": "Header",
+                "size": 107
+              },
+              {
+                "variant": "MarketAdded",
+                "size": 1
+              },
+              {
+                "variant": "SlotContext",
+                "size": 17
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

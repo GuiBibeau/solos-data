@@ -177,4 +177,28 @@ mod tests {
             );
         }
     }
+
+    /// The version stamp must match the codec version the build actually links. The codec pin
+    /// lives in `crates/phoenix-codec/Cargo.toml`; this reads the resolved version from
+    /// `Cargo.lock` so bumping the codec without bumping [`VERSION`] turns this test red.
+    #[test]
+    fn version_ties_to_the_resolved_phoenix_rise_events_version() {
+        let lock =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.lock"))
+                .expect("read Cargo.lock");
+        let doc: toml::Value = toml::from_str(&lock).expect("parse Cargo.lock");
+        let resolved = doc["package"]
+            .as_array()
+            .expect("Cargo.lock package array")
+            .iter()
+            .find(|pkg| pkg["name"].as_str() == Some("phoenix-rise-events"))
+            .expect("phoenix-rise-events in Cargo.lock")["version"]
+            .as_str()
+            .expect("phoenix-rise-events version string");
+        assert_eq!(
+            VERSION,
+            format!("phoenix-rise-events-{resolved}/schema-1"),
+            "VERSION must match the resolved phoenix-rise-events version"
+        );
+    }
 }

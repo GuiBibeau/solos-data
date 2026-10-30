@@ -5,6 +5,7 @@ use crate::collector::config::{Config, load_config, provider_url};
 use crate::collector::limiter::Limiter;
 use crate::collector::rpc::Provider;
 use crate::db::Db;
+use crate::decoder::codec::SCHEDULE;
 use crate::decoder::service::{DecoderConfig, run_decoder, stop_flag};
 use crate::jsonout::{Obj, log, now, safe_error};
 use crate::store::{Store, StoreError};
@@ -558,6 +559,7 @@ pub fn load_decoder_config(args: &[String]) -> Result<DecoderConfig, StoreError>
         compaction_budget_seconds: compaction_budget,
         compaction_settled_batches: compaction_settled,
         decoded_at: None,
+        codec_schedule: SCHEDULE.to_vec(),
     })
 }
 

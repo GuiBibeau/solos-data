@@ -2,7 +2,8 @@
 //! `decode/normalize.ts`, including its `taker_side` comparison against the capitalised `Bid`
 //! while the SDK emits lowercase sides (kept for parity; a correction is a separate change).
 
-use super::schema::{TABLES, VERSION};
+use super::codec::codec_version;
+use super::schema::TABLES;
 use crate::jsonout::{Obj, now};
 use phoenix_codec::DecodedGroup;
 use serde_json::Value;
@@ -42,12 +43,34 @@ impl RawTransaction {
         }
     }
 
-    /// The content hash the decoder keys revisions by:
+    /// The slot as an integer, from either the JSON number or decimal-string rendering.
+    ///
+    /// # Errors
+    ///
+    /// An unparseable slot is a validation error, never a silent `0`: a slot that is neither an
+    /// integer nor a decimal string means the raw row is corrupt, and publishing rows under a
+    /// fabricated slot would misattribute them to the wrong codec version and content hash.
+    pub fn slot_i64(&self) -> Result<i64, String> {
+        let text = self.slot_text();
+        text.parse::<i64>()
+            .map_err(|_| format!("unparseable slot {text:?}"))
+    }
+
+    /// The content hash the decoder keys revisions by under the production codec schedule.
+    ///
+    /// # Errors
+    ///
+    /// An unparseable slot fails, like [`RawTransaction::slot_i64`].
+    pub fn content_hash(&self) -> Result<String, String> {
+        Ok(self.content_hash_with_version(codec_version(self.slot_i64()?)))
+    }
+
+    /// The content hash the decoder keys revisions by for one codec version:
     /// `sha256(JSON.stringify([version, tx_b64, meta_json, tx_index, single_in_slot, terminal_error, err]))`.
     #[must_use]
-    pub fn content_hash(&self) -> String {
+    pub fn content_hash_with_version(&self, version: &str) -> String {
         let array = Value::Array(vec![
-            Value::String(VERSION.into()),
+            Value::String(version.into()),
             self.tx_b64.clone().map_or(Value::Null, Value::String),
             self.meta_json.clone().map_or(Value::Null, Value::String),
             self.tx_index.clone(),
@@ -153,17 +176,46 @@ pub fn normalize(
     groups: &[DecodedGroup],
     source_file: &str,
 ) -> Result<Rows, String> {
-    normalize_at(tx, hash, groups, source_file, &now())
+    normalize_at_version(
+        tx,
+        hash,
+        groups,
+        source_file,
+        &now(),
+        codec_version(tx.slot_i64()?),
+    )
 }
 
 /// [`normalize`] with an explicit `decoded_at`. The golden fixture passes a fixed clock so the
-/// Parquet bytes can be compared; production passes [`now`].
+/// Parquet bytes can be compared; production passes [`now`]. The codec version is resolved from
+/// the production schedule.
 pub fn normalize_at(
     tx: &RawTransaction,
     hash: &str,
     groups: &[DecodedGroup],
     source_file: &str,
     decoded_at: &str,
+) -> Result<Rows, String> {
+    normalize_at_version(
+        tx,
+        hash,
+        groups,
+        source_file,
+        decoded_at,
+        codec_version(tx.slot_i64()?),
+    )
+}
+
+/// [`normalize_at`] with the codec version resolved by the caller, so a batch can follow a
+/// schedule other than the production [`super::codec::SCHEDULE`] (the codec audit test runs a
+/// range across an upgrade boundary).
+pub fn normalize_at_version(
+    tx: &RawTransaction,
+    hash: &str,
+    groups: &[DecodedGroup],
+    source_file: &str,
+    decoded_at: &str,
+    version: &str,
 ) -> Result<Rows, String> {
     let mut rows = Rows::default();
     let meta: Value = tx
@@ -187,7 +239,7 @@ pub fn normalize_at(
                     .with("instruction_path", group.path.clone())
                     .with("error", error.error.clone())
                     .with("bytes_base64", error.bytes.clone())
-                    .with("decoder_version", VERSION),
+                    .with("decoder_version", version),
             );
         }
         let mut header = Value::Object(Default::default());
@@ -247,7 +299,7 @@ pub fn normalize_at(
                     "quote_lot_decimals",
                     coalesce([header.get("quote_lot_decimals")]),
                 )
-                .with("decoder_version", VERSION)
+                .with("decoder_version", version)
                 .with("event_json", event.to_string());
             rows.get_mut("events").push(row.clone());
             // Attempts remain in events; analytic tables contain only executed events whose
@@ -362,7 +414,7 @@ pub fn normalize_at(
             .with("error_count", errors)
             .with("source_file", source_file)
             .with("decoded_at", decoded_at)
-            .with("decoder_version", VERSION),
+            .with("decoder_version", version),
     );
     Ok(rows)
 }
@@ -410,7 +462,27 @@ mod tests {
         let expected = crate::fsutil::sha256_hex(
             br#"["phoenix-rise-events-0.6.12/schema-1","AA==","{}",0,false,null,"null"]"#,
         );
-        assert_eq!(tx.content_hash(), expected);
+        assert_eq!(tx.content_hash().unwrap(), expected);
+    }
+
+    #[test]
+    fn an_unparseable_slot_is_an_error_not_a_silent_zero() {
+        let tx = RawTransaction {
+            signature: "s".into(),
+            slot: Value::String("not-a-slot".into()),
+            block_time: Value::String("100".into()),
+            tx_index: Value::from(0),
+            single_in_slot: Value::Bool(false),
+            tx_b64: Some("AA==".into()),
+            meta_json: Some("{}".into()),
+            terminal_error: None,
+            err: Value::String("null".into()),
+        };
+        let err = tx.slot_i64().unwrap_err();
+        assert!(err.contains("unparseable slot"), "{err}");
+        assert!(tx.content_hash().is_err());
+        assert!(normalize(&tx, "h", &[], "source").is_err());
+        assert!(normalize_at(&tx, "h", &[], "source", "2026-01-01T00:00:00Z").is_err());
     }
 
     #[test]
