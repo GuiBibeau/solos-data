@@ -69,6 +69,9 @@ proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 
 [features]
 default = []
+# Test-only seams in fsutil (failpoints and the write guard). Off by default so they are not
+# compiled into release builds; the test and clippy jobs enable it explicitly.
+test-hooks = []
 # The Old Faithful archive lane through Jetstreamer (heavy build: agave crates and RocksDB).
 archive = ["dep:jetstreamer-firehose", "dep:log", "dep:solana-transaction-status", "dep:wincode", "dep:solana-accounts-db", "dep:solana-ledger", "dep:solana-runtime", "dep:solana-rpc", "dep:solana-geyser-plugin-manager", "dep:solana-storage-proto"]
 # Crash-safety failpoints and the fsync failure injection used by the tests (issue #56).

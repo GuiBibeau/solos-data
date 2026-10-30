@@ -49,7 +49,7 @@ jobs:
           toolchain: 1.96.0
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features solos-data/test-hooks -- -D warnings
       # DuckDB's objects are already archived in libduckdb.a; drop them before the cache is saved.
       # The build script reruns only when its inputs change, so nothing reads them again.
       - name: Prune DuckDB objects before caching
@@ -67,7 +67,7 @@ jobs:
         with:
           toolchain: 1.96.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-      - run: cargo test --workspace --locked
+      - run: cargo test --workspace --locked --features solos-data/test-hooks
       # The npm suite runs on every push to main, and on a pull request that touches its inputs:
       # the TypeScript sources and tests, their config, the npm manifests, and the codec it spawns.
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3

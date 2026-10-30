@@ -24,16 +24,19 @@ the npm lockfile. Then:
 scripts/verify.sh
 ```
 
-That runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
-and `cargo test --workspace --locked`, then the TypeScript check and the Node
-tests. Rust tests run once. The script prints `VERIFY PASS` or `VERIFY FAIL <step>`
-and exits non-zero on failure. It compiles DuckDB's bundled C++ with g++
-(`CC=gcc`, `CXX=g++`).
+That runs `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets --locked --features solos-data/test-hooks -- -D warnings`,
+and `cargo test --workspace --locked --features solos-data/test-hooks`, then the
+TypeScript check and the Node tests. Rust tests run once. The script prints
+`VERIFY PASS` or `VERIFY FAIL <step>` and exits non-zero on failure. It compiles
+DuckDB's bundled C++ with g++ (`CC=gcc`, `CXX=g++`). The `test-hooks` feature
+compiles the test-only fsutil failpoints and write guard; they are absent from
+release builds.
 
 One Rust integration test:
 
 ```sh
-CC=gcc CXX=g++ cargo test --test <name>
+CC=gcc CXX=g++ cargo test --test <name> --features solos-data/test-hooks
 ```
 
 After a spot-decoder change, `SOLOS_DATA_REFRESH_SPOT_FIXTURES=1 cargo test --test spot`
