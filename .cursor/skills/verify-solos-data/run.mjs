@@ -11,6 +11,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { dataDirOverridesIn, subprocessEnv } from './env.mjs';
 
 const skillDir = dirname(fileURLToPath(import.meta.url));
 const repo = join(skillDir, '..', '..', '..');
@@ -30,7 +31,10 @@ const journeys = [];
 const fails = [];
 
 function sh(cmd, args, options = {}) {
-  return spawnSync(cmd, args, { encoding: 'utf8', ...options });
+  // Scrub data-directory overrides (SOLOS_DATA_DIR / SOLOS_DATA_RAW_DIR /
+  // SOLOS_DATA_DECODED_DIR) so no journey can be redirected away from its fixtures into a real
+  // data directory, regardless of what the invoking shell exported.
+  return spawnSync(cmd, args, { encoding: 'utf8', env: subprocessEnv(), ...options });
 }
 
 function binRun(args) {
@@ -74,6 +78,19 @@ doctor.rpcEnvVars = Object.keys(process.env)
   .filter((name) => process.env[name]);
 if (doctor.rpcEnvVars.length > 0) {
   fail('doctor: no RPC env vars', `set: ${doctor.rpcEnvVars.join(', ')}`);
+}
+
+doctor.dataDirOverrides = dataDirOverridesIn(process.env);
+if (doctor.dataDirOverrides.length > 0) {
+  fail(
+    'doctor: no data-directory overrides',
+    `set: ${doctor.dataDirOverrides.join(', ')} (unset them and re-run)`,
+  );
+  process.stderr.write(
+    'verify-solos-data: refusing to start with data-directory overrides set; ' +
+      'unset them and re-run so the journeys stay on their fixtures.\n',
+  );
+  process.exit(1);
 }
 
 process.stdout.write('verify-solos-data: building the release binary...\n');
@@ -185,6 +202,7 @@ const evidence = {
   doctor: {
     noEnvFile: doctor.noEnvFile,
     rpcEnvVars: doctor.rpcEnvVars ?? [],
+    dataDirOverrides: doctor.dataDirOverrides ?? [],
     buildOk: doctor.buildOk,
     runDir,
   },

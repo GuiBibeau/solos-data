@@ -21,6 +21,9 @@ Before any journey the skill checks:
 - no `.env` file is present at the repository root;
 - no provider URL or RPC environment variables are set (`*_RPC_URL`, `*_RPC_ENDPOINT`,
   `*_RPC_HOST`, `PROVIDER_URL`);
+- no data-directory overrides are set (`SOLOS_DATA_DIR`, `SOLOS_DATA_RAW_DIR`,
+  `SOLOS_DATA_DECODED_DIR`); subprocesses are scrubbed of them anyway, but the doctor
+  refuses to start when the invoking shell exported any of them;
 - a fresh temp run directory is created under `target/verify-evidence/`;
 - `solos-data dev version` reports the binary and bundled DuckDB versions;
 - the release binary is built from the current source.
