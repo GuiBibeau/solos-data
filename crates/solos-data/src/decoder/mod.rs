@@ -1,6 +1,7 @@
 //! The decoder: raw Parquet publications in, six decoded Parquet tables out.
 
 pub mod canonical;
+pub mod codec;
 pub mod compact;
 pub mod digest;
 pub mod extract;

@@ -2,7 +2,8 @@
 //! `decode/normalize.ts`, including its `taker_side` comparison against the capitalised `Bid`
 //! while the SDK emits lowercase sides (kept for parity; a correction is a separate change).
 
-use super::schema::{TABLES, VERSION};
+use super::codec::codec_version;
+use super::schema::TABLES;
 use crate::jsonout::{Obj, now};
 use phoenix_codec::DecodedGroup;
 use serde_json::Value;
@@ -42,12 +43,24 @@ impl RawTransaction {
         }
     }
 
-    /// The content hash the decoder keys revisions by:
-    /// `sha256(JSON.stringify([version, tx_b64, meta_json, tx_index, single_in_slot, terminal_error, err]))`.
+    /// The slot as an integer, from either the JSON number or decimal-string rendering.
+    #[must_use]
+    pub fn slot_i64(&self) -> i64 {
+        self.slot_text().parse().unwrap_or(0)
+    }
+
+    /// The content hash the decoder keys revisions by under the production codec schedule.
     #[must_use]
     pub fn content_hash(&self) -> String {
+        self.content_hash_with_version(codec_version(self.slot_i64()))
+    }
+
+    /// The content hash the decoder keys revisions by for one codec version:
+    /// `sha256(JSON.stringify([version, tx_b64, meta_json, tx_index, single_in_slot, terminal_error, err]))`.
+    #[must_use]
+    pub fn content_hash_with_version(&self, version: &str) -> String {
         let array = Value::Array(vec![
-            Value::String(VERSION.into()),
+            Value::String(version.into()),
             self.tx_b64.clone().map_or(Value::Null, Value::String),
             self.meta_json.clone().map_or(Value::Null, Value::String),
             self.tx_index.clone(),
@@ -153,17 +166,46 @@ pub fn normalize(
     groups: &[DecodedGroup],
     source_file: &str,
 ) -> Result<Rows, String> {
-    normalize_at(tx, hash, groups, source_file, &now())
+    normalize_at_version(
+        tx,
+        hash,
+        groups,
+        source_file,
+        &now(),
+        codec_version(tx.slot_i64()),
+    )
 }
 
 /// [`normalize`] with an explicit `decoded_at`. The golden fixture passes a fixed clock so the
-/// Parquet bytes can be compared; production passes [`now`].
+/// Parquet bytes can be compared; production passes [`now`]. The codec version is resolved from
+/// the production schedule.
 pub fn normalize_at(
     tx: &RawTransaction,
     hash: &str,
     groups: &[DecodedGroup],
     source_file: &str,
     decoded_at: &str,
+) -> Result<Rows, String> {
+    normalize_at_version(
+        tx,
+        hash,
+        groups,
+        source_file,
+        decoded_at,
+        codec_version(tx.slot_i64()),
+    )
+}
+
+/// [`normalize_at`] with the codec version resolved by the caller, so a batch can follow a
+/// schedule other than the production [`super::codec::SCHEDULE`] (the codec audit test runs a
+/// range across an upgrade boundary).
+pub fn normalize_at_version(
+    tx: &RawTransaction,
+    hash: &str,
+    groups: &[DecodedGroup],
+    source_file: &str,
+    decoded_at: &str,
+    version: &str,
 ) -> Result<Rows, String> {
     let mut rows = Rows::default();
     let meta: Value = tx
@@ -187,7 +229,7 @@ pub fn normalize_at(
                     .with("instruction_path", group.path.clone())
                     .with("error", error.error.clone())
                     .with("bytes_base64", error.bytes.clone())
-                    .with("decoder_version", VERSION),
+                    .with("decoder_version", version),
             );
         }
         let mut header = Value::Object(Default::default());
@@ -247,7 +289,7 @@ pub fn normalize_at(
                     "quote_lot_decimals",
                     coalesce([header.get("quote_lot_decimals")]),
                 )
-                .with("decoder_version", VERSION)
+                .with("decoder_version", version)
                 .with("event_json", event.to_string());
             rows.get_mut("events").push(row.clone());
             // Attempts remain in events; analytic tables contain only executed events whose
@@ -362,7 +404,7 @@ pub fn normalize_at(
             .with("error_count", errors)
             .with("source_file", source_file)
             .with("decoded_at", decoded_at)
-            .with("decoder_version", VERSION),
+            .with("decoder_version", version),
     );
     Ok(rows)
 }
