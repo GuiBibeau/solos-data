@@ -4,7 +4,7 @@ import { json, loadConfig, log, providerUrl } from './config.ts';
 import { Limiter } from './limiter.ts';
 import { Provider } from './rpc.ts';
 import { Store } from './store.ts';
-import { run, safeError } from './service.ts';
+import { safeError } from './service.ts';
 import { probe } from './probe.ts';
 import { verifyFiles } from './writer.ts';
 import { capabilities } from './capabilities.ts';
@@ -20,7 +20,6 @@ async function main() {
   const command = process.argv[2] ?? 'help';
   if (command === 'help' || command === '--help') {
     console.log(json({ commands: {
-      run: 'Supervised finalized-only collector (tail + backfill)',
       probe: 'Bounded live sizing; isolated in dataDir/probe',
       capabilities: 'Probe Alchemy extensions and oldest indexed program transactions',
       status: 'Read supervisor status snapshot without opening the live writer',
@@ -56,7 +55,7 @@ async function main() {
   }
   if (command === 'probe') config.dataDir = join(config.dataDir, 'probe');
   if(command==='repack') {console.log(json(await repackCheckpoint(config.dataDir)));return;}
-  if (!['run', 'probe', 'capabilities', 'verify-storage', 'storage-stats', 'validate-next-backfill', 'repair-next-backfill', 'maintain', 'relocate', 'benchmark-ordering', 'benchmark-ingest'].includes(command)) throw new Error('Unknown command');
+  if (!['probe', 'capabilities', 'verify-storage', 'storage-stats', 'validate-next-backfill', 'repair-next-backfill', 'maintain', 'relocate', 'benchmark-ordering', 'benchmark-ingest'].includes(command)) throw new Error('Unknown command');
   const store = await Store.open(config.dataDir);
   try {
     if (command === 'benchmark-ordering') { console.log(json(await benchmarkOrdering(store, mode))); return; }
@@ -87,7 +86,6 @@ async function main() {
     const provider = new Provider(providerUrl(), config, limiter);
     if (command === 'capabilities') { console.log(json(await capabilities(provider, config))); return; }
     if (command === 'probe') console.log(json(await probe(provider, store, config)));
-    else await run(provider, store, config);
   } finally { await store.close(); }
 }
 
