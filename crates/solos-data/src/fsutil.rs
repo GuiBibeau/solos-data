@@ -18,6 +18,8 @@ pub enum FsyncStep {
     DirAfterRename,
     /// The parent-directory fsync inside `create_dir_all_durable` (staging directories).
     ParentDir,
+    /// The re-run repair fsync of the parent of the last existing ancestor (ADR-0016).
+    RepairParent,
 }
 
 #[cfg(feature = "failpoints")]
@@ -37,6 +39,25 @@ pub fn inject_fsync_failure(step: FsyncStep) {
 #[cfg(feature = "failpoints")]
 pub fn clear_fsync_failure() {
     FAIL_FSYNC.with(|flag| flag.set(None));
+}
+
+#[cfg(feature = "failpoints")]
+thread_local! {
+    /// The last path whose fsync was requested, so the repair test can tell which directory was
+    /// fsynced (issue #66 follow-up 2).
+    static LAST_FSYNC: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "failpoints")]
+fn record_fsync(path: &Path) {
+    LAST_FSYNC.with(|slot| *slot.borrow_mut() = Some(path.to_path_buf()));
+}
+
+/// The path of the most recent fsync request, for tests.
+#[cfg(feature = "failpoints")]
+pub fn last_fsync_path() -> Option<std::path::PathBuf> {
+    LAST_FSYNC.with(|slot| slot.borrow().clone())
 }
 
 fn sync_all(file: &File) -> io::Result<()> {
@@ -118,7 +139,7 @@ pub fn create_dir_all_durable(path: &Path) -> io::Result<()> {
             break None;
         }
         if cursor.try_exists()? {
-            break parent_dir(&cursor);
+            break Some(parent_or_dot(&cursor));
         }
         let parent = parent_dir(&cursor);
         missing.push(cursor);
@@ -135,15 +156,30 @@ pub fn create_dir_all_durable(path: &Path) -> io::Result<()> {
         }
     }
     if let Some(parent) = existing_parent {
-        sync_path(&parent)?;
+        #[cfg(feature = "failpoints")]
+        record_fsync(&parent);
+        sync_handle(&File::open(&parent)?, FsyncStep::RepairParent)?;
     }
     Ok(())
 }
 
-/// fsync the parent of `dir`, so `dir`'s own directory entry is durable.
+/// fsync the parent of `dir` with [`FsyncStep::ParentDir`], so `dir`'s own directory entry is
+/// durable.
 fn sync_dir_parent(dir: &Path) -> io::Result<()> {
     let parent = dir.parent().filter(|parent| !parent.as_os_str().is_empty());
-    sync_path(parent.unwrap_or(Path::new(".")))
+    sync_handle(
+        &File::open(parent.unwrap_or(Path::new(".")))?,
+        FsyncStep::ParentDir,
+    )
+}
+
+/// The parent directory whose entry must be fsynced to make `path` durable: the lexical parent,
+/// or `.` for a relative single-component path.
+fn parent_or_dot(path: &Path) -> std::path::PathBuf {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    parent.unwrap_or(Path::new(".")).to_path_buf()
 }
 
 fn parent_dir(path: &Path) -> Option<std::path::PathBuf> {
@@ -275,13 +311,29 @@ mod tests {
         // Simulate a crash after `epoch=0` was created but before its parent was fsynced: the
         // directory exists, its entry is not durable. A re-run must fsync that parent.
         std::fs::create_dir_all(&nested).unwrap();
-        inject_fsync_failure(FsyncStep::Any);
+        inject_fsync_failure(FsyncStep::RepairParent);
         let rerun = create_dir_all_durable(&nested);
         clear_fsync_failure();
         let message = rerun.unwrap_err().to_string();
         assert!(message.contains("fsync failed"), "{message}");
+        assert!(message.contains("RepairParent"), "{message}");
+        assert_eq!(
+            last_fsync_path().as_deref(),
+            Some(nested.parent().unwrap()),
+            "the repair must fsync the parent of the last existing ancestor"
+        );
         // Once the fsync succeeds, the re-run is idempotent.
         create_dir_all_durable(&nested).unwrap();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_relative_single_component_ancestor_falls_back_to_dot() {
+        assert_eq!(parent_or_dot(Path::new("staging")), Path::new("."));
+        assert_eq!(
+            parent_or_dot(Path::new("staging/child")),
+            Path::new("staging")
+        );
+        assert_eq!(parent_or_dot(Path::new("/a/b")), Path::new("/a"));
     }
 }

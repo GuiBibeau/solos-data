@@ -116,9 +116,11 @@ pub enum StoreError {
 /// Taking a second lock on the same file conflicts, including from this process.
 pub struct DbLock {
     file: nix::fcntl::Flock<File>,
-    /// The checkpoint root this lock was taken for. `repack_checkpoint` refuses a lock that was
-    /// taken for a different root, so `repack_checkpoint(root_a, &lock_b)` cannot run.
-    root: PathBuf,
+    /// Identity of the lock file this lock was taken for (`dev`, `ino`). `assert_root` compares
+    /// lock-file inodes rather than root path text, so the same checkpoint reached through a
+    /// symlink still matches while `repack_checkpoint(root_a, &lock_b)` cannot run.
+    dev: u64,
+    ino: u64,
 }
 
 impl DbLock {
@@ -127,13 +129,21 @@ impl DbLock {
         let _ = &self.file;
     }
 
-    /// Refuse a checkpoint operation on `root` unless this lock was taken for `root`.
+    /// Refuse a checkpoint operation on `root` unless its lock file is the inode this lock was
+    /// taken for.
     pub fn assert_root(&self, root: &Path) -> Result<(), StoreError> {
-        if self.root != root {
+        let path = lock_path(root);
+        let meta = std::fs::metadata(&path).map_err(|error| {
+            StoreError::Check(format!("lock root mismatch: {}: {error}", path.display()))
+        })?;
+        if meta.dev() != self.dev || meta.ino() != self.ino {
             return Err(StoreError::Check(format!(
-                "lock root mismatch: lock holds {}, requested {}",
-                self.root.display(),
-                root.display()
+                "lock root mismatch: lock holds {}:{}, requested {}:{} ({})",
+                self.dev,
+                self.ino,
+                meta.dev(),
+                meta.ino(),
+                path.display()
             )));
         }
         Ok(())
@@ -179,9 +189,11 @@ pub fn acquire_lock(root: &Path) -> Result<DbLock, StoreError> {
         match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
             Ok(file) => {
                 if same_inode(&file, &path) {
+                    let meta = file.metadata()?;
                     return Ok(DbLock {
                         file,
-                        root: root.to_path_buf(),
+                        dev: meta.dev(),
+                        ino: meta.ino(),
                     });
                 }
             }

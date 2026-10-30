@@ -98,6 +98,10 @@ pub fn assert_registered_keys_unique_catalog(
     root: &Path,
     catalog: &Value,
 ) -> Result<(), StoreError> {
+    // Failpoint for `digest.rs`: a test arms this to record whether a read lease is held while
+    // the uniqueness check runs. `content_digest` must have taken the lease first (issue #66
+    // follow-up 2).
+    crate::crash_point!("digest/duplicate-key-check");
     let files = catalog
         .get("files")
         .and_then(Value::as_array)

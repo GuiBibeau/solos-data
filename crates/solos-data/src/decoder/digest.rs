@@ -218,35 +218,29 @@ mod tests {
     }
 
     #[test]
-    fn the_duplicate_key_check_runs_under_the_read_lease() {
+    fn content_digest_runs_the_duplicate_key_check_under_the_read_lease() {
         let dir = root_with(&[Sample {
             path: "tables/decoded_transactions/epoch=0/a.parquet",
             batch: 1,
             rows: &[("sig-a", 10)],
         }]);
-        let statements: Vec<String> = TABLES
-            .iter()
-            .map(|table| {
-                let projection = column_pairs(table)
-                    .iter()
-                    .map(|(name, _)| name.as_str())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!(
-                    "SELECT {projection} FROM {table} ORDER BY {}",
-                    sort_columns(table)
-                )
-            })
-            .collect();
-        let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
-        let mut lease_held = false;
-        let results = query_decoded_many_checked(&dir, &refs, |catalog| {
-            lease_held = crate::lease::has_readers(&dir).unwrap();
-            assert_registered_keys_unique_catalog(&dir, catalog)
+        // Drive the check through `content_digest`, not `query_decoded_many_checked`: a failpoint
+        // inside `assert_registered_keys_unique_catalog` records whether the read lease is held at
+        // that moment. Moving the check back before the lease must fail this test.
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = std::sync::Arc::clone(&held);
+        let root = dir.clone();
+        crate::failpoints::arm_callback("digest/duplicate-key-check", move || {
+            observed.store(
+                crate::lease::has_readers(&root).unwrap_or(false),
+                std::sync::atomic::Ordering::SeqCst,
+            );
         });
-        assert!(results.is_ok());
+        let digest = content_digest(&dir);
+        crate::failpoints::disarm("digest/duplicate-key-check");
+        digest.unwrap();
         assert!(
-            lease_held,
+            held.load(std::sync::atomic::Ordering::SeqCst),
             "the duplicate-key check must run under the read lease"
         );
         std::fs::remove_dir_all(dir).unwrap();

@@ -1,12 +1,12 @@
-import { log, now, type Config } from './config.ts';
-import type { Provider } from './rpc.ts';
-import type { Store } from './store.ts';
-import { makeWalk, recordVersions, type Watermark } from './pipeline.ts';
-import { walkPage, type Walk } from './walker.ts';
-import { fetchRange } from './fetcher.ts';
-import { orderRange } from './ordering.ts';
-import { assertPublishable, validateRange } from './validation.ts';
-import { publishRange } from './writer.ts';
+import { log, now, type Config } from '../src/config.ts';
+import type { Provider } from '../src/rpc.ts';
+import type { Store } from '../src/store.ts';
+import { makeWalk, recordVersions, type Watermark } from '../src/pipeline.ts';
+import { walkPage, type Walk } from '../src/walker.ts';
+import { fetchRange } from '../src/fetcher.ts';
+import { orderRange } from '../src/ordering.ts';
+import { assertPublishable, validateRange } from '../src/validation.ts';
+import { publishRange } from '../src/writer.ts';
 
 export interface BackfillProgress {
   direction: 'newest-first'; phase: 'fetching' | 'complete'; next: number; ceiling: number;

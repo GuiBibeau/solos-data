@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import { readFile, rm } from 'node:fs/promises';
-import { backfillStep } from '../src/history.ts';
+import { backfillStep } from './backfill-step.ts';
 import { makeWalk } from '../src/pipeline.ts';
 import { walkPage } from '../src/walker.ts';
 import { verifyFiles, recoverFiles, publishRange } from '../src/writer.ts';

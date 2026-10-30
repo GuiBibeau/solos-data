@@ -7,6 +7,7 @@ import { Store } from '../store.ts';
 import { schema } from './schema.ts';
 import { verifyDecoded } from './verify.ts';
 import { safeError } from '../service.ts';
+import { execUnderCheckpointLock } from '../lock.ts';
 
 async function main() {
   const command = process.argv[2] ?? 'help';
@@ -28,13 +29,20 @@ async function main() {
     if (sqlIndex === -1) throw new Error('query requires --sql');
     console.log(JSON.stringify(await queryDecoded(config.dataDir, process.argv[sqlIndex + 1]))); return;
   }
-  if(command==='repack') {console.log(JSON.stringify(await repackCheckpoint(config.dataDir)));return;}
+  if(command==='repack') {
+    await execUnderCheckpointLock(config.dataDir);
+    console.log(JSON.stringify(await repackCheckpoint(config.dataDir)));return;
+  }
   if(command==='verify-storage') {
+    await execUnderCheckpointLock(config.dataDir);
     const store=await Store.open(config.dataDir,schema);
     try {console.log(JSON.stringify(await verifyDecoded(store)));} finally {await store.close();}
     return;
   }
   if (!['once', 'watch'].includes(command)) throw new Error('unknown decoder command');
+  // `once` and `watch` open `<dataDir>/checkpoint.duckdb` through `runDecoder`; take the same
+  // flock as Rust's DbLock before DuckDB is opened (ADR-0016).
+  await execUnderCheckpointLock(config.dataDir);
   await runDecoder(config, command === 'once');
 }
 main().catch(error => { console.error(JSON.stringify({ at: new Date().toISOString(), event: 'decoder_fatal',

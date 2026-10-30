@@ -15,6 +15,7 @@ import { maintain } from './maintenance.ts';
 import { orderRange } from './ordering.ts';
 import { validateRange } from './validation.ts';
 import { repackCheckpoint } from './repack.ts';
+import { execUnderCheckpointLock } from './lock.ts';
 
 async function main() {
   const command = process.argv[2] ?? 'help';
@@ -54,8 +55,14 @@ async function main() {
     console.log(json(await queryDataset(config.dataDir, sql))); return;
   }
   if (command === 'probe') config.dataDir = join(config.dataDir, 'probe');
-  if(command==='repack') {console.log(json(await repackCheckpoint(config.dataDir)));return;}
+  if(command==='repack') {
+    await execUnderCheckpointLock(config.dataDir);
+    console.log(json(await repackCheckpoint(config.dataDir)));return;
+  }
   if (!['probe', 'capabilities', 'verify-storage', 'storage-stats', 'validate-next-backfill', 'repair-next-backfill', 'maintain', 'relocate', 'benchmark-ordering', 'benchmark-ingest'].includes(command)) throw new Error('Unknown command');
+  // Every command below opens `<dataDir>/checkpoint.duckdb`; take the same flock as Rust's
+  // DbLock before DuckDB is opened (ADR-0016).
+  await execUnderCheckpointLock(config.dataDir);
   const store = await Store.open(config.dataDir);
   try {
     if (command === 'benchmark-ordering') { console.log(json(await benchmarkOrdering(store, mode))); return; }
