@@ -63,8 +63,8 @@ export CARGO_BUILD_JOBS=${jobs}
 printf 'verify: CARGO_BUILD_JOBS=%s\n' "${jobs}" >&2
 
 run fmt cargo fmt --all --check
-run clippy cargo clippy --workspace --all-targets --locked --features solos-data/test-hooks -- -D warnings
-run test cargo test --workspace --locked --features solos-data/test-hooks
+run clippy cargo clippy --workspace --all-targets --locked -- -D warnings
+run test cargo test --workspace --locked
 run tsc npm run check
 run codec cargo build --release --locked -p phoenix-codec
 run node npm test

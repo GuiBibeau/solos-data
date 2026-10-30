@@ -124,9 +124,7 @@ fn sync_all(file: &File) -> io::Result<()> {
 #[cfg(feature = "failpoints")]
 fn sync_handle(file: &File, step: FsyncStep) -> io::Result<()> {
     let fault = FSYNC_FAULT.with(|slot| {
-        let Some((target, fault)) = slot.get() else {
-            return None;
-        };
+        let (target, fault) = slot.get()?;
         if target == step || target == FsyncStep::Any {
             slot.set(None); // fire once
             Some(fault)

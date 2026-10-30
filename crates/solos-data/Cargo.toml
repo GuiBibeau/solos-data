@@ -62,16 +62,11 @@ solos-data = { path = ".", features = ["failpoints"] }
 # reads Cargo.lock so the schema VERSION is tied to the resolved phoenix-rise-events version.
 borsh = "1.7"
 toml = "0.5"
-
-[dev-dependencies]
 # Property-based tests for the range checker (offline; no fork/timeout so cases run in-process).
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 
 [features]
 default = []
-# Test-only seams in fsutil (failpoints and the write guard). Off by default so they are not
-# compiled into release builds; the test and clippy jobs enable it explicitly.
-test-hooks = []
 # The Old Faithful archive lane through Jetstreamer (heavy build: agave crates and RocksDB).
 archive = ["dep:jetstreamer-firehose", "dep:log", "dep:solana-transaction-status", "dep:wincode", "dep:solana-accounts-db", "dep:solana-ledger", "dep:solana-runtime", "dep:solana-rpc", "dep:solana-geyser-plugin-manager", "dep:solana-storage-proto"]
 # Crash-safety failpoints and the fsync failure injection used by the tests (issue #56).

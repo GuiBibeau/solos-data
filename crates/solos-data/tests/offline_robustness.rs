@@ -18,7 +18,7 @@ use solos_data::collector::validation::{assert_publishable, validate_range};
 use solos_data::collector::writer::{Checkpoint, publish_range, recover_files};
 use solos_data::decoder::reader::query_decoded;
 use solos_data::decoder::service::{DecoderConfig, run_decoder};
-use solos_data::fsutil::{self, file_hash};
+use solos_data::fsutil::{self, FsyncStep, file_hash};
 use solos_data::store::{Store, StoreError};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -85,31 +85,69 @@ fn complete_valid_range() -> impl Strategy<Value = (i64, i64, Vec<(i64, usize)>)
     })
 }
 
+/// Insert the manifest rows and their collected transactions for `slots`, a complete valid
+/// range: every signature is fetched, every fetched row is listed, and the V6 ordering is correct.
+fn insert_range(store: &mut Store, slots: &[(i64, usize)]) {
+    for (slot, n) in slots {
+        for i in 0..*n {
+            let signature = format!("{slot}-{i}");
+            insert_manifest(store, &signature, *slot, *slot);
+            let (tx_index, single) = if *n == 1 {
+                (None, true)
+            } else {
+                (Some(i as i64), false)
+            };
+            insert_collected(store, &signature, *slot, *slot, tx_index, single);
+        }
+    }
+}
+
+// The seed is pinned so a failing case can be reproduced exactly: `proptest!` replays the same
+// inputs for the fixed seed on every run and in CI.
+const PROPTEST_SEED: u64 = 0x6000_0000_0000_0001;
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig {
+        cases: 128,
+        rng_seed: proptest::test_runner::RngSeed::Fixed(PROPTEST_SEED),
+        ..ProptestConfig::default()
+    })]
 
     #[test]
     fn every_complete_valid_range_publishes((from, to, slots) in complete_valid_range()) {
         let root = tempdir("prop-valid");
         let mut store = open_collector(&root);
-        for (slot, n) in &slots {
-            for i in 0..*n {
-                let signature = format!("{slot}-{i}");
-                insert_manifest(&mut store, &signature, *slot, *slot);
-                let (tx_index, single) = if *n == 1 {
-                    (None, true)
-                } else {
-                    (Some(i as i64), false)
-                };
-                insert_collected(&mut store, &signature, *slot, *slot, tx_index, single);
-            }
-        }
+        insert_range(&mut store, &slots);
         let report = validate_range(&mut store, from, to).unwrap();
         prop_assert!(
             assert_publishable(&report).is_ok(),
             "a complete range must publish: {report:?}"
         );
         prop_assert_eq!(report.get("ok"), Some(&Value::Bool(true)));
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Dropping one fetched body (its `tx_b64` becomes NULL) leaves `missing` as the only failing
+    /// counter: the row and its ordering columns stay, so the V6 ordering counters (`unordered`,
+    /// `badOrderingSlots`) must stay 0.
+    #[test]
+    fn a_dropped_fetch_body_fails_missing_without_ordering_counters((from, to, slots) in complete_valid_range()) {
+        let root = tempdir("prop-dropped-body");
+        let mut store = open_collector(&root);
+        insert_range(&mut store, &slots);
+        let first = format!("{}-0", slots[0].0);
+        store
+            .exec_batch(&format!(
+                "UPDATE transactions SET tx_b64=NULL WHERE signature='{first}'"
+            ))
+            .unwrap();
+        let report = validate_range(&mut store, from, to).unwrap();
+        prop_assert_eq!(report.get("ok"), Some(&Value::Bool(false)), "report: {:?}", report);
+        prop_assert_eq!(report.int("missing"), Some(1), "report: {:?}", report);
+        prop_assert_eq!(report.int("unlisted"), Some(0), "report: {:?}", report);
+        prop_assert_eq!(report.int("unordered"), Some(0), "report: {:?}", report);
+        prop_assert_eq!(report.int("badOrderingSlots"), Some(0), "report: {:?}", report);
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -279,24 +317,35 @@ fn assert_no_staging_files(root: &Path) {
 
 /// A disk full during a durable write (before the body is written) is a typed, retryable error:
 /// it keeps its OS error code and is not wrapped as `fsync failed`, so `fatal_class` does not
-/// treat it as fatal.
-#[test]
-fn a_write_enospc_is_typed_and_retryable() {
-    let root = tempdir("write-enospc");
-    let path = root.join("file.txt");
-    fsutil::inject_write_enospc(true);
-    struct Clear;
-    impl Drop for Clear {
-        fn drop(&mut self) {
-            fsutil::inject_write_enospc(false);
-        }
-    }
-    let _clear = Clear;
-    let error = fsutil::write_durable(&path, b"body").unwrap_err();
-    assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{error}");
-    assert_eq!(error.raw_os_error(), Some(nix::libc::ENOSPC), "{error}");
-    assert_eq!(fatal_class(&error.to_string()), None, "{error}");
-    let _ = std::fs::remove_dir_all(&root);
+/// treat it as fatal. `lane_error` reports it as retryable (not fatal) and records it, so the
+/// lane can retry once the disk frees up.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_enospc_is_typed_retryable_and_recorded() {
+    let f = Fixture::new();
+    let path = f.root.join("file.txt");
+    let io =
+        f.db.run_blocking({
+            let path = path.clone();
+            move |_store| {
+                fsutil::inject_write_enospc();
+                Ok(fsutil::write_durable(&path, b"body").unwrap_err())
+            }
+        })
+        .unwrap();
+    assert_eq!(io.kind(), std::io::ErrorKind::StorageFull, "{io}");
+    assert_eq!(io.raw_os_error(), Some(nix::libc::ENOSPC), "{io}");
+    assert_eq!(fatal_class(&io.to_string()), None, "{io}");
+    let error = StoreError::from(io);
+    let lanes = Lanes::new(true, true);
+    let (hook, calls) = recorder();
+    assert!(!lane_error(&f.db, "fixture", &lanes, "tail", &error, &hook).await);
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "a retryable write failure must not call the fatal hook"
+    );
+    // Retryable: the error is recorded for the lane's streak, unlike a fatal fsync.
+    assert_eq!(f.scalar("SELECT count(*) AS n FROM errors"), "1");
+    f.close();
 }
 
 /// A disk full during publication (ENOSPC on the durable fsync) is fatal like production: the
@@ -310,11 +359,11 @@ async fn an_enospc_fsync_during_publication_is_fatal_and_keeps_the_watermark() {
         f.db.run_blocking({
             let root = root.clone();
             move |store| {
-                fsutil::inject_fsync_enospc(true);
+                fsutil::inject_fsync_enospc(FsyncStep::Any);
                 struct Clear;
                 impl Drop for Clear {
                     fn drop(&mut self) {
-                        fsutil::inject_fsync_enospc(false);
+                        fsutil::clear_fsync_failure();
                     }
                 }
                 let _clear = Clear;
@@ -382,11 +431,11 @@ async fn an_eio_fsync_ends_the_lane_and_does_not_retry() {
         f.db.run_blocking({
             let root = root.clone();
             move |store| {
-                fsutil::inject_fsync_eio(true);
+                fsutil::inject_fsync_eio(FsyncStep::Any);
                 struct Clear;
                 impl Drop for Clear {
                     fn drop(&mut self) {
-                        fsutil::inject_fsync_eio(false);
+                        fsutil::clear_fsync_failure();
                     }
                 }
                 let _clear = Clear;
