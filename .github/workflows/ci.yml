@@ -5,7 +5,8 @@ on:
     branches: [main]
   pull_request:
   # Nightly and manual runs keep the archive compile check (which no longer runs on
-  # every PR) and the shared caches warm; anything moved off PRs fails loudly here.
+  # every PR) exercised; anything moved off PRs fails loudly here. Only pushes to main
+  # save the caches, so a main merge is what keeps them warm.
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
@@ -28,17 +29,51 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 
-# Four jobs in parallel; the wall clock is the slowest one. `cargo clippy` (check, dev profile)
-# and `cargo test` (test profile) resolve different libduckdb-sys build-script units, so a shared
-# target/ would still compile DuckDB twice: each Rust job keeps its own cache instead.
-# `archive-check` compiles DuckDB plus RocksDB, protobuf and the agave crates, and keeps its own.
+# `fmt`, `clippy` and `test` run in parallel; the wall clock is the slowest one. `cargo clippy`
+# (check, dev profile) and `cargo test` (test profile) resolve different libduckdb-sys
+# build-script units, so a shared target/ would still compile DuckDB twice: each Rust job keeps
+# its own cache instead. `archive-check` compiles DuckDB plus RocksDB, protobuf and the agave
+# crates, and keeps its own. `changes` computes the archive input set; `ci-ok` aggregates the
+# results into the single check branch protection should require.
 #
 # Every Rust job uses a shared cache key (Swatinem/rust-cache `shared-key`) with a main-only
-# save: only pushes to main (and manual dispatches, which seed and maintain the cache) write the
-# cache, while pull requests only restore. Swatinem/rust-cache's restore key omits the
-# Cargo.lock hash, so a PR that changes the lockfile still restores main's warm cache and
-# recompiles only the crates whose versions actually changed (ADR-0017).
+# save: only pushes to main write the cache, while pull requests only restore.
+# Swatinem/rust-cache's restore key omits the Cargo.lock hash, so a PR that changes the lockfile
+# still restores main's warm cache and recompiles only the crates whose versions actually changed
+# (ADR-0018).
 jobs:
+  # Computes the archive input set for pull requests. It always runs so downstream jobs can read
+  # its outputs; the filter step itself only applies to pull requests, and on other events the
+  # outputs are empty so every downstream job runs.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      archive: ${{ steps.filter.outputs.archive }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            archive:
+              # Everything that drives `cargo check -p solos-data --features archive`'s build
+              # graph: the workspace and crate manifests, the lockfile, the pinned toolchain,
+              # the solos-data crate and its in-repo path dependencies (phoenix-codec,
+              # solana-wire, the vendored Jetstreamer crate), and this workflow itself.
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '**/Cargo.toml'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/ci.yml'
+              - 'crates/solos-data/**'
+              - 'crates/phoenix-codec/**'
+              - 'crates/solana-wire/**'
+              - 'vendor/**'
+
   fmt:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -61,12 +96,11 @@ jobs:
           components: clippy
       # `shared-key` is the stable shared prefix (equal to the automatic job id, so existing
       # caches are reused); Swatinem's restore key omits the Cargo.lock hash, so a PR that
-      # changes the lockfile still restores main's warm cache. Only main and manual dispatches
-      # save; PRs only restore.
+      # changes the lockfile still restores main's warm cache. Only main saves; PRs only restore.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: clippy
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # DuckDB's objects are already archived in libduckdb.a; drop them before the cache is saved.
       # The build script reruns only when its inputs change, so nothing reads them again.
@@ -87,7 +121,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: test
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --locked
       # The npm suite runs on every push to main, and on a pull request that touches its inputs:
       # the TypeScript sources and tests, their config, the npm manifests, and the codec it spawns.
@@ -106,6 +140,7 @@ jobs:
               - 'crates/phoenix-codec/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         if: github.event_name != 'pull_request' || steps.changes.outputs.npm == 'true'
@@ -130,55 +165,77 @@ jobs:
   # this job only type-checks.
   #
   # It runs on every push to main, nightly and manual dispatches, and on a pull request only
-  # when the PR touches the archive code paths or the manifests that drive its build graph. On
-  # those PRs it restores main's warm cache (see the shared-key note above), so the heavy C++
-  # and agave crates are not rebuilt from scratch.
+  # when the `changes` job says the diff touches the archive inputs. On those runs it restores
+  # main's warm cache (see the shared-key note above), so the heavy C++ and agave crates are not
+  # rebuilt from scratch. The whole job is gated, not just its steps, so a skipped archive check
+  # is visible to the `ci-ok` aggregator instead of reporting green while compiling nothing.
   archive-check:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.archive == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
       contents: read
-      pull-requests: read
     env:
       CC: gcc
       CXX: g++
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
-      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
-        id: changes
-        if: github.event_name == 'pull_request'
-        with:
-          filters: |
-            archive:
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '**/Cargo.toml'
-              - 'vendor/**'
-              - 'crates/solos-data/src/**'
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: 1.96.0
       - name: Install archive build dependencies
-        if: github.event_name != 'pull_request' || steps.changes.outputs.archive == 'true'
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang cmake libclang-dev pkg-config g++
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         id: cache
-        if: github.event_name != 'pull_request' || steps.changes.outputs.archive == 'true'
         with:
           shared-key: archive-check
-          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Record rust-cache
-        if: github.event_name != 'pull_request' || steps.changes.outputs.archive == 'true'
         run: echo "rust-cache hit=${{ steps.cache.outputs.cache-hit }}"
-      - if: github.event_name != 'pull_request' || steps.changes.outputs.archive == 'true'
-        run: cargo check -p solos-data --features archive --locked
+      - run: cargo check -p solos-data --features archive --locked
       # The static libraries already contain these objects. The build scripts rerun only when
       # their inputs change, so nothing reads the .o files again.
       - name: Prune native objects before caching
-        if: github.event_name != 'pull_request' || steps.changes.outputs.archive == 'true'
         run: |
           find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete
           find target -path '*/build/librocksdb-sys-*/out/*' -name '*.o' -delete
           find target -path '*/build/protobuf-src-*/out/*' -name '*.o' -delete
+
+  # The single check branch protection should require. It always runs and aggregates the real
+  # jobs: `changes`, `fmt`, `clippy` and `test` must succeed, and `archive-check` must succeed or
+  # be intentionally skipped because the diff touched no archive inputs. Require `ci-ok` (not the
+  # individual jobs): a skipped required job does not satisfy GitHub's branch protection, while
+  # `ci-ok` evaluates the skip against the filter and fails otherwise.
+  ci-ok:
+    needs: [changes, fmt, clippy, test, archive-check]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate required jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          ARCHIVE_CHANGED: ${{ needs.changes.outputs.archive }}
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          echo "$NEEDS" | jq .
+          for job in changes fmt clippy test; do
+            result="$(echo "$NEEDS" | jq -r --arg j "$job" '.[$j].result')"
+            if [ "$result" != "success" ]; then
+              echo "required job '$job' did not succeed: $result" >&2
+              exit 1
+            fi
+          done
+          archive_result="$(echo "$NEEDS" | jq -r '.["archive-check"].result')"
+          if [ "$archive_result" = "success" ]; then
+            echo "archive-check succeeded"
+          elif [ "$archive_result" = "skipped" ] && [ "$IS_PR" = "true" ] && [ "$ARCHIVE_CHANGED" != "true" ]; then
+            echo "archive-check intentionally skipped: no archive inputs changed on this pull request"
+          else
+            echo "archive-check did not succeed and was not an intentional skip (result=$archive_result, archive-changed=$ARCHIVE_CHANGED)" >&2
+            exit 1
+          fi
+          echo "ci-ok: all required jobs passed"
