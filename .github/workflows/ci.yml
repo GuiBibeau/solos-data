@@ -154,8 +154,7 @@ jobs:
               - 'Cargo.lock'
               - '**/Cargo.toml'
               - 'vendor/**'
-              - 'crates/solos-data/src/**/archive.rs'
-              - 'crates/solos-data/src/stall.rs'
+              - 'crates/solos-data/src/**'
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: 1.96.0

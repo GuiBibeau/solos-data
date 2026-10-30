@@ -13,10 +13,13 @@ unrelated PRs, so no pull request waits on a 23-minute cold compile (issue #68).
   off unrelated PRs, not out of the pipeline: it always runs on pushes to main, on the nightly
   schedule and on `workflow_dispatch`, and it also runs on a PR whose diff touches its inputs.
 - **The archive check is path-gated on pull requests.** It runs on a PR only when the diff
-  touches the archive code paths (`crates/solos-data/src/**/archive.rs`,
-  `crates/solos-data/src/stall.rs`), the vendored Jetstreamer crate (`vendor/**`) or the manifests
-  that drive its build graph (`Cargo.toml`, `Cargo.lock`, `**/Cargo.toml`). Every other PR skips
-  it, which removes the 23-minute cold compile from the common case.
+  touches the `solos-data` crate's Rust sources (`crates/solos-data/src/**`), the vendored
+  Jetstreamer crate (`vendor/**`) or the manifests that drive its build graph (`Cargo.toml`,
+  `Cargo.lock`, `**/Cargo.toml`). Matching the crate's sources keeps archive-only callers honest:
+  `spot/archive.rs` builds `SpotTx`, `Ix` and `Balance` from `spot/tx.rs`, and
+  `venues/history/archive.rs` builds `Tx` from `venues/walk.rs`, so changing a shared type still
+  compiles its archive caller. Every other PR skips it, which removes the 23-minute cold compile
+  from the common case.
 - **Every Rust job uses a shared cache key with a main-only save.** The three cargo jobs pass
   `shared-key` to Swatinem/rust-cache and `save-if:
   github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'`. Pull requests
