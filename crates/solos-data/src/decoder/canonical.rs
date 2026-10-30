@@ -13,7 +13,8 @@ const UINT: u8 = 0x03;
 const FLOAT: u8 = 0x04;
 const DECIMAL: u8 = 0x05;
 const TEXT: u8 = 0x06;
-/// `decoded_at` keeps its schema slot and contributes no clock value.
+/// `decoded_at` and `source_file` keep their schema slots and contribute no value: a wall clock
+/// and a raw-file byte hash are provenance, not decoded content.
 const OMITTED: u8 = 0x0f;
 
 /// One encoded value. Used by the collision test and the row encoder.
@@ -91,7 +92,8 @@ pub(crate) fn put_schema(
     Ok(())
 }
 
-/// Encode one row in schema order. `decoded_at` is the omitted tag, not the stored clock.
+/// Encode one row in schema order. `decoded_at` and `source_file` are omitted tags, not values:
+/// the stored clock and the raw-file byte hash are provenance, not decoded content.
 pub(crate) fn put_row(
     buf: &mut Vec<u8>,
     columns: &[(String, String)],
@@ -100,7 +102,7 @@ pub(crate) fn put_row(
     let count = u32::try_from(columns.len()).map_err(|_| "too many columns".to_owned())?;
     buf.extend_from_slice(&count.to_be_bytes());
     for (name, ty) in columns {
-        if name == "decoded_at" {
+        if name == "decoded_at" || name == "source_file" {
             buf.push(OMITTED);
             continue;
         }

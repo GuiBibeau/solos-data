@@ -2,7 +2,8 @@
 //!
 //! Decodes `tests/data/phoenix-events.json` through the real decoder into a fresh temp directory
 //! with a fixed `decoded_at`. Two fresh directories must share the content digest and every
-//! registered file's SHA-256. The digest is row equivalence. `files.sha256` is the pinned
+//! registered file's SHA-256. The digest is row equivalence and omits the fixed `decoded_at`
+//! clock, `source_file` provenance and `created_by`. `files.sha256` is the pinned
 //! DuckDB 1.4.5 byte check, so a writer-option change fails even when the rows do not. The test
 //! publishes into the temp directory; it does not seal a partition.
 //!
@@ -138,7 +139,7 @@ fn committed() -> Golden {
 fn write_golden(day: &Day) {
     let mut body = format!(
         "# Content digest v2 and pinned DuckDB 1.4.5 file hashes of tests/data/phoenix-events.json.\n\
-         # decoded_at is fixed at {FIXTURE_DECODED_AT}. The digest omits that value and created_by.\n\
+         # decoded_at is fixed at {FIXTURE_DECODED_AT}. The digest omits that clock, source_file and created_by.\n\
          # files.sha256 is the raw file hash. Refresh: SOLOS_DATA_REFRESH_GOLDEN_DAY=1 cargo test --test golden_day\n\
          digest {}\n",
         day.digest

@@ -1,7 +1,7 @@
 # Content digest v2 and pinned DuckDB 1.4.5 file hashes of tests/data/phoenix-events.json.
-# decoded_at is fixed at 2026-10-04T00:00:00.000Z. The digest omits that value and created_by.
+# decoded_at is fixed at 2026-10-04T00:00:00.000Z. The digest omits that clock, source_file and created_by.
 # files.sha256 is the raw file hash. Refresh: SOLOS_DATA_REFRESH_GOLDEN_DAY=1 cargo test --test golden_day
-digest 7b3df686e0a3904d3269c0082b7316a627f8418e9b17977bdc64ef887c9fe0c5
+digest 4f7973e77f6dd8724dad0866311c13b40ac2c0be32c93908f30f80990eac4f95
 file tables/decoded_transactions/epoch=981/000000000001.parquet 6b7e237cc35d0a4432aa5004c542861ca06422bfbef0cb0058b08975f3684339
 file tables/decoded_transactions/epoch=988/000000000001.parquet e1bc2a720c776246585117bec117ec5bbc92b9beddd976e6138d9255323e0e29
 file tables/decoded_transactions/epoch=991/000000000001.parquet 1b96646231a0947b537a48a74f805176488f366029b3a570436bbebe6b19ff0b

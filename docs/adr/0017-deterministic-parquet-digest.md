@@ -23,7 +23,9 @@ Three things keep two writes of the same rows from sharing a file SHA-256:
 
 Catalog `at` and `files.created_at` are wall clocks too. They are not part of the Parquet
 payload. The `sha256` column on `files` stays the raw file hash: V7 checks that the bytes on
-disk are the bytes that were registered. That check is integrity, not replay.
+disk are the bytes that were registered. That check is integrity, not replay. The decoder
+copies that `sha256` into `decoded_transactions.source_file`; it is provenance (which raw file
+produced the row), not decoded content, so the content digest omits it like `decoded_at`.
 
 ## Decision
 
@@ -42,11 +44,12 @@ reader still keeps the newest.
 on disk are the bytes that were registered. It is not the equivalence check.
 
 The equivalence check is a content digest. It hashes, in order, the schema (column name, type,
-and order, including `decoded_at`) and the reader rows. Every field is a tag. Variable-length
-payloads are a big-endian `u32` length plus bytes. `NULL` is its own tag. Integers are 16-byte
-big-endian. Floats are IEEE-754 bits. Decimals are one normalized digit string. `decoded_at`
-keeps its schema slot and is an omitted tag, not the clock. Joined strings are not hashed.
-Footer `created_by` is not read.
+and order, including `decoded_at` and `source_file`) and the reader rows. Every field is a tag.
+Variable-length payloads are a big-endian `u32` length plus bytes. `NULL` is its own tag.
+Integers are 16-byte big-endian. Floats are IEEE-754 bits. Decimals are one normalized digit
+string. `decoded_at` and `source_file` keep their schema slots and are omitted tags, not the
+clock or the raw-file byte hash. Joined strings are not hashed. Footer `created_by` is not
+read.
 
 The golden fixture sets `decoded_at` to `2026-10-04T00:00:00.000Z` and compares both the digest
 and every registered file's SHA-256. On this DuckDB build the file hashes catch a writer-option

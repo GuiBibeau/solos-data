@@ -3,8 +3,9 @@
 //! `files.sha256` stays the raw file hash and is what detects bit-rot. This digest is the
 //! equivalence check: two runs of the same rows produce it, including across a DuckDB build
 //! change. It hashes the schema (column name, type, and order) and the reader rows in a total
-//! order. Each field is tagged and length-prefixed. `decoded_at` keeps its schema slot and
-//! contributes an omitted tag, not the clock. Footer `created_by` is not read.
+//! order. Each field is tagged and length-prefixed. `decoded_at` and `source_file` keep their
+//! schema slots and contribute omitted tags, not the clock or the raw-file byte hash. Footer
+//! `created_by` is not read.
 //!
 //! All six tables are read under one lease, from one catalog snapshot. The rows are still
 //! materialized as JSON before they are encoded. That holds the fixture day and must not be
@@ -80,7 +81,7 @@ mod tests {
     use super::*;
     use crate::store::sql_string;
 
-    fn transactions(path: &std::path::Path, rows: &[(&str, i64)]) {
+    fn transactions(path: &std::path::Path, rows: &[(&str, i64)], source_file: &str) {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -88,7 +89,7 @@ mod tests {
             .iter()
             .map(|(signature, slot)| {
                 format!(
-                    "('{signature}', 'h', {slot}, 0, false, 1, true, 'decoded', 0, 0, 'src', '2026-10-04T00:00:00.000Z', 'v')"
+                    "('{signature}', 'h', {slot}, 0, false, 1, true, 'decoded', 0, 0, '{source_file}', '2026-10-04T00:00:00.000Z', 'v')"
                 )
             })
             .collect::<Vec<_>>()
@@ -113,7 +114,7 @@ mod tests {
         let mut listed = Vec::new();
         for file in files {
             let path = dir.join(file.path);
-            transactions(&path, file.rows);
+            transactions(&path, file.rows, "src");
             listed.push(serde_json::json!({
                 "path": file.path,
                 "table_name": "decoded_transactions",
@@ -126,6 +127,42 @@ mod tests {
         )
         .unwrap();
         dir
+    }
+
+    /// One decoded root with a single `decoded_transactions` row whose `source_file` is the
+    /// given raw-file byte hash.
+    fn root_with_source_file(source_file: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("digest-source-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tables/decoded_transactions/epoch=0/a.parquet");
+        transactions(&path, &[("sig-a", 10)], source_file);
+        std::fs::write(
+            dir.join("catalog.json"),
+            serde_json::json!({ "files": [{
+                "path": "tables/decoded_transactions/epoch=0/a.parquet",
+                "table_name": "decoded_transactions",
+                "batch_id": 1
+            }] })
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn raw_file_provenance_does_not_move_the_digest() {
+        // A DuckDB build bump rewrites the raw Parquet `created_by` footer, so the raw file's
+        // byte hash in `decoded_transactions.source_file` changes while the decoded rows do not.
+        // The content digest must not move with that provenance.
+        let before = root_with_source_file("raw-sha-before-toolchain-bump");
+        let after = root_with_source_file("raw-sha-after-toolchain-bump");
+        assert_eq!(
+            content_digest(&before).unwrap(),
+            content_digest(&after).unwrap(),
+            "source_file provenance (raw Parquet byte hash) moved the content digest"
+        );
+        std::fs::remove_dir_all(before).unwrap();
+        std::fs::remove_dir_all(after).unwrap();
     }
 
     #[test]
