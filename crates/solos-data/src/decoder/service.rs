@@ -4,7 +4,7 @@
 
 use super::compact::{CompactionPolicy, compact_decoded_with};
 use super::extract::extract_groups;
-use super::normalize::{Rows, normalize, quarantine};
+use super::normalize::{Rows, normalize_at, quarantine};
 use super::publish::{SourceProgress, publish_sources, recover, write_catalog};
 use super::schema::{VERSION, schema_static};
 use super::source::{NextSource, SourceRow, attach_previous, pending_sources, read_source_rows};
@@ -47,6 +47,10 @@ pub struct DecoderConfig {
     /// Batches after which a group that receives none is settled and merges its head with two
     /// files (`compactionSettledBatches`, default 100; 0 turns the rule off).
     pub compaction_settled_batches: u64,
+    /// Fixture clock written into `decoded_at`. `None` is the wall clock. The golden-day test
+    /// sets a fixed instant so two fresh roots can compare `files.sha256`. Production leaves it
+    /// unset; a fixed clock is not a way to rewrite sealed partitions.
+    pub decoded_at: Option<String>,
 }
 
 impl DecoderConfig {
@@ -63,6 +67,7 @@ impl DecoderConfig {
             compaction_interval_seconds: 60,
             compaction_budget_seconds: COMPACTION_BUDGET.as_secs(),
             compaction_settled_batches: 100,
+            decoded_at: None,
         }
     }
 }
@@ -165,7 +170,8 @@ pub fn run_decoder(
         }
         let read_seconds = started.elapsed().as_secs_f64();
         let decoded_at = Instant::now();
-        let (rows, seen) = decode_rows(&parts)?;
+        let row_clock = config.decoded_at.clone().unwrap_or_else(now);
+        let (rows, seen) = decode_rows(&parts, &row_clock)?;
         let decode_seconds = decoded_at.elapsed().as_secs_f64();
         let known: HashSet<String> = parts
             .iter()
@@ -313,7 +319,7 @@ struct Outcome {
 }
 
 /// Decode and normalize one source row; pure, so rows decode in parallel.
-fn decode_row(row: &SourceRow, created_at: &str, source_hash: &str) -> Outcome {
+fn decode_row(row: &SourceRow, created_at: &str, source_hash: &str, row_clock: &str) -> Outcome {
     let tx = &row.tx;
     let hash = tx.content_hash();
     if let Some(previous_at) = &row.previous_at
@@ -343,8 +349,8 @@ fn decode_row(row: &SourceRow, created_at: &str, source_hash: &str) -> Outcome {
             tx.tx_b64.as_deref().unwrap_or(""),
         )]
     });
-    let normalized = normalize(tx, &hash, &decoded, source_hash).or_else(|_| {
-        normalize(
+    let normalized = normalize_at(tx, &hash, &decoded, source_hash, row_clock).or_else(|_| {
+        normalize_at(
             tx,
             &hash,
             &[quarantine(
@@ -353,6 +359,7 @@ fn decode_row(row: &SourceRow, created_at: &str, source_hash: &str) -> Outcome {
                 tx.tx_b64.as_deref().unwrap_or(""),
             )],
             source_hash,
+            row_clock,
         )
     });
     Outcome {
@@ -377,7 +384,7 @@ fn decode_threads() -> usize {
 
 /// Decode a batch in parallel, then assemble `(rows, seen per part)` in source order so the
 /// published tables and the progress records are identical to the sequential loop.
-fn decode_rows(parts: &[Part]) -> Result<(Rows, Vec<Seen>), StoreError> {
+fn decode_rows(parts: &[Part], row_clock: &str) -> Result<(Rows, Vec<Seen>), StoreError> {
     let items: Vec<(&SourceRow, &str, &str)> = parts
         .iter()
         .flat_map(|part| {
@@ -394,7 +401,7 @@ fn decode_rows(parts: &[Part]) -> Result<(Rows, Vec<Seen>), StoreError> {
             .map(|part| {
                 scope.spawn(move || {
                     part.iter()
-                        .map(|(row, created_at, hash)| decode_row(row, created_at, hash))
+                        .map(|(row, created_at, hash)| decode_row(row, created_at, hash, row_clock))
                         .collect::<Vec<Outcome>>()
                 })
             })

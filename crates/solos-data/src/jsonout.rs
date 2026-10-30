@@ -111,6 +111,15 @@ impl Obj {
         self.get(key).and_then(Value::as_str)
     }
 
+    /// The row list at `key`, when that entry is one.
+    #[must_use]
+    pub fn rows(&self, key: &str) -> Option<&[Obj]> {
+        match self.0.iter().find(|(k, _)| k == key) {
+            Some((_, Slot::Rows(rows))) => Some(rows),
+            _ => None,
+        }
+    }
+
     /// A number rendered by DuckDB as a string or a number, parsed as `i64`.
     #[must_use]
     pub fn int(&self, key: &str) -> Option<i64> {

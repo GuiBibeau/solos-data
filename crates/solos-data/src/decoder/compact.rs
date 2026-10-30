@@ -4,8 +4,10 @@
 //! only the newest prefix of a group and needed 32 files inside 500k rows, which an `events`
 //! file of 20–50k rows can never satisfy, so the table never compacted.
 
+use super::keys::assert_key_batch_unique;
+use super::parquet::{copy_statement, require_store_duckdb};
 use super::publish::write_catalog;
-use super::schema::key_column;
+use super::schema::{key_column, sort_columns};
 use crate::fsutil::{file_hash, sync_path, tmp_path};
 use crate::jsonout::{Obj, now};
 use crate::store::{Store, StoreError, sql_string};
@@ -220,11 +222,23 @@ fn merge(store: &mut Store, table: &str, epoch: &str, files: &[Obj]) -> Result<(
     )
     .to_string();
     let key = key_column(table);
-    let query = format!(
-        "SELECT p.* EXCLUDE(filename,epoch) FROM read_parquet([{paths}],filename=true,union_by_name=true) p
+    let joined = format!(
+        "read_parquet([{paths}],filename=true,union_by_name=true) p
       JOIN (SELECT value->>'path' AS path,(value->>'batch')::BIGINT AS batch FROM json_each({}::JSON)) r
-      ON r.path=p.filename QUALIFY row_number() OVER(PARTITION BY p.{key} ORDER BY r.batch DESC,p.filename DESC)=1",
+      ON r.path=p.filename",
         sql_string(&registrations)
+    );
+    // Before QUALIFY. The window would otherwise keep one of two rows that share a key and a
+    // batch, choosing by filename, and a check of the QUALIFY output could not see them.
+    require_store_duckdb(store)?;
+    assert_key_batch_unique(
+        store,
+        table,
+        &format!("SELECT p.{key}::VARCHAR AS key, r.batch AS batch_id FROM {joined}"),
+    )?;
+    let query = format!(
+        "SELECT p.* EXCLUDE(filename,epoch) FROM {joined}
+      QUALIFY row_number() OVER(PARTITION BY p.{key} ORDER BY r.batch DESC,p.filename DESC)=1"
     );
     let relative = format!(
         "tables/{table}/epoch={epoch}/compact-{}.parquet",
@@ -235,10 +249,8 @@ fn merge(store: &mut Store, table: &str, epoch: &str, files: &[Obj]) -> Result<(
         std::fs::create_dir_all(parent)?;
     }
     let tmp = tmp_path(&path);
-    store.exec_batch(&format!(
-        "COPY ({query} ORDER BY slot,signature) TO {} (FORMAT PARQUET,COMPRESSION ZSTD)",
-        sql_string(&tmp.to_string_lossy())
-    ))?;
+    let order = sort_columns(table);
+    store.exec_batch(&copy_statement(&format!("{query} ORDER BY {order}"), &tmp))?;
     sync_path(&tmp)?;
     std::fs::rename(&tmp, &path)?;
     if let Some(parent) = path.parent() {
@@ -342,5 +354,46 @@ mod tests {
         ];
         let run = select_run(files, HEAD_MIN_FILES).expect("the two small files below merge");
         assert_eq!(batches(&run), vec![9, 8]);
+    }
+
+    #[test]
+    fn two_inputs_with_the_same_key_and_batch_are_refused() {
+        let root = std::env::temp_dir().join(format!("compact-dup-{}", uuid::Uuid::new_v4()));
+        let mut store =
+            crate::store::Store::open(&root, crate::decoder::schema::schema_static()).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        for name in ["a.parquet", "b.parquet"] {
+            let relative = format!("tables/events/epoch=0/{name}");
+            let path = root.join(&relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            conn.execute_batch(&format!(
+                "COPY (SELECT 'same' AS event_id, 'sig' AS signature, '0' AS instruction_path, \
+                 0 AS event_ordinal, 1::BIGINT AS slot) TO {} (FORMAT PARQUET)",
+                crate::store::sql_string(&path.to_string_lossy())
+            ))
+            .unwrap();
+            store
+                .exec(
+                    "INSERT INTO files VALUES (?, 'events', 1, 'h', 1, 't')",
+                    &[&relative],
+                )
+                .unwrap();
+        }
+        store.set("batch", &serde_json::json!(1)).unwrap();
+        let err = compact_decoded_with(
+            &mut store,
+            CompactionPolicy {
+                budget: Duration::from_secs(5),
+                settled_batches: Some(0),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("duplicate event_id same in events batch 1"),
+            "{err}"
+        );
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

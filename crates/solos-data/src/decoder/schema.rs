@@ -106,6 +106,34 @@ pub fn key_column(table: &str) -> &'static str {
     }
 }
 
+/// Total order for a published file and for the content digest.
+///
+/// Each list ends with the table's primary key ([`key_column`]). That key is unique per batch:
+/// `signature` once per transaction, `event_id` (`signature/instruction_path/event_ordinal`, and
+/// a base58 signature has no `/`) once per event, `error_id` once per decode error. The publisher
+/// and the digest refuse a second row. A sort that ends in a unique key is a total order, so the
+/// digest does not depend on how a tie would have been broken.
+#[must_use]
+pub fn sort_columns(table: &str) -> &'static str {
+    match table {
+        "decoded_transactions" => "slot, signature",
+        "decode_errors" => "slot, signature, instruction_path, error_id",
+        _ => "slot, signature, instruction_path, event_ordinal, event_id",
+    }
+}
+
+/// Column name and type in definition order, including `decoded_at`.
+#[must_use]
+pub fn column_pairs(table: &str) -> Vec<(String, String)> {
+    definition(table)
+        .split(',')
+        .filter_map(|column| {
+            let mut parts = column.split_whitespace();
+            Some((parts.next()?.to_owned(), parts.next()?.to_owned()))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -121,5 +149,32 @@ mod tests {
             text.starts_with("[{\"event_id\":\"VARCHAR\",\"signature\""),
             "definition order is preserved: {text}"
         );
+    }
+
+    #[test]
+    fn the_sort_key_includes_the_primary_key() {
+        let names: Vec<String> = column_pairs("decoded_transactions")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert!(names.iter().any(|name| name == "decoded_at"));
+        assert!(names.iter().any(|name| name == "signature"));
+        assert_eq!(sort_columns("decoded_transactions"), "slot, signature");
+        assert!(
+            column_pairs("events")
+                .iter()
+                .any(|(name, _)| name == "event_ordinal")
+        );
+        assert!(sort_columns("events").ends_with("event_id"));
+        assert!(sort_columns("decode_errors").ends_with("error_id"));
+        for table in TABLES {
+            let key = key_column(table);
+            assert!(
+                sort_columns(table)
+                    .split(',')
+                    .any(|column| column.trim() == key),
+                "{table} sort does not include {key}"
+            );
+        }
     }
 }

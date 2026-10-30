@@ -2,8 +2,10 @@
 //! registering the files, the processed revisions, the source offset and the batch number. A
 //! port of `decode/publish.ts`.
 
+use super::keys::assert_relation_keys_unique;
 use super::normalize::Rows;
-use super::schema::{TABLES, VERSION, definition, type_map};
+use super::parquet::{copy_statement, require_store_duckdb};
+use super::schema::{TABLES, VERSION, definition, sort_columns, type_map};
 use crate::fsutil::{create_dir_all_durable, file_hash, sync_path, write_durable};
 use crate::jsonout::{Obj, now};
 use crate::store::{Store, StoreError, sql_string};
@@ -62,6 +64,8 @@ pub fn publish_sources(
             .or_else(|| v.as_i64())
             .unwrap_or(0)
     }) + 1;
+    // The COPY below writes Parquet with the pinned 1.4.5 settings.
+    require_store_duckdb(store)?;
     // Files are durable before the transaction that registers them and progress.
     let mut files: Vec<Published> = Vec::new();
     for table in TABLES {
@@ -76,6 +80,7 @@ pub fn publish_sources(
         let payload =
             serde_json::to_string(table_rows).map_err(|e| StoreError::Check(e.to_string()))?;
         store.exec(&format!("INSERT INTO {table} SELECT unnest(json_transform(?::JSON, ?::JSON), recursive:=true)"), &[&payload, &type_map(table)])?;
+        assert_relation_keys_unique(store, table, table)?;
         let epochs = store.rows(
             &format!("SELECT DISTINCT slot // 432000 AS epoch FROM {table}"),
             &[],
@@ -88,11 +93,10 @@ pub fn publish_sources(
                 create_dir_all_durable(parent)?;
             }
             let tmp = crate::fsutil::tmp_path(&path);
-            store.exec_batch(&format!(
-                "COPY (SELECT * FROM {table} WHERE slot // 432000={epoch}
-          ORDER BY slot, signature) TO {} (FORMAT PARQUET, COMPRESSION ZSTD)",
-                sql_string(&tmp.to_string_lossy())
-            ))?;
+            let order = sort_columns(table);
+            let select =
+                format!("SELECT * FROM {table} WHERE slot // 432000={epoch} ORDER BY {order}");
+            store.exec_batch(&copy_statement(&select, &tmp))?;
             sync_path(&tmp)?;
             std::fs::rename(&tmp, &path)?;
             if let Some(parent) = path.parent() {
