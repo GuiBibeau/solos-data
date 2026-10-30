@@ -238,6 +238,27 @@ fn each_range_check_mutation_fails_with_its_counter() {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    // Duplicate V6 indexes in a multi-row slot: each row is individually well-formed (`unordered`
+    // stays 0) but the slot's index set is not a permutation, so only `badOrderingSlots` fails.
+    {
+        let root = tempdir("mut-bad-slots");
+        let mut store = open_collector(&root);
+        insert_complete_valid_range(&mut store);
+        assert_ok(&mut store, from, to);
+        store
+            .exec_batch("UPDATE transactions SET tx_index=0 WHERE signature='c'")
+            .unwrap();
+        let report = validate_range(&mut store, from, to).unwrap();
+        assert_eq!(report.get("ok"), Some(&Value::Bool(false)), "{report:?}");
+        assert_eq!(report.int("badOrderingSlots"), Some(1), "{report:?}");
+        assert_eq!(report.int("missing"), Some(0), "{report:?}");
+        assert_eq!(report.int("unlisted"), Some(0), "{report:?}");
+        assert_eq!(report.int("unordered"), Some(0), "{report:?}");
+        assert!(assert_publishable(&report).is_err());
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // A collected row one slot past `to` is outside the range: the boundary must exclude it, so
     // the check stays green and neither `unlisted` nor `fetched` changes.
     {
@@ -315,6 +336,30 @@ fn assert_no_staging_files(root: &Path) {
     assert!(files.is_empty(), "orphan staging files: {files:?}");
 }
 
+/// `.tmp` files under `root/staging` (the publication COPY writes its Parquet as `<path>.tmp`).
+fn staging_tmp_files(root: &Path) -> Vec<std::path::PathBuf> {
+    let staging = root.join("staging");
+    if !staging.exists() {
+        return Vec::new();
+    }
+    let mut files = Vec::new();
+    fn walk(dir: &Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, files);
+            } else {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if name.ends_with(".tmp") {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    walk(&staging, &mut files);
+    files
+}
+
 /// A disk full during a durable write (before the body is written) is a typed, retryable error:
 /// it keeps its OS error code and is not wrapped as `fsync failed`, so `fatal_class` does not
 /// treat it as fatal. `lane_error` reports it as retryable (not fatal) and records it, so the
@@ -348,6 +393,42 @@ async fn a_write_enospc_is_typed_retryable_and_recorded() {
     f.close();
 }
 
+/// A durable write that fails with ENOSPC leaves its empty `.tmp` sibling behind (the file is
+/// created before the body write). The collector's startup recovery owns that cleanup:
+/// `recover_files` removes `.tmp` files, so a full disk while writing `catalog.json` does not
+/// leave a stray file after a restart.
+#[test]
+fn a_write_enospc_orphan_tmp_is_removed_by_recover_files() {
+    let root = tempdir("write-enospc-tmp");
+    let mut store = open_collector(&root);
+    let path = root.join("catalog.json");
+    let error = {
+        fsutil::inject_write_enospc();
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                fsutil::clear_write_failure();
+            }
+        }
+        let _clear = Clear;
+        fsutil::write_durable(&path, b"catalog").unwrap_err()
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::StorageFull, "{error}");
+    assert_eq!(error.raw_os_error(), Some(nix::libc::ENOSPC), "{error}");
+    let tmp = fsutil::tmp_path(&path);
+    assert!(
+        tmp.exists(),
+        "a failed durable write must leave its empty .tmp behind"
+    );
+    recover_files(&mut store, &root).unwrap();
+    assert!(
+        !tmp.exists(),
+        "recover_files must remove the orphan .tmp from a failed durable write"
+    );
+    store.close().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A disk full during publication (ENOSPC on the durable fsync) is fatal like production: the
 /// error is wrapped as `fsync failed: ...`, the lane exits, and the watermark never moves.
 #[tokio::test(flavor = "multi_thread")]
@@ -359,7 +440,7 @@ async fn an_enospc_fsync_during_publication_is_fatal_and_keeps_the_watermark() {
         f.db.run_blocking({
             let root = root.clone();
             move |store| {
-                fsutil::inject_fsync_enospc(FsyncStep::Any);
+                fsutil::inject_fsync_enospc(FsyncStep::TempFile);
                 struct Clear;
                 impl Drop for Clear {
                     fn drop(&mut self) {
@@ -400,11 +481,20 @@ async fn an_enospc_fsync_during_publication_is_fatal_and_keeps_the_watermark() {
     assert_eq!(f.scalar("SELECT count(*) AS n FROM published_ranges"), "0");
     assert!(f.get("W").is_none());
     // The failed publication registered no files, and recovery on restart removes the orphan
-    // `.tmp` the failed COPY left behind, leaving no Parquet under staging.
+    // `.tmp` the failed COPY left behind, leaving no Parquet under staging. The injected failure
+    // fires on the COPY's temp file, so the orphan must exist before recovery and be gone after.
     assert_eq!(f.scalar("SELECT count(*) AS n FROM files"), "0");
     assert_eq!(f.scalar("SELECT count(*) AS n FROM file_bounds"), "0");
+    assert!(
+        !staging_tmp_files(&f.root).is_empty(),
+        "the failed COPY must leave an orphan .tmp under staging"
+    );
     f.db.run_blocking(move |store| recover_files(store, &root))
         .unwrap();
+    assert!(
+        staging_tmp_files(&f.root).is_empty(),
+        "recover_files must remove the orphan .tmp"
+    );
     assert_no_staging_files(&f.root);
     f.close();
 }
@@ -431,7 +521,7 @@ async fn an_eio_fsync_ends_the_lane_and_does_not_retry() {
         f.db.run_blocking({
             let root = root.clone();
             move |store| {
-                fsutil::inject_fsync_eio(FsyncStep::Any);
+                fsutil::inject_fsync_eio(FsyncStep::TempFile);
                 struct Clear;
                 impl Drop for Clear {
                     fn drop(&mut self) {
@@ -466,11 +556,20 @@ async fn an_eio_fsync_ends_the_lane_and_does_not_retry() {
     assert_eq!(f.scalar("SELECT count(*) AS n FROM published_ranges"), "0");
     assert!(f.get("W").is_none());
     // The failed publication registered no files, and recovery on restart removes the orphan
-    // `.tmp` the failed COPY left behind, leaving no Parquet under staging.
+    // `.tmp` the failed COPY left behind, leaving no Parquet under staging. The injected failure
+    // fires on the COPY's temp file, so the orphan must exist before recovery and be gone after.
     assert_eq!(f.scalar("SELECT count(*) AS n FROM files"), "0");
     assert_eq!(f.scalar("SELECT count(*) AS n FROM file_bounds"), "0");
+    assert!(
+        !staging_tmp_files(&f.root).is_empty(),
+        "the failed COPY must leave an orphan .tmp under staging"
+    );
     f.db.run_blocking(move |store| recover_files(store, &root))
         .unwrap();
+    assert!(
+        staging_tmp_files(&f.root).is_empty(),
+        "recover_files must remove the orphan .tmp"
+    );
     assert_no_staging_files(&f.root);
     f.close();
 }
