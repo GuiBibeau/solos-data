@@ -47,8 +47,22 @@ pub fn query_decoded_slots(
 /// # Errors
 ///
 /// A statement is not a single `SELECT`/`WITH`, or the catalog or a file cannot be read.
-pub fn query_decoded_many(root: &Path, statements: &[&str]) -> Result<Vec<Obj>, StoreError> {
-    with_read_lease(root, || read_decoded(root, statements, None, true))
+pub fn query_decoded_many_checked(
+    root: &Path,
+    statements: &[&str],
+    check: impl FnOnce(&Value) -> Result<(), StoreError>,
+) -> Result<Vec<Obj>, StoreError> {
+    with_read_lease(root, || {
+        let catalog = read_catalog(root)?;
+        check(&catalog)?;
+        read_decoded_with_catalog(root, &catalog, statements, None, true)
+    })
+}
+
+/// Read `catalog.json` without taking a lease; the caller must hold one.
+pub fn read_catalog(root: &Path) -> Result<Value, StoreError> {
+    let text = std::fs::read_to_string(root.join("catalog.json"))?;
+    serde_json::from_str(&text).map_err(|e| StoreError::Check(e.to_string()))
 }
 
 /// The epoch a published path belongs to, when its directory says so.
@@ -81,11 +95,20 @@ fn read_decoded(
     epochs: Option<&std::ops::RangeInclusive<i64>>,
     check_version: bool,
 ) -> Result<Vec<Obj>, StoreError> {
+    let catalog = read_catalog(root)?;
+    read_decoded_with_catalog(root, &catalog, statements, epochs, check_version)
+}
+
+fn read_decoded_with_catalog(
+    root: &Path,
+    catalog: &Value,
+    statements: &[&str],
+    epochs: Option<&std::ops::RangeInclusive<i64>>,
+    check_version: bool,
+) -> Result<Vec<Obj>, StoreError> {
     for sql in statements {
         accept_select(sql)?;
     }
-    let catalog: Value = serde_json::from_str(&std::fs::read_to_string(root.join("catalog.json"))?)
-        .map_err(|e| StoreError::Check(e.to_string()))?;
     let memory = std::env::var("SOLOS_DATA_QUERY_MEMORY").unwrap_or_else(|_| "4GB".into());
     let conn = memory_connection("4", &memory)?;
     if check_version {
