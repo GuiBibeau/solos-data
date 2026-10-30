@@ -1,7 +1,8 @@
 # ADR-0017: PR checks finish inside a five-minute budget
 
 Status: accepted, October 30, 2026. Records the CI cache and gating scheme that keeps every
-`pull_request` check inside five minutes cold and three minutes warm (issue #68).
+`pull_request` check inside the three-minute warm budget and keeps the archive compile check off
+unrelated PRs, so no pull request waits on a 23-minute cold compile (issue #68).
 
 ## Decision
 
