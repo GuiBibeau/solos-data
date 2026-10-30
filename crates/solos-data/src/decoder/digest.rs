@@ -16,7 +16,7 @@
 //! `temp_directory` (measured by `digest_rss`).
 
 use super::canonical::{put_row, put_schema};
-use super::keys::reject;
+use super::keys::{assert_registered_keys_unique, reject};
 use super::reader::{DecodedSession, with_decoded_session};
 use super::schema::{TABLES, column_pairs, key_column, sort_columns};
 use crate::jsonout::Obj;
@@ -43,11 +43,17 @@ fn stream_newest(
             Some(value) => value.to_owned(),
             None => return Err(StoreError::Check(format!("NULL {key} in {table}"))),
         };
-        if row.int("key_copies").unwrap_or(0) > 1 {
+        let copies = row.int("key_copies").ok_or_else(|| {
+            StoreError::Check(format!("digest stream lost key_copies for {table}"))
+        })?;
+        if copies > 1 {
             // A repeated key in one batch is not a total order; the digest refuses it.
             return Err(reject(table, key, &value));
         }
-        if row.int("key_rank").unwrap_or(0) == 1 {
+        let rank = row
+            .int("key_rank")
+            .ok_or_else(|| StoreError::Check(format!("digest stream lost key_rank for {table}")))?;
+        if rank == 1 {
             on_new(row)?;
             count += 1;
         }
@@ -64,6 +70,9 @@ fn stream_newest(
 /// DuckDB build is not 1.4.5, or a value cannot be encoded.
 pub fn content_digest(root: &Path) -> Result<String, StoreError> {
     with_decoded_session(root, None, true, |session| {
+        // The full registered-file duplicate check, before the reader views narrow child tables
+        // to rows whose parent is the newest `decoded_transactions` revision.
+        assert_registered_keys_unique(session.conn())?;
         let mut hasher = Sha256::new();
         hasher.update(b"SDD2");
         for table in TABLES {
@@ -384,6 +393,51 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("NULL signature in decoded_transactions"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_duplicate_child_key_under_a_superseded_parent_is_refused() {
+        // `sig-a` is superseded by a newer batch with a different source_hash, and events carries
+        // two `e1` rows under the old parent. The reader joins child tables to the deduplicated
+        // decoded_transactions, so both rows are invisible there; the full registered-file check
+        // must still refuse the duplicate.
+        let dir = std::env::temp_dir().join(format!("digest-child-dup-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("tables/decoded_transactions/epoch=0")).unwrap();
+        std::fs::create_dir_all(dir.join("tables/events/epoch=0")).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        for (name, hash) in [("old.parquet", "h1"), ("new.parquet", "h2")] {
+            let path = dir.join("tables/decoded_transactions/epoch=0").join(name);
+            conn.execute_batch(&format!(
+                "COPY (SELECT * FROM (VALUES ('sig-a', '{hash}', 10, 0, false, 1, true, 'decoded', 1, 0, 'src', '2026-10-04T00:00:00.000Z', 'v')) t(signature, source_hash, slot, tx_index, single_in_slot, block_time, committed, status, event_count, error_count, source_file, decoded_at, decoder_version)) TO {} (FORMAT PARQUET)",
+                sql_string(&path.to_string_lossy())
+            ))
+            .unwrap();
+        }
+        let events_path = dir.join("tables/events/epoch=0/day.parquet");
+        conn.execute_batch(&format!(
+            "COPY (SELECT * FROM (VALUES \
+               ('e1', 'sig-a', 'h1', 10::BIGINT, 0::INTEGER, false, 1::BIGINT, ''::VARCHAR, 0::INTEGER, ''::VARCHAR, true, ''::VARCHAR, ''::VARCHAR, 0::UINTEGER, ''::VARCHAR, ''::VARCHAR, 0::UBIGINT, 0::UBIGINT, 0::SMALLINT, 0::SMALLINT, 'v', ''::VARCHAR), \
+               ('e1', 'sig-a', 'h1', 10::BIGINT, 0::INTEGER, false, 1::BIGINT, ''::VARCHAR, 0::INTEGER, ''::VARCHAR, true, ''::VARCHAR, ''::VARCHAR, 0::UINTEGER, ''::VARCHAR, ''::VARCHAR, 0::UBIGINT, 0::UBIGINT, 0::SMALLINT, 0::SMALLINT, 'v', ''::VARCHAR)) \
+             t(event_id, signature, source_hash, slot, tx_index, single_in_slot, block_time, instruction_path, event_ordinal, event_type, committed, attribution, asset_symbol, asset_id, trader, signer, sequence_number, tick_size, base_lot_decimals, quote_lot_decimals, decoder_version, event_json)) TO {} (FORMAT PARQUET)",
+            sql_string(&events_path.to_string_lossy())
+        ))
+        .unwrap();
+        std::fs::write(
+            dir.join("catalog.json"),
+            serde_json::json!({ "files": [
+                { "path": "tables/decoded_transactions/epoch=0/old.parquet", "table_name": "decoded_transactions", "batch_id": 1 },
+                { "path": "tables/decoded_transactions/epoch=0/new.parquet", "table_name": "decoded_transactions", "batch_id": 2 },
+                { "path": "tables/events/epoch=0/day.parquet", "table_name": "events", "batch_id": 1 }
+            ] })
+            .to_string(),
+        )
+        .unwrap();
+        let err = content_digest(&dir).unwrap_err();
+        assert!(
+            err.to_string().contains("duplicate event_id e1 in events"),
             "{err}"
         );
         std::fs::remove_dir_all(dir).unwrap();

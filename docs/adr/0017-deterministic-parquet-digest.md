@@ -85,17 +85,26 @@ row published from that batch shares the instant. The golden fixture replaces th
 with `2026-10-04T00:00:00.000Z`.
 
 The digest reads every registered row through duckdb-rs 1.4.5's streaming iterator and never
-materializes the day as an arrow result in Rust. Each table is streamed twice under one lease: the
-first pass counts the distinct primary keys and refuses a repeated key in one batch, the second
-hashes the newest revision of every key in canonical order. The record still encodes the row count
-before the rows, so a cursor cannot rewind and the first pass carries the count. Both passes share
-one windowed query: `count(*) OVER (PARTITION BY key, batch_id)` supplies the same-batch duplicate
-refusal and `row_number() OVER (PARTITION BY key ORDER BY batch_id DESC)` keeps only the newest
-revision, so neither depends on two copies being adjacent in the canonical (slot) order. The
-connection sets `temp_directory`, and DuckDB's sort/window buffer is bounded by `memory_limit` and
-spills there; the synthetic-day `digest_rss` benchmark measures that buffer (~0.5-0.85 GiB at
-512MB `memory_limit` for 1M-20M rows, versus ~2.0-3.6 GiB materializing the same days), not the
-day size.
+materializes the day as an arrow result in Rust. Before the streaming loop it runs the full
+registered-file duplicate check: each table's files are read directly, not through the reader's
+parent-joined views, so a repeated `event_id` or `error_id` under a superseded or missing parent
+is still refused. Each table is then streamed twice under one lease: the first pass counts the
+distinct primary keys and refuses a repeated key in one batch, the second hashes the newest
+revision of every key in canonical order. A single NULL primary key is refused. The record still
+encodes the row count before the rows, so a cursor cannot rewind and the first pass carries the
+count. Both passes share one windowed query: `count(*) OVER (PARTITION BY key, batch_id)` supplies
+the same-batch duplicate refusal and `row_number() OVER (PARTITION BY key ORDER BY batch_id DESC)`
+keeps only the newest revision, so neither depends on two copies being adjacent in the canonical
+(slot) order. The connection sets `temp_directory`, and DuckDB's sort/window buffer is bounded by
+`memory_limit` and spills there.
+
+The synthetic-day `digest_rss` benchmark turns that bound into a proof. Run it with
+`CC=gcc CXX=g++ SOLOS_DIGEST_RSS_ROWS=10000000 cargo test --release --test digest_rss -- --ignored digest_peak_rss_on_10m_rows --nocapture`.
+At 512MB `memory_limit` it asserts the 10M-row child's peak RSS is below 1.5 GiB and that going
+from N to 4N rows grows peak RSS by less than 1.5x. The buffer, not the day size, is the bound:
+~0.5-0.85 GiB for 1M-20M rows versus ~2.0-3.6 GiB materializing the same days. A mutation that
+collects all rows instead of streaming drives the 10M-row child to several GiB and fails the
+absolute bound.
 
 The digest encoding changed when the schema and the length-prefixed fields replaced the earlier
 JSON concatenation (`63c06f73d2691e6d8bea9cb45a44505403002cc47fe2c001e376b095b889315d`). The

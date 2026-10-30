@@ -69,6 +69,17 @@ pub(crate) fn with_decoded_session<T>(
     })
 }
 
+/// Removes the spill directory when the session ends. Declared after `conn` in
+/// [`DecodedSession`] so field drop order closes the connection (releasing any spilled files)
+/// before the directory is removed.
+struct SpillDir(PathBuf);
+
+impl Drop for SpillDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// One connection over a decoded root with the reader views attached.
 pub(crate) struct DecodedSession {
     conn: duckdb::Connection,
@@ -76,14 +87,8 @@ pub(crate) struct DecodedSession {
     epochs: Option<RangeInclusive<i64>>,
     decoder_version: Value,
     acceptance: Value,
-    temp_dir: PathBuf,
-}
-
-impl Drop for DecodedSession {
-    fn drop(&mut self) {
-        // The connection is dropped first (field order), then the spill directory it used.
-        let _ = std::fs::remove_dir_all(&self.temp_dir);
-    }
+    /// Private spill directory; removed by [`SpillDir::drop`] after `conn` is dropped.
+    _temp_dir: SpillDir,
 }
 
 impl DecodedSession {
@@ -92,16 +97,32 @@ impl DecodedSession {
         epochs: Option<&RangeInclusive<i64>>,
         check_version: bool,
     ) -> Result<Self, StoreError> {
+        let memory = std::env::var("SOLOS_DATA_QUERY_MEMORY").unwrap_or_else(|_| "4GB".into());
+        // `SOLOS_DATA_QUERY_TEMP_DIR` overrides the spill root; the default is the system
+        // temp directory, which can be RAM-backed on some hosts.
+        let spill_root = std::env::var("SOLOS_DATA_QUERY_TEMP_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| std::env::temp_dir());
+        Self::open_with(root, epochs, check_version, &memory, &spill_root)
+    }
+
+    /// [`Self::open`] with explicit settings, so tests can prove `memory_limit` and
+    /// `temp_directory` are applied without racing on process-wide environment variables.
+    fn open_with(
+        root: &Path,
+        epochs: Option<&RangeInclusive<i64>>,
+        check_version: bool,
+        memory: &str,
+        spill_root: &Path,
+    ) -> Result<Self, StoreError> {
         let catalog: Value =
             serde_json::from_str(&std::fs::read_to_string(root.join("catalog.json"))?)
                 .map_err(|error| StoreError::Check(error.to_string()))?;
-        let memory = std::env::var("SOLOS_DATA_QUERY_MEMORY").unwrap_or_else(|_| "4GB".into());
-        let conn = memory_connection("4", &memory)?;
+        let conn = memory_connection("4", memory)?;
         // The digest streams its window/sort results; without a spill directory DuckDB keeps
         // that buffer in memory and peak RSS grows with the day. A private directory per
         // session keeps concurrent sessions from sharing a spill root.
-        let temp_dir =
-            std::env::temp_dir().join(format!("solos-decode-tmp-{}", uuid::Uuid::new_v4()));
+        let temp_dir = spill_root.join(format!("solos-decode-tmp-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir)?;
         conn.execute_batch(&format!(
             "SET temp_directory = {}",
@@ -137,8 +158,13 @@ impl DecodedSession {
                 .cloned()
                 .unwrap_or(Value::Null),
             acceptance: catalog.get("acceptance").cloned().unwrap_or(Value::Null),
-            temp_dir,
+            _temp_dir: SpillDir(temp_dir),
         })
+    }
+
+    /// The connection with the reader views and registrations attached.
+    pub(crate) fn conn(&self) -> &duckdb::Connection {
+        &self.conn
     }
 
     /// Run one statement and return it as the reader's ordered-JSON result.
@@ -210,6 +236,9 @@ fn attach_views(conn: &duckdb::Connection, root: &Path, files: &[Value]) -> Resu
             conn.execute_batch(&format!(
                 "CREATE VIEW {table}_raw AS SELECT *, NULL::BIGINT AS batch_id FROM {table}"
             ))?;
+            conn.execute_batch(&format!(
+                "CREATE TABLE {table}_registrations(path VARCHAR, batch_id BIGINT)"
+            ))?;
             continue;
         }
         let mut paths = Vec::new();
@@ -260,4 +289,44 @@ fn attach_views(conn: &duckdb::Connection, root: &Path, files: &[Value]) -> Resu
         ))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_applies_memory_limit_and_temp_directory() {
+        let root =
+            std::env::temp_dir().join(format!("solos-decoded-empty-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("catalog.json"), "{}").unwrap();
+        let spill = std::env::temp_dir().join(format!("solos-spill-root-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&spill).unwrap();
+
+        let session = DecodedSession::open_with(&root, None, false, "64MB", &spill).unwrap();
+        let memory: String = session
+            .conn()
+            .query_row("SELECT current_setting('memory_limit')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let temp: String = session
+            .conn()
+            .query_row("SELECT current_setting('temp_directory')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(
+            std::path::Path::new(&temp).starts_with(&spill),
+            "temp_directory {temp} is not under {spill:?}"
+        );
+        assert!(
+            memory.to_ascii_lowercase().ends_with("mib"),
+            "memory_limit was not applied: {memory}"
+        );
+        drop(session);
+        std::fs::remove_dir_all(&spill).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 }

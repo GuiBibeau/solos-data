@@ -512,7 +512,7 @@ pub fn for_each_row(
         for row in 0..batch.num_rows() {
             let mut obj = Obj::new();
             for (i, name) in names.iter().enumerate() {
-                let value: DbValue = value_ref(batch.column(i), row).to_owned();
+                let value: DbValue = value_ref(batch.column(i), row)?.to_owned();
                 obj.set(name, json_of(value, tz[i]));
             }
             visit(&obj)?;
@@ -538,11 +538,11 @@ fn probe_schema(
 /// One DuckDB value at `row` of an arrow column, the same match
 /// `duckdb::Row::value_ref_internal` performs so the streaming path renders values exactly like
 /// the materialized `Statement::query` path does.
-fn value_ref<'a>(column: &'a ArrayRef, row: usize) -> ValueRef<'a> {
+fn value_ref<'a>(column: &'a ArrayRef, row: usize) -> Result<ValueRef<'a>, StoreError> {
     if column.is_null(row) {
-        return ValueRef::Null;
+        return Ok(ValueRef::Null);
     }
-    match column.data_type() {
+    Ok(match column.data_type() {
         DataType::Utf8 => {
             let array = column.as_any().downcast_ref::<StringArray>().unwrap();
             ValueRef::from(array.value(row))
@@ -619,12 +619,13 @@ fn value_ref<'a>(column: &'a ArrayRef, row: usize) -> ValueRef<'a> {
             // DuckDB maps HUGEINT to arrow Decimal128(38, 0): scale zero is a signed 128-bit
             // integer, not a decimal, matching duckdb-rs's own conversion.
             if array.scale() == 0 {
-                return ValueRef::HugeInt(array.value(row));
+                ValueRef::HugeInt(array.value(row))
+            } else {
+                ValueRef::Decimal(Decimal::from_i128_with_scale(
+                    array.value(row),
+                    array.scale() as u32,
+                ))
             }
-            ValueRef::Decimal(Decimal::from_i128_with_scale(
-                array.value(row),
-                array.scale() as u32,
-            ))
         }
         DataType::Timestamp(unit, _) if *unit == ArrowTimeUnit::Second => {
             let array = column
@@ -678,7 +679,11 @@ fn value_ref<'a>(column: &'a ArrayRef, row: usize) -> ValueRef<'a> {
                     nanos: value.nanoseconds,
                 }
             }
-            other => unimplemented!("{other:?}"),
+            other => {
+                return Err(StoreError::Check(format!(
+                    "unsupported interval unit {other:?}"
+                )));
+            }
         },
         DataType::LargeList(..) => {
             let arr = column.as_any().downcast_ref::<LargeListArray>().unwrap();
@@ -690,25 +695,27 @@ fn value_ref<'a>(column: &'a ArrayRef, row: usize) -> ValueRef<'a> {
         }
         DataType::Dictionary(key_type, ..) => {
             let column = column.as_any();
-            ValueRef::Enum(
-                match key_type.as_ref() {
-                    DataType::UInt8 => EnumType::UInt8(
-                        column.downcast_ref::<DictionaryArray<UInt8Type>>().unwrap(),
-                    ),
-                    DataType::UInt16 => EnumType::UInt16(
-                        column
-                            .downcast_ref::<DictionaryArray<UInt16Type>>()
-                            .unwrap(),
-                    ),
-                    DataType::UInt32 => EnumType::UInt32(
-                        column
-                            .downcast_ref::<DictionaryArray<UInt32Type>>()
-                            .unwrap(),
-                    ),
-                    typ => panic!("Unsupported key type: {typ:?}"),
-                },
-                row,
-            )
+            let enum_type = match key_type.as_ref() {
+                DataType::UInt8 => {
+                    EnumType::UInt8(column.downcast_ref::<DictionaryArray<UInt8Type>>().unwrap())
+                }
+                DataType::UInt16 => EnumType::UInt16(
+                    column
+                        .downcast_ref::<DictionaryArray<UInt16Type>>()
+                        .unwrap(),
+                ),
+                DataType::UInt32 => EnumType::UInt32(
+                    column
+                        .downcast_ref::<DictionaryArray<UInt32Type>>()
+                        .unwrap(),
+                ),
+                typ => {
+                    return Err(StoreError::Check(format!(
+                        "unsupported dictionary key type {typ:?}"
+                    )));
+                }
+            };
+            ValueRef::Enum(enum_type, row)
         }
         DataType::Struct(_) => {
             let res = column.as_any().downcast_ref::<StructArray>().unwrap();
@@ -726,8 +733,12 @@ fn value_ref<'a>(column: &'a ArrayRef, row: usize) -> ValueRef<'a> {
             ValueRef::Array(arr, row)
         }
         DataType::Union(..) => ValueRef::Union(column, row),
-        other => unreachable!("invalid value: {other:?}"),
-    }
+        other => {
+            return Err(StoreError::Check(format!(
+                "unsupported arrow value type {other:?}"
+            )));
+        }
+    })
 }
 
 /// Query rows on any connection as ordered JSON objects.
@@ -736,11 +747,31 @@ pub fn query_rows(
     sql: &str,
     params: &[&dyn ToSql],
 ) -> Result<Vec<Obj>, StoreError> {
+    let mut statement = conn.prepare(sql)?;
+    let mut rows = statement.query(params_from_iter(params.iter()))?;
     let mut out = Vec::new();
-    for_each_row(conn, sql, params, |row| {
-        out.push(row.clone());
-        Ok(())
-    })?;
+    let mut names: Option<Vec<String>> = None;
+    let mut tz: Option<Vec<bool>> = None;
+    while let Some(row) = rows.next()? {
+        let statement = row.as_ref();
+        let names = names.get_or_insert_with(|| statement.column_names());
+        let tz = tz.get_or_insert_with(|| {
+            (0..statement.column_count())
+                .map(|i| {
+                    matches!(
+                        statement.column_type(i),
+                        duckdb::arrow::datatypes::DataType::Timestamp(_, Some(_))
+                    )
+                })
+                .collect()
+        });
+        let mut obj = Obj::new();
+        for (i, name) in names.iter().enumerate() {
+            let value: DbValue = row.get(i)?;
+            obj.set(name, json_of(value, tz[i]));
+        }
+        out.push(obj);
+    }
     Ok(out)
 }
 
@@ -914,6 +945,24 @@ mod tests {
             Value::String("2026-10-04 14:01:03+00".into())
         );
         assert_eq!(sql_string("a'b"), "'a''b'");
+    }
+
+    #[test]
+    fn explain_analyze_update_is_not_wrapped_as_a_subquery() {
+        let conn = memory_connection("4", "512MB").unwrap();
+        conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER)")
+            .unwrap();
+        let rows = query_rows(&conn, "EXPLAIN ANALYZE UPDATE t SET x=1 WHERE id=1", &[]).unwrap();
+        assert!(!rows.is_empty(), "EXPLAIN ANALYZE UPDATE must run directly");
+        assert!(rows[0].iter().any(|(name, _)| name == "explain_value"));
+    }
+
+    #[test]
+    fn a_trailing_line_comment_does_not_break_query_rows() {
+        let conn = memory_connection("4", "512MB").unwrap();
+        let rows = query_rows(&conn, "SELECT 1 AS n -- trailing comment", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].int("n"), Some(1));
     }
 
     #[test]

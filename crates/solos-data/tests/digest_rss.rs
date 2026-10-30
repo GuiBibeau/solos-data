@@ -16,6 +16,11 @@
 //! `temp_directory` at a scratch directory, while the digest streams one DuckDB chunk at a time
 //! and never materializes the day as an arrow result. The reported peak RSS is the child's
 //! `VmHWM`.
+//!
+//! The test is the proof, not a printout: it asserts the 10M-row peak RSS stays below 1.5 GiB
+//! (1_572_864 KiB) and that going from N to 4N rows grows peak RSS by less than 1.5x. Mutating
+//! the digest to collect all rows (for example `DecodedSession::stream` falling back to
+//! `query_rows`) drives the 10M-row child to several GiB and turns the absolute bound red.
 
 mod common;
 
@@ -29,6 +34,14 @@ use std::process::Command;
 const ROWS_ENV: &str = "SOLOS_DIGEST_RSS_ROWS";
 const DIR_ENV: &str = "SOLOS_DIGEST_RSS_DIR";
 const DEFAULT_ROWS: u64 = 10_000_000;
+
+/// 1.5 GiB in KiB: the digest at 512MB `memory_limit` stays well under this, while collecting
+/// the day as JSON measures several GiB (ADR-0017).
+const ABSOLUTE_RSS_BOUND_KB: u64 = 1_572_864;
+
+/// Four times the rows must not move peak RSS more than this factor; the digest's buffer is
+/// bounded by `memory_limit` and spills, so it grows sub-linearly.
+const RSS_GROWTH_BOUND: f64 = 1.5;
 
 /// Peak resident set size of this process, in kilobytes, from `/proc/self/status`.
 fn peak_rss_kb() -> u64 {
@@ -90,24 +103,16 @@ fn digest_rss_child() {
     println!("digest={digest} peak_rss_kb={}", peak_rss_kb());
 }
 
-#[test]
-#[ignore = "10M-row synthetic day; run explicitly with the command in this file's header"]
-fn digest_peak_rss_on_10m_rows() {
-    let rows: u64 = std::env::var(ROWS_ENV)
-        .ok()
-        .and_then(|text| text.parse().ok())
-        .unwrap_or(DEFAULT_ROWS);
-    assert!(rows > 0, "the benchmark needs at least one row");
-    let dir = synthetic_day(rows);
+/// Run the digest child on `dir` with `memory` and return its `(digest, peak_rss_kb)`.
+fn child_digest_rss(dir: &std::path::Path, memory: &str) -> (String, u64) {
     let exe = std::env::current_exe().unwrap();
-    let memory = std::env::var("SOLOS_DIGEST_RSS_MEMORY").unwrap_or_else(|_| "512MB".into());
     let output = Command::new(exe)
         .arg("--exact")
         .arg("digest_rss_child")
         .arg("--nocapture")
         .arg("--test-threads=1")
-        .env(DIR_ENV, &dir)
-        .env("SOLOS_DATA_QUERY_MEMORY", &memory)
+        .env(DIR_ENV, dir)
+        .env("SOLOS_DATA_QUERY_MEMORY", memory)
         .output()
         .expect("spawn the digest child");
     assert!(
@@ -124,9 +129,43 @@ fn digest_peak_rss_on_10m_rows() {
         .split_once("digest=")
         .and_then(|(_, rest)| rest.split_once(" peak_rss_kb="))
         .expect("digest line has both fields");
+    (
+        digest.to_owned(),
+        rss.parse().expect("peak rss is an integer"),
+    )
+}
+
+#[test]
+#[ignore = "10M-row synthetic day; run explicitly with the command in this file's header"]
+fn digest_peak_rss_on_10m_rows() {
+    let rows: u64 = std::env::var(ROWS_ENV)
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(DEFAULT_ROWS);
+    assert!(rows > 0, "the benchmark needs at least one row");
+    let memory = std::env::var("SOLOS_DIGEST_RSS_MEMORY").unwrap_or_else(|_| "512MB".into());
+
+    let dir = synthetic_day(rows);
+    let (digest, rss) = child_digest_rss(&dir, &memory);
     println!("SYNTHETIC_DAY_ROWS={rows}");
     println!("QUERY_MEMORY_LIMIT={memory}");
     println!("CONTENT_DIGEST={digest}");
     println!("PEAK_RSS_KB={rss}");
     std::fs::remove_dir_all(dir).unwrap();
+    assert!(
+        rss < ABSOLUTE_RSS_BOUND_KB,
+        "peak RSS {rss} KiB >= {ABSOLUTE_RSS_BOUND_KB} KiB (1.5 GiB) at {rows} rows"
+    );
+
+    let rows4 = rows * 4;
+    let dir4 = synthetic_day(rows4);
+    let (digest4, rss4) = child_digest_rss(&dir4, &memory);
+    println!("SYNTHETIC_DAY_ROWS_4X={rows4}");
+    println!("CONTENT_DIGEST_4X={digest4}");
+    println!("PEAK_RSS_KB_4X={rss4}");
+    std::fs::remove_dir_all(dir4).unwrap();
+    assert!(
+        (rss4 as f64) < (rss as f64) * RSS_GROWTH_BOUND,
+        "peak RSS grew from {rss} KiB to {rss4} KiB (>{RSS_GROWTH_BOUND}x) going {rows} -> {rows4} rows"
+    );
 }
