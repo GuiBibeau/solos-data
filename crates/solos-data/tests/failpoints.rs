@@ -70,6 +70,9 @@ fn spawn(root: &Path, name: Option<&str>, tiny_wal: bool) -> Child {
     if tiny_wal {
         command.env("SOLOS_DATA_WAL_AUTOCHECKPOINT", "1KB");
     }
+    // The armed point writes its name here before aborting; the matrix asserts on the marker,
+    // not only on death by signal.
+    command.env("SOLOS_DATA_FAILPOINT_MARKER", root.join("failpoint-marker"));
     command.spawn().unwrap()
 }
 
@@ -127,6 +130,28 @@ fn assert_restart_ok(root: &Path) {
     );
     restart_predicate(&store, watermark).unwrap();
     store.close().unwrap();
+    assert_no_orphans(root);
+}
+
+/// After recovery, no `.parquet` or `.tmp` may remain under the root: every file of the
+/// interrupted publication was an orphan and `recover_files` removed it.
+fn assert_no_orphans(root: &Path) {
+    fn walk(root: &Path, dir: &Path) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(root, &path);
+            } else {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                assert!(
+                    !name.ends_with(".parquet") && !name.ends_with(".tmp"),
+                    "orphan left after recovery: {}",
+                    path.strip_prefix(root).unwrap_or(&path).display()
+                );
+            }
+        }
+    }
+    walk(root, root);
 }
 
 /// Complete a range from `root` and assert the files are byte-identical to `golden` and that no
@@ -203,6 +228,9 @@ fn the_kill_point_matrix_is_green_and_re_runs_are_byte_identical() {
                 !status.success() && status.signal().is_some(),
                 "kill point {name} (tiny_wal={tiny_wal}) must die by signal, got {status}"
             );
+            let marker = std::fs::read_to_string(root.0.join("failpoint-marker"))
+                .unwrap_or_else(|_| panic!("kill point {name} must write its marker file"));
+            assert_eq!(marker, *name, "the marker must name the point that fired");
             assert_restart_ok(&root.0);
             complete_and_compare(&root.0, &golden, tiny_wal);
         }

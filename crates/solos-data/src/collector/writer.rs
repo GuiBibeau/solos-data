@@ -120,9 +120,9 @@ pub fn publish_range(
             sync_tmp_file(&tmp)?;
             crate::crash_point!("publish/after-file-fsync");
             std::fs::rename(&tmp, &path)?;
-            crate::crash_point!("publish/after-rename");
             crate::crash_point!("publish/before-dir-fsync");
             sync_dir_after_rename(&directory)?;
+            crate::crash_point!("publish/after-dir-fsync");
             let actual = store.rows(
                 &format!(
                     "SELECT count(*) AS n FROM read_parquet({})",
@@ -173,7 +173,7 @@ pub fn publish_range(
             "INSERT OR IGNORE INTO published_ranges VALUES (?, ?)",
             &[&from, &to],
         )?;
-        crate::crash_point!("publish/mid-seal");
+        crate::crash_point!("publish/before-watermark-write");
         if let Some(checkpoint) = &checkpoint {
             store.exec(
                 "INSERT OR REPLACE INTO kv VALUES (?, ?::JSON)",

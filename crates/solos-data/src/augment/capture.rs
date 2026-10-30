@@ -146,6 +146,7 @@ pub fn run_capture(config: &AugmentConfig, stop: Arc<AtomicBool>) -> Result<Obj,
                 &ctx,
                 context_lane.as_ref(),
                 hl.asset_context_interval_seconds,
+                FLUSH_SECONDS,
                 &totals
             ),
             elfa_loop(&ctx, elfa_lane.as_ref(), elfa_cfg.interval_seconds, &totals),
@@ -166,6 +167,24 @@ pub fn run_capture(config: &AugmentConfig, stop: Arc<AtomicBool>) -> Result<Obj,
     });
     let lanes = (elfa_lane.as_ref(), auto_lane.as_ref());
     // A failed fsync ends the lane (ADR-0016): report it and exit without a retry.
+    if let Err(error) = lane_fatal(&totals) {
+        let store = thread.join(db);
+        store.close()?;
+        return Err(error);
+    }
+    let status = write_status(&ctx, &totals, &started_at, lanes, true)?;
+    let store = thread.join(db);
+    store.close()?;
+    log(
+        "augment_capture_done",
+        Obj::new().with("durationSeconds", started.elapsed().as_secs_f64()),
+    );
+    Ok(status)
+}
+
+/// The lanes' recorded fatal error, if any: a failed fsync (or another fatal class, ADR-0016)
+/// ends the capture lane instead of being counted and retried.
+fn lane_fatal(totals: &Mutex<Totals>) -> Result<(), StoreError> {
     let fatal = {
         let guard = totals.lock().expect("totals");
         guard
@@ -176,18 +195,9 @@ pub fn run_capture(config: &AugmentConfig, stop: Arc<AtomicBool>) -> Result<Obj,
             .or_else(|| guard.elfa.fatal.clone())
     };
     if let Some(error) = fatal {
-        let store = thread.join(db);
-        store.close()?;
         return Err(StoreError::Check(error));
     }
-    let status = write_status(&ctx, &totals, &started_at, lanes, true)?;
-    let store = thread.join(db);
-    store.close()?;
-    log(
-        "augment_capture_done",
-        Obj::new().with("durationSeconds", started.elapsed().as_secs_f64()),
-    );
-    Ok(status)
+    Ok(())
 }
 
 /// The Elfa meter with the month's totals from the ledger; a month without a record starts
@@ -252,6 +262,7 @@ async fn context_loop(
     ctx: &Ctx,
     lane: Option<&ContextLane>,
     interval: u64,
+    flush_seconds: u64,
     totals: &Mutex<Totals>,
 ) {
     let Some(lane) = lane else { return };
@@ -276,7 +287,7 @@ async fn context_loop(
                 );
             }
         }
-        if last_flush.elapsed() >= Duration::from_secs(FLUSH_SECONDS) {
+        if last_flush.elapsed() >= Duration::from_secs(flush_seconds) {
             let outcome = contexts::flush(ctx, lane, now_ms()).await;
             totals.lock().expect("totals").contexts.add(&outcome);
             last_flush = tokio::time::Instant::now();
@@ -442,4 +453,62 @@ fn poll_status(lane: &ElfaLane) -> Obj {
                 requests as f64 / polls as f64
             },
         )
+}
+
+/// Test drivers for the capture loops (issue #56), compiled in only under the `failpoints`
+/// feature. Each runs one loop to its natural end against a prepared [`Ctx`] and returns the
+/// lane's recorded fatal error, if any; a loop that stops on a fatal fsync also sets the
+/// context's stop flag.
+#[cfg(feature = "failpoints")]
+pub mod test_drive {
+    use super::{Totals, candle_loop, context_loop, elfa_loop, events_loop};
+    use crate::augment::candles::CandleLane;
+    use crate::augment::contexts::ContextLane;
+    use crate::augment::elfa::ElfaLane;
+    use crate::augment::series::Ctx;
+    use std::sync::Mutex;
+
+    /// Run the candle loop and return its recorded fatal error, if any.
+    pub async fn candle(ctx: &Ctx, lane: &CandleLane, interval: u64) -> Option<String> {
+        let totals = Mutex::new(Totals::default());
+        candle_loop(ctx, Some(lane), interval, &totals).await;
+        totals.into_inner().expect("totals").candles.fatal
+    }
+
+    /// Run the context loop (flushing immediately) and return its recorded fatal error, if any.
+    pub async fn contexts(ctx: &Ctx, lane: &ContextLane, interval: u64) -> Option<String> {
+        let totals = Mutex::new(Totals::default());
+        context_loop(ctx, Some(lane), interval, 0, &totals).await;
+        totals.into_inner().expect("totals").contexts.fatal
+    }
+
+    /// Run the hourly Elfa loop and return its recorded fatal error, if any.
+    pub async fn elfa(ctx: &Ctx, lane: &ElfaLane, interval: u64) -> Option<String> {
+        let totals = Mutex::new(Totals::default());
+        elfa_loop(ctx, Some(lane), interval, &totals).await;
+        totals.into_inner().expect("totals").elfa.fatal
+    }
+
+    /// Run the Elfa events poll loop and return its recorded fatal error, if any.
+    pub async fn events(ctx: &Ctx, lane: &ElfaLane, interval: u64) -> Option<String> {
+        let totals = Mutex::new(Totals::default());
+        events_loop(ctx, Some(lane), interval, &totals).await;
+        totals.into_inner().expect("totals").elfa.fatal
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Totals, lane_fatal};
+    use std::sync::Mutex;
+
+    #[test]
+    fn a_recorded_fatal_ends_the_capture_lane() {
+        let totals = Mutex::new(Totals::default());
+        assert!(lane_fatal(&totals).is_ok());
+        totals.lock().expect("totals").candles.fatal =
+            Some("fsync failed: injected (TempFile)".into());
+        let error = lane_fatal(&totals).unwrap_err().to_string();
+        assert!(error.contains("fsync failed"), "{error}");
+    }
 }

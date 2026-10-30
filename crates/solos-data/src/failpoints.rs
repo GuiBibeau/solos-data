@@ -9,29 +9,37 @@
 ///
 /// - `publish/after-tmp-write`: after the `COPY` wrote the `.tmp` file, before its fsync.
 /// - `publish/after-file-fsync`: after the `.tmp` fsync, before the rename.
-/// - `publish/after-rename`: after the rename onto the final path.
-/// - `publish/before-dir-fsync`: immediately before the directory fsync that follows the rename.
+/// - `publish/before-dir-fsync`: after the rename onto the final path, before the directory
+///   fsync (nothing sits between the rename and this point).
+/// - `publish/after-dir-fsync`: after the directory fsync that follows the rename.
 /// - `publish/after-range-check`: after the exported row count read back matched.
 /// - `publish/before-watermark-commit`: before the transaction that registers the files and
 ///   advances the watermark.
-/// - `publish/mid-seal`: inside that transaction, after the files and range are registered, before
-///   the watermark moves.
+/// - `publish/before-watermark-write`: inside that transaction, after the files and range are
+///   registered, before the watermark (`kv` key `W`) moves.
 pub const KILL_POINTS: &[&str] = &[
     "publish/after-tmp-write",
     "publish/after-file-fsync",
-    "publish/after-rename",
     "publish/before-dir-fsync",
+    "publish/after-dir-fsync",
     "publish/after-range-check",
     "publish/before-watermark-commit",
-    "publish/mid-seal",
+    "publish/before-watermark-write",
 ];
 
-/// Arm each named failpoint to abort the process. Only the listed points fire; the others stay
-/// no-ops. Requires the `failpoints` feature.
+/// Arm each named failpoint to abort the process, after writing a marker file that names the
+/// point when `SOLOS_DATA_FAILPOINT_MARKER` is set (the harness asserts on the marker, not only
+/// on death by signal). Requires the `failpoints` feature.
 #[cfg(feature = "failpoints")]
 pub fn arm_crash(names: &[&str]) {
     for name in names {
-        let _ = fail::cfg_callback(*name, || std::process::abort());
+        let name = (*name).to_owned();
+        let _ = fail::cfg_callback(name.clone(), move || {
+            if let Ok(path) = std::env::var("SOLOS_DATA_FAILPOINT_MARKER") {
+                let _ = std::fs::write(&path, name.as_bytes());
+            }
+            std::process::abort();
+        });
     }
 }
 

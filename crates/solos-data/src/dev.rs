@@ -149,7 +149,10 @@ pub fn crash_writer(root: &Path) -> Result<(), StoreError> {
 
 /// Test fixture for the crash-safety matrix (issue #56): publish `[from, to]` once with the
 /// named kill point armed. When the point fires the process aborts; otherwise the range and its
-/// watermark commit normally and the command prints `published`.
+/// watermark commit normally and the command prints `published`. Only compiled with the
+/// `failpoints` feature; release builds have no kill points, so this command would otherwise
+/// publish a range into any root it is given.
+#[cfg(feature = "failpoints")]
 pub fn failpoint_writer(root: &Path, name: &str, from: i64, to: i64) -> Result<(), StoreError> {
     crate::failpoints::arm_crash(&[name]);
     let mut store = crate::store::Store::open(root, crate::collector::schema::SCHEMA)?;

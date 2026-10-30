@@ -42,9 +42,10 @@ ancestors; this sequence is the Rust writer.
    `create_dir_all_durable`. Each newly created directory's parent is fsynced, including ancestors
    that did not exist (`staging/`, `staging/<table>/`). Directories that already exist are not
    fsynced again. Then `COPY` the rows to a `.tmp` sibling of the final Parquet path.
-3. fsync that temporary file (`sync_path`).
+3. fsync that temporary file (`sync_tmp_file`).
 4. Rename it onto the final path.
-5. fsync the parent directory of that path (the `epoch=…` directory that received the rename).
+5. fsync the parent directory of that path (the `epoch=…` directory that received the rename,
+   `sync_dir_after_rename`).
 6. Read the Parquet back and require its row count to equal the exported count, then SHA-256 the
    file.
 7. In one DuckDB transaction, insert `files`, `file_bounds`, and `published_ranges`, and advance
@@ -53,8 +54,8 @@ ancestors; this sequence is the Rust writer.
 
 A failed fsync (step 2's parent, step 3, or step 5) is fatal. The error message starts with
 `fsync failed`. `fatal_class` returns `fsync`, the lane does not record a retry, and the process
-exits so the supervisor restarts it from `W`. The same rule applies to every `sync_path` and to
-the fsync inside `write_durable`.
+exits so the supervisor restarts it from `W`. The same rule applies to every temporary-file fsync
+and every directory fsync after a rename, and to the fsync inside `write_durable`.
 
 The decoder (`decoder/publish.rs`), augment (`augment/parquet.rs`), spot (`spot/write.rs`) and raw
 compactor (`collector/compactor.rs`) create their output directories with `create_dir_all_durable`
@@ -93,19 +94,33 @@ does not delete files and does not advance a watermark.
 
 The kill-point matrix (`tests/failpoints.rs`) proves the order above against process death. Seven
 named kill points sit in `publish_range`: `publish/after-tmp-write`,
-`publish/after-file-fsync`, `publish/after-rename`, `publish/before-dir-fsync`,
-`publish/after-range-check`, `publish/before-watermark-commit`, and `publish/mid-seal`. Each
-point aborts the process (`std::process::abort`, SIGABRT); none returns an error, because an
-error path runs destructors and is not a crash. They are compiled in only under the `failpoints`
-cargo feature, which release builds leave off.
+`publish/after-file-fsync`, `publish/before-dir-fsync`, `publish/after-dir-fsync`,
+`publish/after-range-check`, `publish/before-watermark-commit`, and
+`publish/before-watermark-write`. Each point aborts the process (`std::process::abort`, SIGABRT);
+none returns an error, because an error path runs destructors and is not a crash. They are
+compiled in only under the `failpoints` cargo feature, which release builds leave off. Before
+aborting, an armed point writes the point's name to the file named by
+`SOLOS_DATA_FAILPOINT_MARKER`, so the harness asserts on that marker, not only on death by
+signal.
 
 The harness spawns the real binary against a fixture source, arms one point, restarts after the
-kill, and asserts the restart predicate. A re-run to completion is byte-identical to an uncrashed
-golden run: the same partition hashes and manifest, and no duplicated primary key. The matrix
-runs twice — with DuckDB's default checkpointing and with `SOLOS_DATA_WAL_AUTOCHECKPOINT` forced
-tiny — so kills land on both sides of a checkpoint.
+kill, and asserts the restart predicate. After each kill it also asserts that the orphan Parquet
+and `.tmp` files left by the interrupted publication are removed by `recover_files` before the
+rerun. A re-run to completion is byte-identical to an uncrashed golden run: the same partition
+hashes and manifest, and no duplicated primary key. The matrix runs twice — with DuckDB's default
+checkpointing and with `SOLOS_DATA_WAL_AUTOCHECKPOINT` forced tiny — so kills land on both sides
+of a checkpoint.
 
 Power loss is out of scope. SIGABRT/SIGKILL is process death; the kernel keeps the page cache and
 releases the flock, so the files and lock behave as after a supervised restart. A power loss that
 drops the page cache can still lose a directory entry whose fsync had not completed; the dir
 fsync step exists for that case but is not what the matrix proves.
+
+## Fatal classes in the augment lane
+
+The augment lane's `series::is_fatal` ends the lane on every error `fatal_class` classifies:
+`fsync`, `rollback_failed`, `commit_failed` and `oom`, not only on a failed fsync. That is
+intended. A failed rollback or commit leaves the DuckDB connection untrusted
+(`docs/issues/002-poisoned-connection.md`), and DuckDB out of its buffer is the same class; none
+of them should be counted and retried in place. The spot and decoder lanes apply the same
+classification through `fatal_class`, so one rule covers every lane.
