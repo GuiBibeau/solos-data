@@ -85,6 +85,19 @@ pub fn assert_registered_keys_unique(root: &Path) -> Result<(), StoreError> {
     let text = std::fs::read_to_string(root.join("catalog.json"))?;
     let catalog: Value =
         serde_json::from_str(&text).map_err(|e| StoreError::Check(e.to_string()))?;
+    assert_registered_keys_unique_catalog(root, &catalog)
+}
+
+/// The same check against a catalog the caller already read under its lease, so the check sees
+/// the same catalog as the rows (issue #66 follow-up 6).
+///
+/// # Errors
+///
+/// A duplicate, a bad catalog, or a Parquet read failure.
+pub fn assert_registered_keys_unique_catalog(
+    root: &Path,
+    catalog: &Value,
+) -> Result<(), StoreError> {
     let files = catalog
         .get("files")
         .and_then(Value::as_array)

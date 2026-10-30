@@ -12,8 +12,8 @@
 //! how a production day is hashed; see ADR-0017.
 
 use super::canonical::{put_row, put_schema};
-use super::keys::assert_registered_keys_unique;
-use super::reader::query_decoded_many;
+use super::keys::assert_registered_keys_unique_catalog;
+use super::reader::query_decoded_many_checked;
 use super::schema::{TABLES, column_pairs, sort_columns};
 use crate::jsonout::Obj;
 use crate::store::StoreError;
@@ -34,7 +34,6 @@ fn row_list<'a>(result: &'a Obj, table: &str) -> Result<&'a [Obj], StoreError> {
 /// The catalog or a Parquet file cannot be read, a primary key is repeated in one batch, the
 /// DuckDB build is not 1.4.5, a query result has no row list, or a value cannot be encoded.
 pub fn content_digest(root: &Path) -> Result<String, StoreError> {
-    assert_registered_keys_unique(root)?;
     let statements: Vec<String> = TABLES
         .iter()
         .map(|table| {
@@ -50,8 +49,11 @@ pub fn content_digest(root: &Path) -> Result<String, StoreError> {
         })
         .collect();
     let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
-    // One lease for every table, so the six results are one snapshot.
-    let results = query_decoded_many(root, &refs)?;
+    // One lease and one catalog read: the duplicate-key check and the six results are one
+    // snapshot (issue #66 follow-up 6).
+    let results = query_decoded_many_checked(root, &refs, |catalog| {
+        assert_registered_keys_unique_catalog(root, catalog)
+    })?;
     if results.len() != TABLES.len() {
         return Err(StoreError::Check(
             "digest did not read every decoded table".into(),
@@ -211,6 +213,41 @@ mod tests {
             err.to_string()
                 .contains("duplicate signature sig-a in decoded_transactions"),
             "{err}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_duplicate_key_check_runs_under_the_read_lease() {
+        let dir = root_with(&[Sample {
+            path: "tables/decoded_transactions/epoch=0/a.parquet",
+            batch: 1,
+            rows: &[("sig-a", 10)],
+        }]);
+        let statements: Vec<String> = TABLES
+            .iter()
+            .map(|table| {
+                let projection = column_pairs(table)
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "SELECT {projection} FROM {table} ORDER BY {}",
+                    sort_columns(table)
+                )
+            })
+            .collect();
+        let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
+        let mut lease_held = false;
+        let results = query_decoded_many_checked(&dir, &refs, |catalog| {
+            lease_held = crate::lease::has_readers(&dir).unwrap();
+            assert_registered_keys_unique_catalog(&dir, catalog)
+        });
+        assert!(results.is_ok());
+        assert!(
+            lease_held,
+            "the duplicate-key check must run under the read lease"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
