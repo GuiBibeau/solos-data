@@ -122,6 +122,30 @@ fn a_second_open_in_this_process_is_already_owned() {
     again.close().unwrap();
 }
 
+#[test]
+fn store_open_rejects_an_invalid_wal_size() {
+    // `Store::open` validates `SOLOS_DATA_WAL_AUTOCHECKPOINT` (failpoints feature) with
+    // `is_wal_size` before interpolating it into SQL. `-1` is rejected by that validator but
+    // DuckDB's own size parser accepts it ("infinite"), so without the guard the same process
+    // would open and publish successfully.
+    let root = TempDir::new("wal-size");
+    let output = Command::new(env!("CARGO_BIN_EXE_solos-data"))
+        .args(["dev", "failpoint-writer", "--root"])
+        .arg(&root.0)
+        .args(["--failpoint", "publish/none"])
+        .env("SOLOS_DATA_WAL_AUTOCHECKPOINT", "-1")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "Store::open must reject an invalid WAL size"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("published"),
+        "the invalid WAL size must fail before any range is published"
+    );
+}
+
 /// One Parquet row registered in `files` and `file_bounds`.
 fn publish_partition(store: &mut Store, path: &Path, slot_from: i64, slot_to: i64) {
     if let Some(parent) = path.parent() {
@@ -275,6 +299,71 @@ fn restart_predicate_is_green_on_a_clean_temp_run_and_red_when_a_covered_partiti
             assert_eq!(path, manifest_path(&truncated_root.0, &truncated));
         }
         other => panic!("truncate must fail the predicate, got {other}"),
+    }
+    store.close().unwrap();
+}
+
+/// Copy the checkpoint files (the DuckDB database and its write-ahead log) of a killed run to
+/// `to`. The WAL holds the committed data a crash left uncheckpointed, so a faithful checkpoint
+/// copy takes both files.
+fn copy_checkpoint(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for name in ["checkpoint.duckdb", "checkpoint.duckdb.wal"] {
+        let source = from.join(name);
+        if source.is_file() {
+            std::fs::copy(&source, to.join(name)).unwrap();
+        }
+    }
+}
+
+#[test]
+fn above_watermark_fires_on_a_checkpoint_copied_from_a_killed_run() {
+    // A killed run: crash-writer commits a durable transaction, leaves a second one open, and
+    // SIGKILL drops the flock and the open transaction with it.
+    let killed = TempDir::new("above-killed");
+    {
+        let mut holder = Holder::spawn(&killed.0);
+        wait_ready(holder.child());
+        holder.child().kill().unwrap();
+        let status = holder.child().wait().unwrap();
+        assert!(!status.success());
+        holder.0.take();
+    }
+    // Copy the checkpoint (the DuckDB file plus its WAL) to a fresh root and recover it: the
+    // killed run's committed row must survive the copy, proving the WAL was included.
+    let copy = TempDir::new("above-copy");
+    copy_checkpoint(&killed.0, &copy.0);
+    let mut store = Store::open(&copy.0, SCHEMA).unwrap();
+    assert_eq!(
+        store.get("durable").unwrap(),
+        Some(json!(true)),
+        "the copy must include the WAL so the killed run's committed row survives"
+    );
+    // Register a partition past the watermark: the corrupt state the check defends against.
+    store
+        .set(
+            "W",
+            &json!({"signature": "sig", "slot": 100, "completedAt": "2026-10-29T00:00:00Z"}),
+        )
+        .unwrap();
+    let above = copy
+        .0
+        .join("staging/transactions/epoch=0/200-210-above.parquet");
+    publish_partition(&mut store, &above, 200, 210);
+    store.close().unwrap();
+
+    let store = open_collector(&copy.0);
+    match predicate(&store).unwrap_err() {
+        RestartError::AboveWatermark {
+            path,
+            slot_to,
+            watermark,
+        } => {
+            assert_eq!(path, manifest_path(&copy.0, &above));
+            assert_eq!(slot_to, 210);
+            assert_eq!(watermark, 100);
+        }
+        other => panic!("a file above W must fail the predicate, got {other}"),
     }
     store.close().unwrap();
 }
