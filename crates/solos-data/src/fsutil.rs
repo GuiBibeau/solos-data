@@ -20,54 +20,180 @@ pub enum FsyncStep {
     ParentDir,
 }
 
+/// The I/O failure a test has armed. Production never arms one; a lane that hits an injected or
+/// real failure must not retry it (ADR-0016).
+#[cfg(feature = "failpoints")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FsyncFault {
+    /// A generic fsync failure with no OS error code (the pre-existing failpoint).
+    Generic,
+    /// EIO, as a failing disk would return.
+    Eio,
+    /// ENOSPC, as a full disk would return.
+    Enospc,
+}
+
 #[cfg(feature = "failpoints")]
 thread_local! {
-    /// When `Some`, the next matching `sync_all` on this thread fails.
-    static FAIL_FSYNC: std::cell::Cell<Option<FsyncStep>> = const { std::cell::Cell::new(None) };
+    /// When `Some`, the next matching fsync on this thread fails with the armed fault. The arm
+    /// fires once: the first matching fsync consumes it. A test that arms one and then keeps
+    /// running past the expected failure should call [`clear_fsync_failure`].
+    static FSYNC_FAULT: std::cell::Cell<Option<(FsyncStep, FsyncFault)>> =
+        const { std::cell::Cell::new(None) };
+    /// When `Some`, the next durable write in [`write_durable`] fails with ENOSPC (fires once).
+    static WRITE_FAULT: std::cell::Cell<Option<FsyncFault>> =
+        const { std::cell::Cell::new(None) };
 }
 
-/// Fail the next fsync of `step` on this thread. For tests, behind the `failpoints` feature. A
-/// lane that hits the failure must exit and restart from the watermark, not retry it (ADR-0016).
+/// Fail the next fsync of `step` on this thread, once, with a generic injected failure. The first
+/// matching fsync consumes the arm. A lane that hits the failure must exit and restart from the
+/// watermark, not retry it (ADR-0016).
 #[cfg(feature = "failpoints")]
 pub fn inject_fsync_failure(step: FsyncStep) {
-    FAIL_FSYNC.with(|flag| flag.set(Some(step)));
+    FSYNC_FAULT.with(|slot| slot.set(Some((step, FsyncFault::Generic))));
 }
 
-/// Clear an injected fsync failure.
+/// Fail the next fsync of `step` on this thread, once, with EIO, as a failing disk would return.
+/// The first matching fsync consumes the arm.
+#[cfg(feature = "failpoints")]
+pub fn inject_fsync_eio(step: FsyncStep) {
+    FSYNC_FAULT.with(|slot| slot.set(Some((step, FsyncFault::Eio))));
+}
+
+/// Fail the next fsync of `step` on this thread, once, with ENOSPC, as a full disk would return.
+/// The first matching fsync consumes the arm.
+#[cfg(feature = "failpoints")]
+pub fn inject_fsync_enospc(step: FsyncStep) {
+    FSYNC_FAULT.with(|slot| slot.set(Some((step, FsyncFault::Enospc))));
+}
+
+/// Fail the next durable write in [`write_durable`] on this thread, once, with ENOSPC. The error
+/// keeps its OS error code (`ErrorKind::StorageFull` / `ENOSPC`), so callers match it as a typed
+/// `StoreError::Io` and a failed write is retryable.
+#[cfg(feature = "failpoints")]
+pub fn inject_write_enospc() {
+    WRITE_FAULT.with(|slot| slot.set(Some(FsyncFault::Enospc)));
+}
+
+/// Clear any armed fsync fault without firing it.
 #[cfg(feature = "failpoints")]
 pub fn clear_fsync_failure() {
-    FAIL_FSYNC.with(|flag| flag.set(None));
+    FSYNC_FAULT.with(|slot| slot.set(None));
 }
 
+/// Clear any armed durable-write fault without firing it.
+#[cfg(feature = "failpoints")]
+pub fn clear_write_failure() {
+    WRITE_FAULT.with(|slot| slot.set(None));
+}
+
+/// The OS-level error an armed [`FsyncFault`] represents, before the production wrap in
+/// [`wrap_fsync`].
+#[cfg(feature = "failpoints")]
+fn fault_error(fault: FsyncFault) -> io::Error {
+    match fault {
+        FsyncFault::Generic => io::Error::other("injected"),
+        FsyncFault::Eio => io::Error::from_raw_os_error(nix::libc::EIO),
+        FsyncFault::Enospc => io::Error::from_raw_os_error(nix::libc::ENOSPC),
+    }
+}
+
+/// The production wrap that makes an fsync failure fatal: `fatal_class` matches the `fsync
+/// failed` prefix (ADR-0016). Injected faults go through this same wrap, so deleting it must turn
+/// both the real and the injected fsync tests red.
+fn wrap_fsync(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("fsync failed: {error}"))
+}
+
+#[cfg(feature = "failpoints")]
+fn sync_all(file: &File, fault: Option<FsyncFault>) -> io::Result<()> {
+    // An injected fault replaces the syscall result, then both paths go through the one
+    // production wrap below, so an injected failure is classified exactly like a real one.
+    let result = match fault {
+        Some(fault) => Err(fault_error(fault)),
+        None => file.sync_all(),
+    };
+    result.map_err(wrap_fsync)
+}
+
+#[cfg(not(feature = "failpoints"))]
 fn sync_all(file: &File) -> io::Result<()> {
-    file.sync_all()
-        .map_err(|error| io::Error::new(error.kind(), format!("fsync failed: {error}")))
+    file.sync_all().map_err(wrap_fsync)
 }
 
 #[cfg(feature = "failpoints")]
 fn sync_handle(file: &File, step: FsyncStep) -> io::Result<()> {
-    let fail = FAIL_FSYNC.with(|flag| {
-        let target = flag.get();
-        match target {
-            Some(pending) if pending == step || pending == FsyncStep::Any => {
-                flag.set(None);
-                true
-            }
-            _ => false,
+    let fault = FSYNC_FAULT.with(|slot| {
+        let Some((target, fault)) = slot.get() else {
+            return None;
+        };
+        if target == step || target == FsyncStep::Any {
+            slot.set(None); // fire once
+            Some(fault)
+        } else {
+            None
         }
     });
-    if fail {
-        return Err(io::Error::other(format!(
-            "fsync failed: injected ({step:?})"
-        )));
-    }
-    sync_all(file)
+    sync_all(file, fault)
 }
 
 #[cfg(not(feature = "failpoints"))]
 fn sync_handle(file: &File, _step: FsyncStep) -> io::Result<()> {
     sync_all(file)
 }
+
+/// The armed durable-write fault, if any, consumed on the first durable write.
+#[cfg(feature = "failpoints")]
+fn write_failpoint() -> Option<io::Error> {
+    WRITE_FAULT.with(|slot| slot.take().map(fault_error))
+}
+
+#[cfg(not(feature = "failpoints"))]
+fn write_failpoint() -> Option<io::Error> {
+    None
+}
+
+// Test-only guard: once [`install_fsutil_write_guard`] sets a root on this thread, an fsutil
+// helper write outside that root panics. It is a narrow assertion on the fsutil helpers only
+// (`write_durable`, `write_atomic`, `create_dir_all_durable`): it compares paths as text, is
+// thread-local, and does not see `sync_path`, plain `std::fs`, renames, or DuckDB COPY/temp
+// writes. Tests install it around their temp dir so a stray fsutil write fails the test instead
+// of landing elsewhere. Production never installs it.
+#[cfg(feature = "failpoints")]
+thread_local! {
+    static WRITE_GUARD: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Restrict the fsutil write helpers (`write_durable`, `write_atomic`,
+/// `create_dir_all_durable`) on this thread to `root` until [`clear_fsutil_write_guard`]. Test
+/// helper; a narrow assertion, not suite-wide coverage.
+#[cfg(feature = "failpoints")]
+pub fn install_fsutil_write_guard(root: &Path) {
+    WRITE_GUARD.with(|guard| *guard.borrow_mut() = Some(root.to_path_buf()));
+}
+
+/// Lift the restriction installed by [`install_fsutil_write_guard`]. Test helper.
+#[cfg(feature = "failpoints")]
+pub fn clear_fsutil_write_guard() {
+    WRITE_GUARD.with(|guard| *guard.borrow_mut() = None);
+}
+
+#[cfg(feature = "failpoints")]
+fn guard_inside(path: &Path) {
+    let Some(root) = WRITE_GUARD.with(|guard| guard.borrow().clone()) else {
+        return;
+    };
+    assert!(
+        inside(&root, path),
+        "test wrote outside its temp dir: {} (guard root {})",
+        path.display(),
+        root.display()
+    );
+}
+
+#[cfg(not(feature = "failpoints"))]
+fn guard_inside(_path: &Path) {}
 
 /// SHA-256 of a file, hex, streamed.
 pub fn file_hash(path: &Path) -> io::Result<String> {
@@ -109,6 +235,7 @@ pub fn sync_dir_after_rename(path: &Path) -> io::Result<()> {
 /// Create `path` and every missing ancestor. Each newly created directory's parent is fsynced, so
 /// the new directory entry itself is durable. Directories that already exist are left alone.
 pub fn create_dir_all_durable(path: &Path) -> io::Result<()> {
+    guard_inside(path);
     let mut missing = Vec::new();
     let mut cursor = path.to_path_buf();
     loop {
@@ -153,6 +280,7 @@ fn parent_dir(path: &Path) -> Option<std::path::PathBuf> {
 
 /// Write `body` to `path` durably: `.tmp` sibling, fsync, rename, fsync the directory.
 pub fn write_durable(path: &Path, body: &[u8]) -> io::Result<()> {
+    guard_inside(path);
     let tmp = tmp_path(path);
     {
         let mut file = OpenOptions::new()
@@ -160,6 +288,9 @@ pub fn write_durable(path: &Path, body: &[u8]) -> io::Result<()> {
             .create(true)
             .truncate(true)
             .open(&tmp)?;
+        if let Some(error) = write_failpoint() {
+            return Err(error);
+        }
         file.write_all(body)?;
         sync_handle(&file, FsyncStep::TempFile)?;
     }
@@ -173,6 +304,7 @@ pub fn write_durable(path: &Path, body: &[u8]) -> io::Result<()> {
 /// Write `body` to `path` through a `.tmp` rename without fsync, as the TypeScript status
 /// snapshots do.
 pub fn write_atomic(path: &Path, body: &[u8]) -> io::Result<()> {
+    guard_inside(path);
     let tmp = tmp_path(path);
     std::fs::write(&tmp, body)?;
     std::fs::rename(&tmp, path)
