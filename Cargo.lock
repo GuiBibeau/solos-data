@@ -9864,6 +9864,7 @@ dependencies = [
  "phoenix-codec",
  "proptest",
  "reqwest 0.13.5",
+ "rust_decimal",
  "serde",
  "serde_json",
  "sha2 0.10.9",
