@@ -147,8 +147,8 @@ pub fn crash_writer(root: &Path) -> Result<(), StoreError> {
     }
 }
 
-/// Test fixture for the random-kill loop (issue #61): generate a deterministic fixture source —
-/// one row per raw table at one slot per epoch inside `[from, to]` — and publish the range,
+/// Test fixture for the random-kill loop (issue #61): generate a deterministic fixture source
+/// (one row per raw table at one slot per epoch inside `[from, to]`) and publish the range,
 /// printing one progress line per publication step and `published` at the end. `INSERT OR IGNORE`
 /// makes a re-run after a kill idempotent. With `recover_only`, it only runs the production
 /// startup recovery ([`crate::collector::service::recover_startup`]) and exits, so the harness's

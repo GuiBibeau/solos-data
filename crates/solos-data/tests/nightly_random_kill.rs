@@ -8,16 +8,18 @@
 //!
 //! After a kill the harness classifies the iteration (killed or completed, the last progress line
 //! seen, and whether the watermark was committed), then restarts the binary so its production
-//! startup recovery removes the orphans — the harness does not call `recover_files` itself — and
+//! startup recovery removes the orphans (the harness does not call `recover_files` itself) and
 //! asserts the restart predicate (ADR-0016), the byte-identical re-run and no orphan files.
 //!
 //! This test is `#[ignore]`d: it never runs in per-PR CI (`cargo test --workspace`), only in the
 //! scheduled `nightly-random-kill` workflow or by hand with `-- --ignored`. Offline, on temporary
-//! directories. A failure reports the seed and a one-command replay that includes every env var:
+//! directories. A failure reports the seed and a one-command replay that pins every input that
+//! changes the kill point:
 //!
 //! ```sh
 //! SOLOS_DATA_NIGHTLY_SEED=<seed> SOLOS_DATA_NIGHTLY_KILL=bytes SOLOS_DATA_NIGHTLY_EPOCHS=4 \
-//!   SOLOS_DATA_NIGHTLY_MAX_DELAY_MS=<ms> cargo test --test nightly_random_kill -- --ignored --nocapture
+//!   SOLOS_DATA_NIGHTLY_JITTER_BUDGET_MS=<ms> SOLOS_DATA_NIGHTLY_MAX_DELAY_MS=<ms> \
+//!   cargo test --test nightly_random_kill -- --ignored --nocapture
 //! ```
 
 use nix::sys::signal::{Signal, kill};
@@ -36,7 +38,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 /// The fixture publishes one row per raw table at one slot per epoch (an epoch is 432000 slots),
-/// so a four-epoch range writes four files per table — enough distinct kill points per stage.
+/// so a four-epoch range writes four files per table, enough distinct kill points per stage.
 const FROM: i64 = 100;
 
 /// The publication steps the fixture prints, in order. Each line is printed immediately before
@@ -179,7 +181,7 @@ fn install_panic_hook() {
 
 /// `(table, epoch, row_count, sha256, slot_from, slot_to)` of every active file, ordered. The
 /// same shape as the crash-safety matrix (`tests/failpoints.rs`): the file name (a random UUID)
-/// is deliberately not compared — byte-identity is the SHA-256 of the bytes on disk.
+/// is deliberately not compared; byte-identity is the SHA-256 of the bytes on disk.
 type Manifest = Vec<(String, i64, i64, String, i64, i64)>;
 
 fn open(root: &Path) -> Store {
@@ -226,7 +228,7 @@ fn spawn(root: &Path, from: i64, to: i64, recover_only: bool) -> Child {
     }
     command
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .unwrap()
 }
@@ -236,6 +238,8 @@ struct Run {
     status: std::process::ExitStatus,
     /// Everything the child wrote to stdout, in order.
     stdout: Vec<u8>,
+    /// Everything the child wrote to stderr, kept for the failure artifact.
+    stderr: Vec<u8>,
     /// Wall-clock duration of the child run.
     duration: Duration,
 }
@@ -258,9 +262,21 @@ fn run(
     let mut child = spawn(root, from, to, recover_only);
     let pid = child.id() as i32;
     let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let threshold = u64::try_from(n_bytes).unwrap_or(u64::MAX);
     let count = Arc::new(AtomicU64::new(0));
     let captured = Arc::new(Mutex::new(Vec::new()));
+    let stderr_captured = Arc::new(Mutex::new(Vec::new()));
+
+    let stderr_reader = {
+        let stderr_captured = Arc::clone(&stderr_captured);
+        std::thread::spawn(move || {
+            let mut stderr = stderr;
+            let mut buf = Vec::new();
+            let _ = stderr.read_to_end(&mut buf);
+            *stderr_captured.lock().unwrap() = buf;
+        })
+    };
 
     let reader_count = Arc::clone(&count);
     let reader_captured = Arc::clone(&captured);
@@ -310,9 +326,11 @@ fn run(
         std::thread::sleep(Duration::from_micros(100));
     };
     reader.join().unwrap();
+    stderr_reader.join().unwrap();
     Run {
         status,
         stdout: captured.lock().unwrap().clone(),
+        stderr: stderr_captured.lock().unwrap().clone(),
         duration: started.elapsed(),
     }
 }
@@ -395,18 +413,18 @@ fn trigger_offset(seed: u64, golden: &Golden) -> (usize, &'static str) {
     (offset + 1, stage)
 }
 
-/// Seeded jitter after the trigger byte arrives: at least 1ms and up to a fraction of the golden
-/// run's measured duration for the slow steps (COPY, readback, commit), so the kill lands inside
-/// the step's work instead of exactly at its first instruction. Zero for the sub-millisecond
-/// fsync/rename windows and for `committed` (already after the atomic commit): the inline kill's
-/// microsecond precision is what spreads those.
-fn jitter_millis(seed: u64, golden: &Golden, stage: &str) -> u64 {
+/// Seeded jitter after the trigger byte arrives: at least 1ms and up to `budget_ms` for the slow
+/// steps (COPY, readback, commit), so the kill lands inside the step's work instead of exactly at
+/// its first instruction. Zero for the sub-millisecond fsync/rename windows and for `committed`
+/// (already after the atomic commit): the inline kill's microsecond precision is what spreads
+/// those. The budget is pinned by `SOLOS_DATA_NIGHTLY_JITTER_BUDGET_MS` when set, otherwise it is
+/// the golden run's measured duration over 8, clamped to [2, 25].
+fn jitter_millis(seed: u64, budget_ms: u64, stage: &str) -> u64 {
     if matches!(stage, "tmp-fsync" | "rename" | "dir-fsync" | "committed") {
         return 0;
     }
-    let budget = (golden.duration.as_millis() as u64 / 8).clamp(2, 25);
     let mut state = seed.wrapping_add(0x6A09_E667_F3BC_C909);
-    1 + (splitmix64(&mut state) % budget)
+    1 + (splitmix64(&mut state) % budget_ms.max(1))
 }
 
 /// The delay for a seed in `delay` mode: `[0, max_delay_ms)`, scaled to the golden run's measured
@@ -592,7 +610,8 @@ fn assert_uncommitted_recovered(
 /// Histogram of the iteration classes.
 #[derive(Default)]
 struct Tally {
-    /// Iterations by the deterministic trigger stage (byte mode). Each stage must be non-zero.
+    /// Iterations by the deterministic trigger stage (byte mode), reported alongside where the
+    /// kill actually landed.
     triggered: BTreeMap<&'static str, usize>,
     /// Killed iterations by the last progress line actually seen before the kill landed.
     killed_by_stage: BTreeMap<&'static str, usize>,
@@ -673,10 +692,11 @@ struct Loop<'a> {
     epochs: i64,
     mode: &'a str,
     max_delay_ms: u64,
+    jitter_budget_ms: u64,
     golden: &'a Golden,
 }
 
-fn run_iteration(seed: u64, loop_: &Loop<'_>, tally: &mut Tally) {
+fn run_iteration(seed: u64, loop_: &Loop<'_>, tally: &mut Tally) -> TempDir {
     let root = TempDir::new(&format!("{seed}"));
     set_current_root(&root.0);
     let (n_bytes, delay, jitter, trigger_stage) = match loop_.mode {
@@ -686,7 +706,7 @@ fn run_iteration(seed: u64, loop_: &Loop<'_>, tally: &mut Tally) {
         }
         _ => {
             let (offset, stage) = trigger_offset(seed, loop_.golden);
-            let jitter = Duration::from_millis(jitter_millis(seed, loop_.golden, stage));
+            let jitter = Duration::from_millis(jitter_millis(seed, loop_.jitter_budget_ms, stage));
             (offset, None, Some(jitter), Some(stage))
         }
     };
@@ -696,6 +716,12 @@ fn run_iteration(seed: u64, loop_: &Loop<'_>, tally: &mut Tally) {
         trigger_stage.unwrap_or("delay")
     ));
     let run = run(&root.0, loop_.from, loop_.to, n_bytes, delay, jitter, false);
+    if !run.stderr.is_empty() {
+        append_log(
+            &root.0,
+            &format!("fixture stderr:\n{}", String::from_utf8_lossy(&run.stderr)),
+        );
+    }
     if !run.status.success() && run.status.signal().is_none() {
         panic!(
             "seed {seed}: fixture exited with an error, not a kill: {}",
@@ -734,6 +760,7 @@ fn run_iteration(seed: u64, loop_: &Loop<'_>, tally: &mut Tally) {
             seed,
         );
     }
+    root
 }
 
 #[test]
@@ -744,10 +771,18 @@ fn nightly_random_kill_loop() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(200);
-    let seed_env = std::env::var("SOLOS_DATA_NIGHTLY_SEED")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok());
+    let seed_env = match std::env::var("SOLOS_DATA_NIGHTLY_SEED") {
+        Ok(v) if !v.trim().is_empty() => match v.trim().parse::<u64>() {
+            Ok(seed) => Some(seed),
+            Err(_) => panic!("SOLOS_DATA_NIGHTLY_SEED is not a valid u64: {v:?}"),
+        },
+        _ => None,
+    };
     let mode = std::env::var("SOLOS_DATA_NIGHTLY_KILL").unwrap_or_else(|_| "bytes".into());
+    assert!(
+        mode == "bytes" || mode == "delay",
+        "SOLOS_DATA_NIGHTLY_KILL must be 'bytes' or 'delay', got {mode:?}"
+    );
     let epochs: i64 = std::env::var("SOLOS_DATA_NIGHTLY_EPOCHS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -760,12 +795,20 @@ fn nightly_random_kill_loop() {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or_else(|| golden.duration.as_millis().max(1) as u64);
+    let jitter_budget_ms = match std::env::var("SOLOS_DATA_NIGHTLY_JITTER_BUDGET_MS") {
+        Ok(v) if !v.trim().is_empty() => match v.trim().parse::<u64>() {
+            Ok(budget) => budget,
+            Err(_) => panic!("SOLOS_DATA_NIGHTLY_JITTER_BUDGET_MS is not a valid u64: {v:?}"),
+        },
+        _ => (golden.duration.as_millis() as u64 / 8).clamp(2, 25),
+    };
     log_line(&format!(
-        "golden: {} files, {} progress lines, {} stdout bytes, {} ms",
+        "golden: {} files, {} progress lines, {} stdout bytes, {} ms, jitter budget {} ms",
         golden.manifest.len(),
         golden.progress_count,
         golden.stdout_len,
-        golden.duration.as_millis()
+        golden.duration.as_millis(),
+        jitter_budget_ms
     ));
 
     let seeds: Vec<u64> = match seed_env {
@@ -778,24 +821,30 @@ fn nightly_random_kill_loop() {
         epochs,
         mode: &mode,
         max_delay_ms,
+        jitter_budget_ms,
         golden: &golden,
     };
     let mut tally = Tally::default();
+    // The last iteration's root stays alive across the histogram assertions, so a failure there
+    // keeps the root (with its harness.log) for the workflow artifact upload.
+    let mut _last_root: Option<TempDir> = None;
     for seed in &seeds {
         let replay = format!(
             "SOLOS_DATA_NIGHTLY_SEED={seed} SOLOS_DATA_NIGHTLY_KILL={mode} \
-             SOLOS_DATA_NIGHTLY_EPOCHS={epochs} SOLOS_DATA_NIGHTLY_MAX_DELAY_MS={max_delay_ms} \
+             SOLOS_DATA_NIGHTLY_EPOCHS={epochs} \
+             SOLOS_DATA_NIGHTLY_JITTER_BUDGET_MS={jitter_budget_ms} \
+             SOLOS_DATA_NIGHTLY_MAX_DELAY_MS={max_delay_ms} \
              cargo test --test nightly_random_kill -- --ignored --nocapture"
         );
         *REPLAY.lock().unwrap() = Some(replay);
-        run_iteration(*seed, &loop_, &mut tally);
+        _last_root = Some(run_iteration(*seed, &loop_, &mut tally));
     }
 
     print_histogram(&tally);
 
-    // Replay mode (a single seed) has no spread to assert; the full loop must target every
-    // publication stage, exercise both commit states, and keep the vacuous completed-before-kill
-    // class under a cap.
+    // Replay mode (a single seed) has no spread to assert; the full loop must land a kill in
+    // every publication stage, exercise both commit states, and keep the vacuous
+    // completed-before-kill class under a cap.
     if seed_env.is_none() {
         // The vacuous class comes first: if too many iterations completed before the kill
         // landed, the loop is not exercising the crash windows at all.
@@ -805,14 +854,15 @@ fn nightly_random_kill_loop() {
             "{} iterations completed before the kill landed (cap {cap}); the kill windows are vacuous",
             tally.completed
         );
-        // Byte mode draws the trigger stage deterministically, so every stage must be targeted
-        // at least once. Delay mode spreads by wall-clock time instead and skips this check.
+        // Byte mode draws the trigger stage deterministically, but the assertion is on where the
+        // kill actually landed: every publication stage must have at least one kill land in its
+        // window. Delay mode spreads by wall-clock time instead and skips this check.
         if mode != "delay" {
             for stage in STAGES {
-                let n = tally.triggered.get(stage).copied().unwrap_or(0);
+                let n = tally.killed_by_stage.get(stage).copied().unwrap_or(0);
                 assert!(
                     n > 0,
-                    "no iteration targeted the {stage} stage; the trigger mapping must not skip a stage"
+                    "no kill landed in the {stage} stage; the kill windows are not spread"
                 );
             }
         }

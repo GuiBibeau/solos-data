@@ -24,27 +24,31 @@ SIGKILLs it, restarts it, and asserts:
 - When the watermark was not committed, the re-run to completion is byte-identical to the golden
   run (same partition hashes and manifest) and registers exactly one file per partition.
 
-`dev publish-fixture` generates a deterministic fixture source — one row per raw table per slot,
-one slot per epoch, four epochs by default — and prints one progress line per publication step
+`dev publish-fixture` generates a deterministic fixture source (one row per raw table per slot,
+one slot per epoch, four epochs by default) and prints one progress line per publication step
 (`tmp-write`, `tmp-fsync`, `rename`, `dir-fsync`, `readback`, `commit`, and `committed` after the
-atomic commit). A seed picks a trigger point — a publication stage, then a progress line of that
-stage — and the harness schedules the SIGKILL the moment that line's bytes arrive plus a seeded
+atomic commit). A seed picks a trigger point (a publication stage, then a progress line of that
+stage), and the harness schedules the SIGKILL the moment that line's bytes arrive plus a seeded
 jitter. A seed therefore picks a trigger point deterministically, but the kill still races the
 child: the jitter and the child's own progress decide exactly where inside the step it lands.
+The jitter budget is pinned by `SOLOS_DATA_NIGHTLY_JITTER_BUDGET_MS` when set (defaulting to the
+golden run's measured duration over 8, clamped to [2, 25] ms), so a replay pins it too.
 The stage is drawn before the line so the single `commit` and `committed` lines are not starved
 by the per-file stages' many lines. A `delay` mode (kill after a seeded wall-clock delay scaled
 to the golden run's measured duration) is also available but is only approximately replayable.
 
-Each iteration is classified — killed or completed, the last progress line seen, and whether the
-watermark was committed — and the harness prints a histogram and asserts every stage is hit at
-least once and that the vacuous `completed-before-kill` class stays under a cap.
+Each iteration is classified (killed or completed, the last progress line seen, and whether the
+watermark was committed), and the harness prints a histogram and asserts a kill lands in every
+publication stage at least once and that the vacuous `completed-before-kill` class stays under a
+cap.
 
-Each iteration logs its seed. A failure reports the seed, and one command replays it with every
-input pinned:
+Each iteration logs its seed. A failure reports the seed, and one command replays it with the
+seed, mode, epochs, jitter budget and delay cap pinned:
 
 ```sh
 SOLOS_DATA_NIGHTLY_SEED=<seed> SOLOS_DATA_NIGHTLY_KILL=<mode> SOLOS_DATA_NIGHTLY_EPOCHS=<epochs> \
-  SOLOS_DATA_NIGHTLY_MAX_DELAY_MS=<ms> cargo test --test nightly_random_kill -- --ignored --nocapture
+  SOLOS_DATA_NIGHTLY_JITTER_BUDGET_MS=<ms> SOLOS_DATA_NIGHTLY_MAX_DELAY_MS=<ms> \
+  cargo test --test nightly_random_kill -- --ignored --nocapture
 ```
 
 The loop runs 200 iterations by default (`SOLOS_DATA_NIGHTLY_ITERATIONS`, 200-500 in CI). It is
@@ -57,9 +61,10 @@ uploads the seed, the harness log and the iteration root with `actions/upload-ar
 
 SIGKILL is process death, not power loss. The loop inherits ADR-0016's scope: it cannot catch a
 missing fsync, because the page cache survives SIGKILL and the kernel still has the bytes. A
-planted "write `W` before the Parquet rename" ordering bug is caught — the proof for this loop,
-committed as `patches/0019-planted-w-outside-transaction.patch` — but a planted "publish before
-fsync" is not, by design.
+planted "write `W` outside the file transaction (after the Parquet renames)" ordering bug is
+caught (the proof for this loop, committed as
+`patches/0019-planted-w-outside-transaction.patch`); a planted "publish before fsync" is not, by
+design.
 
 The loop re-runs the fixture only when the watermark was not committed, so a kill that lands
 after the atomic commit is asserted directly against the golden manifest instead of publishing

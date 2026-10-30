@@ -7,7 +7,7 @@ The atomic commit (ADR-0016 step 7) writes the file rows, bounds, range and the
 watermark in one transaction. This mutation writes the watermark before that
 transaction, in its own autocommit statement, so a SIGKILL after `W` commits but
 before the files commit leaves a committed watermark without the full golden
-manifest — the ordering the nightly random-kill loop's `committed_after_kill`
+manifest: the ordering the nightly random-kill loop's `committed_after_kill`
 assertion must catch ("committed watermark without the full golden manifest").
 
 Apply, run the loop, then revert:

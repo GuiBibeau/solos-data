@@ -105,5 +105,6 @@ byte-identical re-run. Each iteration logs its seed; replay one with:
 
 ```sh
 SOLOS_DATA_NIGHTLY_SEED=<seed> SOLOS_DATA_NIGHTLY_KILL=bytes SOLOS_DATA_NIGHTLY_EPOCHS=4 \
-  SOLOS_DATA_NIGHTLY_MAX_DELAY_MS=<ms> cargo test --test nightly_random_kill -- --ignored --nocapture
+  SOLOS_DATA_NIGHTLY_JITTER_BUDGET_MS=<ms> SOLOS_DATA_NIGHTLY_MAX_DELAY_MS=<ms> \
+  cargo test --test nightly_random_kill -- --ignored --nocapture
 ```
