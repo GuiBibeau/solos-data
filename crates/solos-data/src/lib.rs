@@ -8,6 +8,7 @@ pub mod collector;
 pub mod db;
 pub mod decoder;
 pub mod dev;
+pub mod failpoints;
 pub mod fsutil;
 pub mod gc;
 pub mod health;

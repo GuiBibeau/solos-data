@@ -224,6 +224,21 @@ fn config(read_only: bool) -> Result<Config, duckdb::Error> {
     Ok(config)
 }
 
+/// Whether `value` is a DuckDB size: digits plus an optional `KB`, `MB` or `GB` unit
+/// (case-insensitive). `wal_autocheckpoint` is interpolated into SQL, so anything else is
+/// rejected before use (issue #56).
+#[cfg(feature = "failpoints")]
+#[must_use]
+pub fn is_wal_size(value: &str) -> bool {
+    let split = value
+        .as_bytes()
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, unit) = value.split_at(split);
+    !digits.is_empty() && matches!(unit.to_ascii_uppercase().as_str(), "" | "KB" | "MB" | "GB")
+}
+
 /// An independent in-memory database for readers and offline tools.
 pub fn memory_connection(threads: &str, memory_limit: &str) -> Result<Connection, duckdb::Error> {
     let config = Config::default()
@@ -252,6 +267,18 @@ impl Store {
             timings: Vec::new(),
         };
         store.exec_batch(ddl)?;
+        // Crash-safety matrix (issue #56): the harness forces tiny WAL autocheckpoints so kills
+        // land on both sides of a checkpoint. Test-only, behind the failpoints feature, and the
+        // value is validated as a size before it is interpolated into SQL.
+        #[cfg(feature = "failpoints")]
+        if let Ok(value) = std::env::var("SOLOS_DATA_WAL_AUTOCHECKPOINT") {
+            if !is_wal_size(&value) {
+                return Err(StoreError::Check(format!(
+                    "SOLOS_DATA_WAL_AUTOCHECKPOINT is not a size: {value:?}"
+                )));
+            }
+            store.exec_batch(&format!("SET wal_autocheckpoint = '{value}'"))?;
+        }
         Ok(store)
     }
 
@@ -597,6 +624,16 @@ pub fn sql_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wal_sizes_are_digits_with_an_optional_unit() {
+        for good in ["1", "16", "1KB", "16MB", "2GB", "1kb", "256mb", "4gb"] {
+            assert!(is_wal_size(good), "{good}");
+        }
+        for bad in ["", "KB", "1.5MB", "1 MB", "1KBx", "-1", "'1KB'", "1 KiB"] {
+            assert!(!is_wal_size(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn labels_follow_the_typescript_regex() {

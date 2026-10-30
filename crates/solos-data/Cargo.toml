@@ -51,11 +51,20 @@ solana-runtime = { version = "=4.2.2", optional = true }
 solana-rpc = { version = "=4.2.2", optional = true }
 solana-geyser-plugin-manager = { version = "=4.2.2", optional = true }
 solana-storage-proto = { version = "=4.2.2", optional = true }
+# Crash-safety failpoints (issue #56): kill points that abort the process. Off in release
+# builds; integration tests enable the feature through the self dev-dependency below.
+fail = { version = "0.5.1", features = ["failpoints"], optional = true }
+
+[dev-dependencies]
+# Enable `failpoints` for every test target without turning it on in release builds.
+solos-data = { path = ".", features = ["failpoints"] }
 
 [features]
 default = []
 # The Old Faithful archive lane through Jetstreamer (heavy build: agave crates and RocksDB).
 archive = ["dep:jetstreamer-firehose", "dep:log", "dep:solana-transaction-status", "dep:wincode", "dep:solana-accounts-db", "dep:solana-ledger", "dep:solana-runtime", "dep:solana-rpc", "dep:solana-geyser-plugin-manager", "dep:solana-storage-proto"]
+# Crash-safety failpoints and the fsync failure injection used by the tests (issue #56).
+failpoints = ["dep:fail"]
 
 [lints]
 workspace = true

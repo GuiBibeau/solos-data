@@ -6,7 +6,9 @@ use super::keys::assert_relation_keys_unique;
 use super::normalize::Rows;
 use super::parquet::{copy_statement, require_store_duckdb};
 use super::schema::{TABLES, VERSION, definition, sort_columns, type_map};
-use crate::fsutil::{create_dir_all_durable, file_hash, sync_path, write_durable};
+use crate::fsutil::{
+    create_dir_all_durable, file_hash, sync_dir_after_rename, sync_tmp_file, write_durable,
+};
 use crate::jsonout::{Obj, now};
 use crate::store::{Store, StoreError, sql_string};
 use serde_json::Value;
@@ -97,10 +99,10 @@ pub fn publish_sources(
             let select =
                 format!("SELECT * FROM {table} WHERE slot // 432000={epoch} ORDER BY {order}");
             store.exec_batch(&copy_statement(&select, &tmp))?;
-            sync_path(&tmp)?;
+            sync_tmp_file(&tmp)?;
             std::fs::rename(&tmp, &path)?;
             if let Some(parent) = path.parent() {
-                sync_path(parent)?;
+                sync_dir_after_rename(parent)?;
             }
             let count = store.rows(
                 &format!(

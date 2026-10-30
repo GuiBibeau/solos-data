@@ -620,3 +620,149 @@ fn the_monthly_cap_stops_every_elfa_request() {
     store.close().unwrap();
     let _ = std::fs::remove_dir_all(&root);
 }
+
+fn lane_fatal_after(
+    drive: impl std::future::Future<Output = Option<String>>,
+    label: &str,
+) -> Option<String> {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    match runtime
+        .block_on(async { tokio::time::timeout(std::time::Duration::from_secs(10), drive).await })
+    {
+        Ok(fatal) => fatal,
+        Err(_) => panic!("{label} loop did not stop on a fatal fsync"),
+    }
+}
+
+#[test]
+fn the_capture_loops_stop_on_a_fatal_fsync() {
+    use solos_data::augment::capture::test_drive;
+    use solos_data::fsutil::FsyncStep;
+
+    // Candles: one coin, two closed 1-minute candles, so the first cycle writes one file.
+    {
+        let server = Server::start();
+        let real_now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        server.route("/info", move |request| {
+            let body = request.json();
+            assert_eq!(body["type"], "candleSnapshot");
+            let coin = body["req"]["coin"].as_str().unwrap().to_owned();
+            Response::json(&json!([
+                candle(&coin, real_now_ms - 120_000),
+                candle(&coin, real_now_ms - 60_000)
+            ]))
+        });
+        let root = tempdir("solos-capture-fsync");
+        let (ctx, thread) = ctx(&server, &root);
+        let lane = CandleLane {
+            url: format!("{}/info", server.base),
+            coins: vec![("SOL".into(), "SOL".into())],
+        };
+        ctx.db
+            .run_blocking(|_| {
+                solos_data::fsutil::inject_fsync_failure(FsyncStep::TempFile);
+                Ok(())
+            })
+            .unwrap();
+        let fatal = lane_fatal_after(test_drive::candle(&ctx, &lane, 60), "candle");
+        assert!(
+            fatal.as_deref().unwrap_or("").contains("fsync failed"),
+            "{fatal:?}"
+        );
+        assert!(ctx.stopping(), "the candle loop must set the stop flag");
+        let store = thread.join(ctx.db.clone());
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Contexts: one BTC snapshot buffered, then an immediate flush writes it.
+    {
+        let server = Server::start();
+        let answer: Value = serde_json::from_slice(&fixture("hl-ctxs.json")).unwrap();
+        server.route("/info", move |_request| Response::json(&answer));
+        let root = tempdir("solos-capture-fsync");
+        let (ctx, thread) = ctx(&server, &root);
+        let lane = ContextLane::new(
+            &format!("{}/info", server.base),
+            vec![("BTC".into(), "BTC".into())],
+        );
+        ctx.db
+            .run_blocking(|_| {
+                solos_data::fsutil::inject_fsync_failure(FsyncStep::TempFile);
+                Ok(())
+            })
+            .unwrap();
+        let fatal = lane_fatal_after(test_drive::contexts(&ctx, &lane, 60), "context");
+        assert!(
+            fatal.as_deref().unwrap_or("").contains("fsync failed"),
+            "{fatal:?}"
+        );
+        assert!(ctx.stopping(), "the context loop must set the stop flag");
+        let store = thread.join(ctx.db.clone());
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Elfa hourly cycle: key-status then one events page, whose file write is the fsync.
+    {
+        let server = Server::start();
+        let now_s = NOW_MS / 1000;
+        server.route("/v3/key-status", move |_| {
+            Response::json(&json!({ "credits": { "used": 0 }, "historyFrom": now_s - 86_400 }))
+        });
+        server.route("/v3/events", move |_| {
+            Response::json(&json!({ "events": [{ "id": "e1", "firstSeenAt": now_s - 100, "eventClass": "news" }], "hasMore": false }))
+                .with_header("x-elfa-credits", "0")
+        });
+        let root = tempdir("solos-capture-fsync");
+        let (ctx, thread) = ctx(&server, &root);
+        let lane = ElfaLane::new(&server.base, "test-key", now_s - 86_400);
+        ctx.db
+            .run_blocking(|_| {
+                solos_data::fsutil::inject_fsync_failure(FsyncStep::TempFile);
+                Ok(())
+            })
+            .unwrap();
+        let fatal = lane_fatal_after(test_drive::elfa(&ctx, &lane, 60), "elfa");
+        assert!(
+            fatal.as_deref().unwrap_or("").contains("fsync failed"),
+            "{fatal:?}"
+        );
+        assert!(ctx.stopping(), "the elfa loop must set the stop flag");
+        let store = thread.join(ctx.db.clone());
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // Elfa events poll: one page, whose file write is the fsync.
+    {
+        let server = Server::start();
+        let now_s = NOW_MS / 1000;
+        server.route("/v3/events", move |_| {
+            Response::json(&json!({ "events": [{ "id": "e1", "firstSeenAt": now_s - 100, "eventClass": "news" }], "hasMore": false }))
+                .with_header("x-elfa-credits", "0")
+        });
+        let root = tempdir("solos-capture-fsync");
+        let (ctx, thread) = ctx(&server, &root);
+        let mut lane = ElfaLane::new(&server.base, "test-key", now_s - 86_400);
+        lane.events_pages = 1;
+        ctx.db
+            .run_blocking(|_| {
+                solos_data::fsutil::inject_fsync_failure(FsyncStep::TempFile);
+                Ok(())
+            })
+            .unwrap();
+        let fatal = lane_fatal_after(test_drive::events(&ctx, &lane, 60), "events");
+        assert!(
+            fatal.as_deref().unwrap_or("").contains("fsync failed"),
+            "{fatal:?}"
+        );
+        assert!(ctx.stopping(), "the events loop must set the stop flag");
+        let store = thread.join(ctx.db.clone());
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
