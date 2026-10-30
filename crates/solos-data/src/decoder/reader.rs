@@ -9,7 +9,7 @@ use crate::lease::with_read_lease;
 use crate::store::{StoreError, for_each_row, memory_connection, query_rows, sql_string};
 use serde_json::Value;
 use std::ops::RangeInclusive;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Slots per epoch; the publisher partitions every table into `epoch=<slot / 432000>` directories.
 pub const EPOCH_SLOTS: i64 = 432_000;
@@ -76,6 +76,14 @@ pub(crate) struct DecodedSession {
     epochs: Option<RangeInclusive<i64>>,
     decoder_version: Value,
     acceptance: Value,
+    temp_dir: PathBuf,
+}
+
+impl Drop for DecodedSession {
+    fn drop(&mut self) {
+        // The connection is dropped first (field order), then the spill directory it used.
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+    }
 }
 
 impl DecodedSession {
@@ -89,6 +97,16 @@ impl DecodedSession {
                 .map_err(|error| StoreError::Check(error.to_string()))?;
         let memory = std::env::var("SOLOS_DATA_QUERY_MEMORY").unwrap_or_else(|_| "4GB".into());
         let conn = memory_connection("4", &memory)?;
+        // The digest streams its window/sort results; without a spill directory DuckDB keeps
+        // that buffer in memory and peak RSS grows with the day. A private directory per
+        // session keeps concurrent sessions from sharing a spill root.
+        let temp_dir =
+            std::env::temp_dir().join(format!("solos-decode-tmp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir)?;
+        conn.execute_batch(&format!(
+            "SET temp_directory = {}",
+            sql_string(&temp_dir.to_string_lossy())
+        ))?;
         if check_version {
             require_connection_duckdb(&conn)?;
         }
@@ -119,6 +137,7 @@ impl DecodedSession {
                 .cloned()
                 .unwrap_or(Value::Null),
             acceptance: catalog.get("acceptance").cloned().unwrap_or(Value::Null),
+            temp_dir,
         })
     }
 

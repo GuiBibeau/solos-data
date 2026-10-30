@@ -3,10 +3,17 @@
 //! the rows. The publisher and the digest both refuse it. That is the no-duplicate-primary-key
 //! check crash-safety re-runs use.
 
-use super::schema::{TABLES, key_column};
+#[cfg(test)]
+use super::schema::TABLES;
+use super::schema::key_column;
+#[cfg(test)]
 use super::source::source_path;
-use crate::store::{Store, StoreError, query_rows, sql_string};
+use crate::store::{Store, StoreError};
+#[cfg(test)]
+use crate::store::{query_rows, sql_string};
+#[cfg(test)]
 use serde_json::Value;
+#[cfg(test)]
 use std::path::Path;
 
 pub(crate) fn reject(table: &str, key: &str, value: &str) -> StoreError {
@@ -62,6 +69,7 @@ pub fn assert_relation_keys_unique(
     Ok(())
 }
 
+#[cfg(test)]
 fn batch_id(file: &Value) -> i64 {
     file.get("batch_id")
         .map(|value| {
@@ -81,6 +89,7 @@ fn batch_id(file: &Value) -> i64 {
 /// # Errors
 ///
 /// A duplicate, a bad catalog, or a Parquet read failure.
+#[cfg(test)]
 pub fn assert_registered_keys_unique(root: &Path) -> Result<(), StoreError> {
     let text = std::fs::read_to_string(root.join("catalog.json"))?;
     let catalog: Value =

@@ -3,8 +3,20 @@
 //! (64-bit integers as decimal strings), and per-statement timings for `status.json`.
 
 use crate::jsonout::Obj;
-use duckdb::types::{TimeUnit, Value as DbValue};
+use duckdb::arrow::array::{
+    Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, DictionaryArray,
+    FixedSizeBinaryArray, FixedSizeListArray, Float32Array, Float64Array, Int8Array, Int16Array,
+    Int32Array, Int64Array, IntervalMonthDayNanoArray, LargeBinaryArray, LargeListArray,
+    LargeStringArray, ListArray, MapArray, StringArray, StructArray, Time64MicrosecondArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use duckdb::arrow::datatypes::{
+    DataType, IntervalUnit, SchemaRef, TimeUnit as ArrowTimeUnit, UInt8Type, UInt16Type, UInt32Type,
+};
+use duckdb::types::{EnumType, ListType, TimeUnit, Value as DbValue, ValueRef};
 use duckdb::{Config, Connection, ToSql, params_from_iter};
+use rust_decimal::Decimal;
 use serde_json::Value;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -470,39 +482,252 @@ pub fn statement_label(sql: &str) -> String {
 /// Run one statement and pass each row to `visit` without collecting them.
 ///
 /// The rows are rendered exactly as [`query_rows`] renders them, but the caller sees one row at
-/// a time. Memory stays bounded by one row (plus the caller's own state), not by the result
-/// size, so a streaming consumer such as the content digest never holds a day as JSON.
+/// a time. The statement runs through duckdb-rs 1.4.5's streaming path
+/// (`Statement::stream_arrow` -> `duckdb_execute_prepared_streaming`), so the Rust side never
+/// materializes the full arrow result. The caller's own state (for example the digest's
+/// per-row record) is the only growth; DuckDB's own sort/window buffer is bounded by the
+/// connection's `memory_limit` and spills to `temp_directory`.
 pub fn for_each_row(
     conn: &Connection,
     sql: &str,
     params: &[&dyn ToSql],
     mut visit: impl FnMut(&Obj) -> Result<(), StoreError>,
 ) -> Result<(), StoreError> {
+    let schema = probe_schema(conn, sql, params)?;
     let mut statement = conn.prepare(sql)?;
-    let mut rows = statement.query(params_from_iter(params.iter()))?;
-    let mut names: Option<Vec<String>> = None;
-    let mut tz: Option<Vec<bool>> = None;
-    while let Some(row) = rows.next()? {
-        let statement = row.as_ref();
-        let names = names.get_or_insert_with(|| statement.column_names());
-        let tz = tz.get_or_insert_with(|| {
-            (0..statement.column_count())
-                .map(|i| {
-                    matches!(
-                        statement.column_type(i),
-                        duckdb::arrow::datatypes::DataType::Timestamp(_, Some(_))
-                    )
-                })
-                .collect()
-        });
-        let mut obj = Obj::new();
-        for (i, name) in names.iter().enumerate() {
-            let value: DbValue = row.get(i)?;
-            obj.set(name, json_of(value, tz[i]));
+    let stream = statement.stream_arrow(params_from_iter(params.iter()), schema)?;
+    let names: Vec<String> = stream
+        .get_schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect();
+    let tz: Vec<bool> = stream
+        .get_schema()
+        .fields()
+        .iter()
+        .map(|field| matches!(field.data_type(), DataType::Timestamp(_, Some(_))))
+        .collect();
+    for batch in stream {
+        for row in 0..batch.num_rows() {
+            let mut obj = Obj::new();
+            for (i, name) in names.iter().enumerate() {
+                let value: DbValue = value_ref(batch.column(i), row).to_owned();
+                obj.set(name, json_of(value, tz[i]));
+            }
+            visit(&obj)?;
         }
-        visit(&obj)?;
     }
     Ok(())
+}
+
+/// The arrow schema of `sql`, taken from a zero-row probe of the same statement. The probe runs
+/// `SELECT * FROM ({sql}) LIMIT 0`, so DuckDB reports the exact column names and arrow types
+/// without producing rows; the streaming iterator needs that schema up front because 1.4.5's
+/// `stream_arrow` does not expose it from a streaming result.
+fn probe_schema(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn ToSql],
+) -> Result<SchemaRef, StoreError> {
+    let mut probe = conn.prepare(&format!("SELECT * FROM ({sql}) LIMIT 0"))?;
+    let arrow = probe.query_arrow(params_from_iter(params.iter()))?;
+    Ok(arrow.get_schema())
+}
+
+/// One DuckDB value at `row` of an arrow column, the same match
+/// `duckdb::Row::value_ref_internal` performs so the streaming path renders values exactly like
+/// the materialized `Statement::query` path does.
+fn value_ref<'a>(column: &'a ArrayRef, row: usize) -> ValueRef<'a> {
+    if column.is_null(row) {
+        return ValueRef::Null;
+    }
+    match column.data_type() {
+        DataType::Utf8 => {
+            let array = column.as_any().downcast_ref::<StringArray>().unwrap();
+            ValueRef::from(array.value(row))
+        }
+        DataType::LargeUtf8 => {
+            let array = column.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            ValueRef::from(array.value(row))
+        }
+        DataType::Binary => {
+            let array = column.as_any().downcast_ref::<BinaryArray>().unwrap();
+            ValueRef::Blob(array.value(row))
+        }
+        DataType::LargeBinary => {
+            let array = column.as_any().downcast_ref::<LargeBinaryArray>().unwrap();
+            ValueRef::Blob(array.value(row))
+        }
+        DataType::FixedSizeBinary(_) => {
+            let array = column
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
+            ValueRef::Blob(array.value(row))
+        }
+        DataType::Boolean => {
+            let array = column.as_any().downcast_ref::<BooleanArray>().unwrap();
+            ValueRef::Boolean(array.value(row))
+        }
+        DataType::Int8 => {
+            let array = column.as_any().downcast_ref::<Int8Array>().unwrap();
+            ValueRef::TinyInt(array.value(row))
+        }
+        DataType::Int16 => {
+            let array = column.as_any().downcast_ref::<Int16Array>().unwrap();
+            ValueRef::SmallInt(array.value(row))
+        }
+        DataType::Int32 => {
+            let array = column.as_any().downcast_ref::<Int32Array>().unwrap();
+            ValueRef::Int(array.value(row))
+        }
+        DataType::Int64 => {
+            let array = column.as_any().downcast_ref::<Int64Array>().unwrap();
+            ValueRef::BigInt(array.value(row))
+        }
+        DataType::UInt8 => {
+            let array = column.as_any().downcast_ref::<UInt8Array>().unwrap();
+            ValueRef::UTinyInt(array.value(row))
+        }
+        DataType::UInt16 => {
+            let array = column.as_any().downcast_ref::<UInt16Array>().unwrap();
+            ValueRef::USmallInt(array.value(row))
+        }
+        DataType::UInt32 => {
+            let array = column.as_any().downcast_ref::<UInt32Array>().unwrap();
+            ValueRef::UInt(array.value(row))
+        }
+        DataType::UInt64 => {
+            let array = column.as_any().downcast_ref::<UInt64Array>().unwrap();
+            ValueRef::UBigInt(array.value(row))
+        }
+        DataType::Float16 => {
+            let array = column.as_any().downcast_ref::<Float32Array>().unwrap();
+            ValueRef::Float(array.value(row))
+        }
+        DataType::Float32 => {
+            let array = column.as_any().downcast_ref::<Float32Array>().unwrap();
+            ValueRef::Float(array.value(row))
+        }
+        DataType::Float64 => {
+            let array = column.as_any().downcast_ref::<Float64Array>().unwrap();
+            ValueRef::Double(array.value(row))
+        }
+        DataType::Decimal128(..) => {
+            let array = column.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            // DuckDB maps HUGEINT to arrow Decimal128(38, 0): scale zero is a signed 128-bit
+            // integer, not a decimal, matching duckdb-rs's own conversion.
+            if array.scale() == 0 {
+                return ValueRef::HugeInt(array.value(row));
+            }
+            ValueRef::Decimal(Decimal::from_i128_with_scale(
+                array.value(row),
+                array.scale() as u32,
+            ))
+        }
+        DataType::Timestamp(unit, _) if *unit == ArrowTimeUnit::Second => {
+            let array = column
+                .as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap();
+            ValueRef::Timestamp(TimeUnit::Second, array.value(row))
+        }
+        DataType::Timestamp(unit, _) if *unit == ArrowTimeUnit::Millisecond => {
+            let array = column
+                .as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap();
+            ValueRef::Timestamp(TimeUnit::Millisecond, array.value(row))
+        }
+        DataType::Timestamp(unit, _) if *unit == ArrowTimeUnit::Microsecond => {
+            let array = column
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            ValueRef::Timestamp(TimeUnit::Microsecond, array.value(row))
+        }
+        DataType::Timestamp(unit, _) if *unit == ArrowTimeUnit::Nanosecond => {
+            let array = column
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap();
+            ValueRef::Timestamp(TimeUnit::Nanosecond, array.value(row))
+        }
+        DataType::Date32 => {
+            let array = column.as_any().downcast_ref::<Date32Array>().unwrap();
+            ValueRef::Date32(array.value(row))
+        }
+        DataType::Time64(ArrowTimeUnit::Microsecond) => {
+            let array = column
+                .as_any()
+                .downcast_ref::<Time64MicrosecondArray>()
+                .unwrap();
+            ValueRef::Time64(TimeUnit::Microsecond, array.value(row))
+        }
+        DataType::Interval(unit) => match unit {
+            IntervalUnit::MonthDayNano => {
+                let array = column
+                    .as_any()
+                    .downcast_ref::<IntervalMonthDayNanoArray>()
+                    .unwrap();
+                let value = array.value(row);
+                ValueRef::Interval {
+                    months: value.months,
+                    days: value.days,
+                    nanos: value.nanoseconds,
+                }
+            }
+            other => unimplemented!("{other:?}"),
+        },
+        DataType::LargeList(..) => {
+            let arr = column.as_any().downcast_ref::<LargeListArray>().unwrap();
+            ValueRef::List(ListType::Large(arr), row)
+        }
+        DataType::List(..) => {
+            let arr = column.as_any().downcast_ref::<ListArray>().unwrap();
+            ValueRef::List(ListType::Regular(arr), row)
+        }
+        DataType::Dictionary(key_type, ..) => {
+            let column = column.as_any();
+            ValueRef::Enum(
+                match key_type.as_ref() {
+                    DataType::UInt8 => EnumType::UInt8(
+                        column.downcast_ref::<DictionaryArray<UInt8Type>>().unwrap(),
+                    ),
+                    DataType::UInt16 => EnumType::UInt16(
+                        column
+                            .downcast_ref::<DictionaryArray<UInt16Type>>()
+                            .unwrap(),
+                    ),
+                    DataType::UInt32 => EnumType::UInt32(
+                        column
+                            .downcast_ref::<DictionaryArray<UInt32Type>>()
+                            .unwrap(),
+                    ),
+                    typ => panic!("Unsupported key type: {typ:?}"),
+                },
+                row,
+            )
+        }
+        DataType::Struct(_) => {
+            let res = column.as_any().downcast_ref::<StructArray>().unwrap();
+            ValueRef::Struct(res, row)
+        }
+        DataType::Map(..) => {
+            let arr = column.as_any().downcast_ref::<MapArray>().unwrap();
+            ValueRef::Map(arr, row)
+        }
+        DataType::FixedSizeList(..) => {
+            let arr = column
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .unwrap();
+            ValueRef::Array(arr, row)
+        }
+        DataType::Union(..) => ValueRef::Union(column, row),
+        other => unreachable!("invalid value: {other:?}"),
+    }
 }
 
 /// Query rows on any connection as ordered JSON objects.

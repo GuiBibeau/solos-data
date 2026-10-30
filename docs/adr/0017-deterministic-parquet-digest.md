@@ -84,13 +84,18 @@ Production `decoded_at` is taken once per batch in the decoder service, not once
 row published from that batch shares the instant. The golden fixture replaces the batch clock
 with `2026-10-04T00:00:00.000Z`.
 
-The digest reads every registered row through a cursor, one row at a time, and never
-materializes the day as JSON. Each table is streamed twice under one lease: the first pass counts
-the distinct primary keys and refuses a repeated key in one batch, the second hashes the newest
-revision of every key in canonical order. The record still encodes the row count before the rows,
-so a cursor cannot rewind and the first pass carries the count. Memory is bounded by one row (plus
-DuckDB's own sort/window buffer for the canonical order), not by the day size. The duplicate-key
-refusal is detected across cursor boundaries, not per file.
+The digest reads every registered row through duckdb-rs 1.4.5's streaming iterator and never
+materializes the day as an arrow result in Rust. Each table is streamed twice under one lease: the
+first pass counts the distinct primary keys and refuses a repeated key in one batch, the second
+hashes the newest revision of every key in canonical order. The record still encodes the row count
+before the rows, so a cursor cannot rewind and the first pass carries the count. Both passes share
+one windowed query: `count(*) OVER (PARTITION BY key, batch_id)` supplies the same-batch duplicate
+refusal and `row_number() OVER (PARTITION BY key ORDER BY batch_id DESC)` keeps only the newest
+revision, so neither depends on two copies being adjacent in the canonical (slot) order. The
+connection sets `temp_directory`, and DuckDB's sort/window buffer is bounded by `memory_limit` and
+spills there; the synthetic-day `digest_rss` benchmark measures that buffer (~0.5-0.85 GiB at
+512MB `memory_limit` for 1M-20M rows, versus ~2.0-3.6 GiB materializing the same days), not the
+day size.
 
 The digest encoding changed when the schema and the length-prefixed fields replaced the earlier
 JSON concatenation (`63c06f73d2691e6d8bea9cb45a44505403002cc47fe2c001e376b095b889315d`). The

@@ -7,10 +7,13 @@
 //! schema slots and contribute omitted tags, not the clock or the raw-file byte hash. Footer
 //! `created_by` is not read.
 //!
-//! All six tables are read under one lease, from one catalog snapshot. Rows stream through a
-//! cursor one at a time: memory is bounded by one row, not the day (ADR-0017). The raw view
-//! keeps `batch_id`, so the digest itself drops older revisions and refuses a repeated primary
-//! key in one batch, across cursor boundaries.
+//! All six tables are read under one lease, from one catalog snapshot. The SQL keeps the
+//! canonical `sort_columns` order and adds window functions: `count(*) OVER (PARTITION BY key,
+//! batch_id)` refuses a repeated primary key in one batch, and `row_number() OVER (PARTITION BY
+//! key ORDER BY batch_id DESC)` keeps only the newest revision. Rows stream through duckdb-rs
+//! 1.4.5's streaming iterator (one DuckDB chunk at a time, never the day as a materialized arrow
+//! result); DuckDB's sort/window buffer is bounded by `memory_limit` and spills to
+//! `temp_directory` (measured by `digest_rss`).
 
 use super::canonical::{put_row, put_schema};
 use super::keys::reject;
@@ -22,9 +25,11 @@ use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// Stream one table's rows in canonical order (`sort_columns`, `batch_id DESC`) and pass the
-/// newest revision of each primary key to `on_new`. Older revisions are skipped, not hashed. A
-/// repeated primary key in one batch is refused, including when the two copies arrive in
-/// different cursor steps. Returns how many rows were passed (one per distinct key).
+/// newest revision of each primary key to `on_new`. The newest revision and the same-batch
+/// duplicate refusal are both computed in SQL (`key_rank` and `key_copies` below), not by
+/// comparing one row with the previous one: the sort is by slot, not by key, so two copies of
+/// one key are not adjacent. A NULL key is refused. Returns how many rows were passed (one per
+/// distinct key).
 fn stream_newest(
     session: &DecodedSession,
     sql: &str,
@@ -33,22 +38,19 @@ fn stream_newest(
     mut on_new: impl FnMut(&Obj) -> Result<(), StoreError>,
 ) -> Result<u64, StoreError> {
     let mut count = 0u64;
-    let mut prev_key: Option<String> = None;
-    let mut prev_batch: i64 = 0;
     session.stream(sql, |row| {
-        let value = row.str(key).unwrap_or("").to_owned();
-        let batch = row.int("batch_id").unwrap_or(0);
-        let repeated = prev_key.as_deref() == Some(value.as_str());
-        if repeated && batch == prev_batch {
+        let value = match row.str(key) {
+            Some(value) => value.to_owned(),
+            None => return Err(StoreError::Check(format!("NULL {key} in {table}"))),
+        };
+        if row.int("key_copies").unwrap_or(0) > 1 {
             // A repeated key in one batch is not a total order; the digest refuses it.
             return Err(reject(table, key, &value));
         }
-        if !repeated {
+        if row.int("key_rank").unwrap_or(0) == 1 {
             on_new(row)?;
             count += 1;
         }
-        prev_key = Some(value);
-        prev_batch = batch;
         Ok(())
     })?;
     Ok(count)
@@ -74,30 +76,37 @@ pub fn content_digest(root: &Path) -> Result<String, StoreError> {
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
+            // The window functions run over the inner block, which is ordered by the partition
+            // key so DuckDB streams the window instead of building a per-key hash table. The
+            // outer block re-establishes the canonical order the digest hashes. Both sorts spill
+            // to `temp_directory` under `memory_limit`.
             let sql = format!(
-                "SELECT {projection}, batch_id FROM {table}_raw ORDER BY {}, batch_id DESC",
+                "SELECT * FROM ( \
+                   SELECT {projection}, batch_id, \
+                     count(*) OVER (PARTITION BY {key}, batch_id) AS key_copies, \
+                     row_number() OVER (PARTITION BY {key} ORDER BY batch_id DESC) AS key_rank \
+                   FROM {table}_raw \
+                   ORDER BY {key}, batch_id DESC \
+                 ) AS windowed \
+                 ORDER BY {}, batch_id DESC",
                 sort_columns(table)
             );
             // First pass counts the distinct keys (the rows the digest hashes) and refuses a
             // duplicate; the count must precede the rows in the record, and a cursor cannot
-            // rewind, so the rows are streamed twice. Both passes hold one row, never the day.
+            // rewind, so the rows are streamed twice. Both passes use the same windowed SQL,
+            // so the count and the hashed rows agree by construction.
             let count = stream_newest(session, &sql, key, table, |_| Ok(()))?;
             record.extend_from_slice(&count.to_be_bytes());
             hasher.update(&record);
             if count == 0 {
                 continue;
             }
-            let hashed = stream_newest(session, &sql, key, table, |row| {
+            stream_newest(session, &sql, key, table, |row| {
                 let mut encoded = Vec::new();
                 put_row(&mut encoded, &columns, row).map_err(StoreError::Check)?;
                 hasher.update(&encoded);
                 Ok(())
             })?;
-            if hashed != count {
-                return Err(StoreError::Check(format!(
-                    "digest for {table} hashed {hashed} rows, expected {count}"
-                )));
-            }
         }
         Ok(hex::encode(hasher.finalize()))
     })
@@ -243,10 +252,9 @@ mod tests {
     }
 
     #[test]
-    fn a_duplicate_key_separated_by_other_rows_is_still_refused_while_streaming() {
-        // The two copies of `sig-a` sit in different files and are separated by many other rows;
-        // the streamed refusal has to carry the previous key across every cursor step, not just
-        // within one file or one in-memory batch.
+    fn a_duplicate_key_split_across_files_is_refused() {
+        // The two copies of `sig-a` sit in different files; the SQL window count has to see both
+        // copies regardless of which file or DuckDB chunk they arrive in.
         fn write_rows(path: &std::path::Path, rows: &[(String, i64)]) {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent).unwrap();
@@ -299,11 +307,31 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_key_in_one_batch_with_rows_between_is_refused() {
+        // `sig-a` appears at slots 10 and 20 with another row between them, so a previous-row
+        // comparison ordered by slot would miss it; the window count must not.
+        let dir = root_with(&[Sample {
+            path: "tables/decoded_transactions/epoch=0/a.parquet",
+            batch: 1,
+            rows: &[("sig-a", 10), ("sig-b", 15), ("sig-a", 20)],
+        }]);
+        let err = content_digest(&dir).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("duplicate signature sig-a in decoded_transactions"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_revision_in_a_later_batch_is_kept_and_the_older_one_is_not_hashed() {
+        // The two revisions carry different content (slot 10 vs 20) so that keeping the wrong
+        // revision (flipping `batch_id DESC` to `ASC`) changes the digest and fails this test.
         let latest = root_with(&[Sample {
             path: "tables/decoded_transactions/epoch=0/a.parquet",
             batch: 2,
-            rows: &[("sig-a", 10)],
+            rows: &[("sig-a", 20)],
         }]);
         let revised = root_with(&[
             Sample {
@@ -314,7 +342,7 @@ mod tests {
             Sample {
                 path: "tables/decoded_transactions/epoch=0/b.parquet",
                 batch: 2,
-                rows: &[("sig-a", 10)],
+                rows: &[("sig-a", 20)],
             },
         ]);
         assert_eq!(
@@ -324,5 +352,40 @@ mod tests {
         );
         std::fs::remove_dir_all(latest).unwrap();
         std::fs::remove_dir_all(revised).unwrap();
+    }
+
+    #[test]
+    fn a_null_primary_key_is_refused() {
+        let dir = std::env::temp_dir().join(format!("digest-null-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tables/decoded_transactions/epoch=0/a.parquet");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let conn = duckdb::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "COPY (SELECT NULL::VARCHAR AS signature, 'h' AS source_hash, 10::BIGINT AS slot,
+                0::INTEGER AS tx_index, false AS single_in_slot, 1::BIGINT AS block_time, true AS committed,
+                'decoded' AS status, 0::INTEGER AS event_count, 0::INTEGER AS error_count, 'src' AS source_file,
+                '2026-10-04T00:00:00.000Z' AS decoded_at, 'v' AS decoder_version)
+             TO {} (FORMAT PARQUET)",
+            sql_string(&path.to_string_lossy())
+        ))
+        .unwrap();
+        std::fs::write(
+            dir.join("catalog.json"),
+            serde_json::json!({ "files": [{
+                "path": "tables/decoded_transactions/epoch=0/a.parquet",
+                "table_name": "decoded_transactions",
+                "batch_id": 1
+            }] })
+            .to_string(),
+        )
+        .unwrap();
+        let err = content_digest(&dir).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("NULL signature in decoded_transactions"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

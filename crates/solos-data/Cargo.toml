@@ -15,6 +15,8 @@ path = "src/main.rs"
 phoenix-codec = { path = "../phoenix-codec" }
 solana-wire = { path = "../solana-wire" }
 duckdb = { version = "=1.4.5", features = ["bundled", "json", "parquet"] }
+# Decimal rendering in the streaming row path (same crate and version duckdb 1.4.5 uses).
+rust_decimal = "1.14"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

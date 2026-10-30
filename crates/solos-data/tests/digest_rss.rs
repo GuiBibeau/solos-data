@@ -1,18 +1,21 @@
 //! Peak-RSS benchmark for the streamed content digest (issue #67).
 //!
 //! `digest_peak_rss_on_10m_rows` is ignored in the normal suite: it builds a synthetic day of
-//! 10M `decoded_transactions` rows and re-runs this test binary in a child process that only
-//! computes the digest, so the child's peak RSS is the digest's own, not the generator's.
+//! `SOLOS_DIGEST_RSS_ROWS` `decoded_transactions` rows (default 10M) and re-runs this test
+//! binary in a child process that only computes the digest, so the child's peak RSS is the
+//! digest's own, not the generator's.
 //!
 //! Run it with:
 //!
 //! ```sh
-//! CC=gcc CXX=g++ cargo test --release --test digest_rss -- --ignored digest_peak_rss_on_10m_rows --nocapture
+//! CC=gcc CXX=g++ SOLOS_DIGEST_RSS_ROWS=10000000 cargo test --release --test digest_rss -- --ignored digest_peak_rss_on_10m_rows --nocapture
 //! ```
 //!
-//! The child bounds DuckDB's sort buffer with `SOLOS_DATA_QUERY_MEMORY` (default 4GB, set to
-//! 512MB here so the benchmark stays cheap and shows the spill path) while the digest itself
-//! holds one row at a time. The reported peak RSS is the child's `VmHWM`.
+//! The child bounds DuckDB's sort/window buffer with `SOLOS_DATA_QUERY_MEMORY` (default 4GB,
+//! set to 512MB here so the benchmark stays cheap and shows the spill path) and points
+//! `temp_directory` at a scratch directory, while the digest streams one DuckDB chunk at a time
+//! and never materializes the day as an arrow result. The reported peak RSS is the child's
+//! `VmHWM`.
 
 mod common;
 
@@ -94,10 +97,7 @@ fn digest_peak_rss_on_10m_rows() {
         .ok()
         .and_then(|text| text.parse().ok())
         .unwrap_or(DEFAULT_ROWS);
-    assert!(
-        rows >= DEFAULT_ROWS,
-        "the benchmark needs at least 10M rows"
-    );
+    assert!(rows > 0, "the benchmark needs at least one row");
     let dir = synthetic_day(rows);
     let exe = std::env::current_exe().unwrap();
     let memory = std::env::var("SOLOS_DIGEST_RSS_MEMORY").unwrap_or_else(|_| "512MB".into());
