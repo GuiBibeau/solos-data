@@ -1,7 +1,7 @@
 # ADR-0018: PR checks finish inside a five-minute budget when warm
 
 Status: accepted, October 30, 2026. Records the CI cache and gating scheme that keeps warm
-`pull_request` checks — a cache hit on main's cache — inside a five-minute budget and keeps the
+`pull_request` checks (a cache hit on main's cache) inside a five-minute budget and keeps the
 archive compile check off unrelated PRs. Cold, never-cached runs are slower; that is accepted
 (issue #68), and pull requests can pay it too.
 
@@ -45,7 +45,7 @@ archive compile check off unrelated PRs. Cold, never-cached runs are slower; tha
 - **`cargo nextest` and split test jobs were not adopted.** With main's cache restored, `cargo test`
   is already under the budget; the extra machinery bought nothing. The CI npm step also stops
   re-running `cargo test --workspace` (npm's `codec:test`) because the Rust suite already ran in
-  the job's own `cargo test` step — the same non-duplicative order `scripts/verify.sh` uses.
+  the job's own `cargo test` step, the same non-duplicative order `scripts/verify.sh` uses.
 - **`scripts/verify.sh` is unchanged.** The offline regression script keeps running the same
   checks in the same order; only the GitHub Actions cache keying, the archive-check gating and
   the CI npm step changed.
