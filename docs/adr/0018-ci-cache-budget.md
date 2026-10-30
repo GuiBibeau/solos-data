@@ -1,11 +1,16 @@
-# ADR-0018: PR checks finish inside a five-minute budget
+# ADR-0018: PR checks finish inside a five-minute budget when warm
 
-Status: accepted, October 30, 2026. Records the CI cache and gating scheme that keeps every
-`pull_request` check inside the three-minute warm budget and keeps the archive compile check off
-unrelated PRs, so no pull request waits on a 23-minute cold compile (issue #68).
+Status: accepted, October 30, 2026. Records the CI cache and gating scheme that keeps warm
+`pull_request` checks — a cache hit on main's cache — inside a five-minute budget and keeps the
+archive compile check off unrelated PRs. Cold, never-cached runs are slower; that is accepted
+(issue #68).
 
 ## Decision
 
+- **The target is a five-minute budget for warm runs.** A warm run is a cache hit on main's
+  cache; the measured warm run finishes in about three minutes. Cold, never-cached runs are
+  slower (about 22 minutes wall) and that is accepted: they are a one-time bootstrap paid by
+  main, not by pull requests.
 - **`fmt`, `clippy`, `test` and `archive-check` all keep running.** Nothing is dropped:
   `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
   `cargo test --workspace --locked` and the archive compile check
@@ -23,7 +28,7 @@ unrelated PRs, so no pull request waits on a 23-minute cold compile (issue #68).
   (`vendor/**`). Matching the crate's sources keeps archive-only callers honest: `spot/archive.rs`
   builds `SpotTx`, `Ix` and `Balance` from `spot/tx.rs`, and `venues/history/archive.rs` builds
   `Tx` from `venues/walk.rs`, so changing a shared type still compiles its archive caller. Every
-  other PR skips the whole job, which removes the 23-minute cold compile from the common case.
+  other PR skips the whole job, which removes the 22-minute cold compile from the common case.
 - **Every Rust job uses a shared cache key with a main-only save.** The three cargo jobs pass
   `shared-key` to Swatinem/rust-cache and `save-if: github.ref == 'refs/heads/main'`. Pull
   requests only restore; only pushes to main save, so a main merge is what keeps the cache warm.
@@ -33,7 +38,8 @@ unrelated PRs, so no pull request waits on a 23-minute cold compile (issue #68).
 - **`ci-ok` is the single required check.** It aggregates `fmt`, `clippy`, `test` and
   `archive-check`, and treats a skipped `archive-check` as a pass only when the `changes` job
   said no archive inputs changed. Branch protection must require `ci-ok`, not the individual
-  jobs, because GitHub does not accept a skipped required job.
+  jobs, because GitHub does not accept a skipped required job. `ci-ok` only protects merges once
+  branch protection requires it; Gui will set that up.
 - **`cargo nextest` and split test jobs were not adopted.** With main's cache restored, `cargo test`
   is already under the budget; the extra machinery bought nothing. The CI npm step also stops
   re-running `cargo test --workspace` (npm's `codec:test`) because the Rust suite already ran in
@@ -61,18 +67,19 @@ the live entry per shared-key is restored.
 ## Consequences
 
 - A PR that does not touch the archive inputs sees `fmt` (seconds), `clippy` and `test` restored
-  from main's warm cache (both under the three-minute warm budget), a skipped `archive-check`,
+  from main's warm cache (both under the five-minute warm budget), a skipped `archive-check`,
   and a green `ci-ok` that accepts that skip.
-- The one-time, never-cached ("cold") compile is a bootstrap cost that main pays, not PRs: with
-  no cache at all, `clippy` is about 11 minutes and `test` about 15 minutes on the standard
-  runner (measured on this PR's first run, which used a fresh cache key). A pull request only
-  ever goes cold when its own lockfile hash misses, and then Swatinem's restore key (which omits
-  the Cargo.lock hash) still restores main's cache and recompiles just the changed crates.
+- A cold, never-cached run does not meet the five-minute budget, and that is accepted. Measured
+  on a forced fresh-cache run (https://github.com/GuiBibeau/solos-data/actions/runs/41022348960):
+  `clippy` 14 m 6 s, `test` 16 m 48 s, `archive-check` 22 m 30 s, total wall 22 m 45 s. The warm
+  run (https://github.com/GuiBibeau/solos-data/actions/runs/41025154500) finished in about
+  3 minutes wall with `test` at 2 m 54 s. A pull request only ever goes cold when its own
+  lockfile hash misses, and then Swatinem's restore key (which omits the Cargo.lock hash) still
+  restores main's cache and recompiles just the changed crates.
 - A PR that does touch the archive inputs also runs `archive-check`, warm from main's cache
-  (about a minute). The only case that can exceed the budget is a PR that bumps the native
-  dependency versions themselves (RocksDB, DuckDB, protobuf or the agave crates), because those
-  C++ and Rust graphs genuinely must recompile; that recompilation is still a required check,
-  and main pays the same cost on merge.
+  (about a minute). A PR that bumps the native dependency versions themselves (RocksDB, DuckDB,
+  protobuf or the agave crates) recompiles those C++ and Rust graphs genuinely; that
+  recompilation is still a required check, and main pays the same cost on merge.
 - Cache writes happen only on main, so PR runs no longer churn the shared cache with
   near-duplicate entries. Each job's `shared-key` is the stable job name (`clippy`, `test`,
   `archive-check`); bump the suffix to start the cache fresh if the scheme ever changes.
