@@ -63,6 +63,10 @@ solos-data = { path = ".", features = ["failpoints"] }
 borsh = "1.7"
 toml = "0.5"
 
+[dev-dependencies]
+# Property-based tests for the range checker (offline; no fork/timeout so cases run in-process).
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+
 [features]
 default = []
 # The Old Faithful archive lane through Jetstreamer (heavy build: agave crates and RocksDB).
