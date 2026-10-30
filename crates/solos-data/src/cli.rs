@@ -1179,7 +1179,10 @@ fn failpoint_writer_cmd(args: &[String]) -> i32 {
         .unwrap_or(from);
     match crate::dev::failpoint_writer(&PathBuf::from(root), name, from, to) {
         Ok(()) => 0,
-        Err(_) => 1,
+        Err(error) => {
+            eprintln!("{}", safe_error(&error.to_string()));
+            1
+        }
     }
 }
 

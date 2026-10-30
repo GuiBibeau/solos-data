@@ -1052,6 +1052,38 @@ mod tests {
         assert_eq!(spot.totals.errors, 1, "the failure must be recorded");
         assert_eq!(spot.totals.error_streak, 1);
         assert!(spot.totals.last_error.is_some());
+
+        // The failed batch must not have registered files or advanced the cursor.
+        let (files, cursor) = spot
+            .db
+            .run_blocking(|store| {
+                let files = store.rows("SELECT count(*) AS n FROM files", &[])?;
+                Ok((files[0].int("n").unwrap_or(0), store.get("spot/cursor")?))
+            })
+            .unwrap();
+        assert_eq!(files, 0, "a failed batch must not register files");
+        assert!(
+            cursor.is_none(),
+            "a failed batch must not advance the cursor"
+        );
+
+        // With a valid writer the same batch commits and advances.
+        spot.config.writer_memory = "64MB".into();
+        let step = spot
+            .commit_or_retry(
+                0,
+                100,
+                Done {
+                    stream: Stream::default(),
+                    blocks: Blocks::default(),
+                    window: (0, 100),
+                    manifests: Vec::new(),
+                    seconds: 0.0,
+                },
+            )
+            .unwrap();
+        assert!(matches!(step, CommitStep::Advanced { .. }), "{step:?}");
+
         let store = thread.join(db);
         store.close().unwrap();
         let _ = std::fs::remove_dir_all(&root);

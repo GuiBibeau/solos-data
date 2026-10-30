@@ -122,6 +122,11 @@ fn sync_all(file: &File, fault: Option<FsyncFault>) -> io::Result<()> {
 #[cfg(feature = "failpoints")]
 static FAIL_FSYNC_PROCESS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// Serializes the process-wide arm: the one-shot swap-and-restore in [`sync_handle`] must not
+/// race another thread's swap of the same arm.
+#[cfg(feature = "failpoints")]
+static FAIL_FSYNC_PROCESS_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(feature = "failpoints")]
 fn step_code(step: FsyncStep) -> u8 {
     match step {
@@ -148,12 +153,18 @@ fn code_step(code: u8) -> Option<FsyncStep> {
 /// behind the `failpoints` feature.
 #[cfg(feature = "failpoints")]
 pub fn inject_fsync_failure_process(step: FsyncStep) {
+    let _guard = FAIL_FSYNC_PROCESS_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     FAIL_FSYNC_PROCESS.store(step_code(step), std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Clear the process-wide fsync failure.
 #[cfg(feature = "failpoints")]
 pub fn clear_fsync_failure_process() {
+    let _guard = FAIL_FSYNC_PROCESS_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     FAIL_FSYNC_PROCESS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -178,12 +189,17 @@ fn sync_handle(file: &File, step: FsyncStep) -> io::Result<()> {
     // `sync_all` wrap as a real or thread-local injected failure.
     let fault = fault.or_else(|| {
         use std::sync::atomic::Ordering;
-        let armed = code_step(FAIL_FSYNC_PROCESS.load(Ordering::Relaxed))
-            .is_some_and(|pending| pending == step || pending == FsyncStep::Any);
-        if armed {
-            FAIL_FSYNC_PROCESS.store(0, Ordering::Relaxed);
+        let _guard = FAIL_FSYNC_PROCESS_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let code = FAIL_FSYNC_PROCESS.swap(0, Ordering::Relaxed);
+        let matched =
+            code_step(code).is_some_and(|pending| pending == step || pending == FsyncStep::Any);
+        if matched {
             Some(FsyncFault::Generic)
         } else {
+            // A non-matching step must not consume the arm; put it back for the matching one.
+            FAIL_FSYNC_PROCESS.store(code, Ordering::Relaxed);
             None
         }
     });

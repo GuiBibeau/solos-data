@@ -56,5 +56,13 @@ fn run_capture_returns_the_lane_fatal_error() {
     clear_fsync_failure_process();
     let message = error.to_string();
     assert!(message.contains("fsync failed"), "{message}");
+    // The status loop may have written a running status, but the fatal path must not write the
+    // final status (the one marked `running: false`).
+    if let Ok(body) = std::fs::read_to_string(root.join("status-capture.json")) {
+        assert!(
+            !body.contains("\"running\":false"),
+            "a fatal lane must not write a final status: {body}"
+        );
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
