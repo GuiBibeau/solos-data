@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Nightly and manual runs keep the archive compile check (which no longer runs on
+  # every PR) and the shared caches warm; anything moved off PRs fails loudly here.
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -27,6 +32,12 @@ env:
 # and `cargo test` (test profile) resolve different libduckdb-sys build-script units, so a shared
 # target/ would still compile DuckDB twice: each Rust job keeps its own cache instead.
 # `archive-check` compiles DuckDB plus RocksDB, protobuf and the agave crates, and keeps its own.
+#
+# Every Rust job uses a shared cache key (Swatinem/rust-cache `shared-key`) with a main-only
+# save: only pushes to main (and manual dispatches, which seed and maintain the cache) write the
+# cache, while pull requests only restore. Swatinem/rust-cache's restore key omits the
+# Cargo.lock hash, so a PR that changes the lockfile still restores main's warm cache and
+# recompiles only the crates whose versions actually changed (ADR-0017).
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -48,7 +59,14 @@ jobs:
         with:
           toolchain: 1.96.0
           components: clippy
+      # `shared-key` is the stable shared prefix (equal to the automatic job id, so existing
+      # caches are reused); Swatinem's restore key omits the Cargo.lock hash, so a PR that
+      # changes the lockfile still restores main's warm cache. Only main and manual dispatches
+      # save; PRs only restore.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # DuckDB's objects are already archived in libduckdb.a; drop them before the cache is saved.
       # The build script reruns only when its inputs change, so nothing reads them again.
@@ -67,6 +85,9 @@ jobs:
         with:
           toolchain: 1.96.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
       - run: cargo test --workspace --locked
       # The npm suite runs on every push to main, and on a pull request that touches its inputs:
       # the TypeScript sources and tests, their config, the npm manifests, and the codec it spawns.
@@ -104,29 +125,57 @@ jobs:
   # `c++` fails that configure (no libstdc++), so the job pins gcc/g++. `cargo clippy` would
   # compile the same graph again with clippy-driver, and incremental compilation is off, so
   # this job only type-checks.
+  #
+  # It runs on every push to main, nightly and manual dispatches, and on a pull request only
+  # when the PR touches the archive code paths or the manifests that drive its build graph. On
+  # those PRs it restores main's warm cache (see the shared-key note above), so the heavy C++
+  # and agave crates are not rebuilt from scratch.
   archive-check:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
+      pull-requests: read
     env:
       CC: gcc
       CXX: g++
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: changes
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            archive:
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '**/Cargo.toml'
+              - 'vendor/**'
+              - 'crates/solos-data/src/**/archive.rs'
+              - 'crates/solos-data/src/stall.rs'
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
         with:
           toolchain: 1.96.0
       - name: Install archive build dependencies
+        if: github.event_name != 'pull_request' || steps.changes.outputs.archive == 'true'
         run: |
           sudo DEBIAN_FRONTEND=noninteractive apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang cmake libclang-dev pkg-config g++
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         id: cache
+        if: github.event_name != 'pull_request' || steps.changes.outputs.archive == 'true'
+        with:
+          shared-key: archive-check
+          save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch' }}
       - name: Record rust-cache
+        if: github.event_name != 'pull_request' || steps.changes.outputs.archive == 'true'
         run: echo "rust-cache hit=${{ steps.cache.outputs.cache-hit }}"
-      - run: cargo check -p solos-data --features archive --locked
+      - if: github.event_name != 'pull_request' || steps.changes.outputs.archive == 'true'
+        run: cargo check -p solos-data --features archive --locked
       # The static libraries already contain these objects. The build scripts rerun only when
       # their inputs change, so nothing reads the .o files again.
       - name: Prune native objects before caching
+        if: github.event_name != 'pull_request' || steps.changes.outputs.archive == 'true'
         run: |
           find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete
           find target -path '*/build/librocksdb-sys-*/out/*' -name '*.o' -delete
