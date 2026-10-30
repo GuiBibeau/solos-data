@@ -2,9 +2,12 @@
 //! cutover proof, and the offline fixture builders and checks the verification skill
 //! (`.cursor/skills/verify-solos-data`) drives through the real binary.
 
+use crate::augment::ledger::{self, Lane};
 use crate::decoder::schema::{TABLES, definition, key_column};
 use crate::decoder::source::source_path;
 use crate::jsonout::Obj;
+use crate::spot::archive::{Block, Stream};
+use crate::spot::run::{Blocks, Done, HISTORY, register_batch_to, write_batch_to};
 use crate::store::{StoreError, memory_connection, query_rows, query_scalar, sql_string};
 use duckdb::Connection;
 use serde_json::Value;
@@ -134,14 +137,11 @@ pub fn compare_decoded(left: &Path, right: &Path) -> Result<Obj, StoreError> {
         .with_obj("tables", report))
 }
 
-/// Per-table row counts and one content hash over every latest-revision row except the
-/// wall-clock `decoded_at`, for the verification skill's golden comparison. Row counts render
-/// as decimal strings, the store's convention.
-pub fn decoded_digest(root: &Path) -> Result<Obj, StoreError> {
-    let memory = std::env::var("SOLOS_DATA_QUERY_MEMORY").unwrap_or_else(|_| "4GB".into());
-    let conn = memory_connection("4", &memory)?;
+/// Per-table row counts over the latest-revision views, for the verification skill's golden
+/// comparison. Row counts render as decimal strings, the store's convention.
+fn decoded_rows(root: &Path) -> Result<Obj, StoreError> {
+    let conn = memory_connection("4", "4GB")?;
     let mut rows_report = Obj::new();
-    let mut content = String::new();
     for table in TABLES {
         register_decoded_view(&conn, root, table, table)?;
         rows_report.set(
@@ -152,51 +152,25 @@ pub fn decoded_digest(root: &Path) -> Result<Obj, StoreError> {
                 &[],
             )?,
         );
-        let exclude = if table == "decoded_transactions" {
-            " EXCLUDE(decoded_at)"
-        } else {
-            ""
-        };
-        let key = key_column(table);
-        let entries = query_rows(
-            &conn,
-            &format!(
-                "SELECT {key} AS key, to_json(struct_pack(*COLUMNS(* EXCLUDE({key})))) AS row_json
-                FROM (SELECT *{exclude} FROM {table}) ORDER BY {key}"
-            ),
-            &[],
-        )?;
-        for row in &entries {
-            content.push_str(row.str("key").unwrap_or(""));
-            content.push('\u{1f}');
-            content.push_str(row.str("row_json").unwrap_or("null"));
-            content.push('\n');
-        }
     }
-    Ok(Obj::new().with_obj("rows", rows_report).with(
-        "contentSha256",
-        crate::fsutil::sha256_hex(content.as_bytes()),
-    ))
+    Ok(rows_report)
 }
 
-/// Compare a decoded root against a golden JSON `{rows: {...}, contentSha256}` and report.
+/// Compare a decoded root against a golden JSON `{rows: {...}, contentSha256}` and report. The
+/// content hash is the canonical [`crate::decoder::digest::content_digest`] (ADR-0017), which
+/// hashes the schema and rows but omits `decoded_at` and `source_file` provenance.
 pub fn decoder_verify(root: &Path, golden: &Path) -> Result<Obj, StoreError> {
     let golden_text = std::fs::read_to_string(golden)?;
     let golden: Value =
         serde_json::from_str(&golden_text).map_err(|e| StoreError::Check(e.to_string()))?;
-    let actual = decoded_digest(root)?.to_value();
     let expected_rows = golden.get("rows").cloned().unwrap_or(Value::Null);
-    let actual_rows = actual.get("rows").cloned().unwrap_or(Value::Null);
+    let actual_rows = decoded_rows(root)?.to_value();
     let expected_sha = golden
         .get("contentSha256")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    let actual_sha = actual
-        .get("contentSha256")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_owned();
+    let actual_sha = crate::decoder::digest::content_digest(root)?;
     let rows_match = actual_rows == expected_rows;
     let sha_match = actual_sha == expected_sha;
     Ok(Obj::new()
@@ -220,6 +194,7 @@ pub fn version() -> Result<Obj, StoreError> {
 
 /// Build the raw fixture (`raw/catalog.json` plus `raw/staging/tx.parquet`) the real decoder
 /// consumes, from the repository's golden Phoenix transactions.
+#[cfg(any(debug_assertions, test))]
 pub fn make_decoder_fixture(out: &Path, fixtures_path: Option<&str>) -> Result<Obj, StoreError> {
     let text = std::fs::read_to_string(fixtures_path.unwrap_or("tests/data/phoenix-events.json"))?;
     let doc: Value = serde_json::from_str(&text).map_err(|e| StoreError::Check(e.to_string()))?;
@@ -237,6 +212,7 @@ pub fn make_decoder_fixture(out: &Path, fixtures_path: Option<&str>) -> Result<O
 
 /// Build the collector checkpoint the range-check journey validates, plus a `config.json` that
 /// points the repository collector config at it with a matching backfill chunk.
+#[cfg(any(debug_assertions, test))]
 pub fn make_range_fixture(out: &Path, chunk: i64, next: i64, gap: bool) -> Result<Obj, StoreError> {
     crate::fixtures::write_range_fixture(out, chunk, next, gap)?;
     let base_text = std::fs::read_to_string("config/phoenix.json")?;
@@ -257,45 +233,49 @@ pub fn make_range_fixture(out: &Path, chunk: i64, next: i64, gap: bool) -> Resul
         .with("gap", gap))
 }
 
-/// Decode every spot fixture through the RPC-shape decoder and compare the rows with the
-/// fixture's recorded rows. Exit non-zero (via `ok`) on any mismatch.
-pub fn spot_fixture_decode(fixtures_path: Option<&str>) -> Result<Obj, StoreError> {
+/// Decode every spot fixture through the RPC-shape decoder, compare the rows with the fixture's
+/// recorded rows, and publish them through the production durable write and watermark: the
+/// swaps, liquidity and batches Parquet files are written and registered in the spot-history
+/// ledger and the cursor is advanced. Exit non-zero (via `ok`) on any mismatch.
+pub fn spot_fixture_publish(fixtures_path: Option<&str>, root: &Path) -> Result<Obj, StoreError> {
     let text = std::fs::read_to_string(fixtures_path.unwrap_or("tests/data/spot-fixtures.json"))?;
-    let mut doc: Value =
-        serde_json::from_str(&text).map_err(|e| StoreError::Check(e.to_string()))?;
+    let doc: Value = serde_json::from_str(&text).map_err(|e| StoreError::Check(e.to_string()))?;
     let started = std::time::Instant::now();
     let programs = crate::spot::dex::Programs::all();
+    let mut rows = crate::spot::rows::Rows::new();
     let mut transactions = 0usize;
-    let mut swaps = 0usize;
-    let mut liquidity = 0usize;
     let mut mismatches: Vec<String> = Vec::new();
+    let mut blocks = std::collections::HashMap::new();
+    let mut delivered = std::collections::HashMap::new();
+    let mut min_slot = u64::MAX;
+    let mut max_slot = 0u64;
     let fixtures = doc
-        .get_mut("transactions")
-        .and_then(Value::as_array_mut)
+        .get("transactions")
+        .and_then(Value::as_array)
         .ok_or_else(|| StoreError::Check("spot fixtures have no transactions".into()))?;
     for t in fixtures {
+        let slot = t.get("slot").and_then(Value::as_u64).unwrap_or(0);
+        let index = u32::try_from(t.get("index").and_then(Value::as_u64).unwrap_or(0)).unwrap_or(0);
         transactions += 1;
         let tx = crate::spot::tx::from_rpc(
             t.get("tx_b64").and_then(Value::as_str).unwrap_or(""),
             &t["meta"],
-            t.get("slot").and_then(Value::as_u64).unwrap_or(0),
-            u32::try_from(t.get("index").and_then(Value::as_u64).unwrap_or(0)).unwrap_or(0),
+            slot,
+            index,
         )
         .map_err(StoreError::Check)?;
-        let mut rows = crate::spot::rows::Rows::new();
-        rows.add_tx(
+        let mut tx_rows = crate::spot::rows::Rows::new();
+        tx_rows.add_tx(
             &tx,
             &programs,
             &crate::spot::rows::named(&tx.keys, &programs),
         );
-        swaps += rows.swaps.len();
-        liquidity += rows.liquidity.len();
-        let got_swaps: Vec<Value> = rows
+        let got_swaps: Vec<Value> = tx_rows
             .swaps
             .iter()
             .map(crate::spot::rows::swap_json)
             .collect();
-        let got_liquidity: Vec<Value> = rows
+        let got_liquidity: Vec<Value> = tx_rows
             .liquidity
             .iter()
             .map(crate::spot::rows::liquidity_json)
@@ -308,19 +288,82 @@ pub fn spot_fixture_decode(fixtures_path: Option<&str>) -> Result<Obj, StoreErro
                     .to_owned(),
             );
         }
+        blocks
+            .entry(slot)
+            .or_insert(Block {
+                time: None,
+                executed: 0,
+            })
+            .executed += 1;
+        *delivered.entry(slot).or_default() += 1;
+        min_slot = min_slot.min(slot);
+        max_slot = max_slot.max(slot);
+        rows.append(tx_rows);
     }
-    let seconds = started.elapsed().as_secs_f64();
-    let rows = swaps + liquidity;
-    let rows_per_second = if seconds > 0.0 {
-        rows as f64 / seconds
-    } else {
-        0.0
+    let swaps = rows.swaps.len();
+    let liquidity = rows.liquidity.len();
+    let listed = blocks.len() as u64;
+    let done = Done {
+        stream: Stream {
+            rows,
+            blocks,
+            delivered,
+            sampled: Vec::new(),
+            captured: Vec::new(),
+        },
+        blocks: Blocks {
+            streamed: listed,
+            listed,
+            transactions: transactions as u64,
+        },
+        window: (min_slot, max_slot),
+        manifests: Vec::new(),
+        seconds: started.elapsed().as_secs_f64(),
     };
+    let files = write_batch_to(Lane::Spot, "2GB", root, (min_slot, max_slot), &done)?;
+    let next = min_slot.saturating_sub(1);
+    let cursor =
+        serde_json::json!({ "next": next, "done": true, "updatedAt": crate::jsonout::now() });
+    let mut store = ledger::open(root, Lane::Spot)?;
+    register_batch_to(
+        HISTORY,
+        &mut store,
+        root,
+        (min_slot, max_slot),
+        &files,
+        &cursor,
+    )?;
+    ledger::write_catalog(&mut store, root, Lane::Spot)?;
+    let status = Obj::new()
+        .with("at", crate::jsonout::now())
+        .with("lane", Lane::Spot.name())
+        .with("from", min_slot)
+        .with("to", max_slot)
+        .with("transactions", transactions)
+        .with("swaps", swaps)
+        .with("liquidity", liquidity)
+        .with("watermarkNext", next)
+        .with("files", files.len());
+    ledger::write_status(root, Lane::Spot, &status)?;
+    store.close()?;
+    let base_text = std::fs::read_to_string("config/spot-history.json")?;
+    let mut spot_config: Value =
+        serde_json::from_str(&base_text).map_err(|e| StoreError::Check(e.to_string()))?;
+    spot_config["dataDir"] =
+        Value::String(std::fs::canonicalize(root)?.to_string_lossy().into_owned());
+    std::fs::write(
+        root.join("config.json"),
+        serde_json::to_string_pretty(&spot_config).map_err(|e| StoreError::Check(e.to_string()))?,
+    )?;
     Ok(Obj::new()
         .with("ok", mismatches.is_empty())
         .with("transactions", transactions)
         .with("swaps", swaps)
         .with("liquidity", liquidity)
+        .with("watermarkNext", next)
+        .with("from", min_slot)
+        .with("to", max_slot)
+        .with("files", files.len())
         .with(
             "mismatches",
             Value::Array(
@@ -330,8 +373,25 @@ pub fn spot_fixture_decode(fixtures_path: Option<&str>) -> Result<Obj, StoreErro
                     .collect(),
             ),
         )
-        .with("decodeSeconds", (seconds * 1000.0).round() / 1000.0)
-        .with("rowsPerSecond", (rows_per_second * 100.0).round() / 100.0))
+        .with(
+            "decodeSeconds",
+            (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0,
+        ))
+}
+
+/// The collector checkpoint's backfill watermark (`backfill.next`), for the gap journey's
+/// assertion that a refused range check leaves it unchanged.
+pub fn collector_watermark(config_path: Option<&str>) -> Result<Obj, StoreError> {
+    let config = crate::collector::config::load_config(config_path)?;
+    let store = crate::store::Store::open_read_only(&config.data_dir)?;
+    let backfill = store.get("backfill")?;
+    let next = backfill
+        .as_ref()
+        .and_then(|v| v.get("next"))
+        .and_then(Value::as_i64);
+    Ok(Obj::new()
+        .with("next", next)
+        .with("backfill", backfill.unwrap_or(Value::Null)))
 }
 
 /// Test fixture for crash recovery: commit one row and one key, leave a second transaction

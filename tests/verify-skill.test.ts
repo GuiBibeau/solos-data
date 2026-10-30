@@ -1,47 +1,79 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  DATA_DIR_OVERRIDES,
-  dataDirOverridesIn,
-  subprocessEnv,
-} from '../.cursor/skills/verify-solos-data/env.mjs';
+import { spawnSync } from 'node:child_process';
+import { dangerousEnvNames, subprocessEnv } from '../.cursor/skills/verify-solos-data/env.mjs';
 
-test('verify-solos-data doctor detects data-directory overrides', () => {
-  assert.deepEqual(DATA_DIR_OVERRIDES, [
+test('verify-solos-data doctor detects every journey-redirecting or credential env var', () => {
+  assert.deepEqual(dangerousEnvNames(undefined), []);
+  assert.deepEqual(dangerousEnvNames({}), []);
+  assert.deepEqual(dangerousEnvNames({ SOLOS_DATA_DIR: '', SOLOS_DATA_DECODED_DIR: '/real/decoded' }), [
+    'SOLOS_DATA_DECODED_DIR',
+  ]);
+  const dangerous = [
     'SOLOS_DATA_DIR',
     'SOLOS_DATA_RAW_DIR',
     'SOLOS_DATA_DECODED_DIR',
+    'SOLOS_DATA_CONFIG',
+    'SOLOS_DATA_AUGMENT_DIR',
+    'SOLOS_DATA_DB_CHECKPOINT',
+    'SOLANA_RPC_URL',
+    'HELIUS_RPC_ENDPOINT',
+    'PROVIDER_URL',
+    'ELFA_API_KEY',
+    'JETSTREAMER_THREADS',
+    'JETSTREAMER_ENDPOINT',
+  ];
+  assert.deepEqual(
+    dangerousEnvNames(Object.fromEntries(dangerous.map((name) => [name, 'x']))).sort(),
+    [...dangerous].sort(),
+  );
+  // Empty values are not exported by a shell and are ignored.
+  assert.deepEqual(dangerousEnvNames({ SOLANA_RPC_URL: '', JETSTREAMER_THREADS: '4' }), [
+    'JETSTREAMER_THREADS',
   ]);
-  assert.deepEqual(dataDirOverridesIn(undefined), []);
-  assert.deepEqual(dataDirOverridesIn({}), []);
-  assert.deepEqual(
-    dataDirOverridesIn({ SOLOS_DATA_DIR: '', SOLOS_DATA_DECODED_DIR: '/real/decoded' }),
-    ['SOLOS_DATA_DECODED_DIR'],
-  );
-  assert.deepEqual(
-    dataDirOverridesIn({
-      SOLOS_DATA_DIR: '/real/raw',
-      SOLOS_DATA_RAW_DIR: '/real/raw',
-      SOLOS_DATA_DECODED_DIR: '/real/decoded',
-    }),
-    ['SOLOS_DATA_DIR', 'SOLOS_DATA_RAW_DIR', 'SOLOS_DATA_DECODED_DIR'],
-  );
 });
 
-test('verify-solos-data subprocess environment is scrubbed of data-directory overrides', () => {
+test('verify-solos-data subprocess env is an allowlist, proven by a real child process', () => {
   const env = {
-    SOLOS_DATA_DIR: '/real/raw',
-    SOLOS_DATA_RAW_DIR: '/real/raw',
-    SOLOS_DATA_DECODED_DIR: '/real/decoded',
-    SOLOS_DATA_QUERY_MEMORY: '1GB',
+    // The names the allowlist keeps.
+    PATH: '/usr/bin:/bin',
+    HOME: '/home/verify',
+    TMPDIR: '/tmp',
+    LANG: 'C.UTF-8',
+    RUSTUP_HOME: '/opt/rustup',
     CARGO_TARGET_DIR: '/tmp/target',
-    CC: 'gcc',
+    CARGO_PROFILE_DEV_DEBUG: '0',
+    // Names the allowlist must drop.
+    SOLOS_DATA_DIR: '/real/raw',
+    SOLOS_DATA_CONFIG: '/real/config.json',
+    SOLOS_DATA_AUGMENT_DIR: '/real/augment',
+    SOLOS_DATA_DB_CHECKPOINT: '1GB',
+    SOLANA_RPC_URL: 'https://secret.example',
+    SOME_RPC_ENDPOINT: 'https://secret.example',
+    PROVIDER_URL: 'https://secret.example',
+    ELFA_API_KEY: 'secret-key',
+    JETSTREAMER_THREADS: '16',
+    JETSTREAMER_ENDPOINT: 'https://secret.example',
+    CC: 'clang',
+    NODE_OPTIONS: '--throw-deprecation',
   };
-  const cleaned = subprocessEnv(env);
-  for (const name of DATA_DIR_OVERRIDES) {
-    assert.equal(name in cleaned, false, `${name} must be removed`);
+  const res = spawnSync(
+    process.execPath,
+    ['-e', 'process.stdout.write(JSON.stringify(Object.keys(process.env).sort()))'],
+    { env: subprocessEnv(env), encoding: 'utf8' },
+  );
+  assert.equal(res.status, 0, res.stderr);
+  const names = JSON.parse(res.stdout);
+
+  // The allowlist survives.
+  for (const name of ['PATH', 'HOME', 'TMPDIR', 'LANG', 'RUSTUP_HOME', 'CARGO_TARGET_DIR']) {
+    assert.ok(names.includes(name), `${name} must survive the allowlist`);
   }
-  assert.equal(cleaned.SOLOS_DATA_QUERY_MEMORY, '1GB');
-  assert.equal(cleaned.CARGO_TARGET_DIR, '/tmp/target');
-  assert.equal(cleaned.CC, 'gcc');
+  // Nothing that could redirect a journey or leak a credential survives.
+  for (const name of names) {
+    assert.doesNotMatch(name, /^SOLOS_DATA_|_RPC_|_API_KEY$|^JETSTREAMER_/, `${name} must not survive`);
+  }
+  assert.ok(!names.includes('PROVIDER_URL'), 'PROVIDER_URL must not survive');
+  assert.ok(!names.includes('CC'), 'CC must not survive the allowlist');
+  assert.ok(!names.includes('NODE_OPTIONS'), 'NODE_OPTIONS must not survive');
 });

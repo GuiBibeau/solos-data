@@ -51,8 +51,10 @@ binary through the golden fixtures:
 node .cursor/skills/verify-solos-data/run.mjs
 ```
 
-It drives the release `solos-data` binary through four offline journeys (fixture raw decode
+It builds `target/debug/solos-data`, runs four offline journeys (fixture raw decode
 against a golden row count and hash, a query over the fixture catalog, a watermark/range check
-that refuses on a gap fixture, and a spot fixture decode), prints `PASS` or `FAIL`, and leaves
-reviewable evidence in `target/verify-evidence/`. See
+that refuses on a gap fixture and leaves the watermark unchanged, and a spot fixture publish
+through the durable write and watermark), prints `PASS` or `FAIL`, and leaves
+reviewable evidence in `target/verify-evidence/`. The feature map lives under
+`.cursor/skills/verify-solos-data/features/`. See
 `.cursor/skills/verify-solos-data/SKILL.md`.

@@ -1,31 +1,44 @@
 // Environment isolation for the offline verify skill.
 //
-// The `solos-data` binary gives data-directory overrides from the environment precedence over a
-// config file's `dataDir`/`rawDir` fields (see `load_decoder_config` in
-// crates/solos-data/src/cli.rs and `load_config` in crates/solos-data/src/collector/config.rs).
-// A parent shell that exports SOLOS_DATA_DIR, SOLOS_DATA_RAW_DIR or SOLOS_DATA_DECODED_DIR would
-// therefore silently redirect the offline journeys away from their fixtures and into a real data
-// directory. Every subprocess the skill spawns is scrubbed of these overrides, and the doctor
-// refuses to start when the invoking shell exported any of them.
+// The `solos-data` binary reads many configuration knobs from the environment: the data
+// directories (`SOLOS_DATA_DIR`, `SOLOS_DATA_RAW_DIR`, `SOLOS_DATA_DECODED_DIR`), the
+// collector config path (`SOLOS_DATA_CONFIG`), the augment root (`SOLOS_DATA_AUGMENT_DIR`),
+// DuckDB settings (`SOLOS_DATA_DB_*`), provider URLs and keys (`SOLANA_RPC_URL`,
+// `*_RPC_ENDPOINT`, `PROVIDER_URL`, `ELFA_API_KEY`) and the archive (`JETSTREAMER_*`). A
+// parent shell that exports any of them would silently redirect the offline journeys away from
+// their fixtures, or leak a credential into a child. So every subprocess the skill spawns runs
+// with an allowlist: only the names the build genuinely needs survive, and everything else —
+// including every data-directory, provider and archive override — is dropped. The doctor
+// refuses to start when the invoking shell exported any name that could redirect a journey.
 
-export const DATA_DIR_OVERRIDES = [
-  'SOLOS_DATA_DIR',
-  'SOLOS_DATA_RAW_DIR',
-  'SOLOS_DATA_DECODED_DIR',
-];
+// Whole names that subprocesses may keep.
+const ALLOWED_NAMES = new Set(['PATH', 'HOME', 'TMPDIR', 'LANG']);
 
-/** Names from DATA_DIR_OVERRIDES that are set to a non-empty value in `env`. */
-export function dataDirOverridesIn(env) {
-  return DATA_DIR_OVERRIDES.filter(
-    (name) => env !== undefined && env !== null && env[name] !== undefined && env[name] !== '',
+// Prefixes that subprocesses may keep: cargo needs CARGO_* (including CARGO_TARGET_DIR, which
+// the skill sets to the repository's target/ directory) and rustup needs RUSTUP_*.
+const ALLOWED_PREFIXES = ['CARGO_', 'RUSTUP_'];
+
+function allowed(name) {
+  return ALLOWED_NAMES.has(name) || ALLOWED_PREFIXES.some((prefix) => name.startsWith(prefix));
+}
+
+// A name that could redirect a journey or leak a credential. Used by the doctor and by the
+// subprocess allowlist test; the allowlist itself is broader (it keeps only ALLOWED_*).
+const DANGEROUS = /^SOLOS_DATA_|(^|_)RPC_(URL|ENDPOINT|HOST)$|^PROVIDER_URL$|_API_KEY$|^JETSTREAMER_/;
+
+/** Names in `env` set to a non-empty value that could redirect a journey or leak a credential. */
+export function dangerousEnvNames(env) {
+  const names = Object.keys(env ?? {});
+  return names.filter(
+    (name) => env[name] !== undefined && env[name] !== '' && DANGEROUS.test(name),
   );
 }
 
-/** A copy of `env` with every data-directory override removed, leaving other variables intact. */
+/** A copy of `env` reduced to the build allowlist, dropping every override and credential. */
 export function subprocessEnv(env = process.env) {
-  const cleaned = { ...env };
-  for (const name of DATA_DIR_OVERRIDES) {
-    delete cleaned[name];
+  const cleaned = {};
+  for (const name of Object.keys(env)) {
+    if (allowed(name)) cleaned[name] = env[name];
   }
   return cleaned;
 }

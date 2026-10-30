@@ -1,6 +1,4 @@
-export declare const DATA_DIR_OVERRIDES: readonly string[];
-
-export declare function dataDirOverridesIn(
+export declare function dangerousEnvNames(
   env: Record<string, string | undefined> | undefined | null,
 ): string[];
 

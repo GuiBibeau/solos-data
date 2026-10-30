@@ -9,6 +9,7 @@ pub mod db;
 pub mod decoder;
 pub mod dev;
 pub mod failpoints;
+#[cfg(any(debug_assertions, test))]
 pub mod fixtures;
 pub mod fsutil;
 pub mod gc;

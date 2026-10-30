@@ -1242,6 +1242,7 @@ fn dev(args: &[String]) -> i32 {
             })
         }
         "version" => crate::dev::version().map(|report| (report, true)),
+        #[cfg(any(debug_assertions, test))]
         "make-decoder-fixture" => {
             let Some(out) = flag(args, "--out") else {
                 eprintln!(
@@ -1255,6 +1256,7 @@ fn dev(args: &[String]) -> i32 {
             crate::dev::make_decoder_fixture(&PathBuf::from(out), flag(args, "--fixtures"))
                 .map(|report| (report, true))
         }
+        #[cfg(any(debug_assertions, test))]
         "make-range-fixture" => {
             let Some(out) = flag(args, "--out") else {
                 eprintln!(
@@ -1275,11 +1277,25 @@ fn dev(args: &[String]) -> i32 {
             crate::dev::make_range_fixture(&PathBuf::from(out), chunk, next, gap)
                 .map(|report| (report, true))
         }
-        "spot-fixture-decode" => {
-            crate::dev::spot_fixture_decode(flag(args, "--fixtures")).map(|report| {
-                let ok = report.get("ok") == Some(&Value::Bool(true));
-                (report, ok)
-            })
+        "spot-fixture-publish" => {
+            let Some(root) = flag(args, "--root") else {
+                eprintln!(
+                    "{}",
+                    Obj::new()
+                        .with("error", "spot-fixture-publish requires --root <dir>")
+                        .to_json()
+                );
+                return 1;
+            };
+            crate::dev::spot_fixture_publish(flag(args, "--fixtures"), &PathBuf::from(root)).map(
+                |report| {
+                    let ok = report.get("ok") == Some(&Value::Bool(true));
+                    (report, ok)
+                },
+            )
+        }
+        "collector-watermark" => {
+            crate::dev::collector_watermark(flag(args, "--config")).map(|report| (report, true))
         }
         "decoder-verify" => {
             let (Some(root), Some(golden)) = (flag(args, "--root"), flag(args, "--golden")) else {
@@ -1315,12 +1331,18 @@ fn dev(args: &[String]) -> i32 {
                 "compare-decoded --left <root> --right <root>",
                 "archive-check --from <slot> --to <slot> [--config path]",
                 "version (binary and DuckDB versions)",
-                "make-decoder-fixture --out <dir> [--fixtures path]",
-                "make-range-fixture --out <dir> [--chunk 100] [--next 5000] [--gap]",
-                "spot-fixture-decode [--fixtures path]",
+            ];
+            #[cfg(any(debug_assertions, test))]
+            {
+                commands.push("make-decoder-fixture --out <dir> [--fixtures path]");
+                commands.push("make-range-fixture --out <dir> [--chunk 100] [--next 5000] [--gap]");
+            }
+            commands.extend([
+                "spot-fixture-publish --root <dir> [--fixtures path]",
+                "collector-watermark --config <path>",
                 "decoder-verify --root <decoded dir> --golden <file>",
                 "crash-writer --root <root> (test fixture)",
-            ];
+            ]);
             #[cfg(feature = "failpoints")]
             commands.push(
                 "failpoint-writer --root <root> --failpoint <name> [--from <slot> --to <slot>] (test fixture)",
