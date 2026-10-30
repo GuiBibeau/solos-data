@@ -94,3 +94,15 @@ market data for the Phoenix markets (Binance futures dumps, Hyperliquid funding,
 Deribit DVOL, DefiLlama stablecoins) into Parquet next to the dataset (ADR-0009). For development, use Rust 1.96: `cargo test --workspace`.
 The code is [MIT licensed](LICENSE). This repo contains code and test fixtures;
 collected data is stored separately.
+
+## Crash-safety testing
+
+Two offline loops kill the real binary and check the restart predicate (ADR-0016).
+The matrix (`cargo test --test failpoints`) kills at seven named publication points;
+the nightly loop (`cargo test --test nightly_random_kill -- --ignored --nocapture`,
+ADR-0018) kills at a seeded random point over 200-500 iterations and asserts the
+byte-identical re-run. Each iteration logs its seed; replay one with:
+
+```sh
+SOLOS_DATA_NIGHTLY_SEED=<seed> cargo test --test nightly_random_kill -- --ignored --nocapture
+```

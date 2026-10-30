@@ -1,0 +1,61 @@
+name: nightly-random-kill
+
+on:
+  # Nightly, and manually re-runnable. Not part of per-PR CI (issue #61): the loop is long and
+  # exercises crash orderings over hundreds of iterations, so it runs on a schedule instead of on
+  # every pull request.
+  schedule:
+    - cron: '37 3 * * *'
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: 'Number of kill iterations (200-500)'
+        required: true
+        default: '200'
+        type: string
+      seed:
+        description: 'Starting seed (each iteration logs its own seed)'
+        required: false
+        default: '0'
+        type: string
+      kill:
+        description: 'Kill trigger: bytes (default, deterministic) or delay'
+        required: false
+        default: 'bytes'
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-random-kill
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # No debuginfo: same code, same opt-levels, same tests; DuckDB's C++ compiles without -g,
+  # which is faster and smaller to cache.
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+  CC: gcc
+  CXX: g++
+
+jobs:
+  random-kill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Run the nightly random-kill loop
+        env:
+          SOLOS_DATA_NIGHTLY_ITERATIONS: ${{ github.event.inputs.iterations || '200' }}
+          SOLOS_DATA_NIGHTLY_SEED: ${{ github.event.inputs.seed || '0' }}
+          SOLOS_DATA_NIGHTLY_KILL: ${{ github.event.inputs.kill || 'bytes' }}
+        run: cargo test --test nightly_random_kill -- --ignored --nocapture
+      - name: Prune DuckDB objects before caching
+        run: find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete
