@@ -813,7 +813,12 @@ pub fn run(config: SpotConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError>
                         done = lo <= spot.floor;
                     }
                     Err(error) => {
-                        spot.record_error(&error.to_string());
+                        let message = error.to_string();
+                        // A failed fsync is fatal (ADR-0016): exit, never retry the batch.
+                        if crate::db::fatal_class(&message).is_some() {
+                            return Err(error);
+                        }
+                        spot.record_error(&message);
                         runtime.block_on(spot.pause(RETRY_SECONDS));
                     }
                 },

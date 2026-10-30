@@ -1204,6 +1204,19 @@ fn dev(args: &[String]) -> i32 {
                 Err(_) => 1,
             };
         }
+        "failpoint-writer" => {
+            // Test fixture (issue #56): publish a range with one kill point armed.
+            let (Some(root), Some(name)) = (flag(args, "--root"), flag(args, "--failpoint"))
+            else {
+                return 1;
+            };
+            let from = flag(args, "--from").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+            let to = flag(args, "--to").and_then(|v| v.parse::<i64>().ok()).unwrap_or(from);
+            return match crate::dev::failpoint_writer(&PathBuf::from(root), name, from, to) {
+                Ok(()) => 0,
+                Err(_) => 1,
+            };
+        }
         _ => {
             println!(
                 "{}",
@@ -1213,7 +1226,8 @@ fn dev(args: &[String]) -> i32 {
                         json!([
                             "compare-decoded --left <root> --right <root>",
                             "archive-check --from <slot> --to <slot> [--config path]",
-                            "crash-writer --root <root> (test fixture)"
+                            "crash-writer --root <root> (test fixture)",
+                            "failpoint-writer --root <root> --failpoint <name> [--from <slot> --to <slot>] (test fixture)"
                         ])
                     )
                     .to_json()

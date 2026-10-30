@@ -18,7 +18,7 @@ use super::series::{Ctx, Outcome, budget_bytes};
 use crate::db::Db;
 use crate::jsonout::{Obj, log, now};
 use crate::store::StoreError;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -165,6 +165,21 @@ pub fn run_capture(config: &AugmentConfig, stop: Arc<AtomicBool>) -> Result<Obj,
         );
     });
     let lanes = (elfa_lane.as_ref(), auto_lane.as_ref());
+    // A failed fsync ends the lane (ADR-0016): report it and exit without a retry.
+    let fatal = {
+        let guard = totals.lock().expect("totals");
+        guard
+            .candles
+            .fatal
+            .clone()
+            .or_else(|| guard.contexts.fatal.clone())
+            .or_else(|| guard.elfa.fatal.clone())
+    };
+    if let Some(error) = fatal {
+        let store = thread.join(db);
+        store.close()?;
+        return Err(StoreError::Check(error));
+    }
     let status = write_status(&ctx, &totals, &started_at, lanes, true)?;
     let store = thread.join(db);
     store.close()?;
@@ -225,6 +240,10 @@ async fn candle_loop(ctx: &Ctx, lane: Option<&CandleLane>, interval: u64, totals
             guard.candles.add(&outcome);
             guard.cycles.set("candlesAt", now());
         }
+        if outcome.fatal.is_some() {
+            ctx.stop.store(true, Ordering::Relaxed);
+            return;
+        }
         pause(ctx, interval.max(60)).await;
     }
 }
@@ -261,6 +280,10 @@ async fn context_loop(
             let outcome = contexts::flush(ctx, lane, now_ms()).await;
             totals.lock().expect("totals").contexts.add(&outcome);
             last_flush = tokio::time::Instant::now();
+            if outcome.fatal.is_some() {
+                ctx.stop.store(true, Ordering::Relaxed);
+                return;
+            }
         }
         pause(ctx, interval.max(10)).await;
     }
@@ -277,6 +300,10 @@ async fn elfa_loop(ctx: &Ctx, lane: Option<&ElfaLane>, interval: u64, totals: &M
             guard.elfa.add(&outcome);
             guard.cycles.set("elfaAt", now());
         }
+        if outcome.fatal.is_some() {
+            ctx.stop.store(true, Ordering::Relaxed);
+            return;
+        }
         pause(ctx, interval.max(60)).await;
     }
 }
@@ -292,6 +319,10 @@ async fn events_loop(ctx: &Ctx, lane: Option<&ElfaLane>, interval: u64, totals: 
             let mut guard = totals.lock().expect("totals");
             guard.elfa.add(&outcome);
             guard.cycles.set("elfaEventsAt", now());
+        }
+        if outcome.fatal.is_some() {
+            ctx.stop.store(true, Ordering::Relaxed);
+            return;
         }
         pause(ctx, interval.max(30)).await;
     }

@@ -14,7 +14,7 @@ use super::http::{Http, with_query};
 use super::ledger::{get_progress, register};
 use super::parquet::{Target, read_json_array, stage_json, write_merged};
 use super::periods::{Granularity, Period, date_of_ms};
-use super::series::{Ctx, Outcome};
+use super::series::{Ctx, Outcome, is_fatal};
 use crate::jsonout::{Obj, log, now, safe_error};
 use crate::store::StoreError;
 use serde_json::{Value, json};
@@ -332,6 +332,10 @@ pub async fn poll_events(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
             outcome.add(&result);
         }
         Err(error) => {
+            if is_fatal(&error) {
+                outcome.fatal = Some(error.to_string());
+                return outcome;
+            }
             lane.poll.errors.fetch_add(1, Ordering::Relaxed);
             outcome.errors += 1;
             log_error(Stream::Events, "poll", &error.to_string());
@@ -383,6 +387,10 @@ pub async fn cycle(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
         match pulled {
             Ok(result) => outcome.add(&result),
             Err(error) => {
+                if is_fatal(&error) {
+                    outcome.fatal = Some(error.to_string());
+                    break;
+                }
                 outcome.errors += 1;
                 log_error(stream, "cycle", &error.to_string());
             }

@@ -252,6 +252,11 @@ impl Store {
             timings: Vec::new(),
         };
         store.exec_batch(ddl)?;
+        // Crash-safety matrix (issue #56): the harness forces tiny WAL autocheckpoints so kills
+        // land on both sides of a checkpoint. Production leaves the DuckDB default alone.
+        if let Ok(value) = std::env::var("SOLOS_DATA_WAL_AUTOCHECKPOINT") {
+            store.exec_batch(&format!("SET wal_autocheckpoint = '{value}'"))?;
+        }
         Ok(store)
     }
 

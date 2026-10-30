@@ -125,6 +125,9 @@ pub struct Outcome {
     pub disabled: Option<String>,
     /// How the source ran when it ran partly (Tardis.dev without a key: samples only).
     pub note: Option<String>,
+    /// A fatal error (a failed fsync, ADR-0016) that must end the lane instead of being
+    /// counted and retried.
+    pub fatal: Option<String>,
 }
 
 impl Outcome {
@@ -144,6 +147,9 @@ impl Outcome {
         self.errors += other.errors;
         self.skipped += other.skipped;
         self.requests += other.requests;
+        if self.fatal.is_none() {
+            self.fatal.clone_from(&other.fatal);
+        }
     }
 
     /// As a JSON object.
@@ -172,6 +178,13 @@ pub fn budget_bytes(gb: f64) -> i64 {
         return 0;
     }
     (gb * 1e9).min(i64::MAX as f64) as i64
+}
+
+/// Whether an error must end the lane rather than be counted and retried (ADR-0016: a failed
+/// fsync is fatal).
+#[must_use]
+pub fn is_fatal(error: &StoreError) -> bool {
+    crate::db::fatal_class(&error.to_string()).is_some()
 }
 
 /// Progress key of a series.
@@ -263,7 +276,12 @@ pub async fn sync_series(ctx: &Ctx, series: &dyn Series) -> Outcome {
             }
             Err(error) => {
                 log_error(series, &period.label(), &error.to_string());
-                outcome.errors += 1;
+                if is_fatal(&error) {
+                    // A failed fsync ends the lane instead of being counted (ADR-0016).
+                    outcome.fatal = Some(error.to_string());
+                } else {
+                    outcome.errors += 1;
+                }
                 break;
             }
         }

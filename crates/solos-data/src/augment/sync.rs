@@ -88,6 +88,10 @@ pub fn run_sync(
         totals.add(outcome);
         per_source.set_obj(name, outcome.to_obj());
     }
+    // A failed fsync ends the lane instead of being counted and retried (ADR-0016).
+    if let Some(error) = &totals.fatal {
+        return Err(StoreError::Check(error.clone()));
+    }
     let root = config.data_dir.clone();
     let summary = db.run_blocking(move |store| {
         ledger::write_catalog(store, &root, Lane::Sync)?;

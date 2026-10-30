@@ -221,11 +221,11 @@ async fn an_fsync_failure_ends_the_lane_and_does_not_retry() {
     let root = f.root.clone();
     let error =
         f.db.run_blocking(move |store| {
-            solos_data::fsutil::inject_fsync_failure(true);
+            solos_data::fsutil::inject_fsync_failure(solos_data::fsutil::FsyncStep::Any);
             struct Clear;
             impl Drop for Clear {
                 fn drop(&mut self) {
-                    solos_data::fsutil::inject_fsync_failure(false);
+                    solos_data::fsutil::clear_fsync_failure();
                 }
             }
             let _clear = Clear;
@@ -258,4 +258,74 @@ async fn an_fsync_failure_ends_the_lane_and_does_not_retry() {
     assert_eq!(f.scalar("SELECT count(*) AS n FROM published_ranges"), "0");
     assert!(f.get("W").is_none());
     f.close();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_fsync_failure_on_the_temp_file_ends_the_lane_and_does_not_retry() {
+    let f = Fixture::new();
+    insert_tx(&f, "sig", 100);
+    let root = f.root.clone();
+    let error = fsync_failure(&f, &root, solos_data::fsutil::FsyncStep::TempFile);
+    let message = error.to_string();
+    assert!(message.contains("fsync failed"), "{message}");
+    assert_eq!(fatal_class(&message), Some("fsync"));
+    let lanes = Lanes::new(true, true);
+    let (hook, calls) = recorder();
+    assert!(lane_error(&f.db, "fixture", &lanes, "tail", &error, &hook).await);
+    assert_eq!(*calls.lock().unwrap(), vec![("tail".to_owned(), "fsync")]);
+    assert_eq!(f.scalar("SELECT count(*) AS n FROM errors"), "0");
+    assert_eq!(f.scalar("SELECT count(*) AS n FROM published_ranges"), "0");
+    assert!(f.get("W").is_none());
+    f.close();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_fsync_failure_on_the_epoch_directory_after_rename_ends_the_lane_and_does_not_retry() {
+    let f = Fixture::new();
+    insert_tx(&f, "sig", 100);
+    let root = f.root.clone();
+    let error = fsync_failure(&f, &root, solos_data::fsutil::FsyncStep::DirAfterRename);
+    let message = error.to_string();
+    assert!(message.contains("fsync failed"), "{message}");
+    assert_eq!(fatal_class(&message), Some("fsync"));
+    let lanes = Lanes::new(true, true);
+    let (hook, calls) = recorder();
+    assert!(lane_error(&f.db, "fixture", &lanes, "tail", &error, &hook).await);
+    assert_eq!(*calls.lock().unwrap(), vec![("tail".to_owned(), "fsync")]);
+    assert_eq!(f.scalar("SELECT count(*) AS n FROM errors"), "0");
+    assert_eq!(f.scalar("SELECT count(*) AS n FROM published_ranges"), "0");
+    assert!(f.get("W").is_none());
+    f.close();
+}
+
+/// Run `publish_range` once with an injected fsync failure at `step`, on the writer thread.
+fn fsync_failure(f: &Fixture, root: &std::path::Path, step: solos_data::fsutil::FsyncStep) -> solos_data::store::StoreError {
+    let root = root.to_path_buf();
+    f.db
+        .run_blocking(move |store| {
+            solos_data::fsutil::inject_fsync_failure(step);
+            struct Clear;
+            impl Drop for Clear {
+                fn drop(&mut self) {
+                    solos_data::fsutil::clear_fsync_failure();
+                }
+            }
+            let _clear = Clear;
+            publish_range(
+                store,
+                &root,
+                100,
+                100,
+                Some(Checkpoint {
+                    key: "W".into(),
+                    value: json!({
+                        "signature": "sig",
+                        "slot": 100,
+                        "completedAt": "2026-10-29T00:00:00Z"
+                    }),
+                    cycle_id: None,
+                }),
+            )
+        })
+        .unwrap_err()
 }

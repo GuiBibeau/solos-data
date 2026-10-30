@@ -6,7 +6,7 @@ use super::hyperliquid::{context_rows, contexts_request, contexts_select, dex_of
 use super::ledger::register;
 use super::parquet::{Target, stage_json, write_merged};
 use super::periods::{Granularity, Period, date_of_ms};
-use super::series::{Ctx, Outcome};
+use super::series::{Ctx, Outcome, is_fatal};
 use crate::jsonout::{Obj, log, safe_error};
 use crate::store::StoreError;
 use serde_json::Value;
@@ -104,6 +104,11 @@ pub async fn flush(ctx: &Ctx, lane: &ContextLane, now_ms: i64) -> Outcome {
                 );
             }
             Err(error) => {
+                if is_fatal(&error) {
+                    outcome.fatal = Some(error.to_string());
+                    // Do not keep the rows for a retry: the lane exits.
+                    break;
+                }
                 outcome.errors += 1;
                 // Keep the rows for the next flush rather than lose them.
                 lane.buffer.lock().expect("context buffer").extend(rows);

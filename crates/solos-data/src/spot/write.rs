@@ -8,7 +8,7 @@
 use super::rows::{Liquidity, Swap};
 use super::tx::{Key, b58};
 use crate::augment::ledger::FileRecord;
-use crate::fsutil::{create_dir_all_durable, file_hash, sync_path, tmp_path};
+use crate::fsutil::{create_dir_all_durable, file_hash, sync_dir_after_rename, sync_tmp_file, tmp_path};
 use crate::store::{StoreError, memory_connection, sql_string};
 use duckdb::{Connection, params};
 use std::collections::HashMap;
@@ -173,10 +173,10 @@ pub fn copy_to(
         "COPY ({select}) TO {} (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 1000000)",
         sql_string(&tmp.to_string_lossy())
     ))?;
-    sync_path(&tmp)?;
+    sync_tmp_file(&tmp)?;
     std::fs::rename(&tmp, &path)?;
     if let Some(parent) = path.parent() {
-        sync_path(parent)?;
+        sync_dir_after_rename(parent)?;
     }
     let row_count: i64 = conn.query_row(
         &format!(

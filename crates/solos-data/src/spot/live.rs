@@ -471,7 +471,12 @@ pub fn run(config: LiveConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError>
                 Ok((done, fetched)) => match live.commit((next, hi), &done, fetched) {
                     Ok(()) => next = hi + 1,
                     Err(error) => {
-                        live.record_error(&error.to_string());
+                        let message = error.to_string();
+                        // A failed fsync is fatal (ADR-0016): exit, never retry the batch.
+                        if crate::db::fatal_class(&message).is_some() {
+                            return Err(error);
+                        }
+                        live.record_error(&message);
                         runtime.block_on(live.pause(RETRY_SECONDS));
                     }
                 },

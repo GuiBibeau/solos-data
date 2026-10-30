@@ -2,7 +2,10 @@
 //! bounds and the lane checkpoint in one transaction. A port of `writer.ts` and
 //! `storage-space.ts`.
 
-use crate::fsutil::{create_dir_all_durable, file_hash, manifest_path, sync_path, tmp_path};
+use crate::fsutil::{
+    create_dir_all_durable, file_hash, manifest_path, sync_dir_after_rename, sync_tmp_file,
+    tmp_path,
+};
 use crate::jsonout::{Obj, now};
 use crate::store::{Store, StoreError, sql_string};
 use serde_json::Value;
@@ -113,9 +116,13 @@ pub fn publish_range(
                 "COPY ({query}) TO {} (FORMAT PARQUET, COMPRESSION ZSTD)",
                 sql_string(&tmp.to_string_lossy())
             ))?;
-            sync_path(&tmp)?;
+            crate::crash_point!("publish/after-tmp-write");
+            sync_tmp_file(&tmp)?;
+            crate::crash_point!("publish/after-file-fsync");
             std::fs::rename(&tmp, &path)?;
-            sync_path(&directory)?;
+            crate::crash_point!("publish/after-rename");
+            crate::crash_point!("publish/before-dir-fsync");
+            sync_dir_after_rename(&directory)?;
             let actual = store.rows(
                 &format!(
                     "SELECT count(*) AS n FROM read_parquet({})",
@@ -126,6 +133,7 @@ pub fn publish_range(
             if actual.first().and_then(|r| r.int("n")) != Some(count) {
                 return Err(StoreError::Check("V7: exported row count mismatch".into()));
             }
+            crate::crash_point!("publish/after-range-check");
             files.push(Published {
                 path: path.to_string_lossy().into_owned(),
                 table,
@@ -135,6 +143,7 @@ pub fn publish_range(
             });
         }
     }
+    crate::crash_point!("publish/before-watermark-commit");
     store.transaction(|store| {
         for file in &files {
             store.exec(
@@ -164,6 +173,7 @@ pub fn publish_range(
             "INSERT OR IGNORE INTO published_ranges VALUES (?, ?)",
             &[&from, &to],
         )?;
+        crate::crash_point!("publish/mid-seal");
         if let Some(checkpoint) = &checkpoint {
             store.exec(
                 "INSERT OR REPLACE INTO kv VALUES (?, ?::JSON)",
