@@ -923,6 +923,11 @@ fn offline_or_live(
                 )?;
                 let mut out = report;
                 out.set_rows("anomalies", anomalies);
+                // The publication path refuses before the watermark advances (ADR-0016); the
+                // validate command does the same so a gap fixture fails the run.
+                if command == "validate-next-backfill" {
+                    crate::collector::validation::assert_publishable(&out)?;
+                }
                 println!("{}", out.to_json());
             }
             "storage-stats" => println!(
@@ -1199,7 +1204,7 @@ fn failpoint_writer_cmd(_args: &[String]) -> i32 {
 
 fn dev(args: &[String]) -> i32 {
     let command = args.first().map(String::as_str).unwrap_or("help");
-    let result = match command {
+    let outcome: Result<(Obj, bool), StoreError> = match command {
         "compare-decoded" => {
             let (Some(left), Some(right)) = (flag(args, "--left"), flag(args, "--right")) else {
                 eprintln!(
@@ -1213,7 +1218,10 @@ fn dev(args: &[String]) -> i32 {
                 );
                 return 1;
             };
-            crate::dev::compare_decoded(&PathBuf::from(left), &PathBuf::from(right))
+            crate::dev::compare_decoded(&PathBuf::from(left), &PathBuf::from(right)).map(|report| {
+                let ok = report.get("identical") == Some(&Value::Bool(true));
+                (report, ok)
+            })
         }
         "archive-check" => {
             let (Some(from), Some(to)) = (
@@ -1228,7 +1236,68 @@ fn dev(args: &[String]) -> i32 {
                 );
                 return 1;
             };
-            archive_check(args, from, to)
+            archive_check(args, from, to).map(|report| {
+                let ok = report.get("identical") == Some(&Value::Bool(true));
+                (report, ok)
+            })
+        }
+        "version" => crate::dev::version().map(|report| (report, true)),
+        "make-decoder-fixture" => {
+            let Some(out) = flag(args, "--out") else {
+                eprintln!(
+                    "{}",
+                    Obj::new()
+                        .with("error", "make-decoder-fixture requires --out <dir>")
+                        .to_json()
+                );
+                return 1;
+            };
+            crate::dev::make_decoder_fixture(&PathBuf::from(out), flag(args, "--fixtures"))
+                .map(|report| (report, true))
+        }
+        "make-range-fixture" => {
+            let Some(out) = flag(args, "--out") else {
+                eprintln!(
+                    "{}",
+                    Obj::new()
+                        .with("error", "make-range-fixture requires --out <dir>")
+                        .to_json()
+                );
+                return 1;
+            };
+            let chunk = flag(args, "--chunk")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(100);
+            let next = flag(args, "--next")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(5_000);
+            let gap = has(args, "--gap");
+            crate::dev::make_range_fixture(&PathBuf::from(out), chunk, next, gap)
+                .map(|report| (report, true))
+        }
+        "spot-fixture-decode" => {
+            crate::dev::spot_fixture_decode(flag(args, "--fixtures")).map(|report| {
+                let ok = report.get("ok") == Some(&Value::Bool(true));
+                (report, ok)
+            })
+        }
+        "decoder-verify" => {
+            let (Some(root), Some(golden)) = (flag(args, "--root"), flag(args, "--golden")) else {
+                eprintln!(
+                    "{}",
+                    Obj::new()
+                        .with(
+                            "error",
+                            "decoder-verify requires --root <decoded dir> --golden <file>"
+                        )
+                        .to_json()
+                );
+                return 1;
+            };
+            crate::dev::decoder_verify(&PathBuf::from(root), &PathBuf::from(golden)).map(|report| {
+                let ok = report.get("ok") == Some(&Value::Bool(true));
+                (report, ok)
+            })
         }
         "crash-writer" => {
             // Test fixture: commit one row, leave a transaction open, wait to be killed.
@@ -1245,6 +1314,11 @@ fn dev(args: &[String]) -> i32 {
             let mut commands = vec![
                 "compare-decoded --left <root> --right <root>",
                 "archive-check --from <slot> --to <slot> [--config path]",
+                "version (binary and DuckDB versions)",
+                "make-decoder-fixture --out <dir> [--fixtures path]",
+                "make-range-fixture --out <dir> [--chunk 100] [--next 5000] [--gap]",
+                "spot-fixture-decode [--fixtures path]",
+                "decoder-verify --root <decoded dir> --golden <file>",
                 "crash-writer --root <root> (test fixture)",
             ];
             #[cfg(feature = "failpoints")]
@@ -1255,10 +1329,10 @@ fn dev(args: &[String]) -> i32 {
             return 0;
         }
     };
-    match result {
-        Ok(report) => {
+    match outcome {
+        Ok((report, ok)) => {
             println!("{}", report.to_json());
-            i32::from(report.get("identical") != Some(&Value::Bool(true)))
+            i32::from(!ok)
         }
         Err(error) => {
             eprintln!(
