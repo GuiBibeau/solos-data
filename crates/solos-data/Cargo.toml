@@ -62,6 +62,8 @@ solos-data = { path = ".", features = ["failpoints"] }
 # reads Cargo.lock so the schema VERSION is tied to the resolved phoenix-rise-events version.
 borsh = "1.7"
 toml = "0.5"
+# Property-based tests for the range checker (offline; no fork/timeout so cases run in-process).
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 
 [features]
 default = []
