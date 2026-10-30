@@ -114,9 +114,12 @@ jobs:
           cache: npm
       - if: github.event_name != 'pull_request' || steps.changes.outputs.npm == 'true'
         run: npm ci
-      # Type check, codec tests and release build, then the JavaScript suite (offline, no credentials).
+      # Type check, the release codec binary the JS suite spawns, then the JS suite (offline, no
+      # credentials). The Rust and codec tests already ran in the `cargo test` step above, so the
+      # npm `codec:test` (a second `cargo test --workspace`) is not repeated here; verify.sh does
+      # the same.
       - if: github.event_name != 'pull_request' || steps.changes.outputs.npm == 'true'
-        run: npm run verify
+        run: npm run check && npm run codec:build && npm test
       - name: Prune DuckDB objects before caching
         run: find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete
 

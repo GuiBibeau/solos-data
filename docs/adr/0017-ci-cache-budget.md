@@ -23,19 +23,24 @@ Status: accepted, October 30, 2026. Records the CI cache and gating scheme that 
   Swatinem/rust-cache's restore key omits the Cargo.lock hash, so a PR that changes the lockfile
   still restores main's warm cache and recompiles only the crates whose versions actually changed
   instead of rebuilding DuckDB, RocksDB, protobuf and the agave crates.
-- **`cargo nextest` and split test jobs were not adopted.** The test job was already under the
-  budget (`cargo test` about 2m10s cold), so the extra machinery bought nothing. If the suite
-  grows past the budget, splitting test jobs or `cargo nextest` is the first lever.
+- **`cargo nextest` and split test jobs were not adopted.** With main's cache restored, `cargo test`
+  is already under the budget; the extra machinery bought nothing. The CI npm step also stops
+  re-running `cargo test --workspace` (npm's `codec:test`) because the Rust suite already ran in
+  the job's own `cargo test` step — the same non-duplicative order `scripts/verify.sh` uses.
 - **`scripts/verify.sh` is unchanged.** The offline regression script keeps running the same
-  checks in the same order; only the GitHub Actions cache keying and the archive-check gating
-  changed.
+  checks in the same order; only the GitHub Actions cache keying, the archive-check gating and
+  the CI npm step changed.
 
 ## Consequences
 
-- A PR that does not touch the archive inputs sees four checks: `fmt` (seconds), `clippy`
-  (about two minutes cold), `test` (about two and a half minutes cold, including the npm suite),
-  and a skipped `archive-check`. All are inside the five-minute cold and three-minute warm
-  budgets.
+- A PR that does not touch the archive inputs sees four checks: `fmt` (seconds), `clippy` and
+  `test` restored from main's warm cache (both under the three-minute warm budget), and a
+  skipped `archive-check`.
+- The one-time, never-cached ("cold") compile is a bootstrap cost that main pays, not PRs: with
+  no cache at all, `clippy` is about 11 minutes and `test` about 15 minutes on the standard
+  runner (measured on this PR's first run, which used a fresh cache key). A pull request only
+  ever goes cold when its own lockfile hash misses, and then Swatinem's restore key (which omits
+  the Cargo.lock hash) still restores main's cache and recompiles just the changed crates.
 - A PR that does touch the archive inputs also runs `archive-check`, warm from main's cache
   (about a minute). The only case that can exceed the budget is a PR that bumps the native
   dependency versions themselves (RocksDB, DuckDB, protobuf or the agave crates), because those
