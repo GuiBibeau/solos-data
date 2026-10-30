@@ -1029,6 +1029,35 @@ mod tests {
     }
 
     #[test]
+    fn a_non_fatal_commit_failure_is_a_retry_and_records_the_error() {
+        let root = tempdir("spot-run-retry");
+        let (mut spot, thread, db) = spot_fixture(&root);
+        // An invalid writer memory limit fails the batch write with a DuckDB configuration
+        // error, which is not fatal: the lane must record it and ask for a retry, not exit.
+        spot.config.writer_memory = "not-a-size".into();
+        let step = spot
+            .commit_or_retry(
+                0,
+                100,
+                Done {
+                    stream: Stream::default(),
+                    blocks: Blocks::default(),
+                    window: (0, 100),
+                    manifests: Vec::new(),
+                    seconds: 0.0,
+                },
+            )
+            .unwrap();
+        assert!(matches!(step, CommitStep::Retry), "{step:?}");
+        assert_eq!(spot.totals.errors, 1, "the failure must be recorded");
+        assert_eq!(spot.totals.error_streak, 1);
+        assert!(spot.totals.last_error.is_some());
+        let store = thread.join(db);
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_failed_fsync_ends_the_backfill_lane_without_a_retry() {
         let root = tempdir("spot-run-fsync");
         let (mut spot, thread, db) = spot_fixture(&root);
