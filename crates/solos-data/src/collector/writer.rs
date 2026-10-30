@@ -83,6 +83,21 @@ pub fn publish_range(
     to: i64,
     checkpoint: Option<Checkpoint>,
 ) -> Result<(), StoreError> {
+    publish_range_with(store, root, from, to, checkpoint, &mut |_, _| {})
+}
+
+/// [`publish_range`] with a per-file callback, invoked after each file's range check and hash
+/// (ADR-0016 step 6) and before the watermark transaction (step 7). The random-kill fixture
+/// (`dev publish-fixture`, issue #61) uses it to print deterministic progress so the harness can
+/// kill the process at a seeded byte offset of that output.
+pub fn publish_range_with(
+    store: &mut Store,
+    root: &Path,
+    from: i64,
+    to: i64,
+    checkpoint: Option<Checkpoint>,
+    mut on_file: impl FnMut(&'static str, i64),
+) -> Result<(), StoreError> {
     require_storage_space(root)?;
     struct Published {
         path: String,
@@ -93,7 +108,7 @@ pub fn publish_range(
     }
     let mut files: Vec<Published> = Vec::new();
     for table in TABLES {
-        let groups = store.rows(&format!("SELECT slot // 432000 AS epoch, count(*) AS n FROM {table} WHERE slot BETWEEN ? AND ? GROUP BY epoch"), &[&from, &to])?;
+        let groups = store.rows(&format!("SELECT slot // 432000 AS epoch, count(*) AS n FROM {table} WHERE slot BETWEEN ? AND ? GROUP BY epoch ORDER BY epoch"), &[&from, &to])?;
         for item in groups {
             let epoch = item.int("epoch").unwrap_or(0);
             let count = item.int("n").unwrap_or(0);
@@ -141,6 +156,7 @@ pub fn publish_range(
                 count,
                 hash: file_hash(&path)?,
             });
+            on_file(table, epoch);
         }
     }
     crate::crash_point!("publish/before-watermark-commit");
