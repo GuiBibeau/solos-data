@@ -84,9 +84,13 @@ Production `decoded_at` is taken once per batch in the decoder service, not once
 row published from that batch shares the instant. The golden fixture replaces the batch clock
 with `2026-10-04T00:00:00.000Z`.
 
-The digest reads every registered row into JSON before encoding it. That is enough for the
-fixture day. It is not acceptable for a production day: streaming the digest, so the day is not
-held as JSON, has to land before this digest runs on production days.
+The digest reads every registered row through a cursor, one row at a time, and never
+materializes the day as JSON. Each table is streamed twice under one lease: the first pass counts
+the distinct primary keys and refuses a repeated key in one batch, the second hashes the newest
+revision of every key in canonical order. The record still encodes the row count before the rows,
+so a cursor cannot rewind and the first pass carries the count. Memory is bounded by one row (plus
+DuckDB's own sort/window buffer for the canonical order), not by the day size. The duplicate-key
+refusal is detected across cursor boundaries, not per file.
 
 The digest encoding changed when the schema and the length-prefixed fields replaced the earlier
 JSON concatenation (`63c06f73d2691e6d8bea9cb45a44505403002cc47fe2c001e376b095b889315d`). The
