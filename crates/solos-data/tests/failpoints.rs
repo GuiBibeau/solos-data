@@ -140,10 +140,7 @@ fn complete_and_compare(root: &Path, golden: &Manifest, tiny_wal: bool) {
     assert_eq!(got, *golden, "partition hashes and manifest must match");
     // No duplicate primary keys: one `files` row (unique path), one range, distinct signatures.
     assert_eq!(
-        store
-            .rows("SELECT count(*) AS n FROM files", &[])
-            .unwrap()[0]
-            .int("n"),
+        store.rows("SELECT count(*) AS n FROM files", &[]).unwrap()[0].int("n"),
         Some(i64::try_from(golden.len()).unwrap_or(0))
     );
     assert_eq!(
@@ -159,7 +156,10 @@ fn complete_and_compare(root: &Path, golden: &Manifest, tiny_wal: bool) {
             .unwrap()[0]
             .int("n"),
         store
-            .rows("SELECT count(DISTINCT signature) AS n FROM transactions", &[])
+            .rows(
+                "SELECT count(DISTINCT signature) AS n FROM transactions",
+                &[]
+            )
             .unwrap()[0]
             .int("n")
     );
@@ -178,7 +178,10 @@ fn golden() -> Manifest {
     assert!(status.success(), "golden run failed: {status}");
     let store = open(&root.0);
     let golden = manifest(&store);
-    assert!(!golden.is_empty(), "the fixture must publish at least one file");
+    assert!(
+        !golden.is_empty(),
+        "the fixture must publish at least one file"
+    );
     restart_predicate(&store, tail_watermark(&store).unwrap()).unwrap();
     store.close().unwrap();
     golden
@@ -218,7 +221,8 @@ fn the_range_check_catches_an_export_whose_row_count_changed() {
         let conn = solos_data::store::memory_connection("1", "64MB").unwrap();
         conn.execute_batch("CREATE TABLE t(n BIGINT)").unwrap();
         conn.execute_batch("INSERT INTO t VALUES (1)").unwrap();
-        let path = std::env::temp_dir().join(format!("solos-corrupt-{}.parquet", uuid::Uuid::new_v4()));
+        let path =
+            std::env::temp_dir().join(format!("solos-corrupt-{}.parquet", uuid::Uuid::new_v4()));
         conn.execute_batch(&format!(
             "COPY (SELECT * FROM t) TO '{}' (FORMAT PARQUET)",
             path.to_string_lossy()
@@ -248,10 +252,7 @@ fn the_range_check_catches_an_export_whose_row_count_changed() {
         "the range check must reject a changed row count: {message}"
     );
     assert_eq!(
-        store
-            .rows("SELECT count(*) AS n FROM files", &[])
-            .unwrap()[0]
-            .int("n"),
+        store.rows("SELECT count(*) AS n FROM files", &[]).unwrap()[0].int("n"),
         Some(0),
         "nothing may be registered when the range check fails"
     );

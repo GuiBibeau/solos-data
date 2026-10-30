@@ -4,7 +4,9 @@
 //! and deleted once converted.
 
 use super::ledger::FileRecord;
-use crate::fsutil::{create_dir_all_durable, file_hash, sync_dir_after_rename, sync_tmp_file, tmp_path};
+use crate::fsutil::{
+    create_dir_all_durable, file_hash, sync_dir_after_rename, sync_tmp_file, tmp_path,
+};
 use crate::store::{Store, StoreError, sql_string};
 use std::path::{Path, PathBuf};
 

@@ -1206,12 +1206,15 @@ fn dev(args: &[String]) -> i32 {
         }
         "failpoint-writer" => {
             // Test fixture (issue #56): publish a range with one kill point armed.
-            let (Some(root), Some(name)) = (flag(args, "--root"), flag(args, "--failpoint"))
-            else {
+            let (Some(root), Some(name)) = (flag(args, "--root"), flag(args, "--failpoint")) else {
                 return 1;
             };
-            let from = flag(args, "--from").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
-            let to = flag(args, "--to").and_then(|v| v.parse::<i64>().ok()).unwrap_or(from);
+            let from = flag(args, "--from")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(0);
+            let to = flag(args, "--to")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(from);
             return match crate::dev::failpoint_writer(&PathBuf::from(root), name, from, to) {
                 Ok(()) => 0,
                 Err(_) => 1,

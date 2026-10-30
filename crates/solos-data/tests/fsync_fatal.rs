@@ -166,15 +166,16 @@ async fn augment_sync_series_stops_and_flags_a_fatal_fsync() {
         .unwrap();
     let outcome = sync_series(&ctx, &MockSeries).await;
     let store = thread.join(ctx.db);
-    let files = store
-        .rows("SELECT count(*) AS n FROM files", &[])
-        .unwrap()[0]
+    let files = store.rows("SELECT count(*) AS n FROM files", &[]).unwrap()[0]
         .int("n")
         .unwrap_or(0);
     store.close().unwrap();
     let _ = std::fs::remove_dir_all(&root);
 
-    assert_eq!(outcome.files, 0, "the failed file must not be counted as written");
+    assert_eq!(
+        outcome.files, 0,
+        "the failed file must not be counted as written"
+    );
     let fatal = outcome.fatal.expect("an fsync failure must be fatal");
     assert!(fatal.contains("fsync failed"), "{fatal}");
     assert_eq!(files, 0, "no file may be registered");

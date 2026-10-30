@@ -88,3 +88,24 @@ file is checked. Parquet that `files` does not list is still an orphan. `recover
 those, matching paths with `manifest_path` (relative paths join the root, then symlinks are
 resolved) so a relative registration or a symlinked data directory is not deleted. The predicate
 does not delete files and does not advance a watermark.
+
+## Crash-safety matrix (issue #56)
+
+The kill-point matrix (`tests/failpoints.rs`) proves the order above against process death. Seven
+named kill points sit in `publish_range`: `publish/after-tmp-write`,
+`publish/after-file-fsync`, `publish/after-rename`, `publish/before-dir-fsync`,
+`publish/after-range-check`, `publish/before-watermark-commit`, and `publish/mid-seal`. Each
+point aborts the process (`std::process::abort`, SIGABRT); none returns an error, because an
+error path runs destructors and is not a crash. They are compiled in only under the `failpoints`
+cargo feature, which release builds leave off.
+
+The harness spawns the real binary against a fixture source, arms one point, restarts after the
+kill, and asserts the restart predicate. A re-run to completion is byte-identical to an uncrashed
+golden run: the same partition hashes and manifest, and no duplicated primary key. The matrix
+runs twice — with DuckDB's default checkpointing and with `SOLOS_DATA_WAL_AUTOCHECKPOINT` forced
+tiny — so kills land on both sides of a checkpoint.
+
+Power loss is out of scope. SIGABRT/SIGKILL is process death; the kernel keeps the page cache and
+releases the flock, so the files and lock behave as after a supervised restart. A power loss that
+drops the page cache can still lose a directory entry whose fsync had not completed; the dir
+fsync step exists for that case but is not what the matrix proves.

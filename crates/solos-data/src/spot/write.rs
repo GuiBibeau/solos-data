@@ -8,7 +8,9 @@
 use super::rows::{Liquidity, Swap};
 use super::tx::{Key, b58};
 use crate::augment::ledger::FileRecord;
-use crate::fsutil::{create_dir_all_durable, file_hash, sync_dir_after_rename, sync_tmp_file, tmp_path};
+use crate::fsutil::{
+    create_dir_all_durable, file_hash, sync_dir_after_rename, sync_tmp_file, tmp_path,
+};
 use crate::store::{StoreError, memory_connection, sql_string};
 use duckdb::{Connection, params};
 use std::collections::HashMap;

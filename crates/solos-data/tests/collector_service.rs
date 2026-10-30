@@ -299,33 +299,36 @@ async fn an_fsync_failure_on_the_epoch_directory_after_rename_ends_the_lane_and_
 }
 
 /// Run `publish_range` once with an injected fsync failure at `step`, on the writer thread.
-fn fsync_failure(f: &Fixture, root: &std::path::Path, step: solos_data::fsutil::FsyncStep) -> solos_data::store::StoreError {
+fn fsync_failure(
+    f: &Fixture,
+    root: &std::path::Path,
+    step: solos_data::fsutil::FsyncStep,
+) -> solos_data::store::StoreError {
     let root = root.to_path_buf();
-    f.db
-        .run_blocking(move |store| {
-            solos_data::fsutil::inject_fsync_failure(step);
-            struct Clear;
-            impl Drop for Clear {
-                fn drop(&mut self) {
-                    solos_data::fsutil::clear_fsync_failure();
-                }
+    f.db.run_blocking(move |store| {
+        solos_data::fsutil::inject_fsync_failure(step);
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                solos_data::fsutil::clear_fsync_failure();
             }
-            let _clear = Clear;
-            publish_range(
-                store,
-                &root,
-                100,
-                100,
-                Some(Checkpoint {
-                    key: "W".into(),
-                    value: json!({
-                        "signature": "sig",
-                        "slot": 100,
-                        "completedAt": "2026-10-29T00:00:00Z"
-                    }),
-                    cycle_id: None,
+        }
+        let _clear = Clear;
+        publish_range(
+            store,
+            &root,
+            100,
+            100,
+            Some(Checkpoint {
+                key: "W".into(),
+                value: json!({
+                    "signature": "sig",
+                    "slot": 100,
+                    "completedAt": "2026-10-29T00:00:00Z"
                 }),
-            )
-        })
-        .unwrap_err()
+                cycle_id: None,
+            }),
+        )
+    })
+    .unwrap_err()
 }
