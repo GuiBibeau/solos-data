@@ -3,14 +3,16 @@
 Status: accepted, October 30, 2026. Records the CI cache and gating scheme that keeps warm
 `pull_request` checks — a cache hit on main's cache — inside a five-minute budget and keeps the
 archive compile check off unrelated PRs. Cold, never-cached runs are slower; that is accepted
-(issue #68).
+(issue #68), and pull requests can pay it too.
 
 ## Decision
 
 - **The target is a five-minute budget for warm runs.** A warm run is a cache hit on main's
   cache; the measured warm run finishes in about three minutes. Cold, never-cached runs are
-  slower (about 22 minutes wall) and that is accepted: they are a one-time bootstrap paid by
-  main, not by pull requests.
+  slower (about 22 minutes wall) and that is accepted. Cold runs happen when main's cache is
+  missing (before the first save, after a `shared-key` bump, or after eviction: GitHub drops
+  caches unused for 7 days, and the repository is already near its 10 GB cache limit) or when a
+  PR bumps native dependencies; pull requests then pay the cold cost too.
 - **`fmt`, `clippy`, `test` and `archive-check` all keep running.** Nothing is dropped:
   `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
   `cargo test --workspace --locked` and the archive compile check
@@ -59,10 +61,12 @@ Measured from the Actions cache list (`gh cache list`) on 2026-10-30, the live e
 | `test` | 488.99 MiB |
 | `archive-check` | 543.49 MiB |
 
-That working set is about 1.35 GiB against the repository's 10 GB cache limit. The raw list still
-shows older entries (older lockfile-hash suffixes from before the main-only save) that sum to
-about 10.4 GiB; GitHub evicts those least-recently-used entries as new main saves land, and only
-the live entry per shared-key is restored.
+That working set is about 1.35 GiB, but the raw list still shows older entries (older
+lockfile-hash suffixes from before the main-only save) that sum to about 10.4 GiB, so the
+repository is already at or near its 10 GB cache limit. GitHub evicts least-recently-used
+entries as new saves land and drops any cache unused for 7 days; only the live entry per
+shared-key is restored. If main's live entries are evicted (for example after a week with no
+merge to main), every PR runs cold until main saves again.
 
 ## Consequences
 
@@ -70,16 +74,19 @@ the live entry per shared-key is restored.
   from main's warm cache (both under the five-minute warm budget), a skipped `archive-check`,
   and a green `ci-ok` that accepts that skip.
 - A cold, never-cached run does not meet the five-minute budget, and that is accepted. Measured
-  on a forced fresh-cache run (https://github.com/GuiBibeau/solos-data/actions/runs/41022348960):
+  on a forced fresh-cache run (https://github.com/GuiBibeau/solos-data/actions/runs/41022348960),
+  which came from a throwaway measurement commit (e603b5f, `shared-key: test-cold-measure`):
   `clippy` 14 m 6 s, `test` 16 m 48 s, `archive-check` 22 m 30 s, total wall 22 m 45 s. The warm
   run (https://github.com/GuiBibeau/solos-data/actions/runs/41025154500) finished in about
-  3 minutes wall with `test` at 2 m 54 s. A pull request only ever goes cold when its own
-  lockfile hash misses, and then Swatinem's restore key (which omits the Cargo.lock hash) still
-  restores main's cache and recompiles just the changed crates.
+  3 minutes wall with `test` at 2 m 54 s. A pull request goes cold whenever main's cache is
+  missing (before the first save, after a `shared-key` bump, or after eviction) or when it bumps
+  native dependencies. A PR whose lockfile hash misses still restores main's cache as a fallback
+  (Swatinem's restore key omits the Cargo.lock hash) and recompiles just the changed crates.
 - A PR that does touch the archive inputs also runs `archive-check`, warm from main's cache
   (about a minute). A PR that bumps the native dependency versions themselves (RocksDB, DuckDB,
-  protobuf or the agave crates) recompiles those C++ and Rust graphs genuinely; that
-  recompilation is still a required check, and main pays the same cost on merge.
+  protobuf or the agave crates) recompiles those C++ and Rust graphs genuinely, so that PR pays
+  close to the cold cost; the recompilation is still a required check, and main pays the same
+  cost again on merge.
 - Cache writes happen only on main, so PR runs no longer churn the shared cache with
   near-duplicate entries. Each job's `shared-key` is the stable job name (`clippy`, `test`,
   `archive-check`); bump the suffix to start the cache fresh if the scheme ever changes.
