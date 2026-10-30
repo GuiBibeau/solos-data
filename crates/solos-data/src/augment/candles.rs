@@ -6,7 +6,7 @@ use super::hyperliquid::{candle_request, candle_row, candles_select};
 use super::ledger::{get_progress, register};
 use super::parquet::{Target, stage_json, write_merged};
 use super::periods::{Period, date_of_ms};
-use super::series::{Ctx, Outcome};
+use super::series::{Ctx, Outcome, is_fatal};
 use crate::jsonout::{Obj, log, now, safe_error};
 use crate::store::StoreError;
 use serde_json::{Value, json};
@@ -33,7 +33,6 @@ pub async fn cycle(ctx: &Ctx, lane: &CandleLane, now_ms: i64) -> Outcome {
         match capture_coin(ctx, lane, coin, phoenix, now_ms).await {
             Ok(result) => outcome.add(&result),
             Err(error) => {
-                outcome.errors += 1;
                 log(
                     "augment_series_error",
                     Obj::new()
@@ -43,6 +42,11 @@ pub async fn cycle(ctx: &Ctx, lane: &CandleLane, now_ms: i64) -> Outcome {
                         .with("item", "cycle")
                         .with("error", safe_error(&error.to_string())),
                 );
+                if is_fatal(&error) {
+                    outcome.fatal = Some(error.to_string());
+                    break;
+                }
+                outcome.errors += 1;
             }
         }
     }

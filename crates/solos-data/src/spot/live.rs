@@ -176,6 +176,15 @@ pub async fn batch(
     ))
 }
 
+/// What one commit of a fetched batch decided for the forward loop.
+#[derive(Debug)]
+enum CommitStep {
+    /// Committed; continue from `next`.
+    Advanced { next: u64 },
+    /// Failed non-fatally; pause and retry the batch.
+    Retry,
+}
+
 impl Live {
     fn stopping(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
@@ -193,6 +202,27 @@ impl Live {
         job: impl FnOnce(&mut crate::store::Store) -> Result<T, StoreError> + Send + 'static,
     ) -> Result<T, StoreError> {
         self.db.run_blocking(job)
+    }
+
+    /// Commit a fetched batch and decide the loop's next step. A failed fsync is fatal
+    /// (ADR-0016): the error is returned so the lane exits instead of retrying the batch.
+    fn commit_or_retry(
+        &mut self,
+        range: (u64, u64),
+        done: &Done,
+        fetched: Fetched,
+    ) -> Result<CommitStep, StoreError> {
+        match self.commit(range, done, fetched) {
+            Ok(()) => Ok(CommitStep::Advanced { next: range.1 + 1 }),
+            Err(error) => {
+                let message = error.to_string();
+                if crate::db::fatal_class(&message).is_some() {
+                    return Err(error);
+                }
+                self.record_error(&message);
+                Ok(CommitStep::Retry)
+            }
+        }
     }
 
     fn record_error(&mut self, error: &str) {
@@ -468,12 +498,10 @@ pub fn run(config: LiveConfig, stop: Arc<AtomicBool>) -> Result<Obj, StoreError>
             }
             let outcome = runtime.block_on(batch(rpc, &live.programs, &live.config, (next, hi)));
             match outcome {
-                Ok((done, fetched)) => match live.commit((next, hi), &done, fetched) {
-                    Ok(()) => next = hi + 1,
-                    Err(error) => {
-                        live.record_error(&error.to_string());
-                        runtime.block_on(live.pause(RETRY_SECONDS));
-                    }
+                Ok((done, fetched)) => match live.commit_or_retry((next, hi), &done, fetched) {
+                    Ok(CommitStep::Advanced { next: n }) => next = n,
+                    Ok(CommitStep::Retry) => runtime.block_on(live.pause(RETRY_SECONDS)),
+                    Err(error) => return Err(error),
                 },
                 // A batch cut short by SIGTERM is not a failure; it is redone after the restart.
                 Err(_) if live.stopping() => {}
@@ -601,5 +629,111 @@ mod tests {
         assert_eq!(batch_hi(460_940_000, 9_000), 460_943_999);
         assert_eq!(batch_hi(460_944_000, 9_000), 460_952_999);
         assert_eq!(460_944_000 % EPOCH_SLOTS, 0);
+    }
+
+    struct NoopTransport;
+
+    impl crate::collector::rpc::Transport for NoopTransport {
+        fn post<'a>(
+            &'a self,
+            _url: &'a str,
+            _body: String,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::collector::rpc::HttpReply, String>>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async { Err("noop transport".into()) })
+        }
+    }
+
+    fn dummy_provider() -> Arc<crate::collector::rpc::Provider> {
+        let config: crate::collector::config::Config =
+            serde_json::from_str(include_str!("../../../../config/phoenix.json")).unwrap();
+        let limiter = Arc::new(crate::collector::limiter::Limiter::new(
+            1000.0,
+            0.0,
+            crate::collector::config::Lanes {
+                tail: 1,
+                backfill: 1,
+            },
+        ));
+        Arc::new(crate::collector::rpc::Provider::with_transport(
+            "http://127.0.0.1:8899".into(),
+            config,
+            limiter,
+            Box::new(NoopTransport),
+        ))
+    }
+
+    fn tempdir(prefix: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("{prefix}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn live_fixture(root: &std::path::Path) -> (Live, crate::db::DbThread, crate::db::Db) {
+        let mut store = ledger::open(root, Lane::SpotLive).unwrap();
+        ledger::recover(&mut store, root, Lane::SpotLive).unwrap();
+        let (db, thread) = crate::db::Db::spawn(store);
+        let mut config =
+            LiveConfig::parse(include_str!("../../../../config/spot-live.json")).unwrap();
+        config.data_dir = root.to_path_buf();
+        config.stall_minutes = 0;
+        let programs = config.programs().unwrap();
+        let live = Live {
+            config,
+            programs,
+            root: root.to_path_buf(),
+            rpc: dummy_provider(),
+            db: db.clone(),
+            stop: Arc::new(AtomicBool::new(false)),
+            started_at: now(),
+            started: Instant::now(),
+            finalized: None,
+            wire: Arc::new(AtomicU64::new(0)),
+            totals: Totals::default(),
+        };
+        (live, thread, db)
+    }
+
+    #[test]
+    fn a_failed_fsync_ends_the_forward_lane_without_a_retry() {
+        let root = tempdir("spot-live-fsync");
+        let (mut live, thread, db) = live_fixture(&root);
+        for step in [
+            crate::fsutil::FsyncStep::TempFile,
+            crate::fsutil::FsyncStep::DirAfterRename,
+        ] {
+            crate::fsutil::inject_fsync_failure(step);
+            let error = live
+                .commit_or_retry(
+                    (100, 200),
+                    &Done {
+                        stream: crate::spot::archive::Stream::default(),
+                        blocks: crate::spot::run::Blocks::default(),
+                        window: (100, 200),
+                        manifests: Vec::new(),
+                        seconds: 0.0,
+                    },
+                    Fetched {
+                        blocks: 0,
+                        bytes: 0,
+                    },
+                )
+                .unwrap_err();
+            crate::fsutil::clear_fsync_failure();
+            let message = error.to_string();
+            assert!(
+                message.contains("fsync failed")
+                    && crate::db::fatal_class(&message) == Some("fsync"),
+                "{step:?}: {message}"
+            );
+        }
+        let store = thread.join(db);
+        store.close().unwrap();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -8,7 +8,6 @@ pub mod collector;
 pub mod db;
 pub mod decoder;
 pub mod dev;
-#[cfg(feature = "failpoints")]
 pub mod failpoints;
 pub mod fsutil;
 pub mod gc;

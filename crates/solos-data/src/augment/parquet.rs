@@ -4,7 +4,9 @@
 //! and deleted once converted.
 
 use super::ledger::FileRecord;
-use crate::fsutil::{create_dir_all_durable, file_hash, sync_path, tmp_path};
+use crate::fsutil::{
+    create_dir_all_durable, file_hash, sync_dir_after_rename, sync_tmp_file, tmp_path,
+};
 use crate::store::{Store, StoreError, sql_string};
 use std::path::{Path, PathBuf};
 
@@ -76,10 +78,10 @@ pub fn write_parquet(
         "COPY ({select}) TO {} (FORMAT PARQUET, COMPRESSION ZSTD)",
         sql_string(&tmp.to_string_lossy())
     ))?;
-    sync_path(&tmp)?;
+    sync_tmp_file(&tmp)?;
     std::fs::rename(&tmp, &path)?;
     if let Some(parent) = path.parent() {
-        sync_path(parent)?;
+        sync_dir_after_rename(parent)?;
     }
     let rows = store.rows(
         &format!(

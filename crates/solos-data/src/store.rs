@@ -223,13 +223,34 @@ pub struct Store {
     timings: Vec<(String, Timing)>,
 }
 
+#[cfg(feature = "failpoints")]
+thread_local! {
+    /// When set, the store's DuckDB config builder asks for an invalid memory limit, so
+    /// `config(false)` fails on this thread. Tests inject it to prove the unusable-store path
+    /// after a failed reopen (issue #66); production never sets it.
+    static FAIL_DB_CONFIG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Fail the store's DuckDB config on this thread until cleared. For tests, behind the
+/// `failpoints` feature.
+#[cfg(feature = "failpoints")]
+pub fn inject_db_config_failure(fail: bool) {
+    FAIL_DB_CONFIG.with(|flag| flag.set(fail));
+}
+
+/// Whether the store's DuckDB config must fail on this thread.
+#[cfg(feature = "failpoints")]
+fn db_config_fails() -> bool {
+    FAIL_DB_CONFIG.with(|flag| flag.get())
+}
+
 /// Connection settings: `SOLOS_DATA_DB_MEMORY` (4GB), `SOLOS_DATA_DB_THREADS` (4),
 /// `SOLOS_DATA_DB_CHECKPOINT` (256MB). Extension auto-install stays off: the bundled build has
 /// JSON and Parquet linked in, and nothing else may be fetched over the network.
 fn config(read_only: bool) -> Result<Config, duckdb::Error> {
     let memory = std::env::var("SOLOS_DATA_DB_MEMORY").unwrap_or_else(|_| "4GB".into());
     #[cfg(feature = "failpoints")]
-    let memory = if crate::failpoints::db_config_fails() {
+    let memory = if db_config_fails() {
         "invalid failpoint".into()
     } else {
         memory
@@ -246,6 +267,21 @@ fn config(read_only: bool) -> Result<Config, duckdb::Error> {
         config = config.access_mode(duckdb::AccessMode::ReadOnly)?;
     }
     Ok(config)
+}
+
+/// Whether `value` is a DuckDB size: digits plus an optional `KB`, `MB` or `GB` unit
+/// (case-insensitive). `wal_autocheckpoint` is interpolated into SQL, so anything else is
+/// rejected before use (issue #56).
+#[cfg(feature = "failpoints")]
+#[must_use]
+pub fn is_wal_size(value: &str) -> bool {
+    let split = value
+        .as_bytes()
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(value.len());
+    let (digits, unit) = value.split_at(split);
+    !digits.is_empty() && matches!(unit.to_ascii_uppercase().as_str(), "" | "KB" | "MB" | "GB")
 }
 
 /// An independent in-memory database for readers and offline tools.
@@ -276,6 +312,18 @@ impl Store {
             timings: Vec::new(),
         };
         store.exec_batch(ddl)?;
+        // Crash-safety matrix (issue #56): the harness forces tiny WAL autocheckpoints so kills
+        // land on both sides of a checkpoint. Test-only, behind the failpoints feature, and the
+        // value is validated as a size before it is interpolated into SQL.
+        #[cfg(feature = "failpoints")]
+        if let Ok(value) = std::env::var("SOLOS_DATA_WAL_AUTOCHECKPOINT") {
+            if !is_wal_size(&value) {
+                return Err(StoreError::Check(format!(
+                    "SOLOS_DATA_WAL_AUTOCHECKPOINT is not a size: {value:?}"
+                )));
+            }
+            store.exec_batch(&format!("SET wal_autocheckpoint = '{value}'"))?;
+        }
         Ok(store)
     }
 
@@ -632,6 +680,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wal_sizes_are_digits_with_an_optional_unit() {
+        for good in ["1", "16", "1KB", "16MB", "2GB", "1kb", "256mb", "4gb"] {
+            assert!(is_wal_size(good), "{good}");
+        }
+        for bad in ["", "KB", "1.5MB", "1 MB", "1KBx", "-1", "'1KB'", "1 KiB"] {
+            assert!(!is_wal_size(bad), "{bad}");
+        }
+    }
+
+    #[test]
     fn labels_follow_the_typescript_regex() {
         assert_eq!(
             statement_label("INSERT INTO files VALUES (?)"),
@@ -725,9 +783,9 @@ mod tests {
             "CREATE TABLE IF NOT EXISTS kv(name VARCHAR PRIMARY KEY, value JSON);",
         )
         .unwrap();
-        crate::failpoints::inject_db_config_failure(true);
+        inject_db_config_failure(true);
         let error = store.while_closed(|_root, _lock| Ok(()));
-        crate::failpoints::inject_db_config_failure(false);
+        inject_db_config_failure(false);
         let message = error.unwrap_err().to_string();
         assert!(!message.is_empty());
         let again = store.rows("SELECT 1", &[]).unwrap_err().to_string();

@@ -1161,6 +1161,40 @@ fn archive_check(args: &[String], from: i64, to: i64) -> Result<Obj, StoreError>
     })
 }
 
+/// `dev failpoint-writer` (issue #56): publish a range with one kill point armed. Only the
+/// `failpoints` feature has kill points; release builds refuse the command rather than
+/// publishing a range into any root it is given.
+#[cfg(feature = "failpoints")]
+fn failpoint_writer_cmd(args: &[String]) -> i32 {
+    let (Some(root), Some(name)) = (flag(args, "--root"), flag(args, "--failpoint")) else {
+        return 1;
+    };
+    let from = flag(args, "--from")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(0);
+    let to = flag(args, "--to")
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(from);
+    match crate::dev::failpoint_writer(&PathBuf::from(root), name, from, to) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[cfg(not(feature = "failpoints"))]
+fn failpoint_writer_cmd(_args: &[String]) -> i32 {
+    eprintln!(
+        "{}",
+        Obj::new()
+            .with(
+                "error",
+                "failpoint-writer is a test fixture and needs the failpoints feature"
+            )
+            .to_json()
+    );
+    1
+}
+
 fn dev(args: &[String]) -> i32 {
     let command = args.first().map(String::as_str).unwrap_or("help");
     let result = match command {
@@ -1204,20 +1238,18 @@ fn dev(args: &[String]) -> i32 {
                 Err(_) => 1,
             };
         }
+        "failpoint-writer" => return failpoint_writer_cmd(args),
         _ => {
-            println!(
-                "{}",
-                Obj::new()
-                    .with(
-                        "commands",
-                        json!([
-                            "compare-decoded --left <root> --right <root>",
-                            "archive-check --from <slot> --to <slot> [--config path]",
-                            "crash-writer --root <root> (test fixture)"
-                        ])
-                    )
-                    .to_json()
+            let mut commands = vec![
+                "compare-decoded --left <root> --right <root>",
+                "archive-check --from <slot> --to <slot> [--config path]",
+                "crash-writer --root <root> (test fixture)",
+            ];
+            #[cfg(feature = "failpoints")]
+            commands.push(
+                "failpoint-writer --root <root> --failpoint <name> [--from <slot> --to <slot>] (test fixture)",
             );
+            println!("{}", Obj::new().with("commands", commands).to_json());
             return 0;
         }
     };

@@ -146,3 +146,33 @@ pub fn crash_writer(root: &Path) -> Result<(), StoreError> {
         std::thread::sleep(std::time::Duration::from_secs(1));
     }
 }
+
+/// Test fixture for the crash-safety matrix (issue #56): publish `[from, to]` once with the
+/// named kill point armed. When the point fires the process aborts; otherwise the range and its
+/// watermark commit normally and the command prints `published`. Only compiled with the
+/// `failpoints` feature; release builds have no kill points, so this command would otherwise
+/// publish a range into any root it is given.
+#[cfg(feature = "failpoints")]
+pub fn failpoint_writer(root: &Path, name: &str, from: i64, to: i64) -> Result<(), StoreError> {
+    crate::failpoints::arm_crash(&[name]);
+    let mut store = crate::store::Store::open(root, crate::collector::schema::SCHEMA)?;
+    let watermark = serde_json::json!({
+        "signature": "",
+        "slot": to,
+        "completedAt": crate::jsonout::now(),
+    });
+    crate::collector::writer::publish_range(
+        &mut store,
+        root,
+        from,
+        to,
+        Some(crate::collector::writer::Checkpoint {
+            key: "W".into(),
+            value: watermark,
+            cycle_id: None,
+        }),
+    )?;
+    store.close()?;
+    println!("published");
+    Ok(())
+}

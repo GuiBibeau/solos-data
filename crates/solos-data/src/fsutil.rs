@@ -6,13 +6,67 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-fn sync_handle(file: &File) -> io::Result<()> {
-    #[cfg(feature = "failpoints")]
-    if crate::failpoints::fsync_fails() {
-        return Err(io::Error::other("fsync failed: injected"));
-    }
+/// Which fsync call an injected failure targets (issue #56). Tests inject a fatal fsync at one
+/// step; production never sets one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FsyncStep {
+    /// The next fsync of any kind.
+    Any,
+    /// The temporary file's fsync, before the rename.
+    TempFile,
+    /// The directory fsync after the rename.
+    DirAfterRename,
+    /// The parent-directory fsync inside `create_dir_all_durable` (staging directories).
+    ParentDir,
+}
+
+#[cfg(feature = "failpoints")]
+thread_local! {
+    /// When `Some`, the next matching `sync_all` on this thread fails.
+    static FAIL_FSYNC: std::cell::Cell<Option<FsyncStep>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fail the next fsync of `step` on this thread. For tests, behind the `failpoints` feature. A
+/// lane that hits the failure must exit and restart from the watermark, not retry it (ADR-0016).
+#[cfg(feature = "failpoints")]
+pub fn inject_fsync_failure(step: FsyncStep) {
+    FAIL_FSYNC.with(|flag| flag.set(Some(step)));
+}
+
+/// Clear an injected fsync failure.
+#[cfg(feature = "failpoints")]
+pub fn clear_fsync_failure() {
+    FAIL_FSYNC.with(|flag| flag.set(None));
+}
+
+fn sync_all(file: &File) -> io::Result<()> {
     file.sync_all()
         .map_err(|error| io::Error::new(error.kind(), format!("fsync failed: {error}")))
+}
+
+#[cfg(feature = "failpoints")]
+fn sync_handle(file: &File, step: FsyncStep) -> io::Result<()> {
+    let fail = FAIL_FSYNC.with(|flag| {
+        let target = flag.get();
+        match target {
+            Some(pending) if pending == step || pending == FsyncStep::Any => {
+                flag.set(None);
+                true
+            }
+            _ => false,
+        }
+    });
+    if fail {
+        return Err(io::Error::other(format!(
+            "fsync failed: injected ({step:?})"
+        )));
+    }
+    sync_all(file)
+}
+
+#[cfg(not(feature = "failpoints"))]
+fn sync_handle(file: &File, _step: FsyncStep) -> io::Result<()> {
+    sync_all(file)
 }
 
 /// SHA-256 of a file, hex, streamed.
@@ -39,7 +93,17 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 /// fsync a file or a directory. A failure is an I/O error whose message starts with `fsync failed`,
 /// which the collector treats as fatal.
 pub fn sync_path(path: &Path) -> io::Result<()> {
-    sync_handle(&File::open(path)?)
+    sync_handle(&File::open(path)?, FsyncStep::Any)
+}
+
+/// fsync a temporary file before its rename ([`FsyncStep::TempFile`]).
+pub fn sync_tmp_file(path: &Path) -> io::Result<()> {
+    sync_handle(&File::open(path)?, FsyncStep::TempFile)
+}
+
+/// fsync a directory after a rename ([`FsyncStep::DirAfterRename`]).
+pub fn sync_dir_after_rename(path: &Path) -> io::Result<()> {
+    sync_handle(&File::open(path)?, FsyncStep::DirAfterRename)
 }
 
 /// Create `path` and every missing ancestor. Each newly created directory's parent is fsynced, so
@@ -65,21 +129,24 @@ pub fn create_dir_all_durable(path: &Path) -> io::Result<()> {
     };
     for dir in missing.iter().rev() {
         match std::fs::create_dir(dir) {
-            Ok(()) => sync_dir_parent(dir)?,
+            Ok(()) => {
+                let parent = dir.parent();
+                let parent = parent.filter(|parent| !parent.as_os_str().is_empty());
+                sync_handle(
+                    &File::open(parent.unwrap_or(Path::new(".")))?,
+                    FsyncStep::ParentDir,
+                )?;
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }
+    // Repair: a previous run may have created the last existing ancestor and crashed before
+    // fsyncing its parent. Fsync that parent so the re-run makes the entry durable (ADR-0016).
     if let Some(parent) = existing_parent {
         sync_path(&parent)?;
     }
     Ok(())
-}
-
-/// fsync the parent of `dir`, so `dir`'s own directory entry is durable.
-fn sync_dir_parent(dir: &Path) -> io::Result<()> {
-    let parent = dir.parent().filter(|parent| !parent.as_os_str().is_empty());
-    sync_path(parent.unwrap_or(Path::new(".")))
 }
 
 fn parent_dir(path: &Path) -> Option<std::path::PathBuf> {
@@ -101,11 +168,11 @@ pub fn write_durable(path: &Path, body: &[u8]) -> io::Result<()> {
             .truncate(true)
             .open(&tmp)?;
         file.write_all(body)?;
-        sync_handle(&file)?;
+        sync_handle(&file, FsyncStep::TempFile)?;
     }
     std::fs::rename(&tmp, path)?;
     if let Some(parent) = path.parent() {
-        sync_path(parent)?;
+        sync_handle(&File::open(parent)?, FsyncStep::DirAfterRename)?;
     }
     Ok(())
 }
@@ -196,9 +263,9 @@ mod tests {
         create_dir_all_durable(&nested).unwrap();
         create_dir_all_durable(&nested).unwrap();
         assert!(nested.is_dir());
-        crate::failpoints::inject_fsync_failure(true);
+        inject_fsync_failure(FsyncStep::ParentDir);
         let failed = create_dir_all_durable(&root.join("new/child"));
-        crate::failpoints::inject_fsync_failure(false);
+        clear_fsync_failure();
         let message = failed.unwrap_err().to_string();
         assert!(message.contains("fsync failed"), "{message}");
         let _ = std::fs::remove_dir_all(root);
@@ -211,9 +278,9 @@ mod tests {
         // Simulate a crash after `epoch=0` was created but before its parent was fsynced: the
         // directory exists, its entry is not durable. A re-run must fsync that parent.
         std::fs::create_dir_all(&nested).unwrap();
-        crate::failpoints::inject_fsync_failure(true);
+        inject_fsync_failure(FsyncStep::Any);
         let rerun = create_dir_all_durable(&nested);
-        crate::failpoints::inject_fsync_failure(false);
+        clear_fsync_failure();
         let message = rerun.unwrap_err().to_string();
         assert!(message.contains("fsync failed"), "{message}");
         // Once the fsync succeeds, the re-run is idempotent.
