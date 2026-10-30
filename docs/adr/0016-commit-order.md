@@ -23,7 +23,8 @@ lane can run as separate processes on separate databases. Two opens of the same 
 A second `flock` of the same file conflicts inside one process too, so code that already holds
 the lock must pass that `DbLock` through instead of locking again.
 
-`repack_checkpoint` takes `&DbLock`. The CLI `decoder repack` and `collector repack` paths call
+`repack_checkpoint` takes `&DbLock`, which records the root it was taken for; a lock taken for a
+different root is refused. The CLI `decoder repack` and `collector repack` paths call
 `acquire_lock` and pass it. `Store::while_closed` already holds the lock, closes the connection,
 and passes that same lock into the job; the in-service checkpoint rewrite uses that path and does
 not lock again. If reopening the checkpoint afterwards fails, the store is marked unusable and
@@ -33,15 +34,18 @@ later calls fail instead of writing to the in-memory placeholder.
 
 Collector publication is `validate_range` and `assert_publishable`, then `publish_range`
 (`collector/pipeline.rs` for the tail watermark `W`, `collector/history.rs` for the `backfill`
-cursor). The TypeScript `src/writer.ts` still uses `mkdir` and does not fsync newly created
-ancestors; this sequence is the Rust writer.
+cursor). The TypeScript live collector (`npm start` → `src/cli.ts run` → `tailCycle`/`backfill` →
+`src/writer.ts publishRange`) is retired: it used a plain `mkdir` and never took
+`checkpoint.duckdb.lock`, so it was outside the single-owner guarantee. `publishRange` remains
+only as an offline test fixture, not a shipped path. This sequence is the Rust writer.
 
 1. Range validation runs on the checkpoint rows. On failure the function returns before any file
    is written, and the watermark is not advanced.
 2. For each non-empty table and epoch in the range, create the epoch directory with
    `create_dir_all_durable`. Each newly created directory's parent is fsynced, including ancestors
-   that did not exist (`staging/`, `staging/<table>/`). Directories that already exist are not
-   fsynced again. Then `COPY` the rows to a `.tmp` sibling of the final Parquet path.
+   that did not exist (`staging/`, `staging/<table>/`). The parent of the last existing ancestor is
+   also fsynced, so a crash between creating a directory and fsyncing its parent is repaired by the
+   next run. Then `COPY` the rows to a `.tmp` sibling of the final Parquet path.
 3. fsync that temporary file (`sync_tmp_file`).
 4. Rename it onto the final path.
 5. fsync the parent directory of that path (the `epoch=…` directory that received the rename,
