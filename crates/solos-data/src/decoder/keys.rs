@@ -9,7 +9,7 @@ use crate::store::{Store, StoreError, query_rows, sql_string};
 use serde_json::Value;
 use std::path::Path;
 
-fn reject(table: &str, key: &str, value: &str) -> StoreError {
+pub(crate) fn reject(table: &str, key: &str, value: &str) -> StoreError {
     StoreError::Check(format!("duplicate {key} {value} in {table}"))
 }
 

@@ -7,24 +7,51 @@
 //! schema slots and contribute omitted tags, not the clock or the raw-file byte hash. Footer
 //! `created_by` is not read.
 //!
-//! All six tables are read under one lease, from one catalog snapshot. The rows are still
-//! materialized as JSON before they are encoded. That holds the fixture day and must not be
-//! how a production day is hashed; see ADR-0017.
+//! All six tables are read under one lease, from one catalog snapshot. Rows stream through a
+//! cursor one at a time: memory is bounded by one row, not the day (ADR-0017). The raw view
+//! keeps `batch_id`, so the digest itself drops older revisions and refuses a repeated primary
+//! key in one batch, across cursor boundaries.
 
 use super::canonical::{put_row, put_schema};
-use super::keys::assert_registered_keys_unique;
-use super::reader::query_decoded_many;
-use super::schema::{TABLES, column_pairs, sort_columns};
+use super::keys::reject;
+use super::reader::{DecodedSession, with_decoded_session};
+use super::schema::{TABLES, column_pairs, key_column, sort_columns};
 use crate::jsonout::Obj;
 use crate::store::StoreError;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
-/// The row list of a digest query. A missing list is a shape error, not an empty table.
-fn row_list<'a>(result: &'a Obj, table: &str) -> Result<&'a [Obj], StoreError> {
-    result
-        .rows("rows")
-        .ok_or_else(|| StoreError::Check(format!("digest query for {table} returned no row list")))
+/// Stream one table's rows in canonical order (`sort_columns`, `batch_id DESC`) and pass the
+/// newest revision of each primary key to `on_new`. Older revisions are skipped, not hashed. A
+/// repeated primary key in one batch is refused, including when the two copies arrive in
+/// different cursor steps. Returns how many rows were passed (one per distinct key).
+fn stream_newest(
+    session: &DecodedSession,
+    sql: &str,
+    key: &str,
+    table: &str,
+    mut on_new: impl FnMut(&Obj) -> Result<(), StoreError>,
+) -> Result<u64, StoreError> {
+    let mut count = 0u64;
+    let mut prev_key: Option<String> = None;
+    let mut prev_batch: i64 = 0;
+    session.stream(sql, |row| {
+        let value = row.str(key).unwrap_or("").to_owned();
+        let batch = row.int("batch_id").unwrap_or(0);
+        let repeated = prev_key.as_deref() == Some(value.as_str());
+        if repeated && batch == prev_batch {
+            // A repeated key in one batch is not a total order; the digest refuses it.
+            return Err(reject(table, key, &value));
+        }
+        if !repeated {
+            on_new(row)?;
+            count += 1;
+        }
+        prev_key = Some(value);
+        prev_batch = batch;
+        Ok(())
+    })?;
+    Ok(count)
 }
 
 /// SHA-256, hex, of the schema and decoded rows under `root`.
@@ -32,48 +59,48 @@ fn row_list<'a>(result: &'a Obj, table: &str) -> Result<&'a [Obj], StoreError> {
 /// # Errors
 ///
 /// The catalog or a Parquet file cannot be read, a primary key is repeated in one batch, the
-/// DuckDB build is not 1.4.5, a query result has no row list, or a value cannot be encoded.
+/// DuckDB build is not 1.4.5, or a value cannot be encoded.
 pub fn content_digest(root: &Path) -> Result<String, StoreError> {
-    assert_registered_keys_unique(root)?;
-    let statements: Vec<String> = TABLES
-        .iter()
-        .map(|table| {
-            let projection = column_pairs(table)
+    with_decoded_session(root, None, true, |session| {
+        let mut hasher = Sha256::new();
+        hasher.update(b"SDD2");
+        for table in TABLES {
+            let columns = column_pairs(table);
+            let key = key_column(table);
+            let mut record = Vec::new();
+            put_schema(&mut record, table, &columns).map_err(StoreError::Check)?;
+            let projection = columns
                 .iter()
                 .map(|(name, _)| name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!(
-                "SELECT {projection} FROM {table} ORDER BY {}",
+            let sql = format!(
+                "SELECT {projection}, batch_id FROM {table}_raw ORDER BY {}, batch_id DESC",
                 sort_columns(table)
-            )
-        })
-        .collect();
-    let refs: Vec<&str> = statements.iter().map(String::as_str).collect();
-    // One lease for every table, so the six results are one snapshot.
-    let results = query_decoded_many(root, &refs)?;
-    if results.len() != TABLES.len() {
-        return Err(StoreError::Check(
-            "digest did not read every decoded table".into(),
-        ));
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(b"SDD2");
-    for (table, result) in TABLES.iter().zip(results) {
-        let columns = column_pairs(table);
-        let mut record = Vec::new();
-        put_schema(&mut record, table, &columns).map_err(StoreError::Check)?;
-        let rows = row_list(&result, table)?;
-        let count = u64::try_from(rows.len()).map_err(|_| StoreError::Check("row count".into()))?;
-        record.extend_from_slice(&count.to_be_bytes());
-        hasher.update(&record);
-        for row in rows {
-            let mut encoded = Vec::new();
-            put_row(&mut encoded, &columns, row).map_err(StoreError::Check)?;
-            hasher.update(&encoded);
+            );
+            // First pass counts the distinct keys (the rows the digest hashes) and refuses a
+            // duplicate; the count must precede the rows in the record, and a cursor cannot
+            // rewind, so the rows are streamed twice. Both passes hold one row, never the day.
+            let count = stream_newest(session, &sql, key, table, |_| Ok(()))?;
+            record.extend_from_slice(&count.to_be_bytes());
+            hasher.update(&record);
+            if count == 0 {
+                continue;
+            }
+            let hashed = stream_newest(session, &sql, key, table, |row| {
+                let mut encoded = Vec::new();
+                put_row(&mut encoded, &columns, row).map_err(StoreError::Check)?;
+                hasher.update(&encoded);
+                Ok(())
+            })?;
+            if hashed != count {
+                return Err(StoreError::Check(format!(
+                    "digest for {table} hashed {hashed} rows, expected {count}"
+                )));
+            }
         }
-    }
-    Ok(hex::encode(hasher.finalize()))
+        Ok(hex::encode(hasher.finalize()))
+    })
 }
 
 #[cfg(test)]
@@ -216,14 +243,86 @@ mod tests {
     }
 
     #[test]
-    fn a_digest_result_without_a_row_list_is_an_error() {
-        let err = row_list(&Obj::new(), "events").unwrap_err();
-        assert!(err.to_string().contains("no row list"), "{err}");
-        assert!(err.to_string().contains("events"), "{err}");
-        assert!(
-            row_list(&Obj::new().with_rows("rows", Vec::new()), "events")
-                .unwrap()
-                .is_empty()
+    fn a_duplicate_key_separated_by_other_rows_is_still_refused_while_streaming() {
+        // The two copies of `sig-a` sit in different files and are separated by many other rows;
+        // the streamed refusal has to carry the previous key across every cursor step, not just
+        // within one file or one in-memory batch.
+        fn write_rows(path: &std::path::Path, rows: &[(String, i64)]) {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            let values = rows
+                .iter()
+                .map(|(signature, slot)| {
+                    format!(
+                        "('{signature}', 'h', {slot}, 0, false, 1, true, 'decoded', 0, 0, 'src', '2026-10-04T00:00:00.000Z', 'v')"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let conn = duckdb::Connection::open_in_memory().unwrap();
+            conn.execute_batch(&format!(
+                "COPY (SELECT * FROM (VALUES {values}) t(signature, source_hash, slot, tx_index, single_in_slot, block_time, committed, status, event_count, error_count, source_file, decoded_at, decoder_version)) TO {} (FORMAT PARQUET)",
+                sql_string(&path.to_string_lossy())
+            ))
+            .unwrap();
+        }
+
+        let dir = std::env::temp_dir().join(format!("digest-cross-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut many: Vec<(String, i64)> = (0..2_000).map(|n| (format!("sig-{n:06}"), n)).collect();
+        many.push(("sig-a".to_owned(), 10_000));
+        write_rows(
+            &dir.join("tables/decoded_transactions/epoch=0/a.parquet"),
+            &many,
         );
+        write_rows(
+            &dir.join("tables/decoded_transactions/epoch=0/b.parquet"),
+            &[("sig-a".to_owned(), 10_000)],
+        );
+        std::fs::write(
+            dir.join("catalog.json"),
+            serde_json::json!({ "files": [
+                { "path": "tables/decoded_transactions/epoch=0/a.parquet", "table_name": "decoded_transactions", "batch_id": 1 },
+                { "path": "tables/decoded_transactions/epoch=0/b.parquet", "table_name": "decoded_transactions", "batch_id": 1 }
+            ] })
+            .to_string(),
+        )
+        .unwrap();
+        let err = content_digest(&dir).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("duplicate signature sig-a in decoded_transactions"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_revision_in_a_later_batch_is_kept_and_the_older_one_is_not_hashed() {
+        let latest = root_with(&[Sample {
+            path: "tables/decoded_transactions/epoch=0/a.parquet",
+            batch: 2,
+            rows: &[("sig-a", 10)],
+        }]);
+        let revised = root_with(&[
+            Sample {
+                path: "tables/decoded_transactions/epoch=0/a.parquet",
+                batch: 1,
+                rows: &[("sig-a", 10)],
+            },
+            Sample {
+                path: "tables/decoded_transactions/epoch=0/b.parquet",
+                batch: 2,
+                rows: &[("sig-a", 10)],
+            },
+        ]);
+        assert_eq!(
+            content_digest(&latest).unwrap(),
+            content_digest(&revised).unwrap(),
+            "a later batch must supersede an earlier revision, not be hashed twice"
+        );
+        std::fs::remove_dir_all(latest).unwrap();
+        std::fs::remove_dir_all(revised).unwrap();
     }
 }

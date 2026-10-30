@@ -467,15 +467,19 @@ pub fn statement_label(sql: &str) -> String {
     format!("{verb}:{table}")
 }
 
-/// Query rows on any connection as ordered JSON objects.
-pub fn query_rows(
+/// Run one statement and pass each row to `visit` without collecting them.
+///
+/// The rows are rendered exactly as [`query_rows`] renders them, but the caller sees one row at
+/// a time. Memory stays bounded by one row (plus the caller's own state), not by the result
+/// size, so a streaming consumer such as the content digest never holds a day as JSON.
+pub fn for_each_row(
     conn: &Connection,
     sql: &str,
     params: &[&dyn ToSql],
-) -> Result<Vec<Obj>, StoreError> {
+    mut visit: impl FnMut(&Obj) -> Result<(), StoreError>,
+) -> Result<(), StoreError> {
     let mut statement = conn.prepare(sql)?;
     let mut rows = statement.query(params_from_iter(params.iter()))?;
-    let mut out = Vec::new();
     let mut names: Option<Vec<String>> = None;
     let mut tz: Option<Vec<bool>> = None;
     while let Some(row) = rows.next()? {
@@ -496,8 +500,22 @@ pub fn query_rows(
             let value: DbValue = row.get(i)?;
             obj.set(name, json_of(value, tz[i]));
         }
-        out.push(obj);
+        visit(&obj)?;
     }
+    Ok(())
+}
+
+/// Query rows on any connection as ordered JSON objects.
+pub fn query_rows(
+    conn: &Connection,
+    sql: &str,
+    params: &[&dyn ToSql],
+) -> Result<Vec<Obj>, StoreError> {
+    let mut out = Vec::new();
+    for_each_row(conn, sql, params, |row| {
+        out.push(row.clone());
+        Ok(())
+    })?;
     Ok(out)
 }
 
