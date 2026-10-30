@@ -1,6 +1,12 @@
-//! DuckDB storage compatibility (issue #58): a checkpoint (and its write-ahead log) written by
-//! an older DuckDB storage version must open and migrate cleanly, and a file that is not a valid
-//! database must fail with the typed DuckDB error, never silently.
+//! DuckDB storage compatibility (issue #58): a checkpoint (and its write-ahead log) written at
+//! the oldest storage compatibility version the current DuckDB emits must open and migrate
+//! cleanly, and a file that is not a valid database must fail with the typed DuckDB error, never
+//! silently.
+//!
+//! Honesty note: the first test writes with the *current* DuckDB binary set to its oldest
+//! supported `storage_compatibility_version`; it does not read a file produced by a genuinely
+//! older DuckDB binary. It pins the reopen/migrate path and WAL replay, not cross-binary storage
+//! migration.
 
 use serde_json::json;
 use solos_data::store::{Store, StoreError};
@@ -14,12 +20,13 @@ fn tempdir(label: &str) -> PathBuf {
     dir
 }
 
-/// The oldest storage version DuckDB 1.4.5 can still emit, standing in for a checkpoint written
-/// by an older DuckDB binary (ADR-0007 wrote it from the Node writer's DuckDB 1.4.4).
+/// The oldest storage version the current DuckDB binary can still emit, standing in for a
+/// checkpoint written by an older DuckDB binary (ADR-0007 wrote it from the Node writer's
+/// DuckDB 1.4.4). The file is still written by the current binary.
 const OLDER_STORAGE_VERSION: &str = "v1.4.4";
 
 #[test]
-fn a_checkpoint_and_wal_written_by_an_older_storage_version_migrate_cleanly() {
+fn a_checkpoint_written_at_the_oldest_supported_storage_version_reopens_cleanly() {
     let root = tempdir("duckdb-old");
     let path = root.join("checkpoint.duckdb");
     {

@@ -3,6 +3,12 @@
 //! version a row carries (`decoder_version`) and the content hash a revision is keyed by both
 //! follow the slot, so a range after an upgrade re-decodes under its new version while earlier
 //! rows keep the version that produced them.
+//!
+//! Today exactly one codec is linked (`phoenix-rise-events` 0.6.12), so the schedule stamps that
+//! version on every slot. The audit fixture in `tests/data/codec-audit.json` places two existing
+//! captures on either side of an *invented* boundary and stamps the pre side `0.6.11`; that
+//! version is only a label — the same linked 0.6.12 codec decodes both sides. Nothing here claims
+//! a real historical codec boundary.
 
 use super::schema::VERSION;
 
@@ -21,6 +27,10 @@ pub struct Upgrade {
 /// does not know, the new codec version is added here with its first slot; rows after that slot
 /// are then re-decoded (their content hash changes) and re-stamped, while earlier rows keep the
 /// version that produced them.
+///
+/// The audit fixture exercises that mechanism with an *example* boundary whose pre-upgrade
+/// `0.6.11` stamp is synthetic: the same linked 0.6.12 codec decodes both sides of the fixture,
+/// so the per-slot version is only a stamp there, not a different decoder.
 pub const SCHEDULE: &[Upgrade] = &[Upgrade {
     slot: 0,
     version: VERSION,

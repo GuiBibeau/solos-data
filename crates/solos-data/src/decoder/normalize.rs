@@ -44,15 +44,25 @@ impl RawTransaction {
     }
 
     /// The slot as an integer, from either the JSON number or decimal-string rendering.
-    #[must_use]
-    pub fn slot_i64(&self) -> i64 {
-        self.slot_text().parse().unwrap_or(0)
+    ///
+    /// # Errors
+    ///
+    /// An unparseable slot is a validation error, never a silent `0`: a slot that is neither an
+    /// integer nor a decimal string means the raw row is corrupt, and publishing rows under a
+    /// fabricated slot would misattribute them to the wrong codec version and content hash.
+    pub fn slot_i64(&self) -> Result<i64, String> {
+        let text = self.slot_text();
+        text.parse::<i64>()
+            .map_err(|_| format!("unparseable slot {text:?}"))
     }
 
     /// The content hash the decoder keys revisions by under the production codec schedule.
-    #[must_use]
-    pub fn content_hash(&self) -> String {
-        self.content_hash_with_version(codec_version(self.slot_i64()))
+    ///
+    /// # Errors
+    ///
+    /// An unparseable slot fails, like [`RawTransaction::slot_i64`].
+    pub fn content_hash(&self) -> Result<String, String> {
+        Ok(self.content_hash_with_version(codec_version(self.slot_i64()?)))
     }
 
     /// The content hash the decoder keys revisions by for one codec version:
@@ -172,7 +182,7 @@ pub fn normalize(
         groups,
         source_file,
         &now(),
-        codec_version(tx.slot_i64()),
+        codec_version(tx.slot_i64()?),
     )
 }
 
@@ -192,7 +202,7 @@ pub fn normalize_at(
         groups,
         source_file,
         decoded_at,
-        codec_version(tx.slot_i64()),
+        codec_version(tx.slot_i64()?),
     )
 }
 
@@ -452,7 +462,27 @@ mod tests {
         let expected = crate::fsutil::sha256_hex(
             br#"["phoenix-rise-events-0.6.12/schema-1","AA==","{}",0,false,null,"null"]"#,
         );
-        assert_eq!(tx.content_hash(), expected);
+        assert_eq!(tx.content_hash().unwrap(), expected);
+    }
+
+    #[test]
+    fn an_unparseable_slot_is_an_error_not_a_silent_zero() {
+        let tx = RawTransaction {
+            signature: "s".into(),
+            slot: Value::String("not-a-slot".into()),
+            block_time: Value::String("100".into()),
+            tx_index: Value::from(0),
+            single_in_slot: Value::Bool(false),
+            tx_b64: Some("AA==".into()),
+            meta_json: Some("{}".into()),
+            terminal_error: None,
+            err: Value::String("null".into()),
+        };
+        let err = tx.slot_i64().unwrap_err();
+        assert!(err.contains("unparseable slot"), "{err}");
+        assert!(tx.content_hash().is_err());
+        assert!(normalize(&tx, "h", &[], "source").is_err());
+        assert!(normalize_at(&tx, "h", &[], "source", "2026-01-01T00:00:00Z").is_err());
     }
 
     #[test]

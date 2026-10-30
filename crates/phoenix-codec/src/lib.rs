@@ -13,6 +13,10 @@ use serde_json::{Value, json};
 
 pub mod integrity;
 
+/// The pinned Phoenix Rise events codec this crate wraps, re-exported so audit tests can
+/// inspect the raw wire layout (enum discriminants and borsh sizes) against fixtures.
+pub use phoenix_rise_events;
+
 /// One Phoenix instruction group as the extractor assembles it.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Group {

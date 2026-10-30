@@ -4,7 +4,7 @@
   "source": {
     "kind": "phoenixRiseCapturedTransactions",
     "programId": "EtrnLzgbS7nMMy5fbD42kXiUzGg8XQzJ972Xtk1cjWih",
-    "note": "Real captured Phoenix Rise instructions, selected from tests/data/phoenix-events.json for the codec audit (issue #58). No provider URLs."
+    "note": "Synthetic audit fixture (issue #58). Both transactions are existing captures copied from tests/data/phoenix-events.json (signatures 7wrxAgETB5LX... and 35BixDuj5FXJ...), not new wire data. The upgrade boundary slot 428000000 and the pre-upgrade version 0.6.11 are invented for the exercise, and the per-slot version is only a stamp: the same linked phoenix-rise-events 0.6.12 codec decodes both sides. No provider URLs."
   },
   "upgrade": {
     "slot": 428000000,
@@ -64,6 +64,28 @@
               "PnL",
               "SlotContext",
               "TraderFundingSettled"
+            ],
+            "eventLayout": [
+              {
+                "variant": "LiquidationTransfer",
+                "size": 107
+              },
+              {
+                "variant": "LiquidationTransferSummary",
+                "size": 93
+              },
+              {
+                "variant": "PnL",
+                "size": 101
+              },
+              {
+                "variant": "SlotContext",
+                "size": 17
+              },
+              {
+                "variant": "TraderFundingSettled",
+                "size": 77
+              }
             ]
           }
         ]
@@ -117,6 +139,20 @@
               "Header",
               "MarketAdded",
               "SlotContext"
+            ],
+            "eventLayout": [
+              {
+                "variant": "Header",
+                "size": 107
+              },
+              {
+                "variant": "MarketAdded",
+                "size": 1
+              },
+              {
+                "variant": "SlotContext",
+                "size": 17
+              }
             ]
           }
         ]

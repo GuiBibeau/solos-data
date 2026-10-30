@@ -332,7 +332,16 @@ fn decode_row(
     schedule: &[Upgrade],
 ) -> Outcome {
     let tx = &row.tx;
-    let version = codec_version_for(schedule, tx.slot_i64());
+    let slot = match tx.slot_i64() {
+        Ok(slot) => slot,
+        Err(error) => {
+            return Outcome {
+                seen: None,
+                rows: Some(Err(error)),
+            };
+        }
+    };
+    let version = codec_version_for(schedule, slot);
     let hash = tx.content_hash_with_version(version);
     if let Some(previous_at) = &row.previous_at
         && !previous_at.is_empty()
