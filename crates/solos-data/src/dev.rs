@@ -172,6 +172,11 @@ pub fn failpoint_writer(root: &Path, name: &str, from: i64, to: i64) -> Result<(
             cycle_id: None,
         }),
     )?;
+    // The watermark and the file rows just committed live in the WAL until DuckDB checkpoints
+    // them into the database file. This point is not in the failpoints matrix (the matrix
+    // asserts no watermark was committed); a test kills the process here so a copied checkpoint
+    // plus WAL is the only place the committed W survives.
+    crate::crash_point!("publish/after-watermark-commit");
     store.close()?;
     println!("published");
     Ok(())

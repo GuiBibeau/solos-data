@@ -116,6 +116,58 @@ fn sync_all(file: &File, fault: Option<FsyncFault>) -> io::Result<()> {
     result.map_err(wrap_fsync)
 }
 
+/// A process-wide fsync failure, for lanes that spawn their writer thread themselves (the
+/// capture lane's `run_capture`) so a test can arm the failure without reaching that thread.
+/// Tests only; production never sets it. `0` is off, otherwise the [`FsyncStep`] code.
+#[cfg(feature = "failpoints")]
+static FAIL_FSYNC_PROCESS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Serializes the process-wide arm: the one-shot swap-and-restore in [`sync_handle`] must not
+/// race another thread's swap of the same arm.
+#[cfg(feature = "failpoints")]
+static FAIL_FSYNC_PROCESS_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(feature = "failpoints")]
+fn step_code(step: FsyncStep) -> u8 {
+    match step {
+        FsyncStep::Any => 1,
+        FsyncStep::TempFile => 2,
+        FsyncStep::DirAfterRename => 3,
+        FsyncStep::ParentDir => 4,
+    }
+}
+
+#[cfg(feature = "failpoints")]
+fn code_step(code: u8) -> Option<FsyncStep> {
+    match code {
+        1 => Some(FsyncStep::Any),
+        2 => Some(FsyncStep::TempFile),
+        3 => Some(FsyncStep::DirAfterRename),
+        4 => Some(FsyncStep::ParentDir),
+        _ => None,
+    }
+}
+
+/// Fail the next fsync of `step` on every thread. For the capture lane, which spawns its writer
+/// thread itself; the thread-local [`inject_fsync_failure`] cannot reach that thread. Tests only,
+/// behind the `failpoints` feature.
+#[cfg(feature = "failpoints")]
+pub fn inject_fsync_failure_process(step: FsyncStep) {
+    let _guard = FAIL_FSYNC_PROCESS_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    FAIL_FSYNC_PROCESS.store(step_code(step), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Clear the process-wide fsync failure.
+#[cfg(feature = "failpoints")]
+pub fn clear_fsync_failure_process() {
+    let _guard = FAIL_FSYNC_PROCESS_GUARD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    FAIL_FSYNC_PROCESS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(not(feature = "failpoints"))]
 fn sync_all(file: &File) -> io::Result<()> {
     file.sync_all().map_err(wrap_fsync)
@@ -129,6 +181,25 @@ fn sync_handle(file: &File, step: FsyncStep) -> io::Result<()> {
             slot.set(None); // fire once
             Some(fault)
         } else {
+            None
+        }
+    });
+    // A process-wide armed failure (for lanes that spawn their writer thread themselves) fires
+    // on the matching step from any thread, once, and clears itself. It goes through the same
+    // `sync_all` wrap as a real or thread-local injected failure.
+    let fault = fault.or_else(|| {
+        use std::sync::atomic::Ordering;
+        let _guard = FAIL_FSYNC_PROCESS_GUARD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let code = FAIL_FSYNC_PROCESS.swap(0, Ordering::Relaxed);
+        let matched =
+            code_step(code).is_some_and(|pending| pending == step || pending == FsyncStep::Any);
+        if matched {
+            Some(FsyncFault::Generic)
+        } else {
+            // A non-matching step must not consume the arm; put it back for the matching one.
+            FAIL_FSYNC_PROCESS.store(code, Ordering::Relaxed);
             None
         }
     });
