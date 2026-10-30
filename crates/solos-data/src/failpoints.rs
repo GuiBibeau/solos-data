@@ -5,6 +5,8 @@
 //! feature, which release builds leave off. The harness (`tests/failpoints.rs`) spawns the real
 //! binary, arms exactly one point, and SIGKILL/SIGABRT lands where the point is placed.
 
+use std::cell::Cell;
+
 /// The collector publication kill points, in commit order (ADR-0016 steps 2–7).
 ///
 /// - `publish/after-tmp-write`: after the `COPY` wrote the `.tmp` file, before its fsync.
@@ -75,4 +77,21 @@ macro_rules! crash_point {
 #[macro_export]
 macro_rules! crash_point {
     ($name:expr) => {};
+}
+
+thread_local! {
+    /// When set, the store's DuckDB config builder asks for an invalid memory limit, so
+    /// `config(false)` fails on this thread. Tests use it to cover the reopen failure path in
+    /// `Store::while_closed` (issue #66 item 5).
+    static FAIL_DB_CONFIG: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Fail the store's DuckDB config on this thread until cleared.
+pub fn inject_db_config_failure(fail: bool) {
+    FAIL_DB_CONFIG.with(|flag| flag.set(fail));
+}
+
+/// Whether the store's DuckDB config must fail on this thread.
+pub(crate) fn db_config_fails() -> bool {
+    FAIL_DB_CONFIG.with(|flag| flag.get())
 }
