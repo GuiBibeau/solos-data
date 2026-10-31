@@ -72,6 +72,10 @@ pub fn assert_relation_keys_unique(
 ///
 /// A duplicate, or the query fails.
 pub fn assert_registered_keys_unique(conn: &Connection) -> Result<(), StoreError> {
+    // Failpoint for the digest lease test. `content_digest` must reach this check while the
+    // read lease is held (issue #66). The session that owns `conn` was opened from one catalog
+    // read under that lease.
+    crate::crash_point!("digest/duplicate-key-check");
     for table in TABLES {
         let key = key_column(table);
         let registered = query_rows(

@@ -18,6 +18,8 @@ pub enum FsyncStep {
     DirAfterRename,
     /// The parent-directory fsync inside `create_dir_all_durable` (staging directories).
     ParentDir,
+    /// The re-run repair fsync of the parent of the last existing ancestor (ADR-0016).
+    RepairParent,
 }
 
 /// The I/O failure a test has armed. Production never arms one; a lane that hits an injected or
@@ -134,6 +136,7 @@ fn step_code(step: FsyncStep) -> u8 {
         FsyncStep::TempFile => 2,
         FsyncStep::DirAfterRename => 3,
         FsyncStep::ParentDir => 4,
+        FsyncStep::RepairParent => 5,
     }
 }
 
@@ -144,6 +147,7 @@ fn code_step(code: u8) -> Option<FsyncStep> {
         2 => Some(FsyncStep::TempFile),
         3 => Some(FsyncStep::DirAfterRename),
         4 => Some(FsyncStep::ParentDir),
+        5 => Some(FsyncStep::RepairParent),
         _ => None,
     }
 }
@@ -168,13 +172,51 @@ pub fn clear_fsync_failure_process() {
     FAIL_FSYNC_PROCESS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[cfg(feature = "failpoints")]
+thread_local! {
+    /// The last fsync `sync_handle` performed, path taken from the open handle so it is the
+    /// directory that was synced, and the [`FsyncStep`] (issue #66). Main's injected fsync
+    /// errors go through the production wrap and do not name the step.
+    static LAST_FSYNC: std::cell::RefCell<Option<(FsyncStep, std::path::PathBuf)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "failpoints")]
+fn record_fsync(step: FsyncStep, path: &Path) {
+    LAST_FSYNC.with(|slot| *slot.borrow_mut() = Some((step, path.to_path_buf())));
+}
+
+/// The path of the most recent fsync, taken from the handle that was synced.
+#[cfg(feature = "failpoints")]
+pub fn last_fsync_path() -> Option<std::path::PathBuf> {
+    LAST_FSYNC.with(|slot| slot.borrow().as_ref().map(|(_, path)| path.clone()))
+}
+
+/// The step of the most recent repair fsync request, for tests.
+#[cfg(feature = "failpoints")]
+pub fn last_fsync_step() -> Option<FsyncStep> {
+    LAST_FSYNC.with(|slot| slot.borrow().as_ref().map(|(step, _)| *step))
+}
+
 #[cfg(not(feature = "failpoints"))]
 fn sync_all(file: &File) -> io::Result<()> {
     file.sync_all().map_err(wrap_fsync)
 }
 
+/// The path the kernel has open for `file`. Recording this, not a path the caller names
+/// beside the `open`, is what lets the repair test see the directory that is actually
+/// fsynced: swapping the opened path must change the recorded path.
+#[cfg(feature = "failpoints")]
+fn synced_path(file: &File) -> Option<std::path::PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+}
+
 #[cfg(feature = "failpoints")]
 fn sync_handle(file: &File, step: FsyncStep) -> io::Result<()> {
+    if let Some(path) = synced_path(file) {
+        record_fsync(step, &path);
+    }
     let fault = FSYNC_FAULT.with(|slot| {
         let (target, fault) = slot.get()?;
         if target == step || target == FsyncStep::Any {
@@ -302,40 +344,57 @@ pub fn sync_dir_after_rename(path: &Path) -> io::Result<()> {
 }
 
 /// Create `path` and every missing ancestor. Each newly created directory's parent is fsynced, so
-/// the new directory entry itself is durable. Directories that already exist are left alone.
+/// the new directory entry itself is durable. The parent of the last existing ancestor is also
+/// fsynced: a previous run may have created that ancestor and crashed before fsyncing its parent,
+/// so a re-run repairs it (ADR-0016).
 pub fn create_dir_all_durable(path: &Path) -> io::Result<()> {
     guard_inside(path);
     let mut missing = Vec::new();
     let mut cursor = path.to_path_buf();
-    loop {
+    let existing_parent = loop {
         if cursor.as_os_str().is_empty() {
-            break;
+            break None;
         }
         if cursor.try_exists()? {
-            break;
+            break Some(parent_or_dot(&cursor));
         }
         let parent = parent_dir(&cursor);
         missing.push(cursor);
         match parent {
             Some(parent) => cursor = parent,
-            None => break,
+            None => break None,
         }
-    }
+    };
     for dir in missing.iter().rev() {
         match std::fs::create_dir(dir) {
-            Ok(()) => {
-                let parent = dir.parent();
-                let parent = parent.filter(|parent| !parent.as_os_str().is_empty());
-                sync_handle(
-                    &File::open(parent.unwrap_or(Path::new(".")))?,
-                    FsyncStep::ParentDir,
-                )?;
-            }
+            Ok(()) => sync_dir_parent(dir)?,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
         }
     }
+    if let Some(parent) = existing_parent {
+        sync_handle(&File::open(&parent)?, FsyncStep::RepairParent)?;
+    }
     Ok(())
+}
+
+/// fsync the parent of `dir` with [`FsyncStep::ParentDir`], so `dir`'s own directory entry is
+/// durable.
+fn sync_dir_parent(dir: &Path) -> io::Result<()> {
+    let parent = dir.parent().filter(|parent| !parent.as_os_str().is_empty());
+    sync_handle(
+        &File::open(parent.unwrap_or(Path::new(".")))?,
+        FsyncStep::ParentDir,
+    )
+}
+
+/// The parent directory whose entry must be fsynced to make `path` durable: the lexical parent,
+/// or `.` for a relative single-component path.
+fn parent_or_dot(path: &Path) -> std::path::PathBuf {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    parent.unwrap_or(Path::new(".")).to_path_buf()
 }
 
 fn parent_dir(path: &Path) -> Option<std::path::PathBuf> {
@@ -463,5 +522,42 @@ mod tests {
         let message = failed.unwrap_err().to_string();
         assert!(message.contains("fsync failed"), "{message}");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_rerun_fsyncs_the_parent_of_the_last_existing_ancestor() {
+        let root = std::env::temp_dir().join(format!("solos-mkdir-{}", uuid::Uuid::new_v4()));
+        let nested = root.join("staging/transactions/epoch=0");
+        // Simulate a crash after `epoch=0` was created but before its parent was fsynced: the
+        // directory exists, its entry is not durable. A re-run must fsync that parent.
+        std::fs::create_dir_all(&nested).unwrap();
+        inject_fsync_failure(FsyncStep::RepairParent);
+        let rerun = create_dir_all_durable(&nested);
+        clear_fsync_failure();
+        let message = rerun.unwrap_err().to_string();
+        assert!(message.contains("fsync failed"), "{message}");
+        assert_eq!(last_fsync_step(), Some(FsyncStep::RepairParent));
+        // The path is read back from the directory handle `sync_handle` fsynced, not from the
+        // path named next to the call. Opening `path` here instead of its parent fails this.
+        let synced = last_fsync_path().expect("the repair fsync records the directory it opened");
+        let expected = nested.parent().unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&synced).unwrap_or(synced),
+            std::fs::canonicalize(expected).expect("parent exists"),
+            "the repair must fsync the parent of the last existing ancestor"
+        );
+        // Once the fsync succeeds, the re-run is idempotent.
+        create_dir_all_durable(&nested).unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_relative_single_component_ancestor_falls_back_to_dot() {
+        assert_eq!(parent_or_dot(Path::new("staging")), Path::new("."));
+        assert_eq!(
+            parent_or_dot(Path::new("staging/child")),
+            Path::new("staging")
+        );
+        assert_eq!(parent_or_dot(Path::new("/a/b")), Path::new("/a"));
     }
 }

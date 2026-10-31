@@ -70,8 +70,10 @@ fn stream_newest(
 /// DuckDB build is not 1.4.5, or a value cannot be encoded.
 pub fn content_digest(root: &Path) -> Result<String, StoreError> {
     with_decoded_session(root, None, true, |session| {
-        // The full registered-file duplicate check, before the reader views narrow child tables
-        // to rows whose parent is the newest `decoded_transactions` revision.
+        // The full registered-file duplicate check, under the read lease
+        // `with_decoded_session` holds, before the reader views narrow child tables to rows
+        // whose parent is the newest `decoded_transactions` revision. The session's
+        // registrations come from the one catalog read taken inside that lease (issue #66).
         assert_registered_keys_unique(session.conn())?;
         let mut hasher = Sha256::new();
         hasher.update(b"SDD2");
@@ -439,6 +441,43 @@ mod tests {
         assert!(
             err.to_string().contains("duplicate event_id e1 in events"),
             "{err}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn content_digest_runs_the_duplicate_key_check_under_the_read_lease() {
+        let dir = root_with(&[Sample {
+            path: "tables/decoded_transactions/epoch=0/a.parquet",
+            batch: 1,
+            rows: &[("sig-a", 10)],
+        }]);
+        // Drive the check through `content_digest`. A failpoint inside
+        // `assert_registered_keys_unique` records whether the read lease is held at that
+        // moment, and the session counter records how many catalog reads that took. Moving
+        // the check into its own `with_decoded_session` (a second lease and a second catalog
+        // read) must fail this test, as must running the check before any session.
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = std::sync::Arc::clone(&held);
+        let root = dir.clone();
+        crate::failpoints::arm_callback("digest/duplicate-key-check", move || {
+            observed.store(
+                crate::lease::has_readers(&root).unwrap_or(false),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        });
+        crate::decoder::reader::reset_decoded_session_opens();
+        let digest = content_digest(&dir);
+        crate::failpoints::disarm("digest/duplicate-key-check");
+        digest.unwrap();
+        assert!(
+            held.load(std::sync::atomic::Ordering::SeqCst),
+            "the duplicate-key check must run under the read lease"
+        );
+        assert_eq!(
+            crate::decoder::reader::decoded_session_opens(),
+            1,
+            "content_digest must open one decoded session, so the check and the rows share one catalog read"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }

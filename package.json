@@ -9,7 +9,6 @@
     "node": ">=22.18"
   },
   "scripts": {
-    "start": "node src/cli.ts run",
     "collector": "node src/cli.ts",
     "decoder": "node src/decode/cli.ts",
     "codec:build": "cargo build --release --locked -p phoenix-codec",

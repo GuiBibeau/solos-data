@@ -81,3 +81,26 @@ macro_rules! crash_point {
 macro_rules! crash_point {
     ($name:expr) => {};
 }
+
+#[cfg(feature = "failpoints")]
+use std::cell::Cell;
+
+#[cfg(feature = "failpoints")]
+thread_local! {
+    /// When set, the store's DuckDB config builder asks for an invalid memory limit, so
+    /// `config(false)` fails on this thread. Tests use it to cover the reopen failure path in
+    /// `Store::while_closed` (issue #66 item 5).
+    static FAIL_DB_CONFIG: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Fail the store's DuckDB config on this thread until cleared.
+#[cfg(feature = "failpoints")]
+pub fn inject_db_config_failure(fail: bool) {
+    FAIL_DB_CONFIG.with(|flag| flag.set(fail));
+}
+
+/// Whether the store's DuckDB config must fail on this thread.
+#[cfg(feature = "failpoints")]
+pub(crate) fn db_config_fails() -> bool {
+    FAIL_DB_CONFIG.with(|flag| flag.get())
+}

@@ -277,7 +277,7 @@ jobs:
   # the condition that legitimizes the skip; today that is `archive-check` on a pull request that
   # touched no archive inputs. Every other non-success result fails.
   ci-ok:
-    needs: [changes, fmt, clippy, test, lint, archive-check, ci-self-check]
+    needs: [changes, fmt, clippy, test, lint, verify-skill, archive-check, ci-self-check]
     if: always()
     runs-on: ubuntu-latest
     steps:

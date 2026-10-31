@@ -38,7 +38,7 @@ test('verify-solos-data subprocess env is an allowlist, proven by a real child p
   const env = {
     // The names the allowlist keeps.
     PATH: '/usr/bin:/bin',
-    HOME: '/home/verify',
+    HOME: '/opt/verify-home',
     TMPDIR: '/tmp',
     LANG: 'C.UTF-8',
     RUSTUP_HOME: '/opt/rustup',

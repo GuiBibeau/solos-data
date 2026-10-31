@@ -7,8 +7,8 @@
 // `*_RPC_ENDPOINT`, `PROVIDER_URL`, `ELFA_API_KEY`) and the archive (`JETSTREAMER_*`). A
 // parent shell that exports any of them would silently redirect the offline journeys away from
 // their fixtures, or leak a credential into a child. So every subprocess the skill spawns runs
-// with an allowlist: only the names the build genuinely needs survive, and everything else —
-// including every data-directory, provider and archive override — is dropped. The doctor
+// with an allowlist: only the names the build genuinely needs survive, and everything else
+// (including every data-directory, provider and archive override) is dropped. The doctor
 // refuses to start when the invoking shell exported any name that could redirect a journey.
 
 // Whole names that subprocesses may keep.

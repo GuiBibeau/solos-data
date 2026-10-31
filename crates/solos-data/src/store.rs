@@ -128,12 +128,37 @@ pub enum StoreError {
 /// Taking a second lock on the same file conflicts, including from this process.
 pub struct DbLock {
     file: nix::fcntl::Flock<File>,
+    /// Identity of the lock file this lock was taken for (`dev`, `ino`). `assert_root` compares
+    /// lock-file inodes rather than root path text, so the same checkpoint reached through a
+    /// symlink still matches while `repack_checkpoint(root_a, &lock_b)` cannot run.
+    dev: u64,
+    ino: u64,
 }
 
 impl DbLock {
     /// The caller holds this lock for the duration of the borrow.
     pub fn prove_held(&self) {
         let _ = &self.file;
+    }
+
+    /// Refuse a checkpoint operation on `root` unless its lock file is the inode this lock was
+    /// taken for.
+    pub fn assert_root(&self, root: &Path) -> Result<(), StoreError> {
+        let path = lock_path(root);
+        let meta = std::fs::metadata(&path).map_err(|error| {
+            StoreError::Check(format!("lock root mismatch: {}: {error}", path.display()))
+        })?;
+        if meta.dev() != self.dev || meta.ino() != self.ino {
+            return Err(StoreError::Check(format!(
+                "lock root mismatch: lock holds {}:{}, requested {}:{} ({})",
+                self.dev,
+                self.ino,
+                meta.dev(),
+                meta.ino(),
+                path.display()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -176,7 +201,12 @@ pub fn acquire_lock(root: &Path) -> Result<DbLock, StoreError> {
         match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
             Ok(file) => {
                 if same_inode(&file, &path) {
-                    return Ok(DbLock { file });
+                    let meta = file.metadata()?;
+                    return Ok(DbLock {
+                        file,
+                        dev: meta.dev(),
+                        ino: meta.ino(),
+                    });
                 }
             }
             Err((_, errno))
@@ -222,6 +252,12 @@ pub struct Store {
 /// JSON and Parquet linked in, and nothing else may be fetched over the network.
 fn config(read_only: bool) -> Result<Config, duckdb::Error> {
     let memory = std::env::var("SOLOS_DATA_DB_MEMORY").unwrap_or_else(|_| "4GB".into());
+    #[cfg(feature = "failpoints")]
+    let memory = if crate::failpoints::db_config_fails() {
+        "invalid failpoint".into()
+    } else {
+        memory
+    };
     let threads = std::env::var("SOLOS_DATA_DB_THREADS").unwrap_or_else(|_| "4".into());
     let checkpoint = std::env::var("SOLOS_DATA_DB_CHECKPOINT").unwrap_or_else(|_| "256MB".into());
     let mut config = Config::default()
@@ -404,7 +440,8 @@ impl Store {
     }
 
     /// Close the connection, then run `job` with the lock this store already holds, then reopen
-    /// with the same schema. `job` must not lock the checkpoint again.
+    /// with the same schema. `job` must not lock the checkpoint again. Every failure path marks
+    /// the store unusable, so later calls fail instead of writing to the in-memory placeholder.
     pub fn while_closed<T>(
         &mut self,
         job: impl FnOnce(&Path, &DbLock) -> Result<T, StoreError>,
@@ -412,18 +449,26 @@ impl Store {
         self.ensure_usable()?;
         let placeholder = Connection::open_in_memory()?;
         let conn = std::mem::replace(&mut self.conn, placeholder);
-        conn.close().map_err(|(_, error)| error)?;
+        if let Err((_, error)) = conn.close() {
+            self.unusable = Some(error.to_string());
+            return Err(error.into());
+        }
         let result = job(&self.root, &self.lock);
-        let reopened = match Connection::open_with_flags(
-            self.root.join("checkpoint.duckdb"),
-            config(false)?,
-        ) {
-            Ok(conn) => conn,
+        let db_config = match config(false) {
+            Ok(config) => config,
             Err(error) => {
                 self.unusable = Some(error.to_string());
                 return Err(error.into());
             }
         };
+        let reopened =
+            match Connection::open_with_flags(self.root.join("checkpoint.duckdb"), db_config) {
+                Ok(conn) => conn,
+                Err(error) => {
+                    self.unusable = Some(error.to_string());
+                    return Err(error.into());
+                }
+            };
         self.conn = reopened;
         if let Err(error) = self.exec_batch(self.ddl) {
             self.unusable = Some(error.to_string());
@@ -1005,6 +1050,25 @@ mod tests {
             std::fs::create_dir(&path)?;
             Ok(())
         });
+        let message = error.unwrap_err().to_string();
+        assert!(!message.is_empty());
+        let again = store.rows("SELECT 1", &[]).unwrap_err().to_string();
+        assert!(again.contains("unusable"), "{again}");
+        store.close().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_reopen_config_marks_the_store_unusable() {
+        let root = tempdir();
+        let mut store = Store::open(
+            &root,
+            "CREATE TABLE IF NOT EXISTS kv(name VARCHAR PRIMARY KEY, value JSON);",
+        )
+        .unwrap();
+        crate::failpoints::inject_db_config_failure(true);
+        let error = store.while_closed(|_root, _lock| Ok(()));
+        crate::failpoints::inject_db_config_failure(false);
         let message = error.unwrap_err().to_string();
         assert!(!message.is_empty());
         let again = store.rows("SELECT 1", &[]).unwrap_err().to_string();

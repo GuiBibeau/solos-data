@@ -1,12 +1,12 @@
-import { log, now, type Config } from './config.ts';
-import type { Provider } from './rpc.ts';
-import type { Store } from './store.ts';
-import { makeWalk, recordVersions, type Watermark } from './pipeline.ts';
-import { walkPage, type Walk } from './walker.ts';
-import { fetchRange } from './fetcher.ts';
-import { orderRange } from './ordering.ts';
-import { assertPublishable, validateRange } from './validation.ts';
-import { publishRange } from './writer.ts';
+import { log, now, type Config } from '../src/config.ts';
+import type { Provider } from '../src/rpc.ts';
+import type { Store } from '../src/store.ts';
+import { makeWalk, recordVersions, type Watermark } from '../src/pipeline.ts';
+import { walkPage, type Walk } from '../src/walker.ts';
+import { fetchRange } from '../src/fetcher.ts';
+import { orderRange } from '../src/ordering.ts';
+import { assertPublishable, validateRange } from '../src/validation.ts';
+import { publishRange } from '../src/writer.ts';
 
 export interface BackfillProgress {
   direction: 'newest-first'; phase: 'fetching' | 'complete'; next: number; ceiling: number;
@@ -78,9 +78,4 @@ export async function backfillStep(provider: Provider, store: Store, config: Con
   log('backfill_chunk', { ...report, direction: next.direction, oldestPublishedSlot: from,
     timingSeconds: next.timingSeconds, durationSeconds: (performance.now() - started) / 1000 });
   return next;
-}
-
-export async function backfill(provider: Provider, store: Store, config: Config, programData: string) {
-  while ((await backfillStep(provider, store, config, programData)).phase !== 'complete') {}
-  log('backfill_collection_complete', { direction: 'newest-first', independentValidation: 'pending' });
 }

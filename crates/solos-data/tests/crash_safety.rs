@@ -558,3 +558,13 @@ fn offline_repack_holds_the_checkpoint_lock() {
     assert_eq!(store.get("k").unwrap(), Some(json!({"a": 1})));
     store.close().unwrap();
 }
+
+#[test]
+fn repack_refuses_a_lock_taken_for_a_different_root() {
+    let root_a = TempDir::new("lock-root-a");
+    let root_b = TempDir::new("lock-root-b");
+    let lock_b = solos_data::store::acquire_lock(&root_b.0).unwrap();
+    let error = solos_data::repack::repack_checkpoint(&root_a.0, &lock_b).unwrap_err();
+    assert!(error.to_string().contains("root mismatch"), "{error}");
+    drop(lock_b);
+}
