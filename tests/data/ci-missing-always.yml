@@ -1,0 +1,7 @@
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+  ci-ok:
+    needs: [fmt]
+    runs-on: ubuntu-latest
+    steps: []

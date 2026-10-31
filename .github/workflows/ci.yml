@@ -34,7 +34,8 @@ env:
 # build-script units, so a shared target/ would still compile DuckDB twice: each Rust job keeps
 # its own cache instead. `archive-check` compiles DuckDB plus RocksDB, protobuf and the agave
 # crates, and keeps its own. `changes` computes the archive input set; `ci-ok` aggregates the
-# results into the single check branch protection should require.
+# results into the single check branch protection should require. `ci-self-check` runs the
+# structural checks that need no DuckDB build.
 #
 # Every Rust job uses a shared cache key (Swatinem/rust-cache `shared-key`) with a main-only
 # save: only pushes to main write the cache, while pull requests only restore.
@@ -219,38 +220,51 @@ jobs:
           find target -path '*/build/librocksdb-sys-*/out/*' -name '*.o' -delete
           find target -path '*/build/protobuf-src-*/out/*' -name '*.o' -delete
 
-  # The single check branch protection should require. It always runs and aggregates the real
-  # jobs: `changes`, `fmt`, `clippy` and `test` must succeed, and `archive-check` must succeed or
-  # be intentionally skipped because the diff touched no archive inputs. Require `ci-ok` (not the
-  # individual jobs): a skipped required job does not satisfy GitHub's branch protection, while
-  # `ci-ok` evaluates the skip against the filter and fails otherwise.
+  # Structural self-checks that need no DuckDB build: ci-ok coverage and the release dependency
+  # graph. It keeps a cargo cache entry only for the registry index that `cargo tree` reads, so
+  # the checks stay warm without compiling anything.
+  ci-self-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci-self-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: node scripts/check-ci.mjs
+      - run: scripts/check-release-deps.sh
+
+  # The single check branch protection should require. It always runs and iterates over every job
+  # it needs, so a new job is aggregated by adding it to `needs` (scripts/check-ci.mjs fails when
+  # a job is missing). A job may report `skipped` only when the ALLOWED_SKIPS map names it with
+  # the condition that legitimizes the skip; today that is `archive-check` on a pull request that
+  # touched no archive inputs. Every other non-success result fails.
   ci-ok:
-    needs: [changes, fmt, clippy, test, lint, archive-check]
+    needs: [changes, fmt, clippy, test, lint, archive-check, ci-self-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # scripts/ci-ok.sh lives in the repo, so the aggregator must check it out before
+      # running it. scripts/check-ci.mjs rejects a ci-ok that runs a repo script without
+      # an actions/checkout step first.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Aggregate required jobs
         env:
           NEEDS: ${{ toJSON(needs) }}
           ARCHIVE_CHANGED: ${{ needs.changes.outputs.archive }}
           IS_PR: ${{ github.event_name == 'pull_request' }}
-        run: |
-          set -euo pipefail
-          echo "$NEEDS" | jq .
-          for job in changes fmt clippy test lint; do
-            result="$(echo "$NEEDS" | jq -r --arg j "$job" '.[$j].result')"
-            if [ "$result" != "success" ]; then
-              echo "required job '$job' did not succeed: $result" >&2
-              exit 1
-            fi
-          done
-          archive_result="$(echo "$NEEDS" | jq -r '.["archive-check"].result')"
-          if [ "$archive_result" = "success" ]; then
-            echo "archive-check succeeded"
-          elif [ "$archive_result" = "skipped" ] && [ "$IS_PR" = "true" ] && [ "$ARCHIVE_CHANGED" != "true" ]; then
-            echo "archive-check intentionally skipped: no archive inputs changed on this pull request"
-          else
-            echo "archive-check did not succeed and was not an intentional skip (result=$archive_result, archive-changed=$ARCHIVE_CHANGED)" >&2
-            exit 1
-          fi
-          echo "ci-ok: all required jobs passed"
+          # The skip map: "job: condition that legitimizes a skipped result". The loop in
+          # scripts/ci-ok.sh reads the names; scripts/check-ci.mjs reads them back and fails
+          # when one does not name a real job.
+          ALLOWED_SKIPS: |-
+            archive-check: pull request touched no archive inputs
+        run: scripts/ci-ok.sh
