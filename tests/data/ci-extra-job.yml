@@ -1,0 +1,10 @@
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+  extra:
+    runs-on: ubuntu-latest
+  ci-ok:
+    needs: [fmt]
+    if: always()
+    runs-on: ubuntu-latest
+    steps: []
