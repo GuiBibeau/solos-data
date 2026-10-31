@@ -1,0 +1,13 @@
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+  ci-ok:
+    needs: [fmt]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate required jobs
+        env:
+          ALLOWED_SKIPS: |-
+            archive-check: pull request touched no archive inputs
+        run: echo done

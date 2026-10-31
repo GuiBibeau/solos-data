@@ -32,3 +32,15 @@ test('check-ci passes on a consistent workflow', () => {
   const { status } = runCheck('ci-consistent.yml');
   assert.equal(status, 0);
 });
+
+test('check-ci fails when ci-ok is missing if: always()', () => {
+  const { status, output } = runCheck('ci-missing-always.yml');
+  assert.notEqual(status, 0);
+  assert.match(output, /ci-ok must set "if: always\(\)" so it reports a result even when a job it needs fails/);
+});
+
+test('check-ci fails when the skip map names a job that does not exist', () => {
+  const { status, output } = runCheck('ci-skip-unknown-job.yml');
+  assert.notEqual(status, 0);
+  assert.match(output, /ci-ok skip map names "archive-check", but there is no such job/);
+});

@@ -258,31 +258,9 @@ jobs:
           NEEDS: ${{ toJSON(needs) }}
           ARCHIVE_CHANGED: ${{ needs.changes.outputs.archive }}
           IS_PR: ${{ github.event_name == 'pull_request' }}
-          # The skip map: "job: condition that legitimizes a skipped result". The loop below
-          # reads the names; scripts/check-ci.mjs reads them back and fails when one does not
-          # name a real job.
+          # The skip map: "job: condition that legitimizes a skipped result". The loop in
+          # scripts/ci-ok.sh reads the names; scripts/check-ci.mjs reads them back and fails
+          # when one does not name a real job.
           ALLOWED_SKIPS: |-
             archive-check: pull request touched no archive inputs
-        run: |
-          set -euo pipefail
-          echo "$NEEDS" | jq .
-          allowed_skips="$(printf '%s\n' "$ALLOWED_SKIPS" | sed -n 's/^\([^:]*\):.*/\1/p')"
-          for job in $(echo "$NEEDS" | jq -r 'keys[]'); do
-            result="$(echo "$NEEDS" | jq -r --arg j "$job" '.[$j].result')"
-            if [ "$result" = "success" ]; then
-              continue
-            fi
-            if [ "$result" = "skipped" ] && printf '%s\n' "$allowed_skips" | grep -qxF "$job"; then
-              case "$job" in
-                archive-check)
-                  if [ "$IS_PR" = "true" ] && [ "$ARCHIVE_CHANGED" != "true" ]; then
-                    echo "archive-check intentionally skipped: no archive inputs changed on this pull request"
-                    continue
-                  fi
-                  ;;
-              esac
-            fi
-            echo "required job '$job' did not succeed: $result" >&2
-            exit 1
-          done
-          echo "ci-ok: all required jobs passed"
+        run: scripts/ci-ok.sh
