@@ -24,10 +24,13 @@ the npm lockfile. Then:
 scripts/verify.sh
 ```
 
-That runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+That runs `npm run lint:text`, `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`,
 and `cargo test --workspace --locked`, then the TypeScript check and the Node
 tests. Rust tests run once. The script prints `VERIFY PASS` or `VERIFY FAIL <step>`
-and exits non-zero on failure. It compiles DuckDB's bundled C++ with g++
+and exits non-zero on failure. The lint fails on em-dashes and private host or
+path names; keep machine-specific patterns in the untracked file named by
+`SOLOS_LINT_DENY_FILE`. It compiles DuckDB's bundled C++ with g++
 (`CC=gcc`, `CXX=g++`). The `failpoints` cargo feature compiles the test-only
 fsutil failpoints and write guard; the crate lists itself as a dev-dependency
 with `features = ["failpoints"]`, so tests get them and release builds do not.

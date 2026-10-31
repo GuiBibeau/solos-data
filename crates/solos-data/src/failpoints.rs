@@ -1,6 +1,6 @@
 //! Named crash-safety failpoints (issue #56).
 //!
-//! A kill point aborts the process — it never returns an error — because a returned error runs
+//! A kill point aborts the process. It never returns an error because a returned error runs
 //! destructors and is not a crash. The points are compiled in only under the `failpoints` cargo
 //! feature, which release builds leave off. The harness (`tests/failpoints.rs`) spawns the real
 //! binary, arms exactly one point, and SIGKILL/SIGABRT lands where the point is placed.

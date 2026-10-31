@@ -15,6 +15,7 @@
     "codec:build": "cargo build --release --locked -p phoenix-codec",
     "codec:test": "cargo test --locked --workspace",
     "check": "tsc --noEmit",
+    "lint:text": "node scripts/lint-text.mjs",
     "test": "node --test tests/*.test.ts",
     "verify": "npm run check && npm run codec:test && npm run codec:build && npm test"
   },

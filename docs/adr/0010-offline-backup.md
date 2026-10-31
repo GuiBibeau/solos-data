@@ -22,7 +22,7 @@ October 10, 2026, as the backup half of the roadmap's first step.
   `capabilities.json`; the whole augment root except its DuckDB ledgers and `staging*/`; the
   checkout's `config/`; the `solos-*` user units and drop-ins. Not backed up: `phoenix_decoded`
   (regenerable from raw), every `checkpoint.duckdb*`, raw Parquet the catalog does not list
-  (in-flight or retired), `.readers/`, `~/.config/solos-data/*.env`, `~/research/`.
+  (in-flight or retired), `.readers/`, `~/.config/solos-data/*.env`, `$HOME/research/`.
 - **Copy, never sync.** `rclone copy` adds and never deletes. Compaction retires superseded raw
   files on the box; their copies stay in the bucket, which therefore accumulates history. Raw
   file names are unique and immutable, so the raw pass compares sizes only and runs with

@@ -1,6 +1,6 @@
 //! The fsync-is-fatal rule (ADR-0016) traced through the decoder, augment and spot write paths:
 //! an injected fsync failure on the temporary file or on the directory after rename must end the
-//! lane without a retry — no file registered, no error row, no partial publication. The
+//! lane without a retry: no file registered, no error row, no partial publication. The
 //! collector's halves live in `collector_service.rs`; the crash matrix is `failpoints.rs`.
 
 use serde_json::json;
