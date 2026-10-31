@@ -142,7 +142,7 @@ test('a lint-allow inside a hash comment is honored', () => {
 test('a lint-allow inside a string literal is not honored', () => {
   const dir = fixtureDir();
   try {
-    const file = write(dir, 'lib.rs', `"${EM} lint-allow: em-dash"\n`);
+    const file = write(dir, 'lib.rs', `"${EM} // lint-allow: em-dash in a string"\n`);
     const r = run([file]);
     assert.equal(r.status, 1);
     assertViolation(r.stdout, file, '1:2', 'em-dash');
