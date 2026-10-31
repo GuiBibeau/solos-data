@@ -137,7 +137,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --locked
       # The npm suite runs on every push to main, and on a pull request that touches its inputs:
-      # the TypeScript sources and tests, their config, the npm manifests, and the codec it spawns.
+      # the TypeScript sources and tests, their config, the npm manifests, the lint script (whose
+      # tests live under tests/), and the codec it spawns.
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: changes
         if: github.event_name == 'pull_request'
@@ -146,6 +147,7 @@ jobs:
             npm:
               - 'src/**'
               - 'tests/**'
+              - 'scripts/**'
               - 'config/**'
               - 'package.json'
               - 'package-lock.json'
