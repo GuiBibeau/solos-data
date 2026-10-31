@@ -8,10 +8,14 @@ mod collector_common;
 use collector_common::*;
 use serde_json::json;
 use solos_data::collector::lanes::Lanes;
+use solos_data::collector::limiter::Limiter;
 use solos_data::collector::retention::prune_published;
+use solos_data::collector::rpc::{HttpReply, Provider, Transport};
 use solos_data::collector::service::{FatalHook, fatal_class, lane_error};
 use solos_data::collector::writer::{Checkpoint, publish_range};
 use solos_data::store::StoreError;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 fn publish(f: &Fixture, from: i64, to: i64) {
@@ -331,4 +335,52 @@ fn fsync_failure(
         )
     })
     .unwrap_err()
+}
+
+/// A transport whose every POST fails, so `run_with` stops at `confirm_mainnet` right after the
+/// startup recovery ran.
+struct FailingTransport;
+
+impl Transport for FailingTransport {
+    fn post<'a>(
+        &'a self,
+        _url: &'a str,
+        _body: String,
+    ) -> Pin<Box<dyn Future<Output = Result<HttpReply, String>> + Send + 'a>> {
+        Box::pin(async { Err("rpc down".into()) })
+    }
+}
+
+/// The production service path must run startup recovery itself: delete the `recover_startup`
+/// call in `run_with` and this test goes red because the planted orphans survive.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_with_recovers_orphans_before_it_checks_mainnet() {
+    let f = Fixture::new();
+    let staging = f.root.join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    let orphan = staging.join("orphan.parquet");
+    std::fs::write(&orphan, b"not really parquet").unwrap();
+    let tmp = staging.join("orphan.tmp");
+    std::fs::write(&tmp, b"tmp").unwrap();
+
+    let limiter = Arc::new(Limiter::new(700.0, 0.7, f.config.concurrency.clone()));
+    let provider = Arc::new(Provider::with_transport(
+        "https://rpc.invalid/v2/secret".into(),
+        f.config.clone(),
+        limiter,
+        Box::new(FailingTransport),
+    ));
+    let fatal: FatalHook = Arc::new(|_, _| {});
+    let error =
+        solos_data::collector::service::run_with(provider, f.db.clone(), f.config.clone(), fatal)
+            .await
+            .unwrap_err();
+    // The error is `confirm_mainnet`'s genesis check, proving `run_with` got past recovery.
+    assert!(error.to_string().contains("getGenesisHash"), "{error}");
+    assert!(
+        !orphan.exists(),
+        "recovery did not remove the unregistered parquet"
+    );
+    assert!(!tmp.exists(), "recovery did not remove the tmp file");
+    f.close();
 }

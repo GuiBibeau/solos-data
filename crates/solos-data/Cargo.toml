@@ -15,6 +15,8 @@ path = "src/main.rs"
 phoenix-codec = { path = "../phoenix-codec" }
 solana-wire = { path = "../solana-wire" }
 duckdb = { version = "=1.4.5", features = ["bundled", "json", "parquet"] }
+# Decimal rendering in the streaming row path (same crate and version duckdb 1.4.5 uses).
+rust_decimal = "1.14"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -62,6 +64,8 @@ solos-data = { path = ".", features = ["failpoints"] }
 # reads Cargo.lock so the schema VERSION is tied to the resolved phoenix-rise-events version.
 borsh = "1.7"
 toml = "0.5"
+# Property-based tests for the range checker (offline; no fork/timeout so cases run in-process).
+proptest = { version = "1.11.0", default-features = false, features = ["std"] }
 
 [features]
 default = []

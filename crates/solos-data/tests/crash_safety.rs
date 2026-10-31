@@ -12,6 +12,7 @@ use solos_data::restart::{RestartError, restart_predicate, tail_watermark};
 use solos_data::store::{Store, StoreError, sql_string};
 use std::fs::OpenOptions;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -120,6 +121,35 @@ fn a_second_open_in_this_process_is_already_owned() {
     drop(first);
     let again = Store::open(&root.0, ddl).unwrap();
     again.close().unwrap();
+}
+
+#[test]
+fn store_open_rejects_an_invalid_wal_size() {
+    // `Store::open` validates `SOLOS_DATA_WAL_AUTOCHECKPOINT` (failpoints feature) with
+    // `is_wal_size` before interpolating it into SQL. `-1` is rejected by that validator but
+    // DuckDB's own size parser accepts it ("infinite"), so without the guard the same process
+    // would open and publish successfully.
+    let root = TempDir::new("wal-size");
+    let output = Command::new(env!("CARGO_BIN_EXE_solos-data"))
+        .args(["dev", "failpoint-writer", "--root"])
+        .arg(&root.0)
+        .args(["--failpoint", "publish/none"])
+        .env("SOLOS_DATA_WAL_AUTOCHECKPOINT", "-1")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "Store::open must reject an invalid WAL size"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("SOLOS_DATA_WAL_AUTOCHECKPOINT is not a size"),
+        "stderr must name the invalid WAL size, got: {stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("published"),
+        "the invalid WAL size must fail before any range is published"
+    );
 }
 
 /// One Parquet row registered in `files` and `file_bounds`.
@@ -275,6 +305,118 @@ fn restart_predicate_is_green_on_a_clean_temp_run_and_red_when_a_covered_partiti
             assert_eq!(path, manifest_path(&truncated_root.0, &truncated));
         }
         other => panic!("truncate must fail the predicate, got {other}"),
+    }
+    store.close().unwrap();
+}
+
+/// Copy the checkpoint files (the DuckDB database and its write-ahead log) of a killed run to
+/// `to`. The WAL holds the committed data a crash left uncheckpointed, so a faithful checkpoint
+/// copy takes both files.
+fn copy_checkpoint(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for name in ["checkpoint.duckdb", "checkpoint.duckdb.wal"] {
+        let source = from.join(name);
+        if source.is_file() {
+            std::fs::copy(&source, to.join(name)).unwrap();
+        }
+    }
+}
+
+/// Spawn the real `dev failpoint-writer` binary to publish `[from, to]` with one kill point
+/// armed. `SOLOS_DATA_WAL_AUTOCHECKPOINT` is forced huge so the committed transaction stays in
+/// the WAL instead of being checkpointed into the database file.
+fn failpoint_writer(root: &Path, name: &str, from: i64, to: i64) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_solos-data"))
+        .args(["dev", "failpoint-writer", "--root"])
+        .arg(root)
+        .arg("--failpoint")
+        .arg(name)
+        .arg("--from")
+        .arg(from.to_string())
+        .arg("--to")
+        .arg(to.to_string())
+        .env("SOLOS_DATA_FAILPOINT_MARKER", root.join("failpoint-marker"))
+        .env("SOLOS_DATA_WAL_AUTOCHECKPOINT", "10GB")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// Wait for a child, bounded so a hang fails the test instead of hanging CI.
+fn wait_exit(mut child: Child) -> std::process::ExitStatus {
+    use std::time::{Duration, Instant};
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("binary did not exit within 60s");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn above_watermark_fires_on_a_checkpoint_copied_from_a_killed_run() {
+    // A real failpoint-writer commits W and its file rows, then aborts at
+    // publish/after-watermark-commit, before DuckDB checkpoints them into the database file. The
+    // committed data survives only in the WAL.
+    let killed = TempDir::new("above-killed");
+    {
+        let mut store = open_collector(&killed.0);
+        insert_transaction(&mut store, "sig", 100);
+        store.close().unwrap();
+    }
+    let status = wait_exit(failpoint_writer(
+        &killed.0,
+        "publish/after-watermark-commit",
+        100,
+        101,
+    ));
+    assert!(
+        !status.success() && status.signal().is_some(),
+        "the kill point must die by signal, got {status}"
+    );
+    let marker = std::fs::read_to_string(killed.0.join("failpoint-marker"))
+        .unwrap_or_else(|_| panic!("the kill point must write its marker file"));
+    assert_eq!(marker, "publish/after-watermark-commit");
+
+    // Copy the checkpoint (the DuckDB file plus its WAL) to a fresh root and recover it: the
+    // committed W and file rows survive the copy only if the WAL was included.
+    let copy = TempDir::new("above-copy");
+    copy_checkpoint(&killed.0, &copy.0);
+    let mut store = Store::open(&copy.0, SCHEMA).unwrap();
+    let watermark = tail_watermark(&store).unwrap();
+    assert_eq!(
+        watermark,
+        Some(101),
+        "the killed run's committed W must survive the copy"
+    );
+    predicate(&store).unwrap();
+
+    // Register a partition past the watermark: the corrupt state the check defends against.
+    let above = copy
+        .0
+        .join("staging/transactions/epoch=0/200-210-above.parquet");
+    publish_partition(&mut store, &above, 200, 210);
+    store.close().unwrap();
+
+    let store = open_collector(&copy.0);
+    match predicate(&store).unwrap_err() {
+        RestartError::AboveWatermark {
+            path,
+            slot_to,
+            watermark,
+        } => {
+            assert_eq!(path, manifest_path(&copy.0, &above));
+            assert_eq!(slot_to, 210);
+            assert_eq!(watermark, 101);
+        }
+        other => panic!("a file above W must fail the predicate, got {other}"),
     }
     store.close().unwrap();
 }

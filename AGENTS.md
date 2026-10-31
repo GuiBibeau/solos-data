@@ -24,11 +24,16 @@ the npm lockfile. Then:
 scripts/verify.sh
 ```
 
-That runs `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+That runs `npm run lint:text`, `cargo fmt --all --check`,
+`cargo clippy --workspace --all-targets --locked -- -D warnings`,
 and `cargo test --workspace --locked`, then the TypeScript check and the Node
 tests. Rust tests run once. The script prints `VERIFY PASS` or `VERIFY FAIL <step>`
-and exits non-zero on failure. It compiles DuckDB's bundled C++ with g++
-(`CC=gcc`, `CXX=g++`).
+and exits non-zero on failure. The lint fails on em-dashes and private host or
+path names; keep machine-specific patterns in the untracked file named by
+`SOLOS_LINT_DENY_FILE`. It compiles DuckDB's bundled C++ with g++
+(`CC=gcc`, `CXX=g++`). The `failpoints` cargo feature compiles the test-only
+fsutil failpoints and write guard; the crate lists itself as a dev-dependency
+with `features = ["failpoints"]`, so tests get them and release builds do not.
 
 One Rust integration test:
 
@@ -39,3 +44,20 @@ CC=gcc CXX=g++ cargo test --test <name>
 After a spot-decoder change, `SOLOS_DATA_REFRESH_SPOT_FIXTURES=1 cargo test --test spot`
 rewrites the expected rows in the fixture. Review that diff before committing it.
 Never point tests at provider URLs.
+
+## Verify skill
+
+After `scripts/verify.sh` passes, run the offline verification skill to prove the real
+binary through the golden fixtures:
+
+```sh
+node .cursor/skills/verify-solos-data/run.mjs
+```
+
+It builds `target/debug/solos-data`, runs four offline journeys (fixture raw decode
+against a golden row count and hash, a query over the fixture catalog, a watermark/range check
+that refuses on a gap fixture and leaves the watermark unchanged, and a spot fixture publish
+through the durable write and watermark), prints `PASS` or `FAIL`, and leaves
+reviewable evidence in `target/verify-evidence/`. The feature map lives under
+`.cursor/skills/verify-solos-data/features/`. See
+`.cursor/skills/verify-solos-data/SKILL.md`.

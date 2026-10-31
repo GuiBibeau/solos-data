@@ -1,6 +1,6 @@
 //! Named crash-safety failpoints (issue #56).
 //!
-//! A kill point aborts the process — it never returns an error — because a returned error runs
+//! A kill point aborts the process. It never returns an error because a returned error runs
 //! destructors and is not a crash. The points are compiled in only under the `failpoints` cargo
 //! feature, which release builds leave off. The harness (`tests/failpoints.rs`) spawns the real
 //! binary, arms exactly one point, and SIGKILL/SIGABRT lands where the point is placed.
@@ -17,6 +17,11 @@
 ///   advances the watermark.
 /// - `publish/before-watermark-write`: inside that transaction, after the files and range are
 ///   registered, before the watermark (`kv` key `W`) moves.
+///
+/// `dev failpoint-writer` also has `publish/after-watermark-commit`, which fires after that
+/// transaction commits and before the store closes. It is deliberately not in this matrix:
+/// the matrix asserts a killed run committed no watermark, while this point kills a run whose
+/// watermark and file rows are committed in the WAL but not yet checkpointed.
 pub const KILL_POINTS: &[&str] = &[
     "publish/after-tmp-write",
     "publish/after-file-fsync",

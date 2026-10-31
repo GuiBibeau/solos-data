@@ -97,7 +97,7 @@ Do not point two writers at the same checkpoint directory.
 
 ## Native Linux services
 
-The example units expect the checkout at `~/solos-data` and the binary at
+The example units expect the checkout at `$HOME/solos-data` and the binary at
 `~/.local/share/solos-data/bin/solos-data`. Build the binary in Docker on the
 server (the archive lane needs clang and cmake, which the build image installs):
 
@@ -204,7 +204,7 @@ Re-validate published ranges with the collector running (ADR-0008):
 ```sh
 nice -n 10 env SOLOS_DATA_DB_MEMORY=1GB SOLOS_DATA_DB_THREADS=1 \
   solos-data collector reverify --config config/phoenix.json \
-  --from 427163137 --to 428813136 --out ~/reverify/2026-10-13 --rps 50 --memory 32GB --threads 8
+  --from 427163137 --to 428813136 --out $HOME/reverify/2026-10-13 --rps 50 --memory 32GB --threads 8
 ```
 
 It needs `SOLANA_RPC_URL` (source `collector.env` in the same shell, never print it) and reads the
@@ -549,8 +549,8 @@ the archive feature (the libclang recipe under "Tests"), installed under its own
 checkout of its own, so the running services keep theirs:
 
 ```sh
-git clone https://github.com/GuiBibeau/solos-data.git ~/solos-data-venues-history
-cd ~/solos-data-venues-history
+git clone https://github.com/GuiBibeau/solos-data.git $HOME/solos-data-venues-history
+cd $HOME/solos-data-venues-history
 LIBCLANG_PATH=$HOME/.local/lib LLVM_CONFIG_PATH=/usr/bin/llvm-config-19 \
   nice cargo build --release -p solos-data --features archive
 install -m 0755 target/release/solos-data ~/.local/share/solos-data/bin/solos-data-venues-history
@@ -591,8 +591,8 @@ reads them as `spot_swaps`, `spot_liquidity` and `spot_batches`. About 420 GB, 1
 binary under its own name and a checkout of its own:
 
 ```sh
-git clone https://github.com/GuiBibeau/solos-data.git ~/solos-data-spot
-cd ~/solos-data-spot
+git clone https://github.com/GuiBibeau/solos-data.git $HOME/solos-data-spot
+cd $HOME/solos-data-spot
 LIBCLANG_PATH=$HOME/.local/lib LLVM_CONFIG_PATH=/usr/bin/llvm-config-19 \
   nice cargo build --release -p solos-data --features archive
 install -m 0755 target/release/solos-data ~/.local/share/solos-data/bin/solos-data-spot-history
@@ -797,7 +797,7 @@ if it has already grown past a few million published rows, stop the collector an
 A nightly `rclone copy` sends the raw Parquet the raw catalog lists, the augment root, `config/`
 and the `solos-*` user units to a private Cloudflare R2 bucket (ADR-0010). Not sent: decoded
 Parquet (regenerable from raw), DuckDB checkpoints, unlisted raw files, `.readers/`, staging,
-`*.env`, `~/research/`. It never deletes anything in the bucket: files the box retires stay
+`*.env`, `$HOME/research/`. It never deletes anything in the bucket: files the box retires stay
 there. Bucket layout: `phoenix_raw/`, `augment/`, `config/`, `systemd-user/`, and
 `catalogs/<UTC date>/{phoenix_raw,augment}/` (each night's catalogs).
 

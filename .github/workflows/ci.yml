@@ -4,6 +4,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Nightly and manual runs keep the archive compile check (which no longer runs on
+  # every PR) exercised; anything moved off PRs fails loudly here. Only pushes to main
+  # save the caches, so a main merge is what keeps them warm.
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,11 +29,52 @@ env:
   CARGO_PROFILE_DEV_DEBUG: "0"
   CARGO_PROFILE_TEST_DEBUG: "0"
 
-# Four jobs in parallel; the wall clock is the slowest one. `cargo clippy` (check, dev profile)
-# and `cargo test` (test profile) resolve different libduckdb-sys build-script units, so a shared
-# target/ would still compile DuckDB twice: each Rust job keeps its own cache instead.
-# `archive-check` compiles DuckDB plus RocksDB, protobuf and the agave crates, and keeps its own.
+# `fmt`, `clippy` and `test` run in parallel; the wall clock is the slowest one. `cargo clippy`
+# (check, dev profile) and `cargo test` (test profile) resolve different libduckdb-sys
+# build-script units, so a shared target/ would still compile DuckDB twice: each Rust job keeps
+# its own cache instead. `archive-check` compiles DuckDB plus RocksDB, protobuf and the agave
+# crates, and keeps its own. `changes` computes the archive input set; `ci-ok` aggregates the
+# results into the single check branch protection should require. `ci-self-check` runs the
+# structural checks that need no DuckDB build.
+#
+# Every Rust job uses a shared cache key (Swatinem/rust-cache `shared-key`) with a main-only
+# save: only pushes to main write the cache, while pull requests only restore.
+# Swatinem/rust-cache's restore key omits the Cargo.lock hash, so a PR that changes the lockfile
+# still restores main's warm cache and recompiles only the crates whose versions actually changed
+# (ADR-0018).
 jobs:
+  # Computes the archive input set for pull requests. It always runs so downstream jobs can read
+  # its outputs; the filter step itself only applies to pull requests, and on other events the
+  # outputs are empty so every downstream job runs.
+  changes:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      archive: ${{ steps.filter.outputs.archive }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            archive:
+              # Everything that drives `cargo check -p solos-data --features archive`'s build
+              # graph: the workspace and crate manifests, the lockfile, the pinned toolchain,
+              # the solos-data crate and its in-repo path dependencies (phoenix-codec,
+              # solana-wire, the vendored Jetstreamer crate), and this workflow itself.
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - '**/Cargo.toml'
+              - 'rust-toolchain.toml'
+              - '.github/workflows/ci.yml'
+              - 'crates/solos-data/**'
+              - 'crates/phoenix-codec/**'
+              - 'crates/solana-wire/**'
+              - 'vendor/**'
+
   fmt:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -39,6 +86,19 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # Text lint: em-dashes and private host or path names, the two AGENTS.md rules
+  # made machine-checkable. Node-only, no Rust toolchain and no npm install, so it
+  # finishes in seconds and fails before any cargo work runs.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+      - run: npm run lint:text
+
   clippy:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -48,7 +108,13 @@ jobs:
         with:
           toolchain: 1.96.0
           components: clippy
+      # `shared-key` is the stable shared prefix (equal to the automatic job id, so existing
+      # caches are reused); Swatinem's restore key omits the Cargo.lock hash, so a PR that
+      # changes the lockfile still restores main's warm cache. Only main saves; PRs only restore.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: clippy
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # DuckDB's objects are already archived in libduckdb.a; drop them before the cache is saved.
       # The build script reruns only when its inputs change, so nothing reads them again.
@@ -67,9 +133,17 @@ jobs:
         with:
           toolchain: 1.96.0
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: test
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo test --workspace --locked
+      # Seed the cache with the dev-profile binary the verify-skill job drives. `cargo test`
+      # resolves libduckdb-sys's build script in test mode and `cargo build` in build mode, so
+      # without this line the skill would recompile DuckDB's C++ even after restoring this cache.
+      - run: cargo build --locked --bin solos-data
       # The npm suite runs on every push to main, and on a pull request that touches its inputs:
-      # the TypeScript sources and tests, their config, the npm manifests, and the codec it spawns.
+      # the TypeScript sources and tests, their config, the npm manifests, the lint script (whose
+      # tests live under tests/), and the codec it spawns.
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: changes
         if: github.event_name == 'pull_request'
@@ -78,6 +152,7 @@ jobs:
             npm:
               - 'src/**'
               - 'tests/**'
+              - 'scripts/**'
               - 'config/**'
               - 'package.json'
               - 'package-lock.json'
@@ -85,6 +160,7 @@ jobs:
               - 'crates/phoenix-codec/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
+              - 'rust-toolchain.toml'
               - '.github/workflows/ci.yml'
       - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
         if: github.event_name != 'pull_request' || steps.changes.outputs.npm == 'true'
@@ -93,20 +169,57 @@ jobs:
           cache: npm
       - if: github.event_name != 'pull_request' || steps.changes.outputs.npm == 'true'
         run: npm ci
-      # Type check, codec tests and release build, then the JavaScript suite (offline, no credentials).
+      # Type check, the release codec binary the JS suite spawns, then the JS suite (offline, no
+      # credentials). The Rust and codec tests already ran in the `cargo test` step above, so the
+      # npm `codec:test` (a second `cargo test --workspace`) is not repeated here; verify.sh does
+      # the same.
       - if: github.event_name != 'pull_request' || steps.changes.outputs.npm == 'true'
-        run: npm run verify
+        run: npm run check && npm run codec:build && npm test
       - name: Prune DuckDB objects before caching
         run: find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete
+
+  # The offline verification skill drives the real binary through its golden fixtures. It
+  # restores the same cache the test job saves (`shared-key: test`), including the dev-profile
+  # binary and libduckdb-sys objects built there, so warm runs skip the Rust build entirely and
+  # the journeys finish in seconds. It never saves: the test job owns the cache.
+  verify-skill:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: 1.96.0
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        id: cache
+        with:
+          shared-key: test
+          save-if: false
+      - name: Record rust-cache
+        run: echo "rust-cache hit=${{ steps.cache.outputs.cache-hit }}"
+      - run: node .cursor/skills/verify-solos-data/run.mjs
 
   # The archive feature (Jetstreamer, the agave crates, RocksDB) is otherwise compiled only by
   # the image build. Bindgen needs libclang. RocksDB, DuckDB and protobuf are C++: `clang` as
   # `c++` fails that configure (no libstdc++), so the job pins gcc/g++. `cargo clippy` would
   # compile the same graph again with clippy-driver, and incremental compilation is off, so
   # this job only type-checks.
+  #
+  # It runs on every push to main, nightly and manual dispatches, and on a pull request only
+  # when the `changes` job says the diff touches the archive inputs. On those runs it restores
+  # main's warm cache (see the shared-key note above), so the heavy C++ and agave crates are not
+  # rebuilt from scratch. The whole job is gated, not just its steps, so a skipped archive check
+  # is visible to the `ci-ok` aggregator instead of reporting green while compiling nothing.
   archive-check:
+    needs: changes
+    if: github.event_name != 'pull_request' || needs.changes.outputs.archive == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    permissions:
+      contents: read
     env:
       CC: gcc
       CXX: g++
@@ -121,6 +234,9 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends clang cmake libclang-dev pkg-config g++
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         id: cache
+        with:
+          shared-key: archive-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Record rust-cache
         run: echo "rust-cache hit=${{ steps.cache.outputs.cache-hit }}"
       - run: cargo check -p solos-data --features archive --locked
@@ -131,3 +247,52 @@ jobs:
           find target -path '*/build/libduckdb-sys-*/out/*' -name '*.o' -delete
           find target -path '*/build/librocksdb-sys-*/out/*' -name '*.o' -delete
           find target -path '*/build/protobuf-src-*/out/*' -name '*.o' -delete
+
+  # Structural self-checks that need no DuckDB build: ci-ok coverage and the release dependency
+  # graph. It keeps a cargo cache entry only for the registry index that `cargo tree` reads, so
+  # the checks stay warm without compiling anything.
+  ci-self-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: 1.96.0
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci-self-check
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: node scripts/check-ci.mjs
+      - run: scripts/check-release-deps.sh
+
+  # The single check branch protection should require. It always runs and iterates over every job
+  # it needs, so a new job is aggregated by adding it to `needs` (scripts/check-ci.mjs fails when
+  # a job is missing). A job may report `skipped` only when the ALLOWED_SKIPS map names it with
+  # the condition that legitimizes the skip; today that is `archive-check` on a pull request that
+  # touched no archive inputs. Every other non-success result fails.
+  ci-ok:
+    needs: [changes, fmt, clippy, test, lint, verify-skill, archive-check, ci-self-check]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      # scripts/ci-ok.sh lives in the repo, so the aggregator must check it out before
+      # running it. scripts/check-ci.mjs rejects a ci-ok that runs a repo script without
+      # an actions/checkout step first.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - name: Aggregate required jobs
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          ARCHIVE_CHANGED: ${{ needs.changes.outputs.archive }}
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+          # The skip map: "job: condition that legitimizes a skipped result". The loop in
+          # scripts/ci-ok.sh reads the names; scripts/check-ci.mjs reads them back and fails
+          # when one does not name a real job.
+          ALLOWED_SKIPS: |-
+            archive-check: pull request touched no archive inputs
+        run: scripts/ci-ok.sh

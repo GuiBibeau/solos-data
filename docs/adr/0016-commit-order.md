@@ -32,10 +32,10 @@ the job; the in-service checkpoint rewrite uses that path and does not lock agai
 checkpoint afterwards fails, the store is marked unusable and later calls fail instead of writing
 to the in-memory placeholder.
 
-The TypeScript offline commands that open `<dataDir>/checkpoint.duckdb` — collector `maintain`,
+The TypeScript offline commands that open `<dataDir>/checkpoint.duckdb` (collector `maintain`,
 `repack`, `relocate`, `repair-next-backfill`, `validate-next-backfill`, `verify-storage`,
 `storage-stats`, `benchmark-ordering`, `benchmark-ingest`, and decoder `once`, `watch`, `repack`,
-`verify-storage` — re-exec themselves under `flock -n -x <dataDir>/checkpoint.duckdb.lock`
+`verify-storage`) re-exec themselves under `flock -n -x <dataDir>/checkpoint.duckdb.lock`
 (`src/lock.ts`) before DuckDB is opened, the same lock file and exclusive non-blocking semantics as
 `DbLock`; `flock` refuses (the wrapper prints `checkpoint already owned`) when the lock is held,
 so these commands never open a locked checkpoint. Read-only commands that do not open the
@@ -124,8 +124,8 @@ The harness spawns the real binary against a fixture source, arms one point, res
 kill, and asserts the restart predicate. After each kill it also asserts that the orphan Parquet
 and `.tmp` files left by the interrupted publication are removed by `recover_files` before the
 rerun. A re-run to completion is byte-identical to an uncrashed golden run: the same partition
-hashes and manifest, and no duplicated primary key. The matrix runs twice — with DuckDB's default
-checkpointing and with `SOLOS_DATA_WAL_AUTOCHECKPOINT` forced tiny — so kills land on both sides
+hashes and manifest, and no duplicated primary key. The matrix runs twice, with DuckDB's default
+checkpointing and with `SOLOS_DATA_WAL_AUTOCHECKPOINT` forced tiny, so kills land on both sides
 of a checkpoint.
 
 Power loss is out of scope. SIGABRT/SIGKILL is process death; the kernel keeps the page cache and

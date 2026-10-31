@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: solos-data <noreply@solos-data.invalid>
+Date: Thu, 30 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Planted bug: write the watermark (kv W) outside the file transaction
+
+The atomic commit (ADR-0016 step 7) writes the file rows, bounds, range and the
+watermark in one transaction. This mutation writes the watermark before that
+transaction, in its own autocommit statement, so a SIGKILL after `W` commits but
+before the files commit leaves a committed watermark without the full golden
+manifest: the ordering the nightly random-kill loop's `committed_after_kill`
+assertion must catch ("committed watermark without the full golden manifest").
+
+Apply, run the loop, then revert:
+
+    git apply patches/0019-planted-w-outside-transaction.patch
+    SOLOS_DATA_NIGHTLY_ITERATIONS=40 cargo test --test nightly_random_kill -- --ignored --nocapture
+    git apply -R patches/0019-planted-w-outside-transaction.patch
+
+diff --git a/crates/solos-data/src/collector/writer.rs b/crates/solos-data/src/collector/writer.rs
+index 0000000..0000001 100644
+--- a/crates/solos-data/src/collector/writer.rs
++++ b/crates/solos-data/src/collector/writer.rs
+@@ -233,6 +233,21 @@
+         table: "",
+         epoch: 0,
+     });
++    // PLANTED BUG: the watermark is written outside the file transaction, before the files
++    // commit, so a kill after `W` but before the files transaction leaves a committed watermark
++    // without the full golden manifest.
++    if let Some(checkpoint) = &checkpoint {
++        store.exec(
++            "INSERT OR REPLACE INTO kv VALUES (?, ?::JSON)",
++            &[&checkpoint.key, &checkpoint.value.to_string()],
++        )?;
++        if let Some(cycle) = &checkpoint.cycle_id {
++            store.exec(
++                "UPDATE cycles SET finished_at=?, status='ok' WHERE cycle_id=?",
++                &[&now(), cycle],
++            )?;
++        }
++    }
+     crate::crash_point!("publish/before-watermark-commit");
+     store.transaction(|store| {
+         for file in &files {
+@@ -264,18 +279,6 @@
+             &[&from, &to],
+         )?;
+         crate::crash_point!("publish/before-watermark-write");
+-        if let Some(checkpoint) = &checkpoint {
+-            store.exec(
+-                "INSERT OR REPLACE INTO kv VALUES (?, ?::JSON)",
+-                &[&checkpoint.key, &checkpoint.value.to_string()],
+-            )?;
+-            if let Some(cycle) = &checkpoint.cycle_id {
+-                store.exec(
+-                    "UPDATE cycles SET finished_at=?, status='ok' WHERE cycle_id=?",
+-                    &[&now(), cycle],
+-                )?;
+-            }
+-        }
+         Ok(())
+     })
+ }

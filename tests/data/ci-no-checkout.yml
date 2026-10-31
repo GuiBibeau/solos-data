@@ -1,0 +1,12 @@
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+  ci-ok:
+    needs: [fmt]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate required jobs
+        env:
+          NEEDS: '{}'
+        run: scripts/ci-ok.sh

@@ -7,7 +7,7 @@
 //! Today exactly one codec is linked (`phoenix-rise-events` 0.6.12), so the schedule stamps that
 //! version on every slot. The audit fixture in `tests/data/codec-audit.json` places two existing
 //! captures on either side of an *invented* boundary and stamps the pre side `0.6.11`; that
-//! version is only a label — the same linked 0.6.12 codec decodes both sides. Nothing here claims
+//! version is only a label, the same linked 0.6.12 codec decodes both sides. Nothing here claims
 //! a real historical codec boundary.
 
 use super::schema::VERSION;
