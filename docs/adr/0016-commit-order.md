@@ -107,8 +107,8 @@ The harness spawns the real binary against a fixture source, arms one point, res
 kill, and asserts the restart predicate. After each kill it also asserts that the orphan Parquet
 and `.tmp` files left by the interrupted publication are removed by `recover_files` before the
 rerun. A re-run to completion is byte-identical to an uncrashed golden run: the same partition
-hashes and manifest, and no duplicated primary key. The matrix runs twice — with DuckDB's default
-checkpointing and with `SOLOS_DATA_WAL_AUTOCHECKPOINT` forced tiny — so kills land on both sides
+hashes and manifest, and no duplicated primary key. The matrix runs twice, with DuckDB's default
+checkpointing and with `SOLOS_DATA_WAL_AUTOCHECKPOINT` forced tiny, so kills land on both sides
 of a checkpoint.
 
 Power loss is out of scope. SIGABRT/SIGKILL is process death; the kernel keeps the page cache and
