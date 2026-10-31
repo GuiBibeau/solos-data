@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Offline verification, same checks as CI, with cargo tests run once:
-#   the text lint, fmt, clippy -D warnings, cargo test --workspace --locked,
-#   tsc, the release codec binary the Node tests spawn, then the Node tests.
+#   the text lint, ci-ok coverage, release dependency graph, fmt, clippy -D warnings,
+#   cargo test --workspace --locked, tsc, the release codec binary the Node tests spawn,
+#   then the Node tests.
 # Prints VERIFY PASS, or VERIFY FAIL <step> and exits non-zero.
 
 set -u
@@ -63,6 +64,8 @@ export CARGO_BUILD_JOBS=${jobs}
 printf 'verify: CARGO_BUILD_JOBS=%s\n' "${jobs}" >&2
 
 run lint npm run lint:text
+run ci-check node scripts/check-ci.mjs
+run release-deps scripts/check-release-deps.sh
 run fmt cargo fmt --all --check
 run clippy cargo clippy --workspace --all-targets --locked -- -D warnings
 run test cargo test --workspace --locked
