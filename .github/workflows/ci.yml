@@ -253,6 +253,10 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
+      # scripts/ci-ok.sh lives in the repo, so the aggregator must check it out before
+      # running it. scripts/check-ci.mjs rejects a ci-ok that runs a repo script without
+      # an actions/checkout step first.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - name: Aggregate required jobs
         env:
           NEEDS: ${{ toJSON(needs) }}

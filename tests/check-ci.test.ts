@@ -44,3 +44,9 @@ test('check-ci fails when the skip map names a job that does not exist', () => {
   assert.notEqual(status, 0);
   assert.match(output, /ci-ok skip map names "archive-check", but there is no such job/);
 });
+
+test('check-ci fails when ci-ok runs a repo script without a checkout step', () => {
+  const { status, output } = runCheck('ci-no-checkout.yml');
+  assert.notEqual(status, 0);
+  assert.match(output, /ci-ok runs a repo script but has no actions\/checkout step before it/);
+});
