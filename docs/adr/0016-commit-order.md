@@ -58,7 +58,9 @@ only as an offline test fixture, not a shipped path. This sequence is the Rust w
    `create_dir_all_durable`. Each newly created directory's parent is fsynced, including ancestors
    that did not exist (`staging/`, `staging/<table>/`). The parent of the last existing ancestor is
    also fsynced, so a crash between creating a directory and fsyncing its parent is repaired by the
-   next run. Then `COPY` the rows to a `.tmp` sibling of the final Parquet path.
+   next run. That repair fsync runs on every call, including when every ancestor already exists,
+   so each Parquet write pays one extra directory fsync. Then `COPY` the rows to a `.tmp` sibling
+   of the final Parquet path.
 3. fsync that temporary file (`sync_tmp_file`).
 4. Rename it onto the final path.
 5. fsync the parent directory of that path (the `epoch=…` directory that received the rename,

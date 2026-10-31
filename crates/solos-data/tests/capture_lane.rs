@@ -52,8 +52,29 @@ fn run_capture_returns_the_lane_fatal_error() {
     // because `run_capture`'s own `recover` step fsyncs the catalog's temp file and directory
     // before the loop starts; a parent-directory failure is only reached by the candle write.
     inject_fsync_failure_process(FsyncStep::ParentDir);
-    let error = run_capture(&config, Arc::new(AtomicBool::new(false))).unwrap_err();
+    // A missed fsync arm, or an fsync error that is no longer classified as fatal, leaves the
+    // lane in its interval sleep instead of returning. Bound the wait so that hang fails the
+    // test. The fatal path returns on the first candle write, well inside this limit.
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_for_lane = Arc::clone(&stop);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(run_capture(&config, stop_for_lane));
+    });
+    let result = match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            panic!(
+                "run_capture did not return within 30s; a missed fsync arm or a non-fatal fsync leaves the lane running"
+            );
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("run_capture thread ended without a result");
+        }
+    };
     clear_fsync_failure_process();
+    let error = result.unwrap_err();
     let message = error.to_string();
     assert!(message.contains("fsync failed"), "{message}");
     // The status loop may have written a running status, but the fatal path must not write the

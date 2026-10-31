@@ -69,6 +69,30 @@ pub(crate) fn with_decoded_session<T>(
     })
 }
 
+// Opens of `DecodedSession` on this thread. Each open reads `catalog.json` once.
+// `content_digest` must open exactly one session for the duplicate-key check and the rows.
+#[cfg(feature = "failpoints")]
+thread_local! {
+    static DECODED_SESSION_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(feature = "failpoints")]
+fn note_decoded_session_open() {
+    DECODED_SESSION_OPENS.with(|opens| opens.set(opens.get().saturating_add(1)));
+}
+
+/// Zero the per-thread session-open counter.
+#[cfg(feature = "failpoints")]
+pub fn reset_decoded_session_opens() {
+    DECODED_SESSION_OPENS.with(|opens| opens.set(0));
+}
+
+/// How many [`DecodedSession`]s this thread has opened since [`reset_decoded_session_opens`].
+#[cfg(feature = "failpoints")]
+pub fn decoded_session_opens() -> u64 {
+    DECODED_SESSION_OPENS.with(|opens| opens.get())
+}
+
 /// Removes the spill directory when the session ends. Declared after `conn` in
 /// [`DecodedSession`] so field drop order closes the connection (releasing any spilled files)
 /// before the directory is removed.
@@ -115,6 +139,11 @@ impl DecodedSession {
         memory: &str,
         spill_root: &Path,
     ) -> Result<Self, StoreError> {
+        // One open is one `catalog.json` read. `content_digest` must do this once for the
+        // duplicate-key check and the row stream together (issue #66). A second
+        // `with_decoded_session` around the check is a second read.
+        #[cfg(feature = "failpoints")]
+        note_decoded_session_open();
         let catalog: Value =
             serde_json::from_str(&std::fs::read_to_string(root.join("catalog.json"))?)
                 .map_err(|error| StoreError::Check(error.to_string()))?;

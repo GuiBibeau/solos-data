@@ -174,9 +174,9 @@ pub fn clear_fsync_failure_process() {
 
 #[cfg(feature = "failpoints")]
 thread_local! {
-    /// The last repair fsync requested, so the repair test can tell which directory was
-    /// fsynced and which [`FsyncStep`] was used (issue #66). Main's injected fsync errors go
-    /// through the production wrap and do not name the step.
+    /// The last fsync `sync_handle` performed, path taken from the open handle so it is the
+    /// directory that was synced, and the [`FsyncStep`] (issue #66). Main's injected fsync
+    /// errors go through the production wrap and do not name the step.
     static LAST_FSYNC: std::cell::RefCell<Option<(FsyncStep, std::path::PathBuf)>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -186,7 +186,7 @@ fn record_fsync(step: FsyncStep, path: &Path) {
     LAST_FSYNC.with(|slot| *slot.borrow_mut() = Some((step, path.to_path_buf())));
 }
 
-/// The path of the most recent repair fsync request, for tests.
+/// The path of the most recent fsync, taken from the handle that was synced.
 #[cfg(feature = "failpoints")]
 pub fn last_fsync_path() -> Option<std::path::PathBuf> {
     LAST_FSYNC.with(|slot| slot.borrow().as_ref().map(|(_, path)| path.clone()))
@@ -203,8 +203,20 @@ fn sync_all(file: &File) -> io::Result<()> {
     file.sync_all().map_err(wrap_fsync)
 }
 
+/// The path the kernel has open for `file`. Recording this, not a path the caller names
+/// beside the `open`, is what lets the repair test see the directory that is actually
+/// fsynced: swapping the opened path must change the recorded path.
+#[cfg(feature = "failpoints")]
+fn synced_path(file: &File) -> Option<std::path::PathBuf> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()
+}
+
 #[cfg(feature = "failpoints")]
 fn sync_handle(file: &File, step: FsyncStep) -> io::Result<()> {
+    if let Some(path) = synced_path(file) {
+        record_fsync(step, &path);
+    }
     let fault = FSYNC_FAULT.with(|slot| {
         let (target, fault) = slot.get()?;
         if target == step || target == FsyncStep::Any {
@@ -361,8 +373,6 @@ pub fn create_dir_all_durable(path: &Path) -> io::Result<()> {
         }
     }
     if let Some(parent) = existing_parent {
-        #[cfg(feature = "failpoints")]
-        record_fsync(FsyncStep::RepairParent, &parent);
         sync_handle(&File::open(&parent)?, FsyncStep::RepairParent)?;
     }
     Ok(())
@@ -527,9 +537,13 @@ mod tests {
         let message = rerun.unwrap_err().to_string();
         assert!(message.contains("fsync failed"), "{message}");
         assert_eq!(last_fsync_step(), Some(FsyncStep::RepairParent));
+        // The path is read back from the directory handle `sync_handle` fsynced, not from the
+        // path named next to the call. Opening `path` here instead of its parent fails this.
+        let synced = last_fsync_path().expect("the repair fsync records the directory it opened");
+        let expected = nested.parent().unwrap();
         assert_eq!(
-            last_fsync_path().as_deref(),
-            Some(nested.parent().unwrap()),
+            std::fs::canonicalize(&synced).unwrap_or(synced),
+            std::fs::canonicalize(expected).expect("parent exists"),
             "the repair must fsync the parent of the last existing ancestor"
         );
         // Once the fsync succeeds, the re-run is idempotent.
