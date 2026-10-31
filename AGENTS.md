@@ -44,3 +44,20 @@ CC=gcc CXX=g++ cargo test --test <name>
 After a spot-decoder change, `SOLOS_DATA_REFRESH_SPOT_FIXTURES=1 cargo test --test spot`
 rewrites the expected rows in the fixture. Review that diff before committing it.
 Never point tests at provider URLs.
+
+## Verify skill
+
+After `scripts/verify.sh` passes, run the offline verification skill to prove the real
+binary through the golden fixtures:
+
+```sh
+node .cursor/skills/verify-solos-data/run.mjs
+```
+
+It builds `target/debug/solos-data`, runs four offline journeys (fixture raw decode
+against a golden row count and hash, a query over the fixture catalog, a watermark/range check
+that refuses on a gap fixture and leaves the watermark unchanged, and a spot fixture publish
+through the durable write and watermark), prints `PASS` or `FAIL`, and leaves
+reviewable evidence in `target/verify-evidence/`. The feature map lives under
+`.cursor/skills/verify-solos-data/features/`. See
+`.cursor/skills/verify-solos-data/SKILL.md`.
