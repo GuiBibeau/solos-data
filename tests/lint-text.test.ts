@@ -16,7 +16,7 @@ function run(files: string[], env: Record<string, string> = {}) {
     encoding: 'utf8',
     env: { ...process.env, ...env },
   });
-  return { status: result.status ?? 1, stdout: result.stdout ?? '' };
+  return { status: result.status ?? 1, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
 }
 
 function fixtureDir() {
@@ -121,6 +121,187 @@ test('a lint-allow escape is honored, printed, and the file passes', () => {
     assert.equal(r.status, 0);
     assert.ok(r.stdout.includes(`${file}:1: lint-allow: em-dash intentional`));
     assert.ok(r.stdout.includes('lint-text: PASS 1 files'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a lint-allow inside a hash comment is honored', () => {
+  const dir = fixtureDir();
+  try {
+    const file = write(dir, 'script.sh', `# ${EM} lint-allow: em-dash shell\n`);
+    const r = run([file]);
+    assert.equal(r.status, 0);
+    assert.ok(r.stdout.includes(`${file}:1: lint-allow: em-dash shell`));
+    assert.ok(r.stdout.includes('lint-text: PASS 1 files'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a lint-allow inside a string literal is not honored', () => {
+  const dir = fixtureDir();
+  try {
+    const file = write(dir, 'lib.rs', `"${EM} lint-allow: em-dash"\n`);
+    const r = run([file]);
+    assert.equal(r.status, 1);
+    assertViolation(r.stdout, file, '1:2', 'em-dash');
+    assert.ok(!r.stdout.includes('lint-allow: em-dash'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a lint-allow in prose is not honored', () => {
+  const dir = fixtureDir();
+  try {
+    const file = write(dir, 'prose.md', `plain ${EM} lint-allow: em-dash text\n`);
+    const r = run([file]);
+    assert.equal(r.status, 1);
+    assertViolation(r.stdout, file, '1:7', 'em-dash');
+    assert.ok(!r.stdout.includes('lint-allow: em-dash'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a deny-file pattern matches case-insensitively', () => {
+  const dir = fixtureDir();
+  try {
+    const denyFile = write(dir, 'deny.txt', 'INTERNAL-SECRET-HOST\n');
+    const file = write(dir, 'note.txt', 'use internal-secret-host here\n');
+    const r = run([file], { SOLOS_LINT_DENY_FILE: denyFile });
+    assert.equal(r.status, 1);
+    assertViolation(r.stdout, file, '1:5', 'private-host');
+    assert.ok(r.stdout.includes('deny-file pattern'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a 10/8 address reports file:line:col and exits 1', () => {
+  const dir = fixtureDir();
+  try {
+    const ip = ['10', '0', '0', '1'].join('.');
+    const file = write(dir, 'ip.txt', `ip = ${ip}\n`);
+    const r = run([file]);
+    assert.equal(r.status, 1);
+    assertViolation(r.stdout, file, '1:6', 'private-host');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a 172.16/12 address reports file:line:col and exits 1', () => {
+  const dir = fixtureDir();
+  try {
+    const ip = ['172', '16', '0', '1'].join('.');
+    const file = write(dir, 'ip.txt', `ip = ${ip}\n`);
+    const r = run([file]);
+    assert.equal(r.status, 1);
+    assertViolation(r.stdout, file, '1:6', 'private-host');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a 172.32.0.1 address is outside 172.16/12 and passes', () => {
+  const dir = fixtureDir();
+  try {
+    const ip = ['172', '32', '0', '1'].join('.');
+    const file = write(dir, 'ip.txt', `ip = ${ip}\n`);
+    const r = run([file]);
+    assert.equal(r.status, 0);
+    assert.ok(r.stdout.includes('lint-text: PASS 1 files'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a /Users home path reports file:line:col and exits 1', () => {
+  const dir = fixtureDir();
+  try {
+    const home = ['', 'Users', 'alice', ''].join('/');
+    const file = write(dir, 'path.txt', `path = ${home}\n`);
+    const r = run([file]);
+    assert.equal(r.status, 1);
+    assertViolation(r.stdout, file, '1:8', 'private-host');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a home path without a trailing slash reports and exits 1', () => {
+  const dir = fixtureDir();
+  try {
+    const cmd = ['cd ', 'home', 'debian'].join('/');
+    const file = write(dir, 'cmd.sh', `${cmd}\n`);
+    const r = run([file]);
+    assert.equal(r.status, 1);
+    assertViolation(r.stdout, file, '1:4', 'private-host');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a tilde home path reports and exits 1', () => {
+  const dir = fixtureDir();
+  try {
+    const cmd = ['cd ~', 'research'].join('/');
+    const file = write(dir, 'cmd.sh', `${cmd}\n`);
+    const r = run([file]);
+    assert.equal(r.status, 1);
+    assertViolation(r.stdout, file, '1:4', 'private-host');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a binary file is skipped and not scanned', () => {
+  const dir = fixtureDir();
+  try {
+    const file = write(dir, 'blob.bin', `a${EM}\u0000b\n`);
+    const r = run([file]);
+    assert.equal(r.status, 0);
+    assert.ok(r.stdout.includes('lint-text: PASS 0 files'));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('excluded paths are skipped without being read', () => {
+  const r = run(['vendor/foo.md', 'config/idl/x.md', 'tests/data/y.md', 'Cargo.lock', 'package-lock.json']);
+  assert.equal(r.status, 0);
+  assert.ok(r.stdout.includes('lint-text: PASS 0 files'));
+});
+
+test('a missing deny file is a clean error and exits 1', () => {
+  const dir = fixtureDir();
+  try {
+    const denyPath = join(dir, 'nope.txt');
+    const file = write(dir, 'note.txt', 'ok\n');
+    const r = run([file], { SOLOS_LINT_DENY_FILE: denyPath });
+    assert.equal(r.status, 1);
+    assert.ok(r.stderr.includes('lint-text: ERROR'), `expected lint-text: ERROR in ${r.stderr}`);
+    assert.ok(r.stderr.includes(`cannot read deny file '${denyPath}'`), `expected deny file message in ${r.stderr}`);
+    assert.ok(r.stderr.includes('ENOENT'), `expected ENOENT in ${r.stderr}`);
+    assert.ok(!r.stderr.includes('at readFileSync'), `no stack trace expected in ${r.stderr}`);
+    assert.ok(!r.stderr.includes('node:internal'), `no node internals expected in ${r.stderr}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a missing file is a clean error and exits 1', () => {
+  const dir = fixtureDir();
+  try {
+    const missing = join(dir, 'gone.md');
+    const r = run([missing]);
+    assert.equal(r.status, 1);
+    assert.ok(r.stderr.includes(`lint-text: ERROR cannot read '${missing}'`), `expected error in ${r.stderr}`);
+    assert.ok(r.stderr.includes('ENOENT'), `expected ENOENT in ${r.stderr}`);
+    assert.ok(!r.stderr.includes('at readFileSync'), `no stack trace expected in ${r.stderr}`);
+    assert.ok(r.stdout.includes('lint-text: FAIL'), `expected FAIL summary in ${r.stdout}`);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
