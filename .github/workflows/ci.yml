@@ -85,6 +85,19 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # Text lint: em-dashes and private host or path names, the two AGENTS.md rules
+  # made machine-checkable. Node-only, no Rust toolchain and no npm install, so it
+  # finishes in seconds and fails before any cargo work runs.
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5
+        with:
+          node-version: 24
+      - run: npm run lint:text
+
   clippy:
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -210,7 +223,7 @@ jobs:
   # individual jobs): a skipped required job does not satisfy GitHub's branch protection, while
   # `ci-ok` evaluates the skip against the filter and fails otherwise.
   ci-ok:
-    needs: [changes, fmt, clippy, test, archive-check]
+    needs: [changes, fmt, clippy, test, lint, archive-check]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -222,7 +235,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "$NEEDS" | jq .
-          for job in changes fmt clippy test; do
+          for job in changes fmt clippy test lint; do
             result="$(echo "$NEEDS" | jq -r --arg j "$job" '.[$j].result')"
             if [ "$result" != "success" ]; then
               echo "required job '$job' did not succeed: $result" >&2
