@@ -2,10 +2,11 @@
 
 use serde_json::{Value, json};
 use solos_data::catalog::read_catalog;
+use solos_data::collector::compactor::compact;
 use solos_data::collector::object_store::MemoryStore;
 use solos_data::collector::offload::{
-    OffloadRequest, backup_gap, confirm_remote, halt_offload_before_drop, is_r2_file, object_key,
-    offload, restore,
+    OffloadRequest, backup_gap, backup_gap_exit, confirm_remote, halt_offload_before_drop,
+    is_r2_file, object_key, offload, restore,
 };
 use solos_data::collector::reader::query_dataset;
 use solos_data::collector::schema::SCHEMA;
@@ -13,6 +14,7 @@ use solos_data::collector::seal::{EPOCH_SLOTS, SealRequest, seal_epochs};
 use solos_data::collector::writer::{publish_range, verify_files, verify_files_with};
 use solos_data::decoder::schema::schema_static;
 use solos_data::decoder::source::pending_sources;
+use solos_data::fsutil::{FsyncStep, clear_fsync_failure, inject_fsync_failure};
 use solos_data::fsutil::{sha256_hex, write_durable};
 use solos_data::store::Store;
 use std::path::{Path, PathBuf};
@@ -106,6 +108,49 @@ fn sealed_epochs(report: &solos_data::jsonout::Obj) -> Vec<i64> {
         .iter()
         .filter_map(|value| value.as_i64())
         .collect()
+}
+
+fn parquet_names(root: &Path) -> Vec<String> {
+    let mut names = Vec::new();
+    fn visit(dir: &Path, root: &Path, names: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(&path, root, names);
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("parquet") {
+                names.push(
+                    path.strip_prefix(root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+    }
+    visit(root, root, &mut names);
+    names.sort();
+    names
+}
+
+fn tx_path(store: &Store, epoch: i64) -> String {
+    store
+        .rows(
+            "SELECT path FROM files WHERE status='active' AND table_name='transactions' AND epoch=? ORDER BY path",
+            &[&epoch],
+        )
+        .unwrap()[0]
+        .str("path")
+        .unwrap()
+        .to_owned()
+}
+
+fn stage_remote(scene: &FileScene, bytes: &[u8]) {
+    scene.objects.insert(
+        scene.key.clone(),
+        bytes.to_vec(),
+        Some(scene.sha.clone()),
+        None,
+    );
 }
 
 fn parquet_count(root: &Path) -> usize {
@@ -607,4 +652,436 @@ fn read_catalog_still_accepts_a_file_without_a_location() {
     let catalog = read_catalog(&tmp.0).unwrap();
     assert_eq!(catalog.files[0].location, "local");
     assert!(catalog.files[0].r2_key.is_none());
+}
+
+struct ClearFsync;
+
+impl Drop for ClearFsync {
+    fn drop(&mut self) {
+        clear_fsync_failure();
+    }
+}
+
+fn publish_covered(store: &mut Store, root: &Path, epochs: &[i64]) -> PathBuf {
+    for epoch in epochs {
+        publish_slot(store, root, epoch * EPOCH_SLOTS, &format!("epoch-{epoch}"));
+        cover(store, *epoch);
+    }
+    let decoded = root.join("decoded");
+    consume(&decoded, store, epochs);
+    decoded
+}
+
+/// Mutation: ignore `lag` in the seal cutoff (`current.saturating_sub(lag)`).
+#[test]
+fn lag_two_seals_only_the_oldest_of_four_epochs() {
+    let tmp = Temp::new("lag-two");
+    let mut store = Store::open(&tmp.0, SCHEMA).unwrap();
+    let decoded = publish_covered(&mut store, &tmp.0, &[0, 1, 2, 3]);
+    let report = seal_epochs(
+        &mut store,
+        &SealRequest {
+            lag: 2,
+            decoded_root: &decoded,
+        },
+    )
+    .unwrap();
+    assert_eq!(sealed_epochs(&report), vec![0]);
+    for epoch in [1, 2, 3] {
+        let reason = report
+            .rows("refused")
+            .unwrap()
+            .iter()
+            .find(|row| row.int("epoch") == Some(epoch))
+            .and_then(|row| row.str("reason"));
+        assert_eq!(reason, Some("not settled"), "epoch {epoch}");
+    }
+    store.close().unwrap();
+}
+
+/// Mutation: remove the `lag < 0` refusal in `seal_epochs`.
+#[test]
+fn a_negative_lag_is_refused() {
+    let tmp = Temp::new("lag-negative");
+    let mut store = Store::open(&tmp.0, SCHEMA).unwrap();
+    let err = must_err(seal_epochs(
+        &mut store,
+        &SealRequest {
+            lag: -1,
+            decoded_root: &tmp.0.join("decoded"),
+        },
+    ));
+    assert!(err.contains("lag"), "{err}");
+    store.close().unwrap();
+}
+
+/// Mutation: remove the SHA-256 comparison in `seal_epochs`.
+#[test]
+fn a_flipped_byte_is_not_sealed() {
+    let tmp = Temp::new("seal-hash");
+    let mut store = Store::open(&tmp.0, SCHEMA).unwrap();
+    let decoded = publish_covered(&mut store, &tmp.0, &[0, 1]);
+    let path = tx_path(&store, 0);
+    let mut bytes = std::fs::read(&path).unwrap();
+    let index = bytes.len() / 2;
+    bytes[index] ^= 0xff;
+    std::fs::write(&path, bytes).unwrap();
+    let report = seal_epochs(
+        &mut store,
+        &SealRequest {
+            lag: 0,
+            decoded_root: &decoded,
+        },
+    )
+    .unwrap();
+    assert_eq!(sealed_epochs(&report), Vec::<i64>::new());
+    let reason = report
+        .rows("refused")
+        .unwrap()
+        .iter()
+        .find(|row| row.int("epoch") == Some(0))
+        .and_then(|row| row.str("reason"));
+    assert_eq!(reason, Some("hash mismatch"));
+    store.close().unwrap();
+}
+
+/// Mutation: remove the Parquet row-count comparison in `seal_epochs`.
+#[test]
+fn a_bumped_row_count_is_not_sealed() {
+    let tmp = Temp::new("seal-count");
+    let mut store = Store::open(&tmp.0, SCHEMA).unwrap();
+    publish_slot(&mut store, &tmp.0, 0, "counted");
+    publish_slot(&mut store, &tmp.0, EPOCH_SLOTS, "live");
+    cover(&mut store, 0);
+    cover(&mut store, 1);
+    // The decoder offset matches the bumped catalog count, so only the parquet count can refuse.
+    store
+        .exec(
+            "UPDATE files SET row_count = row_count + 1 WHERE epoch = 0 AND table_name = 'transactions'",
+            &[],
+        )
+        .unwrap();
+    let decoded = tmp.0.join("decoded");
+    consume(&decoded, &store, &[0, 1]);
+    let report = seal_epochs(
+        &mut store,
+        &SealRequest {
+            lag: 0,
+            decoded_root: &decoded,
+        },
+    )
+    .unwrap();
+    assert_eq!(sealed_epochs(&report), Vec::<i64>::new());
+    let reason = report
+        .rows("refused")
+        .unwrap()
+        .iter()
+        .find(|row| row.int("epoch") == Some(0))
+        .and_then(|row| row.str("reason"));
+    assert_eq!(reason, Some("count mismatch"));
+    store.close().unwrap();
+}
+
+/// Mutation: remove the sealed-epoch `continue` in `compact`.
+#[test]
+fn compact_leaves_a_sealed_epoch_unchanged() {
+    let tmp = Temp::new("compact-sealed");
+    let mut store = Store::open(&tmp.0, SCHEMA).unwrap();
+    publish_slot(&mut store, &tmp.0, 0, "base");
+    let original = tx_path(&store, 0);
+    let count = store
+        .rows(
+            "SELECT row_count, sha256 FROM files WHERE path=?",
+            &[&original],
+        )
+        .unwrap();
+    let rows = count[0].int("row_count").unwrap();
+    let sha = count[0].str("sha256").unwrap().to_owned();
+    let bytes = i64::try_from(std::fs::metadata(&original).unwrap().len()).unwrap();
+    let dir = Path::new(&original).parent().unwrap();
+    for i in 1..12 {
+        let path = dir.join(format!("copy-{i}.parquet"));
+        std::fs::copy(&original, &path).unwrap();
+        let text = path.to_string_lossy().into_owned();
+        let created = format!("2026-06-01T00:{i:02}:00.000Z");
+        store
+            .exec(
+                "INSERT INTO files (path, table_name, epoch, row_count, sha256, created_at, status, byte_size, location) VALUES (?, 'transactions', 0, ?, ?, ?, 'active', ?, 'local')",
+                &[&text, &rows, &sha, &created, &bytes],
+            )
+            .unwrap();
+    }
+    store
+        .exec(
+            "INSERT INTO sealed_epochs VALUES (0, 't', ?::JSON)",
+            &[&"{}"],
+        )
+        .unwrap();
+    let before = parquet_names(&tmp.0);
+    assert_eq!(before.len(), 12);
+    compact(&mut store, &tmp.0).unwrap();
+    assert_eq!(parquet_names(&tmp.0), before);
+    let active = store
+        .rows("SELECT count(*) AS n FROM files WHERE status='active'", &[])
+        .unwrap();
+    assert_eq!(active[0].int("n"), Some(12));
+    store.close().unwrap();
+}
+
+/// Mutation: remove the `!request.verify` refusal in `offload`.
+#[test]
+fn offload_refuses_to_run_without_verify() {
+    let bytes = b"needs-verify";
+    let mut scene = FileScene::new(bytes);
+    stage_remote(&scene, bytes);
+    let epoch = [4i64];
+    let err = must_err(offload(
+        scene.store.as_mut().unwrap(),
+        &scene.objects,
+        &OffloadRequest {
+            epochs: &epoch,
+            verify: false,
+            drop_local: true,
+            decoded_root: Some(&scene.decoded),
+        },
+    ));
+    assert!(err.contains("verify"), "{err}");
+    assert!(scene.path.exists());
+    scene.close();
+}
+
+/// Mutation: remove the `decoded_root.is_none()` refusal in `offload`.
+#[test]
+fn drop_local_requires_a_decoded_root() {
+    let bytes = b"needs-decoded-root";
+    let mut scene = FileScene::new(bytes);
+    stage_remote(&scene, bytes);
+    let epoch = [4i64];
+    let err = must_err(offload(
+        scene.store.as_mut().unwrap(),
+        &scene.objects,
+        &OffloadRequest {
+            epochs: &epoch,
+            verify: true,
+            drop_local: true,
+            decoded_root: None,
+        },
+    ));
+    assert!(err.contains("decoded"), "{err}");
+    assert!(scene.path.exists());
+    scene.close();
+}
+
+/// Mutation: skip opening the decoder checkpoint for the whole `--drop-local` run.
+#[test]
+fn drop_local_fails_while_the_decoder_checkpoint_is_held() {
+    let bytes = b"decoder-held";
+    let mut scene = FileScene::new(bytes);
+    stage_remote(&scene, bytes);
+    let held = Store::open(&scene.decoded, schema_static()).unwrap();
+    let err = must_err(scene.offload(true));
+    assert!(err.contains("owned"), "{err}");
+    assert!(
+        scene.path.exists(),
+        "drop ran while the decoder checkpoint was open"
+    );
+    held.close().unwrap();
+    scene.close();
+}
+
+/// Mutation: remove the `!sealed.contains` skip before the local unlink.
+#[test]
+fn an_unsealed_epoch_keeps_its_local_file() {
+    let bytes = b"unsealed-stays-local";
+    let mut scene = FileScene::new(bytes);
+    scene
+        .store
+        .as_mut()
+        .unwrap()
+        .exec("DELETE FROM sealed_epochs", &[])
+        .unwrap();
+    stage_remote(&scene, bytes);
+    let report = scene.offload(true).unwrap();
+    assert!(scene.path.exists());
+    assert_eq!(report.int("dropped"), Some(0));
+    assert_eq!(report.int("keptLocal"), Some(1));
+    assert_eq!(catalog_location(&scene.tmp.0), "both");
+    scene.close();
+}
+
+/// Mutation: ignore the `write_catalog` error after recording `both` (`let _ = write_catalog`).
+#[test]
+fn a_failed_catalog_fsync_keeps_the_local_file() {
+    let bytes = b"fsync-keeps-the-local-file";
+    let mut scene = FileScene::new(bytes);
+    stage_remote(&scene, bytes);
+    let _guard = ClearFsync;
+    inject_fsync_failure(FsyncStep::TempFile);
+    let err = must_err(scene.offload(true));
+    assert!(err.contains("fsync"), "{err}");
+    assert!(
+        scene.path.exists(),
+        "local file was deleted after a failed catalog fsync"
+    );
+    scene.close();
+}
+
+/// Mutation: remove the `part == ".."` rejection in `object_key`.
+#[test]
+fn object_key_rejects_parent_directory_traversal() {
+    let tmp = Temp::new("dotdot");
+    let path = format!("{}/epoch=1/../../outside.parquet", tmp.0.display());
+    assert!(
+        Path::new(&path).strip_prefix(&tmp.0).is_ok(),
+        "the fixture must stay lexically under the root so only the .. check refuses it"
+    );
+    let err = must_err(object_key(&tmp.0, &path));
+    assert!(err.contains("outside"), "{err}");
+}
+
+/// Mutation: remove the local SHA-256 comparison in `expected_size`.
+#[test]
+fn a_local_hash_mismatch_blocks_the_drop() {
+    let bytes = b"local-hash-must-match";
+    let mut scene = FileScene::new(bytes);
+    let mut flipped = bytes.to_vec();
+    flipped[0] ^= 0xff;
+    std::fs::write(&scene.path, &flipped).unwrap();
+    stage_remote(&scene, bytes);
+    let err = must_err(scene.offload(true));
+    assert!(err.contains("sha256"), "{err}");
+    assert!(scene.path.exists());
+    scene.close();
+}
+
+/// Mutation: remove the local hash comparison before restore leaves an existing file in place.
+#[test]
+fn restore_refuses_to_overwrite_a_mismatched_file() {
+    let good = b"restore-do-not-overwrite";
+    let mut scene = FileScene::new(good);
+    let mut bad = good.to_vec();
+    bad[0] ^= 0xff;
+    std::fs::write(&scene.path, &bad).unwrap();
+    stage_remote(&scene, good);
+    let err = must_err(restore(scene.store.as_mut().unwrap(), &scene.objects, &[4]));
+    assert!(err.contains("overwrite"), "{err}");
+    assert_eq!(std::fs::read(&scene.path).unwrap(), bad);
+    scene.close();
+}
+
+/// Mutation: remove `require_inside_root` from `restore`.
+#[test]
+fn restore_refuses_a_path_outside_the_raw_root() {
+    let good = b"stay-inside-the-root";
+    let mut scene = FileScene::new(good);
+    let outside = std::env::temp_dir().join(format!(
+        "solos-offload-escape-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let outside_text = outside.to_string_lossy().into_owned();
+    let key = scene.key.clone();
+    scene
+        .store
+        .as_mut()
+        .unwrap()
+        .exec(
+            "UPDATE files SET path=?, location='r2', r2_key=? WHERE epoch=4",
+            &[&outside_text, &key],
+        )
+        .unwrap();
+    scene.objects.insert(key, good.to_vec(), None, None);
+    let err = must_err(restore(scene.store.as_mut().unwrap(), &scene.objects, &[4]));
+    assert!(err.contains("outside"), "{err}");
+    assert!(!outside.exists(), "restore wrote outside the raw root");
+    scene.close();
+}
+
+/// Mutation: change the backup-gap gap status from 2 to 0.
+#[test]
+fn backup_gap_exits_2_on_a_gap_and_0_when_clean() {
+    let tmp = Temp::new("gap-exit");
+    let rel = "staging/transactions/epoch=1/old.parquet";
+    let path = tmp.0.join(rel);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"x").unwrap();
+    let key = format!("phoenix_raw/{rel}");
+    let catalog = json!({
+        "files": [{
+            "path": path.to_string_lossy(),
+            "created_at": "2020-01-01T00:00:00Z",
+            "location": "local",
+            "r2_key": key,
+        }]
+    });
+    std::fs::write(tmp.0.join("catalog.json"), catalog.to_string()).unwrap();
+    let objects = MemoryStore::new();
+    let now = chrono::DateTime::parse_from_rfc3339("2026-11-01T23:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let age = std::time::Duration::from_secs(30 * 3600);
+    assert_eq!(backup_gap_exit(&tmp.0, &objects, age, now).unwrap(), 2);
+    objects.insert(key, b"x".to_vec(), None, None);
+    assert_eq!(backup_gap_exit(&tmp.0, &objects, age, now).unwrap(), 0);
+}
+
+/// Mutation: `continue` past a keyless catalog row, or treat a missing `created_at` as young.
+#[test]
+fn backup_gap_reports_a_keyless_entry_and_a_missing_timestamp() {
+    let tmp = Temp::new("gap-keyless");
+    let nostamp = tmp.0.join("staging/transactions/epoch=3/nostamp.parquet");
+    let stamp_key = "phoenix_raw/staging/transactions/epoch=3/nostamp.parquet";
+    let catalog = json!({
+        "files": [
+            {
+                "path": "staging/transactions/epoch=9/nokey.parquet",
+                "created_at": "2020-01-01T00:00:00Z",
+                "location": "local"
+            },
+            {
+                "path": "staging/transactions/epoch=9/young-nokey.parquet",
+                "created_at": "2026-11-01T22:30:00Z",
+                "location": "local"
+            },
+            {
+                "path": nostamp.to_string_lossy(),
+                "location": "local",
+                "r2_key": stamp_key
+            }
+        ]
+    });
+    std::fs::write(tmp.0.join("catalog.json"), catalog.to_string()).unwrap();
+    let now = chrono::DateTime::parse_from_rfc3339("2026-11-01T23:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let report = backup_gap(
+        &tmp.0,
+        &MemoryStore::new(),
+        std::time::Duration::from_secs(30 * 3600),
+        now,
+    )
+    .unwrap();
+    assert_eq!(report.get("ok"), Some(&Value::Bool(false)));
+    let files = report.rows("files").unwrap();
+    assert!(
+        files.iter().any(|row| row.str("reason") == Some("no-key")
+            && row.str("path") == Some("staging/transactions/epoch=9/nokey.parquet")),
+        "{files:?}"
+    );
+    assert!(
+        !files.iter().any(|row| row
+            .str("path")
+            .is_some_and(|path| path.contains("young-nokey"))),
+        "{files:?}"
+    );
+    assert!(
+        files
+            .iter()
+            .any(|row| row.str("r2Key") == Some(stamp_key)
+                && row.str("reason") == Some("catalog-local")),
+        "{files:?}"
+    );
 }

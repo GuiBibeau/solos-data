@@ -126,7 +126,8 @@ pub struct Config {
     /// Slots a routine retention pass may trim from the checkpoint (`maintain --all` is unbounded).
     #[serde(default = "d_retention_pass")]
     pub retention_slots_per_pass: i64,
-    /// Epochs kept hot behind the newest epoch. `0` still refuses to seal the current epoch.
+    /// Seal an epoch only when `epoch < newest - seal_lag_epochs`. `0` still refuses the current
+    /// epoch. This is not "at least N epochs behind" (`epoch <= newest - N`).
     #[serde(default = "d_seal_lag")]
     pub seal_lag_epochs: i64,
     /// Whether the live tail lane runs. Off, the collector only backfills, and the archive lane's

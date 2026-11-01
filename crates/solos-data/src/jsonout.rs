@@ -196,17 +196,16 @@ pub fn log(event: &str, fields: Obj) {
     let _ = writeln!(out, "{}", line.to_json());
 }
 
-/// Error text safe for logs: URLs redacted, 300 characters at most.
+/// Error text safe for logs: URLs and R2 endpoint hosts redacted, 300 characters at most.
+///
+/// rclone stderr names the endpoint as `https://<account>.r2.cloudflarestorage.com` and, on a
+/// DNS failure, again as a bare `<account>.r2.cloudflarestorage.com`. Both have to disappear.
+/// The account id is the endpoint.
 #[must_use]
 pub fn safe_error(message: &str) -> String {
     let mut out = String::new();
     let mut rest = message;
-    while let Some(start) = rest
-        .find("http://")
-        .into_iter()
-        .chain(rest.find("https://"))
-        .min()
-    {
+    while let Some(start) = redact_start(rest) {
         out.push_str(&rest[..start]);
         out.push_str("[redacted-url]");
         let tail = &rest[start..];
@@ -217,6 +216,29 @@ pub fn safe_error(message: &str) -> String {
     }
     out.push_str(rest);
     out.chars().take(300).collect()
+}
+
+/// Index of the next URL or R2 endpoint host, or `None`.
+fn redact_start(text: &str) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    if let Some(index) = text.find("https://") {
+        best = Some(best.map_or(index, |so_far| so_far.min(index)));
+    }
+    if let Some(index) = text.find("http://") {
+        best = Some(best.map_or(index, |so_far| so_far.min(index)));
+    }
+    if let Some(index) = text.find("r2.cloudflarestorage.com") {
+        let start = host_token_start(text, index);
+        best = Some(best.map_or(start, |so_far| so_far.min(start)));
+    }
+    best
+}
+
+/// Start of the whitespace-delimited token that contains `index`.
+fn host_token_start(text: &str, index: usize) -> usize {
+    text[..index]
+        .rfind(|c: char| c.is_whitespace() || c == '"' || c == '\'')
+        .map_or(0, |at| at + 1)
 }
 
 #[cfg(test)]
@@ -242,6 +264,18 @@ mod tests {
             "RPC [redacted-url] failed"
         );
         assert_eq!(safe_error(&"a".repeat(400)).len(), 300);
+    }
+
+    #[test]
+    fn redacts_an_r2_endpoint_host_with_or_without_a_scheme() {
+        let bare =
+            safe_error("lookup deadbeef.r2.cloudflarestorage.com on 127.0.0.1:53: no such host");
+        assert!(!bare.contains("deadbeef"), "{bare}");
+        assert!(!bare.contains("cloudflarestorage"), "{bare}");
+        assert!(bare.contains("[redacted-url]"), "{bare}");
+        let url = safe_error("Get \"https://deadbeef.r2.cloudflarestorage.com/bucket\": refused");
+        assert!(!url.contains("deadbeef"), "{url}");
+        assert!(!url.contains("cloudflarestorage"), "{url}");
     }
 
     #[test]

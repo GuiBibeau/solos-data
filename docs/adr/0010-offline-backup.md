@@ -1,6 +1,6 @@
 # ADR-0010: Nightly off-box backup to Cloudflare R2
 
-Status: accepted, October 10, 2026. ADR-0020 supersedes the rule that R2 is only a
+Status: accepted, October 10, 2026. ADR-0022 supersedes the rule that R2 is only a
 backup. After an epoch is sealed and each object's size and SHA-256 have been
 checked, R2 is the durable copy and the local file may be deleted. Until that
 code is running, this note still describes the disk: R2 is a copy, not the only
@@ -25,7 +25,7 @@ October 10, 2026, as the backup half of the roadmap's first step.
 - **What.** The raw table files the raw `catalog.json` lists (published Parquet, including the
   archive lane's files under `staging/`) with that catalog, `status.json` and
   `capabilities.json`; every other `*.parquet` under the raw root, catalogued or not
-  (ADR-0020); the whole augment root except its DuckDB ledgers and `staging*/`; the
+  (ADR-0022); the whole augment root except its DuckDB ledgers and `staging*/`; the
   checkout's `config/`; the `solos-*` user units and drop-ins. Not backed up: `phoenix_decoded`
   (regenerable from raw), every `checkpoint.duckdb*`, in-flight `*.tmp` files, `.readers/`,
   `~/.config/solos-data/*.env`, `$HOME/research/`.

@@ -1,10 +1,11 @@
 //! Seal a settled raw epoch in the catalog after the independent checks pass.
 //!
-//! An epoch is sealed only when it is strictly older than the current epoch by `lag`, its slot
-//! span is covered by `published_ranges` (those ranges were published only after V1/V6), every
-//! active file's bytes match the registered SHA-256 and row count, and every transactions file
-//! is fully consumed in the decoder checkpoint. The current epoch is never sealed. Sealing does
-//! not delete anything.
+//! An epoch is sealed only when `epoch < current - lag` (below the newest epoch minus the lag,
+//! which is stricter than "at least `lag` epochs behind"), its slot span is covered by
+//! `published_ranges` (those ranges were published only after V1/V6), every active file's bytes
+//! match the registered SHA-256 and row count, and every transactions file is fully consumed in
+//! the decoder checkpoint. The current epoch is never sealed. Sealing does not delete anything
+//! and does not check that cold checkpoint rows were trimmed.
 
 use super::catalog::{merge_coverage, write_catalog};
 use crate::fsutil::file_hash;
@@ -19,7 +20,8 @@ pub const EPOCH_SLOTS: i64 = 432_000;
 
 /// What `maintain seal` was asked to do.
 pub struct SealRequest<'a> {
-    /// Epochs strictly older than `current - lag` may seal. `0` still refuses the current epoch.
+    /// Epochs below `current - lag` may seal (`epoch < current - lag`). `0` still refuses the
+    /// current epoch. This is not `epoch <= current - lag`.
     pub lag: i64,
     /// Decoder checkpoint. Opened only for the consumption read, so the decoder must be stopped.
     pub decoded_root: &'a Path,

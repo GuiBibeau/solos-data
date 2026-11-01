@@ -1,7 +1,8 @@
 //! Restart predicate for the collector checkpoint (ADR-0016).
 //!
-//! Every active partition at or below the tail watermark must exist, parse as Parquet, and match
-//! the `files` row count and SHA-256. `W` and the file rows commit in one transaction, so an active
+//! Every active local partition at or below the tail watermark must exist, parse as Parquet, and
+//! match the `files` row count and SHA-256. An `r2` file has no local bytes and is not checked.
+//! `W` and the file rows commit in one transaction, so an active
 //! file whose `file_bounds.slot_to` sits strictly above `W` is a violation. Parquet the `files`
 //! table does not list is an orphan: startup `recover_files` deletes those, and this check does
 //! not read them.
@@ -94,7 +95,7 @@ pub fn covered_partitions(
     watermark: Option<i64>,
 ) -> Result<Vec<CoveredPartition>, RestartError> {
     let rows = store.rows(
-        "SELECT f.path, f.row_count, f.sha256, b.slot_to
+        "SELECT f.path, f.row_count, f.sha256, f.location, b.slot_to
          FROM files f LEFT JOIN file_bounds b ON b.path = f.path
          WHERE f.status = 'active'
          ORDER BY f.path",
@@ -112,6 +113,11 @@ pub fn covered_partitions(
                 slot_to,
                 watermark: mark,
             });
+        }
+        // r2-only bytes are not on disk. Treating them as missing would refuse every restart
+        // after `--drop-local`. `local` and `both` still have to be present.
+        if row.str("location") == Some("r2") {
+            continue;
         }
         let row_count = row.int("row_count").unwrap_or(0);
         covered.push(CoveredPartition {

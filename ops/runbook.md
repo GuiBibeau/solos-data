@@ -796,7 +796,7 @@ if it has already grown past a few million published rows, stop the collector an
 
 A nightly `rclone copy` sends the raw Parquet (catalogued files, and every other `*.parquet`
 under the raw root), the augment root, `config/`
-and the `solos-*` user units to a private Cloudflare R2 bucket (ADR-0010, ADR-0020). Not sent:
+and the `solos-*` user units to a private Cloudflare R2 bucket (ADR-0010, ADR-0022). Not sent:
 decoded Parquet (regenerable from raw), DuckDB checkpoints, in-flight `*.tmp` files, `.readers/`,
 augment `staging*/`, `*.env`, `$HOME/research/`. It never deletes anything in the bucket: files
 the box retires stay there. Bucket layout: `phoenix_raw/`, `augment/`, `config/`, `systemd-user/`, and
@@ -866,7 +866,7 @@ checkpoint.
 `systemctl --user start --no-block solos-data-backup.service` and check that it ends `ok`, then
 revoke the old token.
 
-## Sealed raw epochs (ADR-0020)
+## Sealed raw epochs (ADR-0022)
 
 Old settled epochs can leave the disk after R2 has a verified copy. The collector must be
 stopped for `seal`, `offload`, and `restore`: those commands open the raw checkpoint, and one
@@ -874,10 +874,22 @@ process owns it. `seal` also opens the decoder checkpoint. `--drop-local` holds 
 checkpoint for the whole run, so the decoder stays stopped until the run exits. `backup-gap`
 does not open either database and can run while both services are up.
 
-`seal` refuses the current epoch. An epoch seals only when it is older than the newest epoch
-by `--lag` (default `sealLagEpochs`, 2), `published_ranges` cover its whole span, every active
-file matches its SHA-256 and row count, and the decoder has consumed every transactions file.
-Nothing new is written into a sealed epoch. `offload --verify` records `location: both` only
+`seal` refuses the current epoch. An epoch seals only when its number is below
+`newest - --lag` (`epoch < current - lag`; default lag `sealLagEpochs`, 2). That is stricter
+than "at least `lag` epochs behind": lag 2 with current epoch 10 seals epochs 0 through 7,
+not epoch 8. `published_ranges` must cover its whole span, every active file must match its
+SHA-256 and row count, and the decoder must have consumed every transactions file. Seal does
+not check that cold checkpoint rows were trimmed. `archive_relation` still opens the local
+Parquet to prove those rows, and a routine pass trims at most `retentionSlotsPerPass` slots
+(16,000; an epoch is 432,000). Leave the collector running, or run `collector maintain` with
+it stopped, until that epoch's checkpoint rows are gone, and only then `--drop-local`.
+Dropping first makes the next trim fail on the missing files and leaves the rows in place.
+
+Nothing new is written into a sealed epoch. With `--lag 2` the tail's 150-slot overlap and
+the backfill chunks (1,000 slots, or 10,000 on the archive lane) stay inside epochs that are
+not sealed, so `publish_range`'s hard error on a sealed epoch does not stall a republish.
+`--lag 0` would let that overlap cross into the previous epoch once it is sealed; do not use
+it on the box. `offload --verify` records `location: both` only
 after the R2 object's size and SHA-256 match the catalog (a stored checksum when the listing
 has one, otherwise a streamed hash). `--drop-local` deletes the local file only after that
 catalog write is durable, and only for a sealed epoch. A crash between those two steps leaves

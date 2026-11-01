@@ -171,6 +171,8 @@ pub fn offload(
         if location != "both" && location != "r2" {
             set_location(store, &path_text, "both", &key, size)?;
             let root = store.root.clone();
+            // The `?` is the guard. A failed catalog fsync must abort before any unlink.
+            // Ignoring this error deletes the local file with no durable catalog.
             write_catalog(store, &root)?;
         } else if location == "r2" && local_exists {
             // A restored file is local again. Record both before a second drop.
@@ -272,6 +274,19 @@ fn set_location(
     Ok(())
 }
 
+/// The stored path must normalize strictly inside `root`. A `..` segment that escapes, or a
+/// path in another directory, is refused before restore writes it.
+fn require_inside_root(root: &Path, path: &Path) -> Result<(), StoreError> {
+    let root = crate::fsutil::normalize(root);
+    let full = crate::fsutil::normalize(path);
+    if full == root || !full.starts_with(&root) {
+        return Err(StoreError::Check(
+            "registered file is outside the raw root".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn open_decoder(root: &Path) -> Result<Store, StoreError> {
     Store::open(root, crate::decoder::schema::schema_static()).map_err(|error| match error {
         StoreError::AlreadyOwned { .. } => StoreError::Check(
@@ -308,6 +323,9 @@ pub fn restore(
         let path_text = file.str("path").unwrap_or("").to_owned();
         let sha = file.str("sha256").unwrap_or("").to_owned();
         let path = PathBuf::from(&path_text);
+        // The catalog path is whatever was stored. Refuse one that normalizes outside the raw root
+        // before any download or overwrite.
+        require_inside_root(&store.root, &path)?;
         let key = file
             .str("r2_key")
             .map(str::to_owned)
@@ -453,6 +471,9 @@ pub fn backup_gap(
             .map(str::to_owned)
             .or_else(|| object_key(root, path).ok());
         let Some(key) = key else {
+            // A catalogued local file with no object key cannot be proved present in R2.
+            // Skipping it hid the gap.
+            gaps.push(Obj::new().with("path", path).with("reason", "no-key"));
             continue;
         };
         if objects.head(&key)?.is_none() {
@@ -547,6 +568,24 @@ fn parse_time(text: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::parse_from_rfc3339(text)
         .ok()
         .map(|time| time.with_timezone(&chrono::Utc))
+}
+
+/// Exit code for `maintain backup-gap`: `0` when every old local file is in `objects`, `2` when
+/// one is not. The report JSON is written to stdout.
+///
+/// # Errors
+///
+/// The catalog cannot be read, or the object store listing fails.
+pub fn backup_gap_exit(
+    root: &Path,
+    objects: &dyn ObjectStore,
+    older_than: Duration,
+    now_at: chrono::DateTime<chrono::Utc>,
+) -> Result<i32, StoreError> {
+    let report = backup_gap(root, objects, older_than, now_at)?;
+    println!("{}", report.to_json());
+    let ok = report.get("ok") == Some(&Value::Bool(true));
+    Ok(if ok { 0 } else { 2 })
 }
 
 fn is_old(
@@ -668,15 +707,12 @@ fn command_result(args: &[String]) -> Result<i32, StoreError> {
                 return Err(StoreError::Check("invalid --older-than".into()));
             };
             let objects = super::object_store::RcloneStore::open_default()?;
-            let report = backup_gap(
+            backup_gap_exit(
                 &config.data_dir,
                 &objects,
                 Duration::from_secs(hours.saturating_mul(3600)),
                 chrono::Utc::now(),
-            )?;
-            let ok = report.get("ok") == Some(&Value::Bool(true));
-            println!("{}", report.to_json());
-            Ok(if ok { 0 } else { 2 })
+            )
         }
         "verify-storage" => {
             let mut store = open_raw(&config)?;

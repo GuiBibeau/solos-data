@@ -567,6 +567,15 @@ async fn verify_range(
             .map(|files| files.iter().any(is_r2_file))
     })?;
     let above = if anchor_cold {
+        // An r2-only anchor cannot be opened. Leaving the window empty is visible in the log;
+        // the walk then starts without that anchor signature.
+        log(
+            "reverify_anchor_r2",
+            Obj::new()
+                .with("from", anchor_from)
+                .with("to", anchor_to)
+                .with("reason", "anchor file is r2-only"),
+        );
         Vec::new()
     } else {
         super::reader::range_rows(

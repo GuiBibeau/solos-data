@@ -1,4 +1,4 @@
-# ADR-0020: R2 is the durable copy of a sealed raw epoch
+# ADR-0022: R2 is the durable copy of a sealed raw epoch
 
 Status: accepted, November 1, 2026. Supersedes the keep-raw-locally rule in
 [ADR-0006](0006-continuous-storage-retention.md) and the backup-only rule in
@@ -23,12 +23,17 @@ An epoch is `slot / 432000`, the same width the publisher uses.
 **Seal.** `maintain seal` marks an epoch in `sealed_epochs` and in `catalog.json`
 `sealedEpochs` only when all of these hold:
 
-- The epoch is strictly older than the newest active epoch by `sealLagEpochs` (default
-  2, overridable with `--lag`). The current epoch never seals, including when the lag is
-  0 (`epoch >= current - lag` refuses it).
+- The epoch number is below `current - lag` (`epoch < current - lag`). `current` is the
+  newest active epoch and `lag` is `sealLagEpochs` (default 2, overridable with `--lag`).
+  That is stricter than "at least `lag` epochs behind" (`epoch <= current - lag`): with
+  lag 2 and current epoch 10, only epochs 0 through 7 seal. The current epoch never
+  seals, including when the lag is 0.
 - Merged `published_ranges` cover every slot of the epoch. Those ranges were inserted
-  only after V1/V6, and cold checkpoint rows have already been trimmed, so seal does not
-  re-run V1/V6.
+  only after V1/V6, so seal does not re-run V1/V6. Seal does not check that cold
+  checkpoint rows were trimmed. Retention still opens the local files to prove those
+  rows (`archive_relation`), and a routine pass trims at most `retentionSlotsPerPass`
+  slots. Finish that trim before `--drop-local` (the runbook says how). Dropping first
+  makes the next trim fail on the missing files.
 - Every active file in the epoch hashes to its registered SHA-256 and its Parquet row
   count matches.
 - Every active transactions file is fully consumed in the decoder `sources` table
@@ -38,6 +43,14 @@ This is a storage seal. It is not the V3-V5 acceptance seal, which stays open in
 [issue 001](../issues/001-phoenix-acceptance.md). `publish_range` and raw compaction
 refuse a sealed epoch, so nothing new is written into it. There is no unseal command.
 `restore` puts bytes back and does not unseal.
+
+`publish_range` returns an error, and writes no file, when the range includes a sealed
+epoch. The live tail republishes only `overlapSlots` below the watermark (150 in
+`config/phoenix.json`). Backfill publishes the next older chunk (1,000 slots, or the
+archive lane's 10,000). With the default lag of 2 epochs (864,000 slots) both windows
+stay in epochs that are not sealed, so neither path hits that error or stalls the
+collector. `--lag 0` would let the 150-slot overlap cross into the previous epoch after
+that epoch seals. The runbook uses `--lag 2`.
 
 **Catalog location.** Each active file carries `location` (`local`, `both`, or `r2`),
 `r2_key`, `sha256`, and `byte_size`. The key is `phoenix_raw/` plus the path relative to
