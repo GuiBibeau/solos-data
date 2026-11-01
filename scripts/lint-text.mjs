@@ -210,6 +210,11 @@ function main() {
       errors.push(`cannot read '${path}': ${err.code ?? 'error'}`);
       continue;
     }
+    // Size guard: a runaway edit once grew an ADR to 26 MB; no doc should be near this.
+    const docLines = buf.toString('utf8').split('\n').length;
+    if (path.startsWith('docs/') && (buf.length > 1_000_000 || docLines > 5000)) {
+      errors.push(`'${path}' is ${buf.length} bytes and ${docLines} lines (docs limit 1 MB, 5000 lines)`);
+    }
     const r = lintFile(path, buf, checks);
     if (r.scanned) scanned += 1;
     violations.push(...r.violations);
@@ -230,7 +235,7 @@ function main() {
   if (violations.length > 0 || errors.length > 0) {
     const parts = [];
     if (violations.length > 0) parts.push(`${violations.length} violations`);
-    if (errors.length > 0) parts.push(`${errors.length} unreadable files`);
+    if (errors.length > 0) parts.push(`${errors.length} file errors (unreadable or oversized)`);
     console.log(`lint-text: FAIL ${parts.join(', ')}`);
     process.exitCode = 1;
   } else {
