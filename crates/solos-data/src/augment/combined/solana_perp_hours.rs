@@ -470,6 +470,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             outputs: &outputs,
             hours_skipped,
             lockbox_dropped,
+            lockbox_excluded: lockbox_hours.len() as u64,
+            lockbox_sha256: request.lockbox_sha256,
             watermark: &watermark_facts,
             inputs_sha256: &inputs_sha,
             config_sha256: &config_hash(),
