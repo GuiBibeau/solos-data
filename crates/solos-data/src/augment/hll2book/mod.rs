@@ -57,10 +57,12 @@ pub const DEFAULT_MAX_RATIO: f64 = 1.0;
 /// LIST column under V2, and that page-granular split defeats ZSTD on real book sizes. On the
 /// real 20251001/0 BTC+ETH hour the array file is 1.13x the `.lz4` under V2 and 0.58x under
 /// V1, where `sz` is PLAIN (ZSTD) and `px` keeps its dictionary. `DELTA_BINARY_PACKED` is also
-/// V2-only; `time_ms` is small either way. These options are not the decoder's V1 pin
-/// (ADR-0017); this lane does not share that golden hash.
+/// V2-only; `time_ms` is small either way. ZSTD level 16, not 9: the 2023-era hour is the
+/// hardest (its lz4 compresses best) and 16 is what holds it near 0.70x while 9 sits at
+/// 0.75x. These options are not the decoder's V1 pin (ADR-0017); this lane does not share
+/// that golden hash.
 pub const COPY_OPTIONS: &str = concat!(
-    "FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 9, ",
+    "FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 16, ",
     "ROW_GROUP_SIZE 122880, PARQUET_VERSION 'V1', WRITE_BLOOM_FILTER true"
 );
 
@@ -150,7 +152,7 @@ pub fn s3_url(date: &str, hour: u32, coin: &str) -> String {
 }
 
 /// Pinned [`config_hash`]. A schema or writer change has to update this on purpose.
-pub const CONFIG_HASH: &str = "db5e5d0ab35b787be8430f30fa1ea7f2ea42cb4e2222eba35e0cb647f2d996db";
+pub const CONFIG_HASH: &str = "2b25aaa389f415966ae6b4192528fb17fbb8ea3976e62bbc4230b09619c0032e";
 
 /// SHA-256 of the writer settings that change row bytes.
 ///
