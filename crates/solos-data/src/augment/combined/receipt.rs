@@ -9,12 +9,12 @@
 
 use crate::fsutil::{create_dir_all_durable, write_durable};
 use crate::store::StoreError;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// One sealed output file, path relative to the combined root.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutputFile {
     /// Path relative to the combined root (`mapping/assets.csv`).
     pub path: String,
