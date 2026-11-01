@@ -170,31 +170,15 @@ fn stable_json(value: &Value) -> String {
     value.to_string()
 }
 
-/// `git rev-parse HEAD`, or `SOLOS_DATA_GIT_SHA` when that is set and non-empty.
+/// The git commit embedded by `build.rs` at build time.
+///
+/// Precedence there: a non-empty `SOLOS_DATA_GIT_SHA` in the build environment (verbatim),
+/// then `git rev-parse HEAD` of the repository, then `unknown` when git is unavailable.
+/// A runtime override is deliberately absent: a receipt names the binary that wrote it, not
+/// the shell that happened to start it.
 #[must_use]
 pub fn git_sha() -> String {
-    if let Ok(value) = std::env::var("SOLOS_DATA_GIT_SHA") {
-        let value = value.trim();
-        if !value.is_empty() {
-            return value.to_owned();
-        }
-    }
-    let Ok(output) = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-    else {
-        return "unknown".to_owned();
-    };
-    if !output.status.success() {
-        return "unknown".to_owned();
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    if text.len() == 40 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        text.to_owned()
-    } else {
-        "unknown".to_owned()
-    }
+    env!("SOLOS_DATA_GIT_SHA").to_owned()
 }
 
 /// A DuckDB size: digits plus `KB`, `MB`, `GB`, or `TB`.
@@ -307,5 +291,18 @@ mod tests {
         assert_eq!(parse_day("20261022").unwrap(), "20261022");
         assert!(parse_day("20261301").is_err());
         assert!(parse_day("2026102").is_err());
+    }
+
+    #[test]
+    fn git_sha_is_embedded_by_the_build() {
+        let sha = git_sha();
+        let in_repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(".git")
+            .exists();
+        let embedded = sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit());
+        assert!(
+            embedded || (sha == "unknown" && !in_repo),
+            "git_sha() is '{sha}': build.rs did not embed the commit of this checkout"
+        );
     }
 }
