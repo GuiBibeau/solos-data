@@ -552,9 +552,7 @@ fn elfa_credits_are_metered_per_endpoint_and_one_billed_endpoint_is_disabled_alo
     let root = tempdir("solos-capture");
     let (ctx, thread) = ctx(&server, &root);
     let meter = Arc::new(CreditMeter::new(&server.base, 100));
-    // The HTTP client stamps credits with the wall clock. Carry them in that month, not the
-    // fixture's October, or a later month rolls the balance back to zero.
-    meter.restore(None, 51, chrono::Utc::now().timestamp_millis());
+    meter.restore(None, 51, NOW_MS);
     ctx.http.set_meter(Arc::clone(&meter));
     let now_s = NOW_MS / 1000;
     let lane = ElfaLane::new(&server.base, "test-key", now_s - 86_400);
@@ -598,9 +596,7 @@ fn the_monthly_cap_stops_every_elfa_request() {
     let root = tempdir("solos-capture");
     let (ctx, thread) = ctx(&server, &root);
     let meter = Arc::new(CreditMeter::new(&server.base, 100));
-    // Same wall-clock month the HTTP client uses to record and to enforce the cap.
-    let meter_now = chrono::Utc::now().timestamp_millis();
-    meter.restore(None, 100, meter_now);
+    meter.restore(None, 100, NOW_MS);
     ctx.http.set_meter(Arc::clone(&meter));
     let now_s = NOW_MS / 1000;
     let lane = ElfaLane::new(&server.base, "test-key", now_s - 86_400);
@@ -621,8 +617,8 @@ fn the_monthly_cap_stops_every_elfa_request() {
     // The saved month survives a restart: a new meter restored from it refuses too.
     let saved = serde_json::to_value(meter.snapshot()).unwrap();
     let restarted = CreditMeter::new(&server.base, 100);
-    restarted.restore(Some(&saved), 0, meter_now);
-    assert!(!restarted.allows(0, meter_now));
+    restarted.restore(Some(&saved), 0, NOW_MS);
+    assert!(!restarted.allows(0, NOW_MS));
     let store = thread.join(ctx.db.clone());
     store.close().unwrap();
     let _ = std::fs::remove_dir_all(&root);

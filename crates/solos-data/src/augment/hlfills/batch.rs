@@ -339,8 +339,33 @@ fn write_watermark(out: &Path, hours: &BTreeSet<String>) -> Result<(), StoreErro
     };
     let mut body = serde_json::to_vec(&watermark).map_err(|e| StoreError::Check(e.to_string()))?;
     body.push(b'\n');
+    #[cfg(test)]
+    fire_before_watermark();
     write_durable(&watermark_path(out), &body)?;
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_WATERMARK: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test hook: run `hook` immediately before the watermark's durable write.
+#[cfg(test)]
+pub(crate) fn on_before_watermark(hook: fn()) {
+    BEFORE_WATERMARK.with(|slot| slot.set(Some(hook)));
+}
+
+#[cfg(test)]
+fn fire_before_watermark() {
+    if let Some(hook) = BEFORE_WATERMARK.with(|slot| slot.take()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn clear_before_watermark() {
+    BEFORE_WATERMARK.with(|slot| slot.set(None));
 }
 
 fn already_done(

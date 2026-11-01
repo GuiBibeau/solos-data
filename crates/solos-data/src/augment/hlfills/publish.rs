@@ -75,6 +75,16 @@ pub fn publish_hour(
     let mut spill = Spill::new(staging);
     let input_fills = stream_rows(bytes, &mut spill)?;
     let parts = spill.finish()?;
+    #[cfg(test)]
+    let mut parts = parts;
+    #[cfg(test)]
+    if seams::take_if(seams::CountSeam::Staged)
+        && let Some(part) = parts.first_mut()
+    {
+        // The staged counter claims a row the JSONL does not hold, so only the
+        // Parquet-versus-staged check can see it.
+        part.rows = part.rows.saturating_add(1);
+    }
     let mut pending = Vec::with_capacity(parts.len());
     for part in &parts {
         pending.push(write_tmp(conn, out, hour_key, part)?);
@@ -113,6 +123,8 @@ pub fn publish_hour(
         git_sha: git_sha.to_owned(),
         config_hash: config_hash.to_owned(),
     };
+    #[cfg(test)]
+    seams::fire_before_receipt();
     write_receipt(out, &receipt)?;
     Ok(HourOutput {
         input_fills,
@@ -146,6 +158,12 @@ fn stream_rows(bytes: &[u8], spill: &mut Spill) -> Result<u64, StoreError> {
             .map_err(|e| StoreError::Check(format!("line {}: {e}", index + 1)))?;
         let rows = decode::rows_of_line(&line)
             .map_err(|e| StoreError::Check(format!("line {}: {e}", index + 1)))?;
+        #[cfg(test)]
+        let mut rows = rows;
+        #[cfg(test)]
+        if seams::take_if(seams::CountSeam::Line) {
+            rows.pop();
+        }
         let got =
             u64::try_from(rows.len()).map_err(|_| StoreError::Check("too many rows".into()))?;
         if got != events {
@@ -155,6 +173,13 @@ fn stream_rows(bytes: &[u8], spill: &mut Spill) -> Result<u64, StoreError> {
             )));
         }
         for row in rows {
+            #[cfg(test)]
+            if seams::take_if(seams::CountSeam::Hour) {
+                // Count the event, but do not stage the row. The hour total is then short
+                // while the per-line check and the staged-versus-Parquet check still agree.
+                written += 1;
+                continue;
+            }
             spill.write(&row)?;
             written += 1;
         }
@@ -520,4 +545,61 @@ pub fn current_setting(conn: &Connection, name: &str) -> Result<String, StoreErr
     rows.first()
         .and_then(|row| row.str("v").map(str::to_owned))
         .ok_or_else(|| StoreError::Check(format!("missing setting {name}")))
+}
+
+/// Test-only ways to force one count check, or to arm an fsync immediately before the receipt
+/// write. Production builds do not include this.
+#[cfg(test)]
+pub(crate) mod seams {
+    use std::cell::Cell;
+
+    /// Which count guard a test is pinning.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum CountSeam {
+        /// Drop one decoded row before the per-line length check.
+        Line,
+        /// Count an event that is never staged.
+        Hour,
+        /// Report one more staged row than the JSONL contains.
+        Staged,
+    }
+
+    thread_local! {
+        static COUNT: Cell<Option<CountSeam>> = const { Cell::new(None) };
+        static BEFORE_RECEIPT: Cell<Option<fn()>> = const { Cell::new(None) };
+    }
+
+    pub fn set_count_seam(seam: CountSeam) {
+        COUNT.with(|slot| slot.set(Some(seam)));
+    }
+
+    pub fn take_if(want: CountSeam) -> bool {
+        COUNT.with(|slot| {
+            if slot.get() == Some(want) {
+                slot.set(None);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    pub fn clear_count_seam() {
+        COUNT.with(|slot| slot.set(None));
+    }
+
+    /// `hook` runs once, immediately before the receipt's durable write.
+    pub fn on_before_receipt(hook: fn()) {
+        BEFORE_RECEIPT.with(|slot| slot.set(Some(hook)));
+    }
+
+    pub fn fire_before_receipt() {
+        if let Some(hook) = BEFORE_RECEIPT.with(|slot| slot.take()) {
+            hook();
+        }
+    }
+
+    pub fn clear_before_receipt() {
+        BEFORE_RECEIPT.with(|slot| slot.set(None));
+    }
 }

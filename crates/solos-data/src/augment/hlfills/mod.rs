@@ -161,6 +161,9 @@ pub fn output_relative(corpus: Corpus, row_date: &str, hour_key: &str) -> String
     )
 }
 
+/// Pinned [`config_hash`]. A schema or writer change has to update this on purpose.
+pub const CONFIG_HASH: &str = "1e75e605d88eb8e632f777fe39e3256eb1e65921373128a106e4fadd70cfce62";
+
 /// SHA-256 of the writer settings that change row bytes. Threads, memory, and the disk floor
 /// are not part of it: they do not change the table.
 #[must_use]
@@ -225,10 +228,13 @@ pub fn parse_memory_limit(value: &str) -> Result<String, crate::store::StoreErro
         .unwrap_or(value.len());
     let (digits, unit) = value.split_at(split);
     let unit = unit.to_ascii_uppercase();
-    if digits.is_empty() || digits.len() > 6 || !matches!(unit.as_str(), "KB" | "MB" | "GB" | "TB")
+    if digits.is_empty()
+        || digits.len() > 6
+        || digits.bytes().all(|byte| byte == b'0')
+        || !matches!(unit.as_str(), "KB" | "MB" | "GB" | "TB")
     {
         return Err(crate::store::StoreError::Check(format!(
-            "memory limit '{value}' is not a size (for example 8GB)"
+            "memory limit '{value}' is not a positive size (for example 8GB)"
         )));
     }
     Ok(format!("{digits}{unit}"))
@@ -261,10 +267,15 @@ mod tests {
 
     #[test]
     fn config_hash_is_stable_and_memory_limit_is_strict() {
-        assert_eq!(config_hash(), config_hash());
-        assert_eq!(config_hash().len(), 64);
+        assert_eq!(
+            config_hash(),
+            CONFIG_HASH,
+            "schema pin moved; update CONFIG_HASH"
+        );
         assert_eq!(parse_memory_limit("8gb").unwrap(), "8GB");
         assert!(parse_memory_limit("8").is_err());
         assert!(parse_memory_limit("8XB").is_err());
+        assert!(parse_memory_limit("0GB").is_err());
+        assert!(parse_memory_limit("00MB").is_err());
     }
 }

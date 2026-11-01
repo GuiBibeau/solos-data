@@ -648,3 +648,249 @@ fn cli_command_and_the_live_lane_stays_off() {
     assert!(!refused.join("watermark.json").exists());
     assert!(parquet_files(&refused).is_empty());
 }
+
+fn one_fill(px: &str, sz: &str) -> String {
+    block(
+        1,
+        "2026-10-22T00:00:00.000000000",
+        vec![json!([
+            "0xa",
+            {
+                "coin": "BTC",
+                "px": px,
+                "sz": sz,
+                "side": "B",
+                "time": 1_792_627_200_000_i64,
+                "tid": 1,
+                "oid": 1
+            }
+        ])],
+    )
+    .to_string()
+}
+
+fn stage(root: &Tmp, body: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("SHA256SUMS");
+    let pair = write_lz4(&input, "20261022", 0, body);
+    std::fs::write(&sums, sums_lines(&[pair])).unwrap();
+    (input, out, sums)
+}
+
+struct Reset;
+
+impl Reset {
+    fn arm() -> Self {
+        super::publish::seams::clear_count_seam();
+        super::publish::seams::clear_before_receipt();
+        super::batch::clear_before_watermark();
+        crate::fsutil::clear_fsync_failure();
+        Self
+    }
+}
+
+impl Drop for Reset {
+    fn drop(&mut self) {
+        super::publish::seams::clear_count_seam();
+        super::publish::seams::clear_before_receipt();
+        super::batch::clear_before_watermark();
+        crate::fsutil::clear_fsync_failure();
+    }
+}
+
+fn watermark_hours(out: &Path) -> Vec<String> {
+    if !out.join("watermark.json").is_file() {
+        return Vec::new();
+    }
+    watermark(out)
+}
+
+#[test]
+fn an_hour_missing_from_the_manifest_fails_the_hour() {
+    let root = Tmp::new("no-sum");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let _missing = write_lz4(&input, "20261022", 0, &one_fill("1", "1"));
+    let listed = write_lz4(&input, "20261022", 1, &one_fill("2", "2"));
+    let sums = root.0.join("SHA256SUMS");
+    std::fs::write(&sums, sums_lines(&[listed])).unwrap();
+    let error = run_with(&input, &out, &sums, 1, |_| Ok(u64::MAX)).unwrap_err();
+    assert!(
+        error.to_string().contains("20261022/0: no checksum"),
+        "{error}"
+    );
+    assert!(
+        !watermark_hours(&out).contains(&"20261022/0".to_owned()),
+        "a missing checksum must not be skipped"
+    );
+}
+
+#[test]
+fn a_missing_manifest_file_fails_closed() {
+    let root = Tmp::new("no-manifest");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    write_lz4(&input, "20261022", 0, &one_fill("1", "1"));
+    let sums = root.0.join("no-such-SHA256SUMS");
+    let error = run_with(&input, &out, &sums, 1, |_| Ok(u64::MAX)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("--checksums is not a SHA256SUMS file or a JSON manifest"),
+        "{error}"
+    );
+    assert!(!out.join("watermark.json").exists());
+    assert!(parquet_files(&out).is_empty());
+}
+
+#[test]
+fn fsync_failures_leave_the_watermark_and_a_rerun_succeeds() {
+    use crate::fsutil::{FsyncStep, inject_fsync_failure};
+    // The extra file check is what goes red when that site's fsync is removed and a later
+    // write_durable consumes the same one-shot injection instead.
+    type Arm = fn();
+    type Check = fn(&Path);
+    let cases: &[(&str, Arm, Check)] = &[
+        (
+            "parquet-tmp",
+            || inject_fsync_failure(FsyncStep::TempFile),
+            |out| {
+                assert!(
+                    !out.join("train/date=2026-10-22/hour=20261022-0.parquet")
+                        .is_file(),
+                    "tmp fsync failed after the rename"
+                );
+            },
+        ),
+        (
+            "parquet-dir",
+            || inject_fsync_failure(FsyncStep::DirAfterRename),
+            |out| {
+                assert!(
+                    !out.join("receipts/20261022/0.json").is_file(),
+                    "dir fsync failed after the receipt was written"
+                );
+            },
+        ),
+        (
+            "receipt",
+            || {
+                super::publish::seams::on_before_receipt(|| {
+                    inject_fsync_failure(FsyncStep::TempFile);
+                });
+            },
+            |out| {
+                assert!(
+                    !out.join("receipts/20261022/0.json").is_file(),
+                    "receipt write was not durable"
+                );
+            },
+        ),
+        (
+            "watermark",
+            || {
+                super::batch::on_before_watermark(|| {
+                    inject_fsync_failure(FsyncStep::TempFile);
+                });
+            },
+            |out| {
+                assert!(
+                    out.join("receipts/20261022/0.json").is_file(),
+                    "watermark fsync failed before the receipt"
+                );
+                assert!(!out.join("watermark.json").is_file());
+            },
+        ),
+    ];
+    for (label, arm, check) in cases {
+        let _reset = Reset::arm();
+        let root = Tmp::new(label);
+        let (input, out, sums) = stage(&root, &one_fill("1", "1"));
+        arm();
+        let error = run_with(&input, &out, &sums, 1, |_| Ok(u64::MAX)).unwrap_err();
+        assert!(
+            error.to_string().contains("fsync failed"),
+            "{label}: {error}"
+        );
+        assert!(watermark_hours(&out).is_empty(), "{label}: watermark moved");
+        check(&out);
+        let again = run_with(&input, &out, &sums, 1, |_| Ok(u64::MAX)).unwrap();
+        assert_eq!(again.stop, Stop::Done, "{label}");
+        assert_eq!(again.hours_verified, 1, "{label}");
+        assert_eq!(watermark_hours(&out), vec!["20261022/0".to_owned()]);
+    }
+}
+
+#[test]
+fn a_dropped_row_fails_each_count_guard_without_a_watermark() {
+    use super::publish::seams::{CountSeam, set_count_seam};
+    for seam in [CountSeam::Line, CountSeam::Hour, CountSeam::Staged] {
+        let _reset = Reset::arm();
+        set_count_seam(seam);
+        let root = Tmp::new("count");
+        let (input, out, sums) = stage(&root, &one_fill("1", "1"));
+        let error = run_with(&input, &out, &sums, 1, |_| Ok(u64::MAX)).unwrap_err();
+        let message = error.to_string();
+        match seam {
+            CountSeam::Line => assert!(message.contains("line "), "{seam:?}: {message}"),
+            CountSeam::Hour => assert!(message.contains("!= parquet rows"), "{seam:?}: {message}"),
+            CountSeam::Staged => assert!(message.contains("staged"), "{seam:?}: {message}"),
+        }
+        assert!(
+            watermark_hours(&out).is_empty(),
+            "{seam:?}: watermark moved"
+        );
+    }
+}
+
+#[test]
+fn a_changed_output_or_input_or_config_hash_is_rewritten() {
+    let root = Tmp::new("redo");
+    let (input, out, sums) = stage(&root, &one_fill("1", "1"));
+    run_with(&input, &out, &sums, 1, |_| Ok(u64::MAX)).unwrap();
+    let parquet = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+    let receipt_path = out.join("receipts/20261022/0.json");
+
+    std::fs::write(&parquet, b"truncated").unwrap();
+    let redone = run_with(&input, &out, &sums, 1, |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(redone.hours_verified, 1, "truncated output was skipped");
+    assert_eq!(redone.hours_skipped, 0);
+    assert!(parquet.metadata().unwrap().len() > 8);
+
+    let replacement = one_fill("9", "9");
+    let pair = write_lz4(&input, "20261022", 0, &replacement);
+    std::fs::write(&sums, sums_lines(std::slice::from_ref(&pair))).unwrap();
+    let redone = run_with(&input, &out, &sums, 1, |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(redone.hours_verified, 1, "changed input was skipped");
+    let receipt: Value =
+        serde_json::from_str(&std::fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["input_sha256"], pair.1);
+
+    let mut edited: Value =
+        serde_json::from_str(&std::fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    edited["config_hash"] = json!("0".repeat(64));
+    std::fs::write(&receipt_path, edited.to_string()).unwrap();
+    let redone = run_with(&input, &out, &sums, 1, |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(redone.hours_verified, 1, "changed config hash was skipped");
+    let receipt: Value =
+        serde_json::from_str(&std::fs::read_to_string(&receipt_path).unwrap()).unwrap();
+    assert_eq!(receipt["config_hash"], super::config_hash());
+}
+
+#[test]
+fn decimal_strings_round_trip_as_identical_f64_bits() {
+    let root = Tmp::new("bits");
+    let (input, out, sums) = stage(&root, &one_fill("0.1", "0.3"));
+    run_with(&input, &out, &sums, 1, |_| Ok(u64::MAX)).unwrap();
+    let rows = read_rows(&out.join("train/date=2026-10-22/hour=20261022-0.parquet"));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].get("px").unwrap().as_f64().unwrap().to_bits(),
+        "0.1".parse::<f64>().unwrap().to_bits()
+    );
+    assert_eq!(
+        rows[0].get("sz").unwrap().as_f64().unwrap().to_bits(),
+        "0.3".parse::<f64>().unwrap().to_bits()
+    );
+}

@@ -38,7 +38,8 @@ ends in `YYYYMMDD/H.lz4`.
 it is the encoding behind the measured 49 bytes per row. A missing field, JSON null, or
 empty string is NULL, never 0 and never `""`. A present value that is not a finite decimal
 fails the hour. `coin`, `user`, and `time` are required, because the row cannot be classed
-or split without them.
+or split without them. A source decimal string parsed as `f64`, written through the staged
+JSON, DuckDB and Parquet, comes back with the same `f64` bits.
 
 ### Schema
 
@@ -149,8 +150,9 @@ code 2 and does not start the next hour. Exit code 0 means every discovered hour
 verified. Exit code 1 is a failed hour or a bad argument.
 
 `--threads` and `--memory` are the DuckDB caps (`SET threads`, `SET memory_limit`). The
-sort spills under `<out>/.tmp-duckdb` on the same filesystem. The process also holds the
-compressed hour while it streams the frame. A second run against the same output root is
+sort spills under `<out>/.tmp-duckdb` on the same filesystem. Peak memory is roughly that
+cap, plus the compressed hour (it is held while the frame is streamed), plus about 0.5 GB
+for the process. A second run against the same output root is
 refused while the first still holds `hl-fills.lock`.
 
 ### Size
@@ -163,6 +165,8 @@ keeps `hash` and `cloid`, so the planning figure is about 220 GB. `coin_class` r
 
 ## Consequences
 
-Readers train on `<out>/train/date=*/*.parquet` and keep `<out>/forward/` for eval. The
-watermark, not the presence of a file, is the list of verified hours. A schema change bumps
+Readers train on `<out>/train/date=*/*.parquet` and keep `<out>/forward/` for eval. They
+must filter by `watermark.json` or the receipts. A crash after a Parquet rename and before
+the watermark write leaves a verified-looking file under `train/` or `forward/`; that file
+is not a verified hour until the watermark lists it. A schema change bumps
 `hl-fills-v1`; an old watermark is refused rather than mixed with new files.
