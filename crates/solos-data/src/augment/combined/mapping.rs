@@ -631,7 +631,7 @@ fn parse_check_days(text: &str) -> Result<Vec<NaiveDate>, StoreError> {
 }
 
 /// The provenance object is required and must be a JSON object.
-fn load_provenance(path: &Path) -> Result<Value, StoreError> {
+pub(crate) fn load_provenance(path: &Path) -> Result<Value, StoreError> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| StoreError::Check(format!("--provenance: cannot read: {error}")))?;
     let value: Value = serde_json::from_str(&text)
@@ -1606,7 +1606,7 @@ pub(crate) fn lock_output(out: &Path) -> Result<nix::fcntl::Flock<std::fs::File>
 
 /// Open the pinned in-memory reader: the caller's thread and memory caps, spill
 /// dir under the output root.
-fn open_reader(
+pub(crate) fn open_reader(
     out: &Path,
     threads: u32,
     memory_limit: &str,
@@ -1638,10 +1638,11 @@ pub(crate) fn clear_before_verify_for_tests() {
 }
 
 /// The `.tmp-duckdb` spill dir is removed when the run ends.
-struct TempClean(PathBuf);
+pub(crate) struct TempClean(PathBuf);
 
 impl TempClean {
-    fn new(out: &Path) -> Self {
+    #[must_use]
+    pub(crate) fn new(out: &Path) -> Self {
         Self(out.join(".tmp-duckdb"))
     }
 }
