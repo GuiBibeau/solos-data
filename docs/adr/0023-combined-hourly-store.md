@@ -73,7 +73,7 @@ symbol, feed id) and Jupiter custodies (label, address) come from
 `config/venues.json`; a feed without a market name falls back to its base
 symbol. Pyth and Jupiter rows are `mapped=true` from the config alone: no
 price check, no exposure or decimals check, and feed ids are recorded as the
-carries them, not normalized. Venue names are the store's: `hl`, `phoenix`,
+config carries them, not normalized. Venue names are the store's: `hl`, `phoenix`,
 `jup`, `pyth`. `asset_id` is not unique within a venue on purpose: the perp
 `BTC` and the HIP-3 `dex:BTC` both map to `BTC` and stay separate rows.
 Unmapped or demoted

@@ -784,6 +784,21 @@ fn a_failed_output_write_leaves_no_receipt() {
         error.is_err(),
         "the injected fsync failure must fail the run"
     );
+    // The fault must have been consumed by the assets.csv temp-file fsync: the
+    // last recorded fsync is that step, the file itself never landed, and with
+    // a plain fs::write the fault would instead fire on the receipt write and
+    // leave the output behind.
+    assert_eq!(
+        crate::fsutil::last_fsync_step(),
+        Some(FsyncStep::TempFile),
+        "the fault hit the output's temp-file fsync"
+    );
+    let synced = crate::fsutil::last_fsync_path().unwrap_or_default();
+    assert!(
+        synced.to_string_lossy().ends_with("assets.csv.tmp"),
+        "fsynced {synced:?}"
+    );
+    assert!(!out.join("mapping/assets.csv").exists(), "no sealed output");
     assert!(!receipt::receipt_path(&out, "mapping", "mapping").exists());
     assert!(!out.join("catalog.json").exists());
     // A rerun without the fault succeeds and writes everything, and the failed
