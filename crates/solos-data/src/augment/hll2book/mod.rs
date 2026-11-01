@@ -44,13 +44,15 @@ pub const DEFAULT_MEMORY: &str = "8GB";
 
 /// Parquet writer settings for this lane.
 ///
-/// `PARQUET_VERSION 'V2'` is what makes DuckDB 1.4.5 write `BYTE_STREAM_SPLIT` on floats and
-/// `DELTA_BINARY_PACKED` on integers. ZSTD level 9 is the compression that produced the
-/// measured ratio against the `.lz4` bytes. These options are not the decoder's V1 pin
+/// `PARQUET_VERSION 'V1'`: DuckDB 1.4.5 writes `BYTE_STREAM_SPLIT` on the DOUBLE child of a
+/// LIST column under V2, and that page-granular split defeats ZSTD on real book sizes. On the
+/// real 20251001/0 BTC+ETH hour the array file is 1.13x the `.lz4` under V2 and 0.58x under
+/// V1, where `sz` is PLAIN (ZSTD) and `px` keeps its dictionary. `DELTA_BINARY_PACKED` is also
+/// V2-only; `time_ms` is small either way. These options are not the decoder's V1 pin
 /// (ADR-0017); this lane does not share that golden hash.
 pub const COPY_OPTIONS: &str = concat!(
     "FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 9, ",
-    "ROW_GROUP_SIZE 122880, PARQUET_VERSION 'V2', WRITE_BLOOM_FILTER true"
+    "ROW_GROUP_SIZE 122880, PARQUET_VERSION 'V1', WRITE_BLOOM_FILTER true"
 );
 
 /// How many snapshots are re-read from Parquet and compared to the source line.
@@ -139,7 +141,7 @@ pub fn s3_url(date: &str, hour: u32, coin: &str) -> String {
 }
 
 /// Pinned [`config_hash`]. A schema or writer change has to update this on purpose.
-pub const CONFIG_HASH: &str = "8ee22a0a01176a78d3a976d83f528e335cff766cb93474dd2a6a380d8260c442";
+pub const CONFIG_HASH: &str = "db5e5d0ab35b787be8430f30fa1ea7f2ea42cb4e2222eba35e0cb647f2d996db";
 
 /// SHA-256 of the writer settings that change row bytes.
 ///
@@ -155,7 +157,8 @@ pub fn config_hash() -> String {
     let body = serde_json::json!({
         "schema": SCHEMA,
         "columns": columns,
-        "sort": ["coin", "time_ms"],
+        "sort": ["coin", "time_ms", "_seq"],
+        "duplicateRule": "identical resend dropped, distinct kept in archive line order",
         "forwardStartSecs": FORWARD_START_SECS,
         "levels": BOOK_LEVELS,
         "decimals": "double",

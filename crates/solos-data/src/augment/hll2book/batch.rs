@@ -71,6 +71,10 @@ pub struct Report {
     pub hours_uncovered: u64,
     /// Rows in the hours verified on this call.
     pub rows: u64,
+    /// Identical re-sends dropped by the duplicate rule in the verified hours.
+    pub dup_identical: u64,
+    /// Extra rows kept for a distinct book at a repeated `time_ms`.
+    pub dup_distinct: u64,
     /// Raw bytes deleted on this call.
     pub raw_bytes_dropped: u64,
     /// Free bytes observed on the last check.
@@ -110,6 +114,8 @@ impl Report {
             .with("hoursPending", self.hours_pending)
             .with("hoursUncovered", self.hours_uncovered)
             .with("rows", self.rows)
+            .with("dupIdentical", self.dup_identical)
+            .with("dupDistinct", self.dup_distinct)
             .with("rawBytesDropped", self.raw_bytes_dropped)
             .with("freeBytes", json_u64(self.free_bytes))
             .with("floorBytes", self.floor_bytes)
@@ -164,6 +170,8 @@ pub fn run(
         hours_pending: 0,
         hours_uncovered: 0,
         rows: 0,
+        dup_identical: 0,
+        dup_distinct: 0,
         raw_bytes_dropped: 0,
         free_bytes: None,
         floor_bytes: request.min_free_bytes,
@@ -285,10 +293,10 @@ pub fn run(
         };
         let output = publish::publish_hour(conn, request.out, &job)
             .map_err(|error| StoreError::Check(format!("{key}: {error}")))?;
-        if output.input_snapshots != output.output_rows {
+        if output.input_snapshots != output.output_rows + output.dup_identical {
             return Err(StoreError::Check(format!(
-                "{key}: hour total {} != parquet rows {}",
-                output.input_snapshots, output.output_rows
+                "{key}: hour total {} != kept {} + identical re-sends {}",
+                output.input_snapshots, output.output_rows, output.dup_identical
             )));
         }
         if output.inputs.is_empty() && output.input_snapshots != 0 {
@@ -300,6 +308,8 @@ pub fn run(
         write_watermark(request.out, &watermark)?;
         report.hours_verified += 1;
         report.rows += output.output_rows;
+        report.dup_identical += output.dup_identical;
+        report.dup_distinct += output.dup_distinct;
         if request.drop_raw {
             report.raw_bytes_dropped += drop_raw(request.input, request.out, &key)?;
         }

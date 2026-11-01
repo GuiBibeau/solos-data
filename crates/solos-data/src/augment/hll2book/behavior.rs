@@ -264,6 +264,70 @@ fn flat_rows_nulls_sort_and_a_rerun_skips() {
     assert_eq!(watermark(&out), vec!["20261022/0".to_owned()]);
 }
 
+/// One input, four lines: an identical re-send is dropped, a distinct book at the same
+/// `time_ms` is kept in archive line order, and the counts reach the report and the receipt.
+#[test]
+fn duplicates_follow_the_duplicate_rule() {
+    let root = Tmp::new("dups");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let time = 1_792_627_200_000_i64;
+    let first = book("BTC", time, 1, "100.0");
+    // The same book re-sent under a later envelope time: dropped, dup_identical.
+    let resend = book("BTC", time, 1, "100.0");
+    // A different book at the same time_ms: kept, dup_distinct.
+    let distinct = book("BTC", time, 1, "101.0");
+    let later = book("BTC", time + 5_000, 1, "102.0");
+    let body = lines(&[first.clone(), resend, distinct.clone(), later.clone()]);
+    let file = write_coin(&input, "20261022", 0, "BTC", &body);
+    let sums = root.0.join("MANIFEST.json");
+    std::fs::write(&sums, manifest(std::slice::from_ref(&file))).unwrap();
+    let report = run_ok(&input, &out, &sums).unwrap();
+    assert_eq!(report.hours_verified, 1);
+    assert_eq!(report.rows, 3, "3 of 4 lines are kept rows");
+    assert_eq!(report.dup_identical, 1);
+    assert_eq!(report.dup_distinct, 1);
+    let path = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+    // No ORDER BY: the physical file order is the deterministic (coin, time_ms, _seq) order.
+    let conn = crate::store::memory_connection("1", "512MB").unwrap();
+    let in_order = crate::store::query_rows(
+        &conn,
+        &format!(
+            "SELECT bid_px[1] AS px FROM read_parquet({})",
+            crate::store::sql_string(&path.to_string_lossy())
+        ),
+        &[],
+    )
+    .unwrap();
+    let prices: Vec<f64> = in_order
+        .iter()
+        .map(|row| row.get("px").and_then(|v| v.as_f64()).unwrap_or(f64::NAN))
+        .collect();
+    assert_eq!(prices, vec![100.0, 101.0, 102.0], "archive line order");
+    let receipt: Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("receipts/20261022/0.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["input_snapshots"], 4);
+    assert_eq!(receipt["output_rows"], 3);
+    assert_eq!(receipt["dup_identical"], 1);
+    assert_eq!(receipt["dup_distinct"], 1);
+    // The identical re-send can also repeat a book kept earlier in the same hour.
+    let again = write_coin(
+        &input,
+        "20261022",
+        0,
+        "BTC",
+        &lines(&[first.clone(), distinct, first, later]),
+    );
+    let out2 = root.0.join("out2");
+    std::fs::write(&sums, manifest(std::slice::from_ref(&again))).unwrap();
+    let report = run_ok(&input, &out2, &sums).unwrap();
+    assert_eq!(report.rows, 3);
+    assert_eq!(report.dup_identical, 1, "a repeat of the first book");
+    assert_eq!(report.dup_distinct, 1);
+}
+
 /// Mutation: change `>=` in `Corpus::of_time_ms` to `>`.
 #[test]
 fn forward_boundary_is_inclusive() {
@@ -452,7 +516,7 @@ fn a_short_write_fails_each_count_guard_without_a_watermark() {
         let message = error.to_string();
         match seam {
             CountSeam::Line => assert!(message.contains("line "), "{seam:?}: {message}"),
-            CountSeam::Hour => assert!(message.contains("hour total"), "{seam:?}: {message}"),
+            CountSeam::Hour => assert!(message.contains("hour kept"), "{seam:?}: {message}"),
             CountSeam::Staged => assert!(message.contains("staged"), "{seam:?}: {message}"),
             _ => unreachable!(),
         }
@@ -833,8 +897,13 @@ fn coins_and_dates_filter_the_hours() {
     );
 }
 
+/// The layout and encoding pin, on the fixture and against the alternative flat layout.
+/// On real hours (ADR-0021) this layout under `PARQUET_VERSION 'V1'` measures 0.58x of the
+/// `.lz4`; V2's `BYTE_STREAM_SPLIT` on the array child measures 1.13x, and 120 flat columns
+/// measure 0.81x. This test pins the encoding DuckDB must pick (`px` dictionary, ZSTD) and
+/// that the arrays stay at or below the flat-column file of the same rows.
 #[test]
-fn side_arrays_are_smaller_than_flat_columns_and_the_lz4() {
+fn side_arrays_with_v1_dictionaries_beat_the_flat_columns_and_the_lz4() {
     let root = Tmp::new("ratio");
     let mut rows = Vec::new();
     for i in 0..720 {
@@ -951,17 +1020,13 @@ fn side_arrays_are_smaller_than_flat_columns_and_the_lz4() {
             )
         })
         .collect();
+    // V1 has no BYTE_STREAM_SPLIT. That encoding on the array child is what made real
+    // hours larger than the lz4 (1.13x under V2, 0.58x under V1); which encoding DuckDB
+    // picks for a column is data-dependent (dictionary when prices repeat, PLAIN when they
+    // do not, as on this smooth walk), so the pin is its absence, plus ZSTD compression.
     assert!(
-        encoded("bid_px", "BYTE_STREAM_SPLIT"),
-        "bid_px encodings {paths:?}"
-    );
-    assert!(
-        encoded("ask_px", "BYTE_STREAM_SPLIT"),
-        "ask_px encodings {paths:?}"
-    );
-    assert!(
-        encoded("time_ms", "DELTA_BINARY_PACKED"),
-        "time_ms encodings {paths:?}"
+        !encoded("", "BYTE_STREAM_SPLIT"),
+        "V2 byte-stream-split on the array child is what made real hours larger than the lz4: {paths:?}"
     );
     let compression = meta
         .iter()

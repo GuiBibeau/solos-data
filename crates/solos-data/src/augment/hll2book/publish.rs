@@ -5,7 +5,7 @@
 //! watermark alone. The caller writes the watermark after this returns, and only then may
 //! delete raw inputs.
 
-use super::decode::{self, Snapshot};
+use super::decode::{self, DuplicateRule, Snapshot};
 use super::{
     BOOK_LEVELS, COPY_OPTIONS, Corpus, FORWARD_START_MS, SAMPLE_CAP, SCHEMA, column_specs,
     output_relative, utc_date,
@@ -76,10 +76,14 @@ pub struct InputFile {
 /// What one verified hour wrote.
 #[derive(Clone, Debug)]
 pub struct HourOutput {
-    /// Independent snapshot count.
+    /// Independent snapshot count of every line, duplicates included.
     pub input_snapshots: u64,
-    /// Rows read back from Parquet.
+    /// Rows read back from Parquet: kept rows, identical re-sends excluded.
     pub output_rows: u64,
+    /// Byte-identical re-sends dropped by [`DuplicateRule`] (`dup_identical`).
+    pub dup_identical: u64,
+    /// Extra rows kept for a distinct book at a repeated `time_ms` (`dup_distinct`).
+    pub dup_distinct: u64,
     /// Inputs the receipt recorded.
     pub inputs: Vec<InputFile>,
 }
@@ -93,10 +97,14 @@ pub struct Receipt {
     pub hour: String,
     /// SHA-256 of the sorted `coin sha256` lines. Resume compares this, not a single file.
     pub input_sha256: String,
-    /// Independent snapshot count.
+    /// Independent snapshot count of every line, duplicates included.
     pub input_snapshots: u64,
-    /// Rows read back from Parquet.
+    /// Rows read back from Parquet: kept rows, identical re-sends excluded.
     pub output_rows: u64,
+    /// Byte-identical re-sends dropped by [`DuplicateRule`] (`dup_identical`).
+    pub dup_identical: u64,
+    /// Extra rows kept for a distinct book at a repeated `time_ms` (`dup_distinct`).
+    pub dup_distinct: u64,
     /// Rows under `train/`.
     pub train_rows: u64,
     /// Rows under `forward/`.
@@ -130,7 +138,7 @@ pub fn publish_hour(
     let mut spill = Spill::new(staging);
     let mut samples = Vec::new();
     let mut tallies = BTreeMap::new();
-    let input_snapshots = stream_hour(job.files, &mut spill, &mut samples, &mut tallies)?;
+    let streamed = stream_hour(job.files, &mut spill, &mut samples, &mut tallies)?;
     let parts = spill.finish()?;
     #[cfg(test)]
     let mut parts = parts;
@@ -148,10 +156,19 @@ pub fn publish_hour(
     for file in &pending {
         output_rows += check_tmp(conn, file)?;
     }
-    if output_rows != input_snapshots {
+    if output_rows != streamed.written {
         drop_tmps(&pending);
         return Err(StoreError::Check(format!(
-            "hour total {input_snapshots} != parquet rows {output_rows}"
+            "hour kept {} rows != parquet rows {output_rows}",
+            streamed.written
+        )));
+    }
+    // Every line the independent count saw is either kept or was an identical re-send.
+    if streamed.counted != streamed.written + streamed.dup_identical {
+        drop_tmps(&pending);
+        return Err(StoreError::Check(format!(
+            "snapshot count {} != kept {} + identical re-sends {}",
+            streamed.counted, streamed.written, streamed.dup_identical
         )));
     }
     check_coins(conn, &pending, &tallies)?;
@@ -173,8 +190,10 @@ pub fn publish_hour(
         schema: SCHEMA.to_owned(),
         hour: job.hour_key.to_owned(),
         input_sha256: input_identity(&inputs),
-        input_snapshots,
+        input_snapshots: streamed.counted,
         output_rows: outputs.iter().map(|file| file.rows).sum(),
+        dup_identical: streamed.dup_identical,
+        dup_distinct: streamed.dup_distinct,
         train_rows: parts.iter().map(|part| part.train_rows).sum(),
         forward_rows: parts.iter().map(|part| part.forward_rows).sum(),
         outputs: outputs.clone(),
@@ -186,8 +205,10 @@ pub fn publish_hour(
     seams::fire_before_receipt();
     write_receipt(out, &receipt)?;
     Ok(HourOutput {
-        input_snapshots,
+        input_snapshots: streamed.counted,
         output_rows,
+        dup_identical: streamed.dup_identical,
+        dup_distinct: streamed.dup_distinct,
         inputs,
     })
 }
@@ -224,15 +245,32 @@ impl Drop for DirClean {
     }
 }
 
+/// What streaming one hour produced.
+struct Streamed {
+    /// Lines the independent count saw, duplicates included.
+    counted: u64,
+    /// Rows staged for Parquet.
+    written: u64,
+    /// Identical re-sends dropped by [`DuplicateRule`].
+    dup_identical: u64,
+    /// Extra rows kept for a distinct book at a repeated `time_ms`.
+    dup_distinct: u64,
+}
+
 fn stream_hour(
     files: &[FileBytes<'_>],
     spill: &mut Spill,
     samples: &mut Vec<Snapshot>,
     tallies: &mut BTreeMap<String, u64>,
-) -> Result<u64, StoreError> {
+) -> Result<Streamed, StoreError> {
     let mut counted = 0u64;
     let mut written = 0u64;
-    let mut seen = BTreeSet::new();
+    let mut dup_identical = 0u64;
+    let mut dup_distinct = 0u64;
+    // Every `(coin, time_ms)` seen so far maps to the book digests kept for it. A later line
+    // that repeats one of them is an identical re-send and is dropped; a new digest is a
+    // distinct book and is kept. DuplicateRule never fails the hour.
+    let mut seen: BTreeMap<(String, i64), Vec<[u8; 32]>> = BTreeMap::new();
     for file in files {
         if !file.bytes.starts_with(&crate::augment::hls3::LZ4_MAGIC) {
             return Err(StoreError::Check(format!(
@@ -271,12 +309,20 @@ fn stream_hour(
                 )));
             }
             for row in rows {
-                if !seen.insert((row.coin.clone(), row.time_ms)) {
-                    return Err(StoreError::Check(format!(
-                        "{} {} duplicate time_ms",
-                        row.coin, row.time_ms
-                    )));
+                counted += 1;
+                let key = (row.coin.clone(), row.time_ms);
+                let digest = decode::book_digest(&row);
+                let kept = seen.entry(key).or_default();
+                if !kept.is_empty() {
+                    match DuplicateRule::classify(kept, &digest) {
+                        DuplicateRule::Identical => {
+                            dup_identical += 1;
+                            continue;
+                        }
+                        DuplicateRule::Distinct => dup_distinct += 1,
+                    }
                 }
+                kept.push(digest);
                 *tallies.entry(file.coin.to_owned()).or_default() += 1;
                 #[cfg(test)]
                 if seams::take_if(seams::CountSeam::Hour) {
@@ -285,18 +331,22 @@ fn stream_hour(
                 }
                 consider_sample(samples, &row, written);
                 let row = stage_mutation(row);
-                spill.write(&row)?;
+                spill.write(&row, written)?;
                 written += 1;
             }
-            counted += events;
         }
     }
-    if counted != written {
+    if counted != written + dup_identical {
         return Err(StoreError::Check(format!(
-            "snapshot count {counted} diverged from {written} rows"
+            "snapshot count {counted} diverged from {written} rows + {dup_identical} identical re-sends"
         )));
     }
-    Ok(counted)
+    Ok(Streamed {
+        counted,
+        written,
+        dup_identical,
+        dup_distinct,
+    })
 }
 
 /// Test seams that change the staged row after the sample and the file tally are recorded.
@@ -367,7 +417,7 @@ impl Spill {
         }
     }
 
-    fn write(&mut self, row: &Snapshot) -> Result<(), StoreError> {
+    fn write(&mut self, row: &Snapshot, seq: u64) -> Result<(), StoreError> {
         let date = utc_date(row.time_ms)
             .ok_or_else(|| StoreError::Check("time is out of range".into()))?;
         let corpus = Corpus::of_time_ms(row.time_ms);
@@ -389,8 +439,8 @@ impl Spill {
             .files
             .get_mut(&(corpus, date))
             .ok_or_else(|| StoreError::Check("spill file missing".into()))?;
-        let line =
-            decode::snapshot_line(row).map_err(|e| StoreError::Check(format!("row json: {e}")))?;
+        let line = decode::snapshot_line(row, seq)
+            .map_err(|e| StoreError::Check(format!("row json: {e}")))?;
         std::io::Write::write_all(&mut entry.writer, &line)?;
         entry.rows += 1;
         match corpus {
@@ -440,7 +490,7 @@ fn write_tmp(
     let tmp = tmp_path(&final_path);
     let _ = std::fs::remove_file(&tmp);
     let select = format!(
-        "SELECT {cols} FROM {src} ORDER BY coin, time_ms",
+        "SELECT {cols} FROM {src} ORDER BY coin, time_ms, _seq",
         cols = select_list(),
         src = ndjson(&part.path)
     );
@@ -487,15 +537,18 @@ fn sample_select() -> String {
 }
 
 fn ndjson(path: &Path) -> String {
-    let columns = column_specs()
+    let mut columns = column_specs()
         .iter()
         .map(|(name, kind)| format!("{}: '{kind}'", sql_string(name)))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect::<Vec<_>>();
+    // `_seq` is the archive line order of the hour. It is the tiebreak of the COPY's ORDER BY
+    // so two distinct books at one `time_ms` keep their arrival order (DuplicateRule), and
+    // the file bytes stay deterministic. It is not a column of the output.
+    columns.push("\"_seq\": 'BIGINT'".to_owned());
     format!(
         "read_json({}, format='newline_delimited', columns={{{}}})",
         sql_string(&path.to_string_lossy()),
-        columns
+        columns.join(", ")
     )
 }
 
@@ -620,22 +673,37 @@ fn check_samples(
     samples: &[Snapshot],
 ) -> Result<(), StoreError> {
     for sample in samples {
-        let row = find_sample(conn, pending, sample)?;
-        if let Err(field) = row_matches(sample, &row) {
+        let found = find_sample(conn, pending, sample)?;
+        if found.is_empty() {
             return Err(StoreError::Check(format!(
-                "sample mismatch {field} for {} {}",
+                "sample mismatch missing row for {} {}",
                 sample.coin, sample.time_ms
+            )));
+        }
+        // A distinct book kept at a repeated `time_ms` (DuplicateRule) shares the key with
+        // another row, so exactly one of the tied rows must match the sample bit for bit.
+        let matched = found
+            .iter()
+            .filter(|row| row_matches(sample, row).is_ok())
+            .count();
+        if matched != 1 {
+            return Err(StoreError::Check(format!(
+                "sample mismatch matched {matched} of {} rows for {} {}",
+                found.len(),
+                sample.coin,
+                sample.time_ms
             )));
         }
     }
     Ok(())
 }
 
+/// Every staged row with the sample's `(coin, time_ms)`, in file order.
 fn find_sample(
     conn: &Connection,
     pending: &[Pending],
     sample: &Snapshot,
-) -> Result<crate::jsonout::Obj, StoreError> {
+) -> Result<Vec<crate::jsonout::Obj>, StoreError> {
     let mut found = Vec::new();
     for file in pending {
         let sql = format!(
@@ -647,17 +715,7 @@ fn find_sample(
         );
         found.extend(query_rows(conn, &sql, &[])?);
     }
-    match found.len() {
-        1 => Ok(found.remove(0)),
-        0 => Err(StoreError::Check(format!(
-            "sample mismatch missing row for {} {}",
-            sample.coin, sample.time_ms
-        ))),
-        _ => Err(StoreError::Check(format!(
-            "sample mismatch ambiguous row for {} {}",
-            sample.coin, sample.time_ms
-        ))),
-    }
+    Ok(found)
 }
 
 fn row_matches(sample: &Snapshot, row: &crate::jsonout::Obj) -> Result<(), String> {
