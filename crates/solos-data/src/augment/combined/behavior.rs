@@ -304,11 +304,11 @@ fn build_fixtures(dir: &Path) -> Fixtures {
     ))
     .unwrap();
 
-    // Pyth prices: one file, one row per feed, plus LOCKFEED and LOCKFEED2
-    // publishes whose whole history lies inside the lockbox week (counted as
-    // lockbox-only, never named), and SOL publishes inside the lockbox week:
-    // SOL also publishes on the check days, so its span must stay put when
-    // the lockbox filter hides the June hours.
+    // Pyth prices: one file, one row per feed, plus LOCKFEED, LOCKFEED2 and
+    // LOCKFEED3 publishes whose whole history lies inside the lockbox week
+    // (counted as lockbox-only, never named), and SOL publishes inside the
+    // lockbox week: SOL also publishes on the check days, so its span must
+    // stay put when the lockbox filter hides the June hours.
     let pyth = dir.join("pyth-prices");
     std::fs::create_dir_all(&pyth).unwrap();
     let pyth_path = pyth.join("prices.parquet");
@@ -325,7 +325,7 @@ fn build_fixtures(dir: &Path) -> Fixtures {
             "SELECT 'SOL' AS symbol, {} AS publish_time",
             (june_hour + offset) * 3600
         ));
-        for feed in ["LOCKFEED", "LOCKFEED2"] {
+        for feed in ["LOCKFEED", "LOCKFEED2", "LOCKFEED3"] {
             pyth_rows.push(format!(
                 "SELECT {} AS symbol, {} AS publish_time",
                 sql_string(feed),
@@ -745,14 +745,15 @@ fn mapping_rules_lockbox_filters_and_receipt() {
     );
     assert_eq!(
         catalog["watermarks"]["mapping"]["lockbox_only_symbols"],
-        serde_json::json!({"hl": 2, "phoenix": 1, "pyth": 2})
+        serde_json::json!({"hl": 2, "phoenix": 1, "pyth": 3})
     );
 }
 
 /// Symbols whose whole history lies inside the lockbox have no row in any
 /// output table, so the per-venue counts are the only trace they leave. The
-/// fixture carries two such HL coins, one Phoenix asset and two Pyth feeds, so
-/// the counts are nonzero and distinct per venue, and the report, the receipt
+/// fixture carries two such HL coins, one Phoenix asset and three Pyth feeds,
+/// so the counts are nonzero and distinct per venue (2, 1, 3: no two fields
+/// can be swapped without this test going red), and the report, the receipt
 /// inputs and the catalog watermark all agree on them. Counts only, no names.
 #[test]
 fn lockbox_only_symbols_are_counted_per_venue() {
@@ -763,11 +764,11 @@ fn lockbox_only_symbols_are_counted_per_venue() {
         mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
     assert_eq!(report.lockbox_only_symbols["hl"], 2);
     assert_eq!(report.lockbox_only_symbols["phoenix"], 1);
-    assert_eq!(report.lockbox_only_symbols["pyth"], 2);
+    assert_eq!(report.lockbox_only_symbols["pyth"], 3);
     let report_json: Value = serde_json::from_str(&report.to_json()).unwrap();
     assert_eq!(
         report_json["lockboxOnlySymbols"],
-        serde_json::json!({"hl": 2, "phoenix": 1, "pyth": 2})
+        serde_json::json!({"hl": 2, "phoenix": 1, "pyth": 3})
     );
     let receipt: Value = serde_json::from_str(
         &std::fs::read_to_string(receipt::receipt_path(&out, "mapping", "mapping")).unwrap(),
@@ -778,12 +779,12 @@ fn lockbox_only_symbols_are_counted_per_venue() {
         receipt["inputs"]["phoenix_fills"]["lockbox_only_symbols"],
         1
     );
-    assert_eq!(receipt["inputs"]["pyth_prices"]["lockbox_only_symbols"], 2);
+    assert_eq!(receipt["inputs"]["pyth_prices"]["lockbox_only_symbols"], 3);
     let catalog: Value =
         serde_json::from_str(&std::fs::read_to_string(out.join("catalog.json")).unwrap()).unwrap();
     assert_eq!(
         catalog["watermarks"]["mapping"]["lockbox_only_symbols"],
-        serde_json::json!({"hl": 2, "phoenix": 1, "pyth": 2})
+        serde_json::json!({"hl": 2, "phoenix": 1, "pyth": 3})
     );
     // Counts only: the dropped symbols are named nowhere in the outputs.
     let csv = std::fs::read_to_string(out.join("mapping/assets.csv")).unwrap();
