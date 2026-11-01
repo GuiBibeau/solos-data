@@ -7,8 +7,10 @@ accepted deviation from this branch's brief; everything else is non-blocking.
 
 ## Throughput levers (the 20 MB/s deviation)
 
-Measured 13.9 MB/s of lz4 at twelve workers on the shared box (ADR-0021 has
-the table); the serial per-hour work is the bottleneck, roughly 13-15 s of
+Measured 14.1 MB/s of lz4 at twelve workers, one DuckDB thread each, over
+the fourteen scratch hours (402,328,613 bytes) on the shared box (the
+scaling table is in ADR-0021, under "Throughput measured on the fourteen
+scratch hours"); the serial per-hour work is the bottleneck, roughly 13-15 s of
 single-threaded Rust per all-coin hour. Levers, in the order they should be
 tried:
 
@@ -36,7 +38,8 @@ tried:
   mutation test.
 - [x] Duplicate `time_ms` aborted the hour; `DuplicateRule` now drops identical
   books and keeps distinct ones in archive line order, and the COPY's `_seq`
-  tiebreak is pinned structurally and behaviorally.
+  tiebreak is pinned behaviorally only (a fixture staged in reverse `_seq`
+  order goes red without it); no test inspects the SQL text.
 - [x] The git sha was never embedded (build.rs looked for `<crate>/.git`);
   now resolved by walking ancestors and worktree pointers, tested against
   `git rev-parse HEAD`.
@@ -51,8 +54,14 @@ tried:
 - [ ] The `ratio == max` boundary is untested (only strictly-above and
   strictly-below).
 - [ ] The count checks after `seal_hour` (batch) and the second hour-total
-  compare in publish are defense in depth; `prepare_hour` already returns the
-  error. Kept, documented as such.
+  compares in publish are dead code, not defense in depth: the same equality
+  is already enforced earlier on the same values, so they can never fire and
+  no test or mutant reaches them. Delete them, or make one of them check an
+  independent quantity.
+- [ ] A worker failure discards prepared hours: when one worker returns an
+  error the run stops, and hours other workers already prepared (staged
+  `.tmp` output and checks done) are dropped instead of sealed, so a rerun
+  redoes them. Correct, but wasted work on a long run.
 - [ ] Drop-record durability (`write_drop_record`) has no fault test of its
   own; `write_durable`-to-`write_atomic` and
   `create_dir_all_durable`-to-`create_dir_all` mutants survive.

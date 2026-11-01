@@ -628,9 +628,9 @@ fn select_list() -> String {
 
 /// The COPY's query: the output columns only, sorted by `coin`, `time_ms`, and the staged
 /// `_seq`. `_seq` is the archive line order and the tiebreak that keeps distinct books at a
-/// repeated `time_ms` in arrival order and the file bytes deterministic; DuckDB happens to
-/// preserve input order for ties at fixture scale, so the clause is pinned structurally in
-/// the tests below as well as behaviorally.
+/// repeated `time_ms` in arrival order and the file bytes deterministic. It is pinned
+/// behaviorally only: `the_copy_sorts_tied_books_into_archive_line_order` stages tied books
+/// in reverse `_seq` order and goes red without the tiebreak.
 fn copy_select(src: &str) -> String {
     format!(
         "SELECT {cols} FROM {src} ORDER BY coin, time_ms, _seq",
