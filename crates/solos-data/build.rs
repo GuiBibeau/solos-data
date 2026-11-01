@@ -28,6 +28,7 @@ fn main() {
         }
         Err(_) => rev_parse(&manifest).unwrap_or_else(|| "unknown".to_owned()),
     };
+    println!("cargo:rerun-if-env-changed=SOLOS_DATA_GIT_SHA");
     println!("cargo:rustc-env=SOLOS_DATA_GIT_SHA={sha}");
 }
 
