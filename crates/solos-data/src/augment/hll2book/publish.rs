@@ -102,7 +102,8 @@ pub struct HourOutput {
     pub input_snapshots: u64,
     /// Rows read back from Parquet: kept rows, identical re-sends excluded.
     pub output_rows: u64,
-    /// Byte-identical re-sends dropped by [`DuplicateRule`] (`dup_identical`).
+    /// Re-sends with an identical book (same coin, `time_ms` and levels; `recv_time_ms`
+    /// ignored, so not byte identity) dropped by [`DuplicateRule`] (`dup_identical`).
     pub dup_identical: u64,
     /// Extra rows kept for a distinct book at a repeated `time_ms` (`dup_distinct`).
     pub dup_distinct: u64,
@@ -127,7 +128,8 @@ pub struct Receipt {
     pub input_snapshots: u64,
     /// Rows read back from Parquet: kept rows, identical re-sends excluded.
     pub output_rows: u64,
-    /// Byte-identical re-sends dropped by [`DuplicateRule`] (`dup_identical`).
+    /// Re-sends with an identical book (same coin, `time_ms` and levels; `recv_time_ms`
+    /// ignored, so not byte identity) dropped by [`DuplicateRule`] (`dup_identical`).
     pub dup_identical: u64,
     /// Extra rows kept for a distinct book at a repeated `time_ms` (`dup_distinct`).
     pub dup_distinct: u64,
