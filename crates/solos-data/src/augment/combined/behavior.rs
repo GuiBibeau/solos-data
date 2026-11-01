@@ -1,6 +1,8 @@
 //! Behavior of the combined mapping unit, offline: fixture HL/Phoenix/Pyth
 //! Parquet trees built in-test with DuckDB, then the lockbox checks, the mapping
-//! rules, the receipt ordering, and rerun idempotence.
+//! rules, the durable-write ordering, and rerun idempotence. The fixture puts
+//! fills inside a lockbox week and a Phoenix asset outside the check days, so
+//! every filter is load-bearing: removing one changes the pinned output.
 
 use super::mapping::{self, Request};
 use super::receipt;
@@ -12,29 +14,57 @@ use std::path::{Path, PathBuf};
 /// Check days the fixtures have data for (outside the lockbox weeks).
 const CHECK_DAYS: &str = "2026-10-15,2026-10-16,2026-10-17";
 
-/// HL coins of the fixture: (coin, class, px, hours with fills).
-const HL_COINS: &[(&str, &str, f64, usize)] = &[
-    ("SOL", "perp", 100.0, 72),
-    ("kBONK", "perp", 1.0, 72),
-    ("xyz:CL", "hip3", 50.0, 72),
-    ("DIV", "perp", 200.0, 72),
-    ("THIN", "perp", 100.0, 5),
-    ("RENAMED", "perp", 100.0, 72),
-    ("ONLYHL", "perp", 10.0, 72),
-    ("@1", "spot", 5.0, 3),
-    ("#9", "outcome", 3.0, 3),
-];
+/// Boundary prices: 0.9% and 1.01% log gaps, and a 20% gap.
+fn eq99_px() -> f64 {
+    100.0 * 0.0099_f64.exp()
+}
+
+fn eq101_px() -> f64 {
+    100.0 * 0.0101_f64.exp()
+}
+
+fn mid02_px() -> f64 {
+    100.0 * 0.2_f64.exp()
+}
+
+/// HL coins of the fixture: (coin, class, px on even hours, px on odd hours,
+/// hours with fills). Prices alternate so even-count medians are averages.
+fn hl_coins() -> Vec<(String, String, f64, f64, usize)> {
+    vec![
+        ("SOL".into(), "perp".into(), 100.0, 100.0, 72),
+        ("kBONK".into(), "perp".into(), 1.0, 1.0, 72),
+        ("xyz:CL".into(), "hip3".into(), 50.0, 50.0, 72),
+        ("DIV".into(), "perp".into(), 200.0, 201.0, 72),
+        ("THIN".into(), "perp".into(), 100.0, 100.0, 5),
+        ("RENAMED".into(), "perp".into(), 100.0, 100.0, 72),
+        ("ONLYHL".into(), "perp".into(), 10.0, 10.0, 72),
+        ("@1".into(), "spot".into(), 5.0, 5.0, 3),
+        ("#9".into(), "outcome".into(), 3.0, 3.0, 3),
+        ("EQ99".into(), "perp".into(), eq99_px(), eq99_px(), 48),
+        ("EQ101".into(), "perp".into(), eq101_px(), eq101_px(), 24),
+        ("MID02".into(), "perp".into(), mid02_px(), mid02_px(), 72),
+        ("TENH".into(), "perp".into(), 100.0, 100.0, 10),
+        ("TWO".into(), "perp".into(), 100.0, 100.0, 72),
+        ("xyz:TWO".into(), "hip3".into(), mid02_px(), mid02_px(), 72),
+    ]
+}
 
 /// Phoenix assets of the fixture: (symbol, price_ticks, hours with fills). The
-/// tick/lot scaling is the real one: price = ticks * 100 * 10^(2-6).
+/// tick/lot scaling is the real one: price = ticks * 100 * 10^(2-6), so 10_000
+/// ticks is 100.0.
 const PHOENIX_ASSETS: &[(&str, i64, usize)] = &[
-    ("SOL", 10_000, 72),        // 100.0
-    ("kBONK", 100, 72),         // 1.0
-    ("CL", 5_000, 72),          // 50.0
-    ("DIV", 10_000, 72),        // 100.0 against HL 200.0
-    ("THIN", 10_000, 5),        // 100.0, only 5 hours
-    ("OLDNAME", 10_000, 72),    // 100.0 against HL RENAMED 100.0
-    ("PHOENIXONLY", 7_000, 72), // 70.0, no HL pair
+    ("SOL", 10_000, 72),
+    ("kBONK", 100, 72),
+    ("CL", 5_000, 72),
+    ("DIV", 10_000, 72),
+    ("THIN", 10_000, 5),
+    ("OLDNAME", 10_000, 72),
+    ("PHOENIXONLY", 7_000, 72),
+    ("EQ99", 10_000, 48),
+    ("EQ101", 10_000, 24),
+    ("MID02", 10_000, 72),
+    ("TENH", 10_000, 10),
+    ("TWO", 10_000, 72),
 ];
 
 struct Tmp(PathBuf);
@@ -107,6 +137,7 @@ fn venues_file(dir: &Path) -> PathBuf {
     path
 }
 
+#[derive(Clone)]
 struct Fixtures {
     hl: PathBuf,
     phoenix: PathBuf,
@@ -118,18 +149,32 @@ struct Fixtures {
     provenance: PathBuf,
 }
 
-/// Build the fixture trees: one HL hour file per check-day hour (per-coin fills
-/// 60 s into the hour), one Phoenix fills file, one Pyth prices file, one
-/// asset_contexts seed file.
+/// The check-day hour base and the lockbox-week hour (fixture constants).
+fn hour_bases() -> (i64, i64) {
+    let base = super::grid::hour_of_secs(super::grid::day_start_secs(
+        super::grid::parse_date("2026-10-15").unwrap(),
+    ));
+    // 2026-06-02 is inside the early_stress week with its guard.
+    let june = super::grid::hour_of_secs(super::grid::day_start_secs(
+        super::grid::parse_date("2026-06-02").unwrap(),
+    ));
+    (base, june)
+}
+
+/// Build the fixture trees: one HL hour file per check-day hour (plus three
+/// SOL hours inside the lockbox week), one Phoenix fills file (plus SOL fills
+/// in the lockbox week and PHOENIXONLY fills outside the check days), one Pyth
+/// prices file, one asset_contexts seed file.
 fn build_fixtures(dir: &Path) -> Fixtures {
     let conn = memory_connection("1", "512MB").unwrap();
     let hl = dir.join("hl-fills-v1");
     std::fs::create_dir_all(&hl).unwrap();
-    let base_hour = super::grid::hour_of_secs(super::grid::day_start_secs(
-        super::grid::parse_date("2026-10-15").unwrap(),
-    ));
+    let (base_hour, june_hour) = hour_bases();
     let mut watermark_hours = Vec::new();
-    for (index, hour) in (base_hour..base_hour + 72).enumerate() {
+    let write_hl_hour = |conn: &duckdb::Connection,
+                         hour: i64,
+                         watermark_hours: &mut Vec<String>,
+                         rows: &Vec<(String, String, f64)>| {
         let start = hour * 3600;
         let dt = chrono::DateTime::from_timestamp(start, 0).unwrap();
         let ymd = dt.format("%Y%m%d");
@@ -139,24 +184,57 @@ fn build_fixtures(dir: &Path) -> Fixtures {
         let dir_path = hl.join(format!("train/date={dashed}"));
         std::fs::create_dir_all(&dir_path).unwrap();
         let path = dir_path.join(format!("hour={ymd}-{hour_of_day}.parquet"));
-        let mut selects = Vec::new();
-        for (coin, class, px, trade_hours) in HL_COINS {
-            if index >= *trade_hours {
-                continue;
-            }
-            selects.push(format!(
-                "SELECT {} AS coin, {} AS coin_class, {} AS time_ms, {hour} AS tid, {px} AS px",
-                sql_string(coin),
-                sql_string(class),
-                start * 1000 + 60_000
-            ));
-        }
+        let selects: Vec<String> = rows
+            .iter()
+            .map(|(coin, class, px)| {
+                format!(
+                    "SELECT {} AS coin, {} AS coin_class, {} AS time_ms, {hour} AS tid, CAST({px} AS DOUBLE) AS px",
+                    sql_string(coin),
+                    sql_string(class),
+                    start * 1000 + 60_000
+                )
+            })
+            .collect();
         let union = selects.join(" UNION ALL ");
         conn.execute_batch(&format!(
             "COPY ({union}) TO {} (FORMAT PARQUET)",
             sql_string(&path.to_string_lossy())
         ))
         .unwrap();
+    };
+    for (index, hour) in (base_hour..base_hour + 72).enumerate() {
+        let rows: Vec<(String, String, f64)> = hl_coins()
+            .iter()
+            .filter(|(_, _, _, _, trade_hours)| index < *trade_hours)
+            .map(|(coin, class, px_even, px_odd, _)| {
+                (
+                    coin.clone(),
+                    class.clone(),
+                    if index % 2 == 0 { *px_even } else { *px_odd },
+                )
+            })
+            .collect();
+        write_hl_hour(&conn, hour, &mut watermark_hours, &rows);
+    }
+    // Three SOL hours inside the lockbox week: the universe and price filters
+    // must keep them out of first_ts/last_ts and out of the price check.
+    for offset in 1..=3 {
+        write_hl_hour(
+            &conn,
+            june_hour + offset,
+            &mut watermark_hours,
+            &vec![("SOL".to_owned(), "perp".to_owned(), 111.0)],
+        );
+    }
+    // A coin that trades only inside the lockbox week: it has no row left
+    // after the drop, so it must not appear in the mapping at all.
+    for offset in 1..=3 {
+        write_hl_hour(
+            &conn,
+            june_hour + offset,
+            &mut watermark_hours,
+            &vec![("LOCKCOIN".to_owned(), "perp".to_owned(), 7.0)],
+        );
     }
     std::fs::write(
         hl.join("watermark.json"),
@@ -171,9 +249,10 @@ fn build_fixtures(dir: &Path) -> Fixtures {
     // Phoenix fills: one file, one fill per (asset, traded hour) at +120 s.
     let phoenix = dir.join("phoenix-fills");
     std::fs::create_dir_all(&phoenix).unwrap();
+    let market_of = |symbol: &str| symbol.bytes().map(u64::from).sum::<u64>() % 97 + 1;
     let mut values = Vec::new();
     for (symbol, ticks, trade_hours) in PHOENIX_ASSETS {
-        let market = symbol.bytes().map(u64::from).sum::<u64>() % 97 + 1;
+        let market = market_of(symbol);
         for hour in base_hour..base_hour + i64::try_from(*trade_hours).unwrap() {
             values.push(format!(
                 "({}, {}, {ticks}, 100, 2, 6, {market})",
@@ -181,6 +260,28 @@ fn build_fixtures(dir: &Path) -> Fixtures {
                 hour * 3600 + 120
             ));
         }
+    }
+    // SOL fills inside the lockbox week (price 111.0 = 11_100 ticks).
+    for offset in 1..=3 {
+        values.push(format!(
+            "({}, {}, 11_100, 100, 2, 6, {})",
+            sql_string("SOL"),
+            (june_hour + offset) * 3600 + 120,
+            market_of("SOL")
+        ));
+    }
+    // PHOENIXONLY fills outside the check days (2026-10-20), inside no lockbox
+    // week: the price window must keep them out of the price check.
+    let oct20 = super::grid::hour_of_secs(super::grid::day_start_secs(
+        super::grid::parse_date("2026-10-20").unwrap(),
+    ));
+    for offset in 5..=6 {
+        values.push(format!(
+            "({}, {}, 7_000, 100, 2, 6, {})",
+            sql_string("PHOENIXONLY"),
+            (oct20 + offset) * 3600 + 120,
+            market_of("PHOENIXONLY")
+        ));
     }
     let phoenix_path = phoenix.join("fills.parquet");
     conn.execute_batch(&format!(
@@ -268,6 +369,18 @@ fn line_of(lines: &[String], venue: &str, symbol: &str) -> String {
         .clone()
 }
 
+/// First and last fixture fill second on the check days (fills sit 60 s into
+/// the hour on HL, 120 s on Phoenix).
+fn check_bounds() -> (i64, i64, i64, i64) {
+    let base = super::grid::day_start_secs(super::grid::parse_date("2026-10-15").unwrap());
+    (
+        base,
+        base + 60,
+        base + 71 * 3600 + 60,
+        base + 71 * 3600 + 120,
+    )
+}
+
 #[test]
 fn lockbox_sha_mismatch_refuses_and_writes_nothing() {
     let tmp = Tmp::new("sha");
@@ -287,25 +400,22 @@ fn a_check_day_inside_the_lockbox_refuses() {
         &out,
         &fixtures,
         &fixtures.lockbox_sha,
-        "2026-09-10,2026-10-16,2026-10-17",
+        "2026-06-03,2026-10-16,2026-10-17",
     ))
     .unwrap_err();
     assert!(error.to_string().contains("inside the lockbox"), "{error}");
 }
 
 #[test]
-fn three_check_days_are_required() {
+fn three_distinct_check_days_are_required() {
     let tmp = Tmp::new("days");
     let fixtures = build_fixtures(tmp.dir());
     let out = tmp.dir().join("store");
-    let error = mapping::run(&request(
-        &out,
-        &fixtures,
-        &fixtures.lockbox_sha,
-        "2026-10-15,2026-10-16",
-    ))
-    .unwrap_err();
-    assert!(error.to_string().contains("exactly three"), "{error}");
+    for days in ["2026-10-15,2026-10-16", "2026-10-15,2026-10-15,2026-10-16"] {
+        let error =
+            mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, days)).unwrap_err();
+        assert!(error.to_string().contains("exactly three"), "{error}");
+    }
 }
 
 #[test]
@@ -324,38 +434,98 @@ fn threads_and_memory_caps_are_enforced() {
 }
 
 #[test]
-fn mapping_rules_and_receipt() {
+fn a_v2_lockbox_with_the_wrong_week_count_refuses() {
+    let tmp = Tmp::new("shape");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    // A v2-labeled lockbox with only three weeks is not the lockbox the plan
+    // pins: it must refuse before anything is written.
+    let body: serde_json::Value = serde_json::from_str(&super::lockbox::tests::v2_body()).unwrap();
+    let mut three = body.clone();
+    three["weeks"] = three["weeks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .into();
+    let path = tmp.dir().join("lockbox-three.json");
+    std::fs::write(&path, three.to_string()).unwrap();
+    let sha = crate::fsutil::sha256_hex(three.to_string().as_bytes());
+    let fixtures = Fixtures {
+        lockbox: path.clone(),
+        lockbox_sha: sha,
+        ..fixtures
+    };
+    let error =
+        mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap_err();
+    assert!(error.to_string().contains("864"), "{error}");
+    assert!(!out.join("mapping").exists());
+}
+
+/// The full mapping rules on the extended fixture: every price-relevant filter
+/// (lockbox weeks, check-day files, Phoenix window) is load-bearing, because
+/// the fixture holds fills the filters must hide.
+#[test]
+fn mapping_rules_lockbox_filters_and_receipt() {
     let tmp = Tmp::new("rules");
     let fixtures = build_fixtures(tmp.dir());
     let out = tmp.dir().join("store");
     let report =
         mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
     assert_eq!(report.exit_code(), 0);
-    // 9 HL + 7 phoenix + 2 pyth + 1 jupiter custody; the flash pool is skipped.
-    assert_eq!(report.rows, 19);
-    assert_eq!(report.per_venue["hl"], 9);
-    assert_eq!(report.per_venue["phoenix"], 7);
+    // 15 HL + 12 phoenix + 2 pyth + 1 jup; the flash pool is skipped and
+    // LOCKCOIN (lockbox-only) has no row at all.
+    assert_eq!(report.rows, 30);
+    assert_eq!(report.per_venue["hl"], 15);
+    assert_eq!(report.per_venue["phoenix"], 12);
     assert_eq!(report.per_venue["pyth"], 2);
     assert_eq!(report.per_venue["jup"], 1);
-    assert_eq!(report.pairs_checked, 6);
-    assert_eq!(report.pairs_mapped, 4);
-    assert_eq!(report.price_divergence, 1);
-    assert_eq!(report.thin, 1);
+    assert_eq!(report.pairs_checked, 12);
+    assert_eq!(report.pairs_mapped, 6);
+    assert_eq!(report.price_divergence, 4);
+    assert_eq!(report.thin, 2);
     assert_eq!(report.spot_unnamed, 1);
     assert_eq!(report.outcome, 1);
-    assert_eq!(report.lockbox_hours_dropped, 864);
+    assert_eq!(report.lockbox_hours_dropped, 3);
+    assert_eq!(report.lockbox_hours_excluded, 864);
 
     let lines = assets_lines(&out);
-    assert_eq!(lines.len(), 20, "header plus 19 rows: {:?}", &lines[..3]);
-    let first = super::grid::day_start_secs(super::grid::parse_date("2026-10-15").unwrap()) + 60;
-    let last = first + 71 * 3600;
-    // Direct pair, equal prices: mapped. The contexts file seeds SOL to itself,
-    // so the source of truth is the seed table.
+    assert_eq!(lines.len(), 31, "header plus 30 rows");
+    let (day_start, first, last, phoenix_last) = check_bounds();
+    // The sort the ADR states: venue, then venue symbol.
+    assert_eq!(
+        lines[0],
+        "asset_id,venue,venue_symbol,builder,coin_class,venue_market_id,first_ts,last_ts,source_of_truth,mapped,reason,median_abs_log_ratio,n_hours"
+    );
+    assert!(lines[1].starts_with(",hl,#9,"), "outcomes sort first");
+    assert!(lines[2].starts_with(",hl,@1,,spot,"));
+    assert!(
+        lines[16].starts_with("SOL,jup,"),
+        "jup follows the hl block"
+    );
+    assert!(lines[17].starts_with("CL,phoenix,"));
+    assert!(lines[29].starts_with("BTC,pyth,"), "pyth closes the file");
+
+    // The lockbox-week fills (SOL 111.0 on both venues, June) are invisible:
+    // SOL keeps its check-day span, its 72 common hours, and its price.
     assert_eq!(
         line_of(&lines, "hl", "SOL"),
         format!("SOL,hl,SOL,,perp,,{first},{last},asset_contexts,true,,0.000000,72")
     );
-    // The k-class is kept as its own base name.
+    assert_eq!(
+        line_of(&lines, "phoenix", "SOL"),
+        format!(
+            "SOL,phoenix,SOL,,spot,45,{},{phoenix_last},asset_contexts,true,,0.000000,72",
+            day_start + 120
+        )
+    );
+    assert!(
+        !lines.iter().any(|line| line.contains("LOCKCOIN")),
+        "a coin trading only inside the lockbox has no mapping row"
+    );
+    // The k-class is kept as its own base name (the seed-fallback pair).
     assert_eq!(
         line_of(&lines, "hl", "kBONK"),
         format!("kBONK,hl,kBONK,,perp,,{first},{last},base_name,true,,0.000000,72")
@@ -374,12 +544,13 @@ fn mapping_rules_and_receipt() {
         line_of(&lines, "hl", "RENAMED"),
         format!("RENAMED,hl,RENAMED,,perp,,{first},{last},asset_contexts,true,,0.000000,72")
     );
-    // Divergent prices demote the pair; the median is |ln(200/100)|.
+    // Divergent prices demote the pair. DIV alternates 200/201 against 100, so
+    // the even-count median is the average of ln 2 and ln 2.01.
     assert_eq!(
         line_of(&lines, "hl", "DIV"),
-        format!("DIV,hl,DIV,,perp,,{first},{last},base_name,false,price_divergence,0.693147,72")
+        format!("DIV,hl,DIV,,perp,,{first},{last},base_name,false,price_divergence,0.695641,72")
     );
-    // Fewer than 24 common hours is thin even when prices agree.
+    // Thin wins below the hour floor even at a perfect price.
     assert_eq!(
         line_of(&lines, "hl", "THIN"),
         format!(
@@ -387,43 +558,85 @@ fn mapping_rules_and_receipt() {
             first + 4 * 3600
         )
     );
-    // No Phoenix candidate: unmapped with no reason.
+    // Boundary pairs around the 1% bar and the 24-hour floor.
     assert_eq!(
-        line_of(&lines, "hl", "ONLYHL"),
-        format!("ONLYHL,hl,ONLYHL,,perp,,{first},{last},,false,,,")
+        line_of(&lines, "hl", "EQ99"),
+        format!(
+            "EQ99,hl,EQ99,,perp,,{first},{},base_name,true,,0.009900,48",
+            first + 47 * 3600
+        )
+    );
+    assert_eq!(
+        line_of(&lines, "hl", "EQ101"),
+        format!(
+            "EQ101,hl,EQ101,,perp,,{first},{},base_name,false,price_divergence,0.010100,24",
+            first + 23 * 3600
+        )
+    );
+    assert_eq!(
+        line_of(&lines, "hl", "MID02"),
+        format!(
+            "MID02,hl,MID02,,perp,,{first},{last},base_name,false,price_divergence,0.200000,72"
+        )
+    );
+    assert_eq!(
+        line_of(&lines, "hl", "TENH"),
+        format!(
+            "TENH,hl,TENH,,perp,,{first},{},base_name,false,thin,0.000000,10",
+            first + 9 * 3600
+        )
+    );
+    // Two HL coins collapse onto one Phoenix asset and stay separate rows with
+    // their own outcomes.
+    assert_eq!(
+        line_of(&lines, "hl", "TWO"),
+        format!("TWO,hl,TWO,,perp,,{first},{last},base_name,true,,0.000000,72")
+    );
+    let two_hip3 = lines
+        .iter()
+        .find(|line| line.contains(",hl,xyz:TWO,"))
+        .expect("xyz:TWO row");
+    assert_eq!(
+        two_hip3,
+        &format!(
+            "TWO,hl,xyz:TWO,xyz,hip3,,{first},{last},base_name,false,price_divergence,0.200000,72"
+        )
     );
     // HL spot and outcomes never map; their asset_id is empty.
-    let spot = lines
-        .iter()
-        .find(|line| line.contains(",hl,@1,"))
-        .expect("@1 row");
     assert_eq!(
-        spot,
+        lines
+            .iter()
+            .find(|line| line.contains(",hl,@1,"))
+            .expect("@1 row"),
         &format!(
             ",hl,@1,,spot,,{first},{},,false,spot_unnamed,,",
             first + 2 * 3600
         )
     );
-    let outcome = lines
-        .iter()
-        .find(|line| line.contains(",hl,#9,"))
-        .expect("#9 row");
     assert_eq!(
-        outcome,
+        lines
+            .iter()
+            .find(|line| line.contains(",hl,#9,"))
+            .expect("#9 row"),
         &format!(
             ",hl,#9,,outcome,,{first},{},,false,outcome,,",
             first + 2 * 3600
         )
     );
-    // Phoenix rows: mapped when their HL pair passed; unmapped assets carry no
-    // reason when nothing was checked.
-    assert!(line_of(&lines, "phoenix", "OLDNAME").starts_with("OLDNAME,phoenix,OLDNAME,,spot,"));
+    // No Phoenix candidate: unmapped with no reason.
+    assert_eq!(
+        line_of(&lines, "hl", "ONLYHL"),
+        format!("ONLYHL,hl,ONLYHL,,perp,,{first},{last},,false,,,")
+    );
+    // Phoenix rows: mapped when ANY HL pair for the asset passed (TWO has one
+    // mapped and one divergent pair).
+    assert!(line_of(&lines, "phoenix", "TWO").contains(",base_name,true,,0.000000,72"));
     assert!(line_of(&lines, "phoenix", "OLDNAME").contains(",asset_contexts,true,,0.000000,72"));
     assert!(line_of(&lines, "phoenix", "PHOENIXONLY").ends_with(",,false,,,"));
-    assert!(line_of(&lines, "phoenix", "DIV").ends_with(",false,price_divergence,0.693147,72"));
-    assert!(line_of(&lines, "phoenix", "SOL").contains(",asset_contexts,true,,0.000000,72"));
+    assert!(line_of(&lines, "phoenix", "EQ99").ends_with(",base_name,true,,0.009900,48"));
+    assert!(line_of(&lines, "phoenix", "DIV").ends_with(",false,price_divergence,0.695641,72"));
     // Pyth feed row: venue symbol is the market, market id the feed id.
-    let publish0 = super::grid::day_start_secs(super::grid::parse_date("2026-10-15").unwrap());
+    let publish0 = day_start;
     let sol_feed = lines
         .iter()
         .find(|line| line.contains(",pyth,SOL/USD,"))
@@ -442,13 +655,16 @@ fn mapping_rules_and_receipt() {
     );
 
     // The receipt: written after the durable output, with its sha, the lockbox
-    // fields, and the provenance passthrough.
-    let receipt_text = std::fs::read_to_string(receipt::receipt_path(&out, "mapping")).unwrap();
+    // drop counts (input hours actually dropped vs the 864-hour set), and the
+    // provenance passthrough.
+    let receipt_text =
+        std::fs::read_to_string(receipt::receipt_path(&out, "mapping", "mapping")).unwrap();
     let receipt: Value = serde_json::from_str(&receipt_text).unwrap();
     assert_eq!(receipt["unit"], "mapping");
     assert_eq!(receipt["unit_version"], 1);
-    assert_eq!(receipt["rows"], 19);
-    assert_eq!(receipt["lockbox_hours_dropped"], 864);
+    assert_eq!(receipt["rows"], 30);
+    assert_eq!(receipt["lockbox_hours_dropped"], 3);
+    assert_eq!(receipt["lockbox_hours_excluded"], 864);
     assert_eq!(
         receipt["lockbox_sha256"], fixtures.lockbox_sha,
         "the receipt records the checked sha"
@@ -460,7 +676,13 @@ fn mapping_rules_and_receipt() {
         receipt["provenance"]["solos_data_git_sha"],
         "0123456789abcdef0123456789abcdef01234567"
     );
-    assert_eq!(receipt["inputs"]["hl_fills"]["hours"], 72);
+    assert_eq!(receipt["inputs"]["hl_fills"]["hours"], 75);
+    assert_eq!(receipt["inputs"]["hl_fills"]["lockbox_hours_dropped"], 3);
+    assert_eq!(
+        receipt["inputs"]["phoenix_fills"]["lockbox_hours_dropped"],
+        3
+    );
+    assert_eq!(receipt["inputs"]["pyth_prices"]["lockbox_hours_dropped"], 0);
     assert_eq!(
         receipt["inputs"]["check_days"],
         serde_json::json!(["2026-10-15", "2026-10-16", "2026-10-17"])
@@ -477,15 +699,50 @@ fn mapping_rules_and_receipt() {
     assert_eq!(catalog["schema"], "combined-v1");
     assert_eq!(catalog["files"][0]["path"], "mapping/assets.csv");
     assert_eq!(catalog["files"][0]["sha256"], file_sha.as_str());
+    assert_eq!(catalog["watermarks"]["mapping"]["lockbox_hours_dropped"], 3);
     assert_eq!(
-        catalog["watermarks"]["mapping"]["lockbox_hours_dropped"],
+        catalog["watermarks"]["mapping"]["lockbox_hours_excluded"],
         864
     );
 }
 
 #[test]
+fn the_phoenix_price_window_excludes_out_of_window_fills() {
+    let tmp = Tmp::new("phxwindow");
+    let fixtures = build_fixtures(tmp.dir());
+    let conn = memory_connection("1", "512MB").unwrap();
+    let files = super::mapping::walk_parquet(&fixtures.phoenix).unwrap();
+    let check_days: Vec<chrono::NaiveDate> = CHECK_DAYS
+        .split(',')
+        .map(|day| super::grid::parse_date(day).unwrap())
+        .collect();
+    let ranges = super::lockbox::tests::v2_ranges_for_test();
+    let phoenix =
+        super::mapping::scan_phoenix(&conn, &fixtures.phoenix, &files, &check_days, &ranges);
+    let phoenix = phoenix.unwrap();
+    // PHOENIXONLY has check-day fills and 2026-10-20 fills; only the check days
+    // may reach the price map.
+    let phx = phoenix.prices.get("PHOENIXONLY").unwrap();
+    let window_start =
+        super::grid::day_start_secs(chrono::NaiveDate::from_ymd_opt(2026, 10, 15).unwrap());
+    let window_end = window_start + 3 * 86_400;
+    assert_eq!(phx.len(), 72, "exactly the check-day hours");
+    assert!(
+        phx.keys()
+            .all(|hour| *hour >= window_start && *hour < window_end)
+    );
+    // The SOL lockbox-week fills stay out of the price map too.
+    assert_eq!(phoenix.prices.get("SOL").unwrap().len(), 72);
+    // And out of the universe span: SOL's first fill second is the check day.
+    assert_eq!(
+        phoenix.universe.get("SOL").unwrap().first_ts,
+        window_start + 120
+    );
+}
+
+#[test]
 fn a_failed_output_write_leaves_no_receipt() {
-    let tmp = Tmp::new("fsync");
+    let tmp = Tmp::new("fsync-assets");
     let fixtures = build_fixtures(tmp.dir());
     let out = tmp.dir().join("store");
     crate::fsutil::inject_fsync_eio(FsyncStep::TempFile);
@@ -495,11 +752,83 @@ fn a_failed_output_write_leaves_no_receipt() {
         error.is_err(),
         "the injected fsync failure must fail the run"
     );
-    assert!(!receipt::receipt_path(&out, "mapping").exists());
+    assert!(!receipt::receipt_path(&out, "mapping", "mapping").exists());
     assert!(!out.join("catalog.json").exists());
     // A rerun without the fault succeeds and writes everything.
     mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
-    assert!(receipt::receipt_path(&out, "mapping").exists());
+    assert!(receipt::receipt_path(&out, "mapping", "mapping").exists());
+}
+
+#[test]
+fn a_failed_receipt_write_leaves_the_output_but_no_receipt() {
+    let tmp = Tmp::new("fsync-receipt");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    receipt::on_before_write(|| crate::fsutil::inject_fsync_eio(FsyncStep::TempFile));
+    let error = mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS));
+    receipt::clear_before_write();
+    crate::fsutil::clear_fsync_failure();
+    assert!(
+        error.is_err(),
+        "the faulted receipt write must fail the run"
+    );
+    assert!(
+        out.join("mapping/assets.csv").exists(),
+        "the output is durable"
+    );
+    assert!(!receipt::receipt_path(&out, "mapping", "mapping").exists());
+    assert!(
+        !out.join("catalog.json").exists(),
+        "no catalog after a failed receipt"
+    );
+}
+
+#[test]
+fn a_failed_catalog_write_leaves_output_and_receipt() {
+    let tmp = Tmp::new("fsync-catalog");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    catalog_seam_arm();
+    let error = mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS));
+    catalog_seam_clear();
+    crate::fsutil::clear_fsync_failure();
+    assert!(
+        error.is_err(),
+        "the faulted catalog write must fail the run"
+    );
+    assert!(out.join("mapping/assets.csv").exists());
+    assert!(receipt::receipt_path(&out, "mapping", "mapping").exists());
+    assert!(!out.join("catalog.json").exists());
+}
+
+/// Corrupt the sealed file after the durable write but keep the header, so
+/// only the read-back row count can see this.
+fn corrupt_sealed_output(path: &Path) {
+    let header = "asset_id,venue,venue_symbol,builder,coin_class,venue_market_id,first_ts,last_ts,source_of_truth,mapped,reason,median_abs_log_ratio,n_hours";
+    std::fs::write(path, format!("{header}\nX\n")).unwrap();
+}
+
+fn catalog_seam_arm() {
+    crate::augment::combined::catalog::on_before_save(|| {
+        crate::fsutil::inject_fsync_eio(FsyncStep::TempFile);
+    });
+}
+
+fn catalog_seam_clear() {
+    crate::augment::combined::catalog::clear_before_save();
+}
+
+#[test]
+fn a_corrupt_output_fails_the_read_back_check() {
+    let tmp = Tmp::new("readback");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    mapping::on_before_verify_for_tests(corrupt_sealed_output);
+    let error = mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS));
+    mapping::clear_before_verify_for_tests();
+    let error = error.unwrap_err();
+    assert!(error.to_string().contains("read-back"), "{error}");
+    assert!(!receipt::receipt_path(&out, "mapping", "mapping").exists());
 }
 
 #[test]
@@ -547,4 +876,113 @@ fn the_lockbox_loader_rejects_a_wrong_version_and_sha() {
     std::fs::write(&path, &v2).unwrap();
     let error = super::lockbox::load(&path, &sha).unwrap_err();
     assert!(error.to_string().contains("sha256 mismatch"), "{error}");
+}
+
+#[test]
+fn an_hl_coin_with_two_classes_refuses() {
+    let tmp = Tmp::new("twoclass");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    // Overwrite one receipted hour with a file that carries SOL both as perp
+    // and as spot: the universe cannot split a coin's identity.
+    let (base_hour, _) = hour_bases();
+    let dt = chrono::DateTime::from_timestamp(base_hour * 3600, 0).unwrap();
+    let path = fixtures.hl.join(format!(
+        "train/date={}/hour={}-{}.parquet",
+        dt.format("%Y-%m-%d"),
+        dt.format("%Y%m%d"),
+        dt.format("%H")
+    ));
+    let conn = memory_connection("1", "512MB").unwrap();
+    conn.execute_batch(&format!(
+        "COPY (SELECT 'SOL' AS coin, 'perp' AS coin_class, {} AS time_ms, 1 AS tid, 100.0 AS px
+               UNION ALL
+               SELECT 'SOL', 'spot', {}, 2, 100.0) TO {} (FORMAT PARQUET)",
+        base_hour * 3_600_000 + 60_000,
+        base_hour * 3_600_000 + 61_000,
+        sql_string(&path.to_string_lossy())
+    ))
+    .unwrap();
+    let error =
+        mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap_err();
+    assert!(error.to_string().contains("two classes"), "{error}");
+}
+
+#[test]
+fn a_wrong_watermark_schema_refuses() {
+    let tmp = Tmp::new("wmschema");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    let watermark: Value =
+        serde_json::from_str(&std::fs::read_to_string(fixtures.hl.join("watermark.json")).unwrap())
+            .unwrap();
+    let mut wrong = watermark.clone();
+    wrong["schema"] = serde_json::json!("hl-fills-v2");
+    std::fs::write(
+        fixtures.hl.join("watermark.json"),
+        serde_json::to_vec(&wrong).unwrap(),
+    )
+    .unwrap();
+    let error =
+        mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap_err();
+    assert!(error.to_string().contains("schema"), "{error}");
+}
+
+#[test]
+fn an_empty_phoenix_dir_refuses() {
+    let tmp = Tmp::new("emptyphx");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    let empty = tmp.dir().join("no-phoenix");
+    std::fs::create_dir_all(&empty).unwrap();
+    let mut req = request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS);
+    req.phoenix_fills = &empty;
+    let error = mapping::run(&req).unwrap_err();
+    assert!(error.to_string().contains("no parquet files"), "{error}");
+}
+
+#[test]
+fn venues_config_without_pyth_feeds_refuses() {
+    let tmp = Tmp::new("nopyth");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    let path = tmp.dir().join("venues-nopyth.json");
+    std::fs::write(&path, r#"{"venues": [], "pyth": {"feeds": []}}"#).unwrap();
+    let mut req = request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS);
+    req.venues_config = &path;
+    let error = mapping::run(&req).unwrap_err();
+    assert!(error.to_string().contains("no pyth feeds"), "{error}");
+}
+
+#[test]
+fn non_object_provenance_refuses() {
+    let tmp = Tmp::new("prov");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    let path = tmp.dir().join("provenance-array.json");
+    std::fs::write(&path, "[1,2,3]").unwrap();
+    let mut req = request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS);
+    req.provenance = &path;
+    let error = mapping::run(&req).unwrap_err();
+    assert!(error.to_string().contains("JSON object"), "{error}");
+}
+
+#[test]
+fn an_ambiguous_phoenix_market_id_is_left_empty() {
+    let tmp = Tmp::new("marketid");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    // A second Phoenix file gives SOL a different numeric market id.
+    let conn = memory_connection("1", "512MB").unwrap();
+    let extra = fixtures.phoenix.join("extra.parquet");
+    conn.execute_batch(&format!(
+        "COPY (SELECT 'SOL' AS asset_symbol, 1792022461 AS block_time, 10000 AS price_ticks,
+               100 AS tick_size, 2 AS base_lot_decimals, 6 AS quote_lot_decimals,
+               999 AS asset_id) TO {} (FORMAT PARQUET)",
+        sql_string(&extra.to_string_lossy())
+    ))
+    .unwrap();
+    mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
+    let sol = line_of(&assets_lines(&out), "phoenix", "SOL");
+    assert!(sol.contains(",spot,,"), "market id empty: {sol}");
 }

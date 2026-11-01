@@ -120,8 +120,10 @@ pub struct Report {
     pub spot_unnamed: u64,
     /// `#N` outcome rows.
     pub outcome: u64,
-    /// Excluded lockbox hours recorded in the receipt.
+    /// Input hours the lockbox actually dropped (the widest input).
     pub lockbox_hours_dropped: u64,
+    /// Distinct UTC hours in the lockbox exclusion set (864 for v2).
+    pub lockbox_hours_excluded: u64,
     /// Sealed outputs.
     pub outputs: Vec<receipt::OutputFile>,
 }
@@ -153,6 +155,7 @@ impl Report {
             .with("spotUnnamed", self.spot_unnamed)
             .with("outcome", self.outcome)
             .with("lockboxHoursDropped", self.lockbox_hours_dropped)
+            .with("lockboxHoursExcluded", self.lockbox_hours_excluded)
             .with(
                 "outputs",
                 self.outputs
@@ -294,9 +297,9 @@ struct HlWatermark {
 
 /// Universe entry of one venue symbol.
 #[derive(Clone, Debug)]
-struct Universe {
-    first_ts: i64,
-    last_ts: i64,
+pub(crate) struct Universe {
+    pub(crate) first_ts: i64,
+    pub(crate) last_ts: i64,
 }
 
 /// Run the mapping unit.
@@ -317,6 +320,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let config = load_venues_config(request.venues_config)?;
     let lockbox = lockbox::load(request.lockbox, request.lockbox_sha256)?;
     let lockbox_hours = lockbox.excluded_hours()?;
+    let lockbox_ranges = lockbox.excluded_ranges()?;
     lockbox.assert_v2_shape(&lockbox_hours)?;
     lockbox::refuse_check_days_inside(&lockbox_hours, &check_days)?;
 
@@ -326,20 +330,41 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let conn = open_reader(request.out, request.threads, &memory_limit)?;
 
     // Inputs: file lists are walked before any query, so the receipt's watermarks
-    // describe exactly what the queries read.
-    let hl = HlInput::scan(&conn, request.hl_fills, &check_days)?;
+    // describe exactly what the queries read. Every span filter excludes the
+    // lockbox hours: first_ts/last_ts and the price check never see them.
+    let hl = HlInput::scan(&conn, request.hl_fills, &check_days, &lockbox_ranges)?;
     let phoenix_files = walk_parquet(request.phoenix_fills)?;
     if phoenix_files.is_empty() {
         return Err(StoreError::Check(
             "--phoenix-fills has no parquet files".into(),
         ));
     }
-    let phoenix = scan_phoenix(&conn, request.phoenix_fills, &phoenix_files, &check_days)?;
+    let phoenix = scan_phoenix(
+        &conn,
+        request.phoenix_fills,
+        &phoenix_files,
+        &check_days,
+        &lockbox_ranges,
+    )?;
     let (context_files, contexts) = scan_asset_contexts(&conn, request.asset_contexts)?;
-    let (pyth_files, pyth) = scan_pyth(&conn, request.pyth_prices)?;
+    let (pyth_files, pyth) = scan_pyth(&conn, request.pyth_prices, &lockbox_ranges)?;
     if config.pyth.feeds.is_empty() {
         return Err(StoreError::Check("venues config has no pyth feeds".into()));
     }
+    // Input hours the lockbox actually dropped: hours each input covers that
+    // fall inside the exclusion set. HL is exact (watermark hours); Phoenix and
+    // Pyth count distinct covered hours inside the set. The widest input
+    // defines the store-wide drop; the set's own size is recorded separately.
+    let hl_dropped = hl
+        .hours
+        .iter()
+        .filter_map(|key| watermark_unix_hour(key))
+        .filter(|hour| in_ranges(&lockbox_ranges, *hour))
+        .count() as u64;
+    let lockbox_hours_dropped = hl_dropped
+        .max(phoenix.lockbox_hours_dropped)
+        .max(pyth.lockbox_hours_dropped);
+    let lockbox_hours_excluded = lockbox_hours.len() as u64;
 
     let mut rows = build_rows(&hl, &phoenix, &contexts, &pyth, &config);
     rows.sort_by(|a, b| (a.venue, &a.venue_symbol).cmp(&(b.venue, &b.venue_symbol)));
@@ -354,6 +379,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     write_durable(&final_path, body.as_bytes())?;
     let bytes = std::fs::metadata(&final_path)?.len();
     let sha = file_hash(&final_path)?;
+    #[cfg(test)]
+    seams::fire_before_verify(&final_path);
     verify_written(&final_path, rows.len())?;
     let output = receipt::OutputFile {
         path: "mapping/assets.csv".to_owned(),
@@ -362,12 +389,24 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         sha256: sha,
     };
 
-    let inputs = inputs_value(&hl, &phoenix_files, &context_files, &pyth_files, request);
+    let inputs = inputs_value(
+        &hl,
+        &phoenix_files,
+        &context_files,
+        &pyth_files,
+        request,
+        DroppedHours {
+            hl: hl_dropped,
+            phoenix: phoenix.lockbox_hours_dropped,
+            pyth: pyth.lockbox_hours_dropped,
+        },
+    );
     let finished = grid::now_rfc3339();
     let counts = count_per_venue(&rows);
     let counters = PairCounters::of(&rows);
     receipt::write(
         request.out,
+        "mapping",
         &receipt::Receipt {
             unit: UNIT.to_owned(),
             unit_version: UNIT_VERSION,
@@ -375,7 +414,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             outputs: vec![output.clone()],
             inputs,
             lockbox_sha256: request.lockbox_sha256.trim().to_ascii_lowercase(),
-            lockbox_hours_dropped: lockbox_hours.len() as u64,
+            lockbox_hours_dropped,
+            lockbox_hours_excluded,
             config_sha256: config_hash(&check_days),
             provenance,
             started_utc: started,
@@ -399,7 +439,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             "hl_fills_hours_sha256": hl.hours_sha256,
             "check_days": check_days.iter().map(ToString::to_string).collect::<Vec<_>>(),
             "lockbox_sha256": request.lockbox_sha256.trim().to_ascii_lowercase(),
-            "lockbox_hours_dropped": lockbox_hours.len() as u64,
+            "lockbox_hours_dropped": lockbox_hours_dropped,
+            "lockbox_hours_excluded": lockbox_hours_excluded,
         }),
     );
     cat.save(request.out)?;
@@ -413,9 +454,75 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         thin: counters.thin,
         spot_unnamed: counters.spot_unnamed,
         outcome: counters.outcome,
-        lockbox_hours_dropped: lockbox_hours.len() as u64,
+        lockbox_hours_dropped,
+        lockbox_hours_excluded,
         outputs: vec![output],
     })
+}
+
+/// A unix-hour number inside any lockbox range.
+fn in_ranges(ranges: &[(i64, i64)], hour: i64) -> bool {
+    ranges
+        .iter()
+        .any(|(first, last_exclusive)| hour >= *first && hour < *last_exclusive)
+}
+
+/// The SQL complement of [`in_ranges`]: `NOT (hour in any range)` for a row
+/// filter. Empty ranges free everything.
+fn lockbox_free_sql(ranges: &[(i64, i64)], hour_expression: &str) -> String {
+    if ranges.is_empty() {
+        return "TRUE".to_owned();
+    }
+    let clauses = ranges
+        .iter()
+        .map(|(first, last_exclusive)| {
+            format!("({hour_expression} >= {first} AND {hour_expression} < {last_exclusive})")
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    format!("NOT ({clauses})")
+}
+
+/// `YYYYMMDD/H` watermark key to the unix hour it names.
+fn watermark_unix_hour(key: &str) -> Option<i64> {
+    let (date, hour_of_day) = key.split_once('/')?;
+    if date.len() != 8 || !date.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let hour_of_day: i64 = hour_of_day.parse().ok()?;
+    let day = chrono::NaiveDate::parse_from_str(
+        &format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..]),
+        "%Y-%m-%d",
+    )
+    .ok()?;
+    Some(grid::hour_of_secs(grid::day_start_secs(day)) + hour_of_day)
+}
+
+/// Test-only ways to force one check so a removed guard goes red.
+#[cfg(test)]
+pub(crate) mod seams {
+    use std::cell::Cell;
+    use std::path::Path;
+
+    thread_local! {
+        static BEFORE_VERIFY: Cell<Option<fn(&Path)>> = const { Cell::new(None) };
+    }
+
+    /// `hook` runs once with the sealed output path, immediately before the
+    /// assets.csv read-back check.
+    pub fn on_before_verify(hook: fn(&Path)) {
+        BEFORE_VERIFY.with(|slot| slot.set(Some(hook)));
+    }
+
+    pub fn clear_before_verify() {
+        BEFORE_VERIFY.with(|slot| slot.set(None));
+    }
+
+    pub(crate) fn fire_before_verify(path: &Path) {
+        if let Some(hook) = BEFORE_VERIFY.with(std::cell::Cell::take) {
+            hook(path);
+        }
+    }
 }
 
 /// DuckDB memory cap: the shared parser, plus the plan's 32GB ceiling.
@@ -542,12 +649,20 @@ fn config_hash(check_days: &[NaiveDate]) -> String {
 
 /// Everything the run read, for the receipt. Relative paths and sizes only; no
 /// absolute machine paths.
+/// Per-input lockbox drops, for the receipt.
+struct DroppedHours {
+    hl: u64,
+    phoenix: u64,
+    pyth: u64,
+}
+
 fn inputs_value(
     hl: &HlInput,
     phoenix_files: &[FileRef],
     contexts: &[FileRef],
     pyth_files: &[FileRef],
     request: &Request<'_>,
+    dropped: DroppedHours,
 ) -> Value {
     json!({
         "check_days": hl.check_days.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
@@ -557,15 +672,18 @@ fn inputs_value(
             "hours_sha256": hl.hours_sha256,
             "files": hl.files.len(),
             "files_sha256": file_list_sha256(&hl.files),
+            "lockbox_hours_dropped": dropped.hl,
         },
         "phoenix_fills": {
             "files": phoenix_files.len(),
             "files_sha256": file_list_sha256(phoenix_files),
             "root": root_name(request.phoenix_fills),
+            "lockbox_hours_dropped": dropped.phoenix,
         },
         "pyth_prices": {
             "files": pyth_files.len(),
             "files_sha256": file_list_sha256(pyth_files),
+            "lockbox_hours_dropped": dropped.pyth,
         },
         "asset_contexts": {
             "files": contexts.len(),
@@ -597,13 +715,13 @@ fn file_list_sha256(files: &[FileRef]) -> String {
 
 /// A walked input file.
 #[derive(Clone, Debug)]
-struct FileRef {
-    relative: String,
-    size: u64,
+pub(crate) struct FileRef {
+    pub(crate) relative: String,
+    pub(crate) size: u64,
 }
 
 /// Walk `root` recursively for Parquet files, sorted by relative path.
-fn walk_parquet(root: &Path) -> Result<Vec<FileRef>, StoreError> {
+pub(crate) fn walk_parquet(root: &Path) -> Result<Vec<FileRef>, StoreError> {
     let mut out = Vec::new();
     walk_dir(root, root, &mut out)?;
     out.sort_by(|a, b| a.relative.cmp(&b.relative));
@@ -679,11 +797,13 @@ struct HlInput {
 
 impl HlInput {
     /// Read the watermark, check every receipted hour's files exist, and scan
-    /// the universe plus the check-day hourly last prices.
+    /// the universe plus the check-day hourly last prices. The universe span
+    /// excludes the lockbox hours: a coin trading only inside them vanishes.
     fn scan(
         conn: &duckdb::Connection,
         root: &Path,
         check_days: &[NaiveDate],
+        lockbox_ranges: &[(i64, i64)],
     ) -> Result<Self, StoreError> {
         let path = root.join("watermark.json");
         let text = std::fs::read_to_string(&path)
@@ -705,10 +825,13 @@ impl HlInput {
         let hours_sha256 = crate::fsutil::sha256_hex(hours_sha.as_bytes());
         let files = watermark_files(root, &watermark.hours)?;
         let table = parquet_list(&absolute(root, &files))?;
+        let free = lockbox_free_sql(lockbox_ranges, "(time_ms // 3600000)");
         let rows = query_rows(
             conn,
             &format!(
-                "SELECT coin, coin_class, min(time_ms) AS first_ms, max(time_ms) AS last_ms
+                "SELECT coin, coin_class,
+                        min(CASE WHEN {free} THEN time_ms END) AS first_ms,
+                        max(CASE WHEN {free} THEN time_ms END) AS last_ms
                  FROM {table} WHERE coin IS NOT NULL GROUP BY 1, 2"
             ),
             &[],
@@ -720,12 +843,11 @@ impl HlInput {
                 .ok_or_else(|| StoreError::Check("hl universe: null coin".into()))?
                 .to_owned();
             let class = row.str("coin_class").unwrap_or_default().to_owned();
-            let first_ms = row
-                .int("first_ms")
-                .ok_or_else(|| StoreError::Check(format!("hl universe {coin}: null first")))?;
-            let last_ms = row
-                .int("last_ms")
-                .ok_or_else(|| StoreError::Check(format!("hl universe {coin}: null last")))?;
+            let (Some(first_ms), Some(last_ms)) = (row.int("first_ms"), row.int("last_ms")) else {
+                // Every fill of this coin sits in lockbox hours: it has no row
+                // in any output table, so it is not a mapping row either.
+                continue;
+            };
             if universe.contains_key(&coin) {
                 return Err(StoreError::Check(format!(
                     "hl universe: coin {coin} has two classes"
@@ -844,10 +966,19 @@ fn hourly_prices(
         let hour = row
             .int("hour_s")
             .ok_or_else(|| StoreError::Check("prices: null hour".into()))?;
+        // A DECIMAL-typed source column renders the price as a decimal string;
+        // parse instead of refusing, so the reader does not depend on the
+        // column's exact logical type.
         let px = row
             .get("px")
-            .and_then(Value::as_f64)
-            .ok_or_else(|| StoreError::Check("prices: null px".into()))?;
+            .map(|value| match value {
+                Value::Number(number) => number.as_f64(),
+                Value::String(text) => text.parse().ok(),
+                _ => None,
+            })
+            .unwrap_or(None)
+            .filter(|value| value.is_finite())
+            .ok_or_else(|| StoreError::Check(format!("prices: bad px for {symbol} at {hour}")))?;
         prices.entry(symbol).or_default().insert(hour, px);
     }
     Ok(prices)
@@ -856,24 +987,30 @@ fn hourly_prices(
 /// The Phoenix fills input: universe (per asset symbol) and check-day prices.
 /// Price is `price_ticks * tick_size * 10^(base_lot_decimals - quote_lot_decimals)`
 /// (slice 0 measured; validated against HL for BTC and SOL).
-struct PhoenixInput {
-    universe: BTreeMap<String, Universe>,
+pub(crate) struct PhoenixInput {
+    pub(crate) universe: BTreeMap<String, Universe>,
     /// asset symbol, Phoenix numeric market id when every fill agrees.
     market_id: BTreeMap<String, Option<String>>,
-    prices: BTreeMap<String, BTreeMap<i64, f64>>,
+    pub(crate) prices: BTreeMap<String, BTreeMap<i64, f64>>,
+    /// Distinct fill hours inside the lockbox that this input drops.
+    lockbox_hours_dropped: u64,
 }
 
-fn scan_phoenix(
+pub(crate) fn scan_phoenix(
     conn: &duckdb::Connection,
     root: &Path,
     files: &[FileRef],
     check_days: &[NaiveDate],
+    lockbox_ranges: &[(i64, i64)],
 ) -> Result<PhoenixInput, StoreError> {
     let table = parquet_list(&absolute(root, files))?;
+    let free = lockbox_free_sql(lockbox_ranges, "(block_time // 3600)");
     let rows = query_rows(
         conn,
         &format!(
-            "SELECT asset_symbol, min(block_time) AS first_s, max(block_time) AS last_s,
+            "SELECT asset_symbol,
+                    min(CASE WHEN {free} THEN block_time END) AS first_s,
+                    max(CASE WHEN {free} THEN block_time END) AS last_s,
                     min(asset_id) AS id_min, max(asset_id) AS id_max
              FROM {table} WHERE asset_symbol IS NOT NULL GROUP BY 1"
         ),
@@ -886,12 +1023,10 @@ fn scan_phoenix(
             .str("asset_symbol")
             .ok_or_else(|| StoreError::Check("phoenix universe: null symbol".into()))?
             .to_owned();
-        let first = row
-            .int("first_s")
-            .ok_or_else(|| StoreError::Check(format!("phoenix universe {symbol}: null first")))?;
-        let last = row
-            .int("last_s")
-            .ok_or_else(|| StoreError::Check(format!("phoenix universe {symbol}: null last")))?;
+        let (Some(first), Some(last)) = (row.int("first_s"), row.int("last_s")) else {
+            // Every fill of this asset sits in lockbox hours.
+            continue;
+        };
         let id = match (row.int("id_min"), row.int("id_max")) {
             (Some(min), Some(max)) if min == max => Some(min.to_string()),
             _ => None,
@@ -905,6 +1040,19 @@ fn scan_phoenix(
         );
         market_id.insert(symbol, id);
     }
+    // Distinct hours with fills that the lockbox drops from this input.
+    let dropped_rows = query_rows(
+        conn,
+        &format!(
+            "SELECT count(DISTINCT (block_time // 3600)) AS dropped
+             FROM {table} WHERE NOT ({free}) AND block_time IS NOT NULL"
+        ),
+        &[],
+    )?;
+    let lockbox_hours_dropped = dropped_rows
+        .first()
+        .and_then(|row| row.int("dropped"))
+        .unwrap_or(0) as u64;
     let first_day = grid::day_start_secs(check_days[0]);
     let last_day = grid::day_start_secs(check_days[check_days.len() - 1]) + 86_400;
     let price_expression = "price_ticks::DOUBLE * tick_size::DOUBLE
@@ -925,6 +1073,7 @@ fn scan_phoenix(
         universe,
         market_id,
         prices,
+        lockbox_hours_dropped,
     })
 }
 
@@ -962,11 +1111,14 @@ fn scan_asset_contexts(
 /// Pyth price history across all given directories, merged per feed symbol.
 struct PythInput {
     universe: BTreeMap<String, Universe>,
+    /// Distinct publish hours inside the lockbox that this input drops.
+    lockbox_hours_dropped: u64,
 }
 
 fn scan_pyth(
     conn: &duckdb::Connection,
     dirs: &[PathBuf],
+    lockbox_ranges: &[(i64, i64)],
 ) -> Result<(Vec<FileRef>, PythInput), StoreError> {
     if dirs.is_empty() {
         return Err(StoreError::Check(
@@ -975,6 +1127,7 @@ fn scan_pyth(
     }
     let mut all: Vec<FileRef> = Vec::new();
     let mut universe: BTreeMap<String, Universe> = BTreeMap::new();
+    let free = lockbox_free_sql(lockbox_ranges, "(publish_time // 3600)");
     for (index, dir) in dirs.iter().enumerate() {
         let root_files = walk_parquet(dir)?;
         if root_files.is_empty() {
@@ -990,7 +1143,9 @@ fn scan_pyth(
         let rows = query_rows(
             conn,
             &format!(
-                "SELECT symbol, min(publish_time) AS first_s, max(publish_time) AS last_s
+                "SELECT symbol,
+                        min(CASE WHEN {free} THEN publish_time END) AS first_s,
+                        max(CASE WHEN {free} THEN publish_time END) AS last_s
                  FROM {table} WHERE symbol IS NOT NULL GROUP BY 1"
             ),
             &[],
@@ -1014,7 +1169,37 @@ fn scan_pyth(
             "--pyth-prices has no parquet files".into(),
         ));
     }
-    Ok((all, PythInput { universe }))
+    // Distinct publish hours inside the lockbox, counted over every directory's
+    // files in one pass (the live lane overlaps the history tail).
+    let mut lockbox_hours_dropped = 0u64;
+    for dir in dirs {
+        let root_files = walk_parquet(dir)?;
+        if root_files.is_empty() {
+            continue;
+        }
+        let table = parquet_list(&absolute(dir, &root_files))?;
+        let dropped_rows = query_rows(
+            conn,
+            &format!(
+                "SELECT count(DISTINCT (publish_time // 3600)) AS dropped
+                 FROM {table} WHERE NOT ({free}) AND publish_time IS NOT NULL"
+            ),
+            &[],
+        )?;
+        lockbox_hours_dropped = lockbox_hours_dropped.max(
+            dropped_rows
+                .first()
+                .and_then(|row| row.int("dropped"))
+                .unwrap_or(0) as u64,
+        );
+    }
+    Ok((
+        all,
+        PythInput {
+            universe,
+            lockbox_hours_dropped,
+        },
+    ))
 }
 
 /// Build every CSV row: HL coins (with pair checks), Phoenix assets, Pyth feeds,
@@ -1076,13 +1261,7 @@ fn build_rows(
                             hl.prices.get(coin).unwrap_or(&empty_prices),
                             phoenix.prices.get(asset).unwrap_or(&empty_prices),
                         );
-                        let (mapped, reason) = if n < MIN_HOURS {
-                            (false, REASON_THIN.to_owned())
-                        } else if med.is_some_and(|value| value >= PRICE_THRESHOLD) {
-                            (false, REASON_DIVERGENT.to_owned())
-                        } else {
-                            (true, String::new())
-                        };
+                        let (mapped, reason) = pair_decision(n, med);
                         pair_outcomes
                             .entry(asset.clone())
                             .or_default()
@@ -1290,6 +1469,20 @@ fn price_check(hl: &BTreeMap<i64, f64>, ph: &BTreeMap<i64, f64>) -> (u64, Option
     (n, median(&mut ratios))
 }
 
+/// The pair verdict: thin first (a short window cannot support the median at
+/// any price level), then the 1% bar: a pair maps only when the median exists
+/// and is strictly below [`PRICE_THRESHOLD`]; a median exactly at the bar is a
+/// divergence.
+fn pair_decision(n_hours: u64, median: Option<f64>) -> (bool, String) {
+    if n_hours < MIN_HOURS {
+        (false, REASON_THIN.to_owned())
+    } else if median.is_some_and(|value| value < PRICE_THRESHOLD) {
+        (true, String::new())
+    } else {
+        (false, REASON_DIVERGENT.to_owned())
+    }
+}
+
 /// Median of a sample; the sample is sorted in place.
 fn median(values: &mut [f64]) -> Option<f64> {
     if values.is_empty() {
@@ -1367,6 +1560,18 @@ fn open_reader(
     Ok(conn)
 }
 
+/// Test access to the read-back seam (see `seams`).
+#[cfg(test)]
+pub(crate) fn on_before_verify_for_tests(hook: fn(&Path)) {
+    seams::on_before_verify(hook);
+}
+
+/// Test access: clear the read-back seam.
+#[cfg(test)]
+pub(crate) fn clear_before_verify_for_tests() {
+    seams::clear_before_verify();
+}
+
 /// The `.tmp-duckdb` spill dir is removed when the run ends.
 struct TempClean(PathBuf);
 
@@ -1379,5 +1584,56 @@ impl TempClean {
 impl Drop for TempClean {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pair_decision_boundaries() {
+        // Strict bar: 0.0099 maps, exactly 0.01 diverges, 0.0101 diverges.
+        assert_eq!(pair_decision(24, Some(0.0099)), (true, String::new()));
+        assert_eq!(
+            pair_decision(24, Some(PRICE_THRESHOLD)),
+            (false, REASON_DIVERGENT.to_owned())
+        );
+        assert_eq!(
+            pair_decision(24, Some(0.0101)),
+            (false, REASON_DIVERGENT.to_owned())
+        );
+        // Thin wins below the hour floor, whatever the prices say.
+        assert_eq!(
+            pair_decision(23, Some(0.0101)),
+            (false, REASON_THIN.to_owned())
+        );
+        assert_eq!(pair_decision(0, None), (false, REASON_THIN.to_owned()));
+        // A missing median never maps, even with enough hours (unreachable
+        // from price_check, but the safe side is divergence).
+        assert_eq!(
+            pair_decision(24, None),
+            (false, REASON_DIVERGENT.to_owned())
+        );
+    }
+
+    #[test]
+    fn lockbox_range_helpers_and_watermark_hours() {
+        let ranges = vec![(100, 200), (300, 400)];
+        assert!(in_ranges(&ranges, 100));
+        assert!(in_ranges(&ranges, 399));
+        assert!(!in_ranges(&ranges, 200));
+        assert!(!in_ranges(&ranges, 50));
+        assert_eq!(
+            lockbox_free_sql(&ranges, "h"),
+            "NOT ((h >= 100 AND h < 200) OR (h >= 300 AND h < 400))"
+        );
+        assert_eq!(lockbox_free_sql(&[], "h"), "TRUE");
+        let day = grid::hour_of_secs(grid::day_start_secs(
+            grid::parse_date("2026-10-15").unwrap(),
+        ));
+        assert_eq!(watermark_unix_hour("20261015/13"), Some(day + 13));
+        assert_eq!(watermark_unix_hour("bad"), None);
+        assert_eq!(watermark_unix_hour("20261015/x"), None);
     }
 }

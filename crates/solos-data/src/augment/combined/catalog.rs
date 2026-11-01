@@ -99,8 +99,36 @@ impl Catalog {
         if let Some(parent) = path.parent() {
             create_dir_all_durable(parent)?;
         }
+        #[cfg(test)]
+        fire_before_save();
         write_durable(&path, &body)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_SAVE: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test hook: run `hook` immediately before the catalog's durable write, so a
+/// test can arm an fsync fault at exactly this step (swapping in `fs::write`
+/// never fires the fault, which is what the mutant check looks for).
+#[cfg(test)]
+pub fn on_before_save(hook: fn()) {
+    BEFORE_SAVE.with(|slot| slot.set(Some(hook)));
+}
+
+/// Clear the hook without firing it.
+#[cfg(test)]
+pub fn clear_before_save() {
+    BEFORE_SAVE.with(|slot| slot.set(None));
+}
+
+#[cfg(test)]
+fn fire_before_save() {
+    if let Some(hook) = BEFORE_SAVE.with(std::cell::Cell::take) {
+        hook();
     }
 }
 

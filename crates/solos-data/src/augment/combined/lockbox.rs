@@ -66,6 +66,14 @@ pub fn load(path: &Path, expected_sha256: &str) -> Result<Lockbox, StoreError> {
     }
     let lockbox: Lockbox = serde_json::from_slice(&bytes)
         .map_err(|error| StoreError::Check(format!("lockbox: bad JSON: {error}")))?;
+    check(&lockbox)?;
+    Ok(lockbox)
+}
+
+/// The structural guards of a parsed lockbox: version, guard hours, and the
+/// weeks' timestamps. `load` applies them after the sha check; tests call this
+/// directly on hand-built values.
+pub(crate) fn check(lockbox: &Lockbox) -> Result<(), StoreError> {
     if lockbox.version != LOCKBOX_VERSION {
         return Err(StoreError::Check(format!(
             "lockbox version {} is not {LOCKBOX_VERSION}",
@@ -90,19 +98,20 @@ pub fn load(path: &Path, expected_sha256: &str) -> Result<Lockbox, StoreError> {
             )));
         }
     }
-    Ok(lockbox)
+    Ok(())
 }
 
 impl Lockbox {
-    /// Every excluded unix hour: for each week, the hours that intersect
-    /// `[start - guard, end + guard)`.
+    /// Half-open unix-hour ranges `[first, last + 1)` of the exclusion set, one
+    /// per week (week hours with the guard on both sides). The SQL-side filters
+    /// use these ranges: they are the same hours as [`Lockbox::excluded_hours`]
+    /// without materialising 864 values per query.
     ///
     /// # Errors
     ///
-    /// A week timestamp is malformed (rechecked here so the set is always in
-    /// sync with the parsed weeks).
-    pub fn excluded_hours(&self) -> Result<BTreeSet<i64>, StoreError> {
-        let mut hours = BTreeSet::new();
+    /// A week timestamp is malformed.
+    pub fn excluded_ranges(&self) -> Result<Vec<(i64, i64)>, StoreError> {
+        let mut ranges = Vec::new();
         let guard = self.guard_hours * grid::HOUR_SECS;
         for week in &self.weeks {
             let start = grid::parse_rfc3339_secs(&week.start).map_err(|error| {
@@ -114,7 +123,23 @@ impl Lockbox {
             let first = grid::hour_of_secs(start - guard);
             // `end - 1 + guard` is the last second the guard keeps.
             let last = grid::hour_of_secs(end - 1 + guard);
-            for hour in first..=last {
+            ranges.push((first, last + 1));
+        }
+        ranges.sort();
+        Ok(ranges)
+    }
+
+    /// Every excluded unix hour: for each week, the hours that intersect
+    /// `[start - guard, end + guard)`.
+    ///
+    /// # Errors
+    ///
+    /// A week timestamp is malformed (rechecked here so the set is always in
+    /// sync with the parsed weeks).
+    pub fn excluded_hours(&self) -> Result<BTreeSet<i64>, StoreError> {
+        let mut hours = BTreeSet::new();
+        for (first, last_exclusive) in self.excluded_ranges()? {
+            for hour in first..last_exclusive {
                 hours.insert(hour);
             }
         }
@@ -189,6 +214,11 @@ pub fn excluded_dates(hours: &BTreeSet<i64>) -> Vec<String> {
 pub(crate) mod tests {
     use super::*;
 
+    /// A parsed v2 lockbox for helper methods.
+    pub fn from_body_for_test() -> super::Lockbox {
+        serde_json::from_str::<super::Lockbox>(&v2_body()).unwrap()
+    }
+
     /// The real v2 shape: four Monday weeks in 2026 with a 24-hour guard.
     pub fn v2_body() -> String {
         serde_json::json!({
@@ -235,6 +265,51 @@ pub(crate) mod tests {
         let lockbox: Lockbox = serde_json::from_value(body).unwrap();
         let hours = lockbox.excluded_hours().unwrap();
         assert!(lockbox.assert_v2_shape(&hours).is_err());
+    }
+
+    #[test]
+    fn ranges_and_hours_agree_and_the_v2_loader_guards_hold() {
+        let lockbox: Lockbox = serde_json::from_str(&v2_body()).unwrap();
+        let hours = lockbox.excluded_hours().unwrap();
+        let ranges = lockbox.excluded_ranges().unwrap();
+        assert_eq!(ranges.len(), 4);
+        let from_ranges: BTreeSet<i64> = ranges
+            .iter()
+            .flat_map(|(first, last_exclusive)| *first..*last_exclusive)
+            .collect();
+        assert_eq!(from_ranges, hours);
+        // Each loader guard refuses its own malformed file.
+        let negative: Lockbox = serde_json::from_value(serde_json::json!({
+            "version": "v2", "guard_hours": -1, "weeks": [{"name": "w", "start": "2026-06-01T00:00:00Z", "end": "2026-06-08T00:00:00Z"}]
+        }))
+        .unwrap();
+        assert!(
+            negative.excluded_hours().is_ok(),
+            "parsed; load() refuses it"
+        );
+        let body = serde_json::json!({
+            "version": "v2", "guard_hours": 24, "weeks": [{"name": "w", "start": "2026-06-01T00:00:00Z", "end": "2026-06-08T00:00:00Z"}]
+        });
+        let mut bad = body.clone();
+        bad["guard_hours"] = serde_json::json!(-1);
+        let bad: Lockbox = serde_json::from_value(bad).unwrap();
+        let error = super::check(&bad).unwrap_err();
+        assert!(error.to_string().contains("negative"), "{error}");
+        let mut bad = body.clone();
+        bad["weeks"] = serde_json::json!([]);
+        let bad: Lockbox = serde_json::from_value(bad).unwrap();
+        let error = super::check(&bad).unwrap_err();
+        assert!(error.to_string().contains("no weeks"), "{error}");
+        let mut bad = body;
+        bad["weeks"][0]["end"] = serde_json::json!("2026-05-31T00:00:00Z");
+        let bad: Lockbox = serde_json::from_value(bad).unwrap();
+        let error = super::check(&bad).unwrap_err();
+        assert!(error.to_string().contains("not after start"), "{error}");
+    }
+
+    /// The v2 ranges, for tests outside this module.
+    pub fn v2_ranges_for_test() -> Vec<(i64, i64)> {
+        from_body_for_test().excluded_ranges().unwrap()
     }
 
     #[test]
