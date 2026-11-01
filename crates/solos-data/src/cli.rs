@@ -1030,7 +1030,7 @@ fn offline_or_live(
 // ---------------------------------------------------------------------------------------------
 // augment
 
-const AUGMENT_COMMANDS: [(&str, &str); 9] = [
+const AUGMENT_COMMANDS: &[(&str, &str)] = &[
     (
         "sync",
         "Backfill and catch up dated files and paged histories, then exit: [--source name] [--symbol SYM]",
@@ -1061,6 +1061,10 @@ const AUGMENT_COMMANDS: [(&str, &str); 9] = [
         "hl-l2book-manifest",
         "Build the sha256 manifest from the downloader TSV and the local bytes (MD5 etag is a gate, never the checksum): --input <dir> --tsv <MANIFEST.tsv.gz> --out <MANIFEST> [--jobs 4]",
     ),
+    (
+        "combined",
+        "Combined Hyperliquid + Solana store units (ADR-0023): mapping | help. Every unit requires the lockbox and drops its hours from the outputs",
+    ),
 ];
 
 fn augment(args: &[String]) -> i32 {
@@ -1068,7 +1072,7 @@ fn augment(args: &[String]) -> i32 {
     if command == "help" || command == "--help" {
         let mut commands = Obj::new();
         for (name, text) in AUGMENT_COMMANDS {
-            commands.set(name, text);
+            commands.set(name, *text);
         }
         println!(
             "{}",
@@ -1090,6 +1094,9 @@ fn augment(args: &[String]) -> i32 {
     }
     if command == "hl-l2book-manifest" {
         return hl_l2book_manifest_cli(&args[1..]);
+    }
+    if command == "combined" {
+        return combined_cli(&args[1..]);
     }
     match augment_command(command, args) {
         Ok(code) => code,
@@ -1360,6 +1367,90 @@ fn hl_l2book_run(args: &[String]) -> Result<i32, StoreError> {
     let report = crate::augment::hll2book::run(&request, filesystem_free)?;
     println!("{}", report.to_json());
     Ok(report.exit_code())
+}
+
+/// `solos-data augment combined <unit>`: the combined Hyperliquid + Solana store
+/// (ADR-0023). Units run one at a time against one output root.
+fn combined_cli(args: &[String]) -> i32 {
+    let unit = args.first().map(String::as_str).unwrap_or("help");
+    if unit == "help" || unit == "--help" || args.len() == 1 {
+        println!(
+            "{}",
+            Obj::new()
+                .with(
+                    "command",
+                    "solos-data augment combined mapping --out <root> --lockbox <json> --lockbox-sha256 <hex> --provenance <json> --hl-fills <hl-fills-v1 root> --phoenix-fills <fills dir> --pyth-prices <dir[,dir...]> --venues-config <config/venues.json> --asset-contexts <dir> --check-days YYYY-MM-DD,YYYY-MM-DD,YYYY-MM-DD [--threads 4] [--memory 8GB]"
+                )
+                .with(
+                    "out",
+                    "combined store root: mapping/assets.csv, mapping/receipt-mapping.json, catalog.json"
+                )
+                .with(
+                    "lockbox",
+                    "v2 lockbox JSON; its sha256 must match --lockbox-sha256 and its hours are dropped from every table"
+                )
+                .with(
+                    "check-days",
+                    "exactly three UTC days outside the lockbox for the HL-Phoenix price-tracking check"
+                )
+                .to_json()
+        );
+        return 0;
+    }
+    let result = match unit {
+        "mapping" => combined_mapping_run(&args[1..]),
+        _ => Err(StoreError::Check(format!(
+            "unknown combined unit '{unit}' (units: mapping)"
+        ))),
+    };
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            log(
+                "combined_failed",
+                Obj::new().with("error", safe_error(&error.to_string())),
+            );
+            1
+        }
+    }
+}
+
+fn combined_mapping_run(args: &[String]) -> Result<i32, StoreError> {
+    let pyth_prices: Vec<PathBuf> = required_flag(args, "--pyth-prices")?
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let memory = flag(args, "--memory").unwrap_or("8GB").to_owned();
+    let request = crate::augment::combined::mapping::Request {
+        out: Path::new(required_flag(args, "--out")?),
+        lockbox: Path::new(required_flag(args, "--lockbox")?),
+        lockbox_sha256: required_flag(args, "--lockbox-sha256")?,
+        provenance: Path::new(required_flag(args, "--provenance")?),
+        hl_fills: Path::new(required_flag(args, "--hl-fills")?),
+        phoenix_fills: Path::new(required_flag(args, "--phoenix-fills")?),
+        pyth_prices: &pyth_prices,
+        venues_config: Path::new(required_flag(args, "--venues-config")?),
+        asset_contexts: Path::new(required_flag(args, "--asset-contexts")?),
+        check_days: required_flag(args, "--check-days")?,
+        threads: combined_threads_flag(args)?,
+        memory_limit: memory,
+    };
+    let report = crate::augment::combined::mapping::run(&request)?;
+    println!("{}", report.to_json());
+    Ok(report.exit_code())
+}
+
+/// Combined units cap threads at 8 (PLAN.md).
+fn combined_threads_flag(args: &[String]) -> Result<u32, StoreError> {
+    let threads = threads_flag(args)?;
+    if threads > 8 {
+        return Err(StoreError::Check(
+            "--threads must be 1..=8 for combined units".into(),
+        ));
+    }
+    Ok(threads)
 }
 
 fn required_flag<'a>(args: &'a [String], name: &str) -> Result<&'a str, StoreError> {

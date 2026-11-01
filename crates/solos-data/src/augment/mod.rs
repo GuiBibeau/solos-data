@@ -12,6 +12,7 @@ pub mod binance;
 pub mod bybit;
 pub mod candles;
 pub mod capture;
+pub mod combined;
 pub mod config;
 pub mod contexts;
 pub mod defillama;
