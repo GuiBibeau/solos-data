@@ -242,8 +242,35 @@ output's path, rows, bytes, and sha256, plus `config_hash` and `git_sha`.
 
 A rerun skips an hour when the watermark lists it, the receipt's input sha and
 config hash still match, and every output file is still there with the
-receipt's sha. Deleting a receipt, changing an input, or editing the config hash
-rewrites that hour.
+receipt's sha. A config-hash change re-seals that hour, and so does a strict
+superset of the receipt's inputs (a late coin with its manifest row). A dropped
+input, or a coin whose sha256 changed, is refused before any work, because
+sealing the subset would delete the missing coins' rows and then their raw:
+
+```
+20261022/0: refusing to re-seal: current inputs are not a superset of the sealed
+receipt; missing SOL (sha256 3f2a91c4...). Restore the missing file(s) at the
+receipt sha256 with their manifest rows, or, for a corrected re-download, rerun
+with --reseal 20261022/0 while every receipt input's raw file is on disk (see
+ADR-0021).
+```
+
+`--reseal YYYYMMDD/H` (repeatable, comma lists) is the supported way to re-seal
+a corrected re-download of a verified hour. The run validates up front, before
+any work, that each named hour is in the watermark, has a readable receipt,
+sits inside `--since`/`--until`, is covered by in-scope manifest entries for
+every receipt coin, and keeps every receipt input's raw file on disk; the
+hour's files must also all be present at their manifest sizes. For a named hour
+only, the guard is bypassed, the old receipt stays in place until the new seal
+so stale cleanup still removes outputs the new seal does not produce, and the
+drop record merge keeps both the old and the new sha256 of a changed file.
+
+Without the flag the only manual route is deleting `receipts/YYYYMMDD/H.json`.
+That works only while the raw is on disk: with the receipt gone and a file
+missing or short, the hour falls to the partial branch and fails with "verified
+hour is incomplete and its output does not match the receipt". It also forfeits
+stale cleanup, which reads the old receipt to remove outputs the new seal does
+not produce. Do not do that; use `--reseal`.
 
 ### Parallel hours (`--jobs`)
 

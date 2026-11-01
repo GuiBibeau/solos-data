@@ -65,6 +65,9 @@ pub struct HourJob<'a> {
     pub config_hash: &'a str,
     /// Injected fault for the count-guard tests.
     pub fault: Fault,
+    /// True when the hour is named in `--reseal`: the superset guard's re-check in
+    /// [`seal_hour`] is bypassed for a corrected re-download of this hour.
+    pub allow_shrink: bool,
 }
 
 /// One sealed Parquet file, paths relative to the output root.
@@ -225,6 +228,7 @@ pub fn prepare_hour(
         inputs,
         threads: settings.threads.clone(),
         memory_limit: settings.memory_limit.clone(),
+        allow_shrink: job.allow_shrink,
     })
 }
 
@@ -260,6 +264,9 @@ pub struct Prepared {
     pub threads: String,
     /// `memory_limit` of the connection that staged the hour, for the run report.
     pub memory_limit: String,
+    /// Rides [`HourJob::allow_shrink`]: `seal_hour` skips its receipt re-check for a
+    /// `--reseal` hour.
+    pub allow_shrink: bool,
 }
 
 impl Drop for Prepared {
@@ -286,10 +293,15 @@ pub fn seal_hour(out: &Path, prepared: Prepared) -> Result<HourOutput, StoreErro
     // cleanup would remove the missing coins' files, and the later raw drop would delete
     // their `.lz4`: refuse instead, and delete nothing. `Prepared`'s Drop removes the
     // staged temporaries when this returns.
-    if let Some(previous) = read_receipt(out, &prepared.hour_key) {
+    if !prepared.allow_shrink
+        && let Some(previous) = read_receipt(out, &prepared.hour_key)
+    {
         let missing = missing_inputs(&previous, &prepared.inputs);
         if !missing.is_empty() {
-            return Err(StoreError::Check(refusing_reseal(&missing)));
+            return Err(StoreError::Check(refusing_reseal(
+                &prepared.hour_key,
+                &missing,
+            )));
         }
     }
     let outputs = rename_all(&prepared.pending)?;
@@ -359,8 +371,9 @@ pub fn missing_inputs(previous: &Receipt, current: &[InputFile]) -> Vec<InputFil
 const REFUSAL_LIST_CAP: usize = 8;
 
 /// The refusal message for a shrinking re-seal, without the hour prefix the callers add.
+/// The hour is named in the `--reseal` hint so the fix is copy-pasteable.
 #[must_use]
-pub fn refusing_reseal(missing: &[InputFile]) -> String {
+pub fn refusing_reseal(hour_key: &str, missing: &[InputFile]) -> String {
     let mut parts: Vec<String> = missing
         .iter()
         .take(REFUSAL_LIST_CAP)
@@ -373,7 +386,7 @@ pub fn refusing_reseal(missing: &[InputFile]) -> String {
         parts.push(format!("and {} more", missing.len() - REFUSAL_LIST_CAP));
     }
     format!(
-        "refusing to re-seal: current inputs are not a superset of the sealed receipt; missing {}",
+        "refusing to re-seal: current inputs are not a superset of the sealed receipt; missing {}. Restore the missing file(s) at the receipt sha256 with their manifest rows, or, for a corrected re-download, rerun with --reseal {hour_key} while every receipt input's raw file is on disk (see ADR-0021).",
         parts.join(", ")
     )
 }

@@ -82,6 +82,8 @@ struct Opts {
     fault: Fault,
     /// Hour workers.
     jobs: u32,
+    /// Hours this run may re-seal past the superset guard (`--reseal`).
+    reseal: BTreeSet<String>,
 }
 
 impl Default for Opts {
@@ -95,6 +97,7 @@ impl Default for Opts {
             max_ratio: 1e12,
             fault: Fault::None,
             jobs: 1,
+            reseal: BTreeSet::new(),
         }
     }
 }
@@ -121,6 +124,7 @@ fn run_with(
         max_ratio: opts.max_ratio,
         jobs: opts.jobs,
         fault: opts.fault,
+        reseal: opts.reseal,
     };
     super::run(&request, free)
 }
@@ -218,6 +222,7 @@ impl Reset {
         super::batch::clear_before_watermark();
         super::batch::clear_drop_fault();
         crate::fsutil::clear_fsync_failure();
+        crate::fsutil::clear_write_failure();
         Self
     }
 }
@@ -228,6 +233,7 @@ impl Drop for Reset {
         super::batch::clear_before_watermark();
         super::batch::clear_drop_fault();
         crate::fsutil::clear_fsync_failure();
+        crate::fsutil::clear_write_failure();
     }
 }
 
@@ -1012,6 +1018,7 @@ fn a_changed_output_or_config_hash_is_rewritten_and_a_shrinking_input_is_refused
     assert!(message.contains("refusing to re-seal"), "{message}");
     assert!(message.contains("not a superset"), "{message}");
     assert!(message.contains("BTC"), "{message}");
+    assert!(message.contains("--reseal 20261022/0"), "{message}");
     assert_eq!(
         crate::fsutil::file_hash(&parquet).unwrap(),
         parquet_sha,
@@ -1278,6 +1285,11 @@ fn side_arrays_with_v1_dictionaries_beat_the_flat_columns_and_the_lz4() {
         compression.to_ascii_lowercase().contains("zstd"),
         "{compression} {paths:?}"
     );
+}
+
+/// `--reseal` hour set from a list.
+fn reseal_hours(hours: &[&str]) -> BTreeSet<String> {
+    hours.iter().map(|hour| (*hour).to_owned()).collect()
 }
 
 fn drop_opts() -> Opts {
@@ -1620,6 +1632,8 @@ fn shrinking_inputs_refused() {
     assert!(message.contains("refusing to re-seal"), "{message}");
     assert!(message.contains("not a superset"), "{message}");
     assert!(message.contains("SOL"), "{message}");
+    assert!(message.contains("--reseal 20261022/0"), "{message}");
+    assert!(message.contains("Restore the missing file(s)"), "{message}");
     assert_eq!(
         crate::fsutil::file_hash(&parquet).unwrap(),
         parquet_sha,
@@ -1761,6 +1775,7 @@ fn seal_hour_refuses_to_shrink_a_sealed_hour() {
             git_sha: GIT,
             config_hash: &hash,
             fault: Fault::None,
+            allow_shrink: false,
         };
         super::publish::prepare_hour(&conn, &out, &job, &settings).unwrap()
     };
@@ -1822,4 +1837,384 @@ fn receipt_with_inputs(files: &[(&str, &str, &str, u64)]) -> super::publish::Rec
         git_sha: "x".to_owned(),
         config_hash: super::config_hash(),
     }
+}
+
+/// A corrected re-download of a sealed hour: without `--reseal` the changed sha256 is
+/// refused, with the fix in the error; with `--reseal` the hour re-seals from the new
+/// bytes, the receipt records the new sha, and stale cleanup removes the forward output
+/// the corrected seal no longer produces. A second `--reseal` run is a normal skip.
+#[test]
+fn reseal_corrected_redownload() {
+    let root = Tmp::new("reseal-fix");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("MANIFEST.json");
+    let time = 1_792_627_200_000_i64;
+    let btc = write_coin(&input, "20261022", 0, "BTC", &book("BTC", time, 1, "1"));
+    let eth = write_coin(
+        &input,
+        "20261022",
+        0,
+        "ETH",
+        &book("ETH", time + 5_000, 1, "2"),
+    );
+    // The old SOL content has a train row and a forward-dated row, so the old seal
+    // produces a forward output the corrected content drops.
+    let old_sol = write_coin(
+        &input,
+        "20261022",
+        0,
+        "SOL",
+        &lines(&[
+            book("SOL", time + 10_000, 1, "3"),
+            book("SOL", super::FORWARD_START_MS + 5_000, 1, "4"),
+        ]),
+    );
+    std::fs::write(
+        &sums,
+        manifest(&[btc.clone(), eth.clone(), old_sol.clone()]),
+    )
+    .unwrap();
+    let first = run_ok(&input, &out, &sums).unwrap();
+    assert_eq!(first.hours_verified, 1);
+    let train = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+    let forward = out.join("forward/date=2026-10-23/hour=20261022-0.parquet");
+    assert!(forward.is_file(), "the old seal wrote a forward output");
+    assert_eq!(read_rows(&train).len(), 3);
+    assert_eq!(read_rows(&forward).len(), 1);
+    let train_sha = crate::fsutil::file_hash(&train).unwrap();
+
+    // Corrected re-download: SOL's bytes change and its manifest row follows.
+    let new_sol = write_coin(
+        &input,
+        "20261022",
+        0,
+        "SOL",
+        &book("SOL", time + 10_000, 1, "33"),
+    );
+    assert_ne!(
+        new_sol.1, old_sol.1,
+        "the corrected bytes have a new sha256"
+    );
+    std::fs::write(
+        &sums,
+        manifest(&[btc.clone(), eth.clone(), new_sol.clone()]),
+    )
+    .unwrap();
+    let refused = run_ok(&input, &out, &sums).unwrap_err();
+    let message = refused.to_string();
+    assert!(message.contains("20261022/0"), "{message}");
+    assert!(message.contains("refusing to re-seal"), "{message}");
+    assert!(message.contains("SOL"), "{message}");
+    assert!(message.contains("--reseal 20261022/0"), "{message}");
+    assert_eq!(
+        crate::fsutil::file_hash(&train).unwrap(),
+        train_sha,
+        "the refusal touched the hour"
+    );
+    assert!(forward.is_file());
+
+    let fixed = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            reseal: reseal_hours(&["20261022/0"]),
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap();
+    assert_eq!(fixed.hours_verified, 1, "the named hour re-seals");
+    assert_eq!(watermark(&out), vec!["20261022/0".to_owned()]);
+    assert!(
+        !forward.exists(),
+        "the stale forward output survived the re-seal"
+    );
+    let receipt: Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("receipts/20261022/0.json")).unwrap(),
+    )
+    .unwrap();
+    let inputs = receipt["inputs"].as_array().unwrap();
+    assert_eq!(inputs.len(), 3);
+    assert!(
+        inputs
+            .iter()
+            .any(|file| file["sha256"] == new_sol.1.as_str()),
+        "the receipt records the corrected sha"
+    );
+    let outputs: Vec<&str> = receipt["outputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        outputs,
+        vec!["train/date=2026-10-22/hour=20261022-0.parquet"],
+        "the receipt names exactly the outputs on disk"
+    );
+    let rows = read_rows(&train);
+    assert_eq!(rows.len(), 3);
+    let sol_px = rows
+        .iter()
+        .find(|row| row.str("coin") == Some("SOL"))
+        .and_then(|row| {
+            row.get("bid_px")
+                .and_then(|px| px.as_array())
+                .map(|a| a[0].clone())
+        })
+        .and_then(|px| px.as_f64());
+    assert_eq!(sol_px, Some(33.0), "the output holds the corrected content");
+
+    // A second --reseal run with nothing changed is a normal, idempotent skip.
+    let again = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            reseal: reseal_hours(&["20261022/0"]),
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap();
+    assert_eq!(again.hours_skipped, 1);
+    assert_eq!(again.hours_verified, 0);
+    assert_eq!(watermark(&out), vec!["20261022/0".to_owned()]);
+}
+
+/// `--reseal` without the receipt's raw on disk is refused up front: without the raw the
+/// sealed coins cannot be rebuilt, and the refusal touches nothing.
+#[test]
+fn reseal_refused_when_receipt_raw_missing() {
+    let root = Tmp::new("reseal-no-raw");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("MANIFEST.json");
+    let time = 1_792_627_200_000_i64;
+    let btc = write_coin(&input, "20261022", 0, "BTC", &book("BTC", time, 1, "1"));
+    let eth = write_coin(
+        &input,
+        "20261022",
+        0,
+        "ETH",
+        &book("ETH", time + 5_000, 1, "2"),
+    );
+    std::fs::write(&sums, manifest(&[btc, eth])).unwrap();
+    let sealed = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(sealed.hours_verified, 1);
+    assert!(
+        !input.join("20261022/0/BTC.lz4").exists(),
+        "the seal dropped its raw"
+    );
+    let train = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+    let receipt = out.join("receipts/20261022/0.json");
+    let drops = out.join("drops/20261022/0.json");
+    let train_sha = crate::fsutil::file_hash(&train).unwrap();
+    let receipt_bytes = std::fs::read(&receipt).unwrap();
+    let drops_bytes = std::fs::read(&drops).unwrap();
+    let watermark_before = watermark(&out);
+
+    let error = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            reseal: reseal_hours(&["20261022/0"]),
+            ..drop_opts()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("20261022/0"), "{message}");
+    assert!(message.contains("20261022/0/BTC.lz4"), "{message}");
+    assert!(message.contains("not on disk"), "{message}");
+    assert_eq!(
+        crate::fsutil::file_hash(&train).unwrap(),
+        train_sha,
+        "the hour was touched"
+    );
+    assert_eq!(
+        std::fs::read(&receipt).unwrap(),
+        receipt_bytes,
+        "the receipt was touched"
+    );
+    assert_eq!(
+        std::fs::read(&drops).unwrap(),
+        drops_bytes,
+        "the drop record was touched"
+    );
+    assert_eq!(watermark(&out), watermark_before, "the watermark moved");
+}
+
+/// `--reseal` of an hour the watermark does not list fails before any work.
+#[test]
+fn reseal_unknown_hour_refused() {
+    let root = Tmp::new("reseal-unknown");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("MANIFEST.json");
+    let btc = write_coin(
+        &input,
+        "20261022",
+        0,
+        "BTC",
+        &book("BTC", 1_792_627_200_000, 1, "1"),
+    );
+    std::fs::write(&sums, manifest(&[btc])).unwrap();
+    let error = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            reseal: reseal_hours(&["20261022/1"]),
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("--reseal 20261022/1"), "{message}");
+    assert!(message.contains("not in the watermark"), "{message}");
+    assert!(
+        !out.join("watermark.json").exists(),
+        "the run wrote a watermark"
+    );
+    assert!(!out.join("receipts").exists(), "the run wrote a receipt");
+    assert!(parquet_files(&out).is_empty(), "the run wrote parquet");
+}
+
+/// A foreign-schema or wrong-hour drop record refuses the whole drop: the record is
+/// unchanged and no raw file is deleted after it.
+#[test]
+fn drop_record_wrong_schema_is_refused() {
+    for (label, body) in [
+        (
+            "schema",
+            json!({"schema": "hl-l2book-drop-v2", "hour": "20261022/0", "files": []}).to_string(),
+        ),
+        (
+            "hour",
+            json!({"schema": super::DROP_SCHEMA, "hour": "20261022/1", "files": []}).to_string(),
+        ),
+    ] {
+        let root = Tmp::new(&format!("drop-bad-{label}"));
+        let (input, out, sums) = stage_pair(&root);
+        run_ok(&input, &out, &sums).unwrap();
+        let record = out.join("drops/20261022/0.json");
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        std::fs::write(&record, &body).unwrap();
+        let error = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("drops/20261022/0.json"),
+            "{label}: {message}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            body,
+            "{label}: the record was replaced"
+        );
+        assert!(
+            input.join("20261022/0/BTC.lz4").is_file(),
+            "{label}: raw was deleted"
+        );
+        assert!(
+            input.join("20261022/0/ETH.lz4").is_file(),
+            "{label}: raw was deleted"
+        );
+    }
+}
+
+/// The drop record's durable write happens before any unlink: a failed write leaves the
+/// raw files and the earlier record intact, and a rerun merges and drops as usual.
+#[test]
+fn drop_record_durable_write_fault() {
+    let _reset = Reset::arm();
+    let root = Tmp::new("drop-write-fault");
+    let (input, out, sums) = stage_pair(&root);
+    let btc_path = input.join("20261022/0/BTC.lz4");
+    let btc_bytes = std::fs::read(&btc_path).unwrap();
+    run_ok(&input, &out, &sums).unwrap();
+    let record = out.join("drops/20261022/0.json");
+    let dropped = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(dropped.hours_skipped, 1, "the drop ran on the skip path");
+    assert!(record.is_file());
+    let before = std::fs::read(&record).unwrap();
+
+    // BTC is re-downloaded; the merged record's durable write fails with ENOSPC.
+    std::fs::write(&btc_path, &btc_bytes).unwrap();
+    crate::fsutil::inject_write_enospc();
+    let error = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap_err();
+    assert!(error.to_string().contains("No space left"), "{error}");
+    assert_eq!(
+        std::fs::read(&btc_path).unwrap(),
+        btc_bytes,
+        "raw was deleted past the failed write"
+    );
+    assert_eq!(
+        std::fs::read(&record).unwrap(),
+        before,
+        "the record was replaced by a failed write"
+    );
+
+    // Without the fault the rerun merges the record and drops the re-downloaded file.
+    let again = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(again.hours_skipped, 1);
+    assert!(
+        !btc_path.exists(),
+        "the re-downloaded raw survived a good rerun"
+    );
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
+    assert_eq!(
+        value["files"].as_array().unwrap().len(),
+        2,
+        "the merge kept every entry"
+    );
+}
+
+/// The work_one guard runs before any staging: a refused run opens no writer, so no
+/// `.tmp-duckdb-<worker>` directory is left behind (ClearStaging never removes those), and
+/// nothing final moves.
+#[test]
+fn work_one_guard_alone() {
+    let root = Tmp::new("guard-alone");
+    let (input, out, sums) = stage_pair(&root);
+    run_ok(&input, &out, &sums).unwrap();
+    let writer_dir = out.join(".tmp-duckdb-0");
+    assert!(writer_dir.is_dir(), "the first run opened a writer");
+    std::fs::remove_dir_all(&writer_dir).unwrap();
+
+    // Narrow the hour below its receipt: the refusal must come from work_one, before the
+    // writer opens and before anything is staged.
+    let mut coins = BTreeSet::new();
+    coins.insert("BTC".to_owned());
+    let error = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            coins: Some(coins),
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("refusing to re-seal"), "{error}");
+    assert!(
+        !writer_dir.exists(),
+        "a writer was opened before the refusal"
+    );
+    assert_eq!(
+        watermark(&out),
+        vec!["20261022/0".to_owned()],
+        "the watermark moved"
+    );
+    assert!(
+        out.join("train/date=2026-10-22/hour=20261022-0.parquet")
+            .is_file(),
+        "the hour Parquet was touched"
+    );
 }
