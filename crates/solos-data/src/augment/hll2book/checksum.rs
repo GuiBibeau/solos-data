@@ -383,7 +383,9 @@ mod tests {
         std::fs::write(&sums, &body).unwrap();
         let error = load_entries(&sums).unwrap_err();
         assert!(
-            error.to_string().contains("duplicate checksum for 20261022/0/C0007"),
+            error
+                .to_string()
+                .contains("duplicate checksum for 20261022/0/C0007"),
             "{error}"
         );
         body.pop();

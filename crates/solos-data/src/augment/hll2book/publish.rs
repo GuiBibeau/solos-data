@@ -33,6 +33,26 @@ pub struct FileBytes<'a> {
     pub bytes: &'a [u8],
 }
 
+/// An injected count fault for the guard tests (ADR-0021 verification). It rides the job, so
+/// a worker thread reads no shared state and one test's fault cannot touch another's run.
+/// Production always passes [`Fault::None`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Fault {
+    /// No fault: the normal path.
+    #[default]
+    None,
+    /// Drop the decoded row before the per-line length check.
+    Line,
+    /// Count a snapshot that is never staged.
+    Hour,
+    /// Report one more staged row than the JSONL contains.
+    Staged,
+    /// Stage the row under a different coin than the file tally.
+    PerFile,
+    /// Change a sampled price after the sample is recorded.
+    Sample,
+}
+
 /// What the batch asked to publish.
 pub struct HourJob<'a> {
     /// `YYYYMMDD/H`.
@@ -43,6 +63,8 @@ pub struct HourJob<'a> {
     pub git_sha: &'a str,
     /// [`super::config_hash`].
     pub config_hash: &'a str,
+    /// Injected fault for the count-guard tests.
+    pub fault: Fault,
 }
 
 /// One sealed Parquet file, paths relative to the output root.
@@ -127,31 +149,33 @@ pub struct Receipt {
     pub config_hash: String,
 }
 
-/// Decode `job` and seal its Parquet files.
+/// Decode `job`, stage its Parquet files, and run every check that can read a temporary.
+///
+/// Nothing final is touched: the hour's files stay `.tmp` siblings of their final paths, and
+/// [`Prepared`] deletes them and the staging directory when it is dropped without
+/// [`seal_hour`]. A worker thread may call this concurrently with other hours; the commit
+/// order is the caller's.
 ///
 /// # Errors
 ///
 /// A frame is short or corrupt, a line does not parse, a count or sample check fails, or a
-/// sealed file fails a range check. No final path is replaced in those cases unless a rename
-/// itself fails after an earlier rename in the same hour; the watermark is still not moved.
-pub fn publish_hour(
+/// staged file fails a range check.
+pub fn prepare_hour(
     conn: &Connection,
     out: &Path,
     job: &HourJob<'_>,
-) -> Result<HourOutput, StoreError> {
+    settings: &WriterSettings,
+) -> Result<Prepared, StoreError> {
     let staging = out.join(".staging").join(job.hour_key.replace('/', "-"));
     let _ = std::fs::remove_dir_all(&staging);
     create_dir_all_durable(&staging)?;
     let cleaner = DirClean(staging.clone());
-    let mut spill = Spill::new(staging);
+    let mut spill = Spill::new(staging.clone());
     let mut samples = Vec::new();
     let mut tallies = BTreeMap::new();
-    let streamed = stream_hour(job.files, &mut spill, &mut samples, &mut tallies)?;
-    let parts = spill.finish()?;
-    #[cfg(test)]
-    let mut parts = parts;
-    #[cfg(test)]
-    if seams::take_if(seams::CountSeam::Staged)
+    let streamed = stream_hour(job.files, &mut spill, &mut samples, &mut tallies, job.fault)?;
+    let mut parts = spill.finish()?;
+    if job.fault == Fault::Staged
         && let Some(part) = parts.first_mut()
     {
         part.rows = part.rows.saturating_add(1);
@@ -181,9 +205,82 @@ pub fn publish_hour(
     }
     check_coins(conn, &pending, &tallies)?;
     check_samples(conn, &pending, &samples)?;
-    let outputs = rename_all(&pending)?;
+    let inputs = input_files(job, &tallies);
     drop(cleaner);
-    let stale = stale_paths(out, job.hour_key, &outputs);
+    Ok(Prepared {
+        hour_key: job.hour_key.to_owned(),
+        git_sha: job.git_sha.to_owned(),
+        config_hash: job.config_hash.to_owned(),
+        pending,
+        staging,
+        input_snapshots: streamed.counted,
+        output_rows,
+        dup_identical: streamed.dup_identical,
+        dup_distinct: streamed.dup_distinct,
+        lz4_bytes: inputs.iter().map(|file| file.bytes).sum(),
+        train_rows: parts.iter().map(|part| part.train_rows).sum(),
+        forward_rows: parts.iter().map(|part| part.forward_rows).sum(),
+        inputs,
+        threads: settings.threads.clone(),
+        memory_limit: settings.memory_limit.clone(),
+    })
+}
+
+/// One hour staged by [`prepare_hour`], waiting for its ordered commit.
+pub struct Prepared {
+    /// `YYYYMMDD/H`.
+    pub hour_key: String,
+    /// Receipt field.
+    pub git_sha: String,
+    /// Receipt field.
+    pub config_hash: String,
+    /// Staged `.tmp` files, one per output.
+    pub pending: Vec<Pending>,
+    /// The staging directory of this hour, removed when this is dropped unsealed.
+    pub staging: PathBuf,
+    /// Independent snapshot count of every line, duplicates included.
+    pub input_snapshots: u64,
+    /// Rows read back from Parquet.
+    pub output_rows: u64,
+    /// Identical re-sends dropped by [`DuplicateRule`].
+    pub dup_identical: u64,
+    /// Extra rows kept for a distinct book at a repeated `time_ms`.
+    pub dup_distinct: u64,
+    /// Sum of the hour's `.lz4` input bytes.
+    pub lz4_bytes: u64,
+    /// Rows under `train/`.
+    pub train_rows: u64,
+    /// Rows under `forward/`.
+    pub forward_rows: u64,
+    /// The coin files this hour verified.
+    pub inputs: Vec<InputFile>,
+    /// `threads` of the connection that staged the hour, for the run report.
+    pub threads: String,
+    /// `memory_limit` of the connection that staged the hour, for the run report.
+    pub memory_limit: String,
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.staging);
+        for file in &self.pending {
+            let _ = std::fs::remove_file(&file.tmp);
+        }
+    }
+}
+
+/// Seal one prepared hour: fsync, rename, hash, stale cleanup, then the durable receipt.
+/// This is the ordered commit step; the caller writes the watermark after it returns.
+///
+/// # Errors
+///
+/// A rename or its directory fsync fails, the sealed file cannot be hashed, or the receipt
+/// cannot be written. A rename failure after an earlier rename in the same hour leaves that
+/// earlier file in place; the watermark is still not moved.
+pub fn seal_hour(out: &Path, prepared: Prepared) -> Result<HourOutput, StoreError> {
+    let mut prepared = prepared;
+    let outputs = rename_all(&prepared.pending)?;
+    let stale = stale_paths(out, &prepared.hour_key, &outputs);
     for relative in stale {
         let path = under_out(out, &relative)?;
         if path.is_file() {
@@ -193,33 +290,35 @@ pub fn publish_hour(
             }
         }
     }
-    let inputs = input_files(job, &tallies);
     let receipt = Receipt {
         schema: SCHEMA.to_owned(),
-        hour: job.hour_key.to_owned(),
-        input_sha256: input_identity(&inputs),
-        input_snapshots: streamed.counted,
+        hour: prepared.hour_key.clone(),
+        input_sha256: input_identity(&prepared.inputs),
+        input_snapshots: prepared.input_snapshots,
         output_rows: outputs.iter().map(|file| file.rows).sum(),
-        dup_identical: streamed.dup_identical,
-        dup_distinct: streamed.dup_distinct,
-        lz4_bytes: inputs.iter().map(|file| file.bytes).sum(),
+        dup_identical: prepared.dup_identical,
+        dup_distinct: prepared.dup_distinct,
+        lz4_bytes: prepared.lz4_bytes,
         parquet_bytes: outputs.iter().map(|file| file.bytes).sum(),
-        train_rows: parts.iter().map(|part| part.train_rows).sum(),
-        forward_rows: parts.iter().map(|part| part.forward_rows).sum(),
+        train_rows: prepared.train_rows,
+        forward_rows: prepared.forward_rows,
         outputs: outputs.clone(),
-        inputs: inputs.clone(),
-        git_sha: job.git_sha.to_owned(),
-        config_hash: job.config_hash.to_owned(),
+        inputs: prepared.inputs.clone(),
+        git_sha: prepared.git_sha.clone(),
+        config_hash: prepared.config_hash.clone(),
     };
     #[cfg(test)]
     seams::fire_before_receipt();
     write_receipt(out, &receipt)?;
+    prepared.pending.clear();
+    let _ = std::fs::remove_dir_all(&prepared.staging);
+    let inputs = std::mem::take(&mut prepared.inputs);
     Ok(HourOutput {
-        input_snapshots: streamed.counted,
-        output_rows,
-        dup_identical: streamed.dup_identical,
-        dup_distinct: streamed.dup_distinct,
-        lz4_bytes: inputs.iter().map(|file| file.bytes).sum(),
+        input_snapshots: prepared.input_snapshots,
+        output_rows: prepared.output_rows,
+        dup_identical: prepared.dup_identical,
+        dup_distinct: prepared.dup_distinct,
+        lz4_bytes: prepared.lz4_bytes,
         parquet_bytes: outputs.iter().map(|file| file.bytes).sum(),
         inputs,
     })
@@ -274,6 +373,7 @@ fn stream_hour(
     spill: &mut Spill,
     samples: &mut Vec<Snapshot>,
     tallies: &mut BTreeMap<String, u64>,
+    fault: Fault,
 ) -> Result<Streamed, StoreError> {
     let mut counted = 0u64;
     let mut written = 0u64;
@@ -283,6 +383,7 @@ fn stream_hour(
     // that repeats one of them is an identical re-send and is dropped; a new digest is a
     // distinct book and is kept. DuplicateRule never fails the hour.
     let mut seen: BTreeMap<(String, i64), Vec<[u8; 32]>> = BTreeMap::new();
+    let mut fault_fired = false;
     for file in files {
         if !file.bytes.starts_with(&crate::augment::hls3::LZ4_MAGIC) {
             return Err(StoreError::Check(format!(
@@ -304,11 +405,9 @@ fn stream_hour(
                 .map_err(|e| StoreError::Check(format!("{} line {}: {e}", file.coin, index + 1)))?;
             let snapshot = decode::snapshot_of_line(line, file.coin)
                 .map_err(|e| StoreError::Check(format!("{} line {}: {e}", file.coin, index + 1)))?;
-            let rows = vec![snapshot];
-            #[cfg(test)]
-            let mut rows = rows;
-            #[cfg(test)]
-            if seams::take_if(seams::CountSeam::Line) {
+            let mut rows = vec![snapshot];
+            if fault == Fault::Line && !fault_fired {
+                fault_fired = true;
                 rows.pop();
             }
             let got =
@@ -336,13 +435,13 @@ fn stream_hour(
                 }
                 kept.push(digest);
                 *tallies.entry(file.coin.to_owned()).or_default() += 1;
-                #[cfg(test)]
-                if seams::take_if(seams::CountSeam::Hour) {
+                if fault == Fault::Hour && !fault_fired {
+                    fault_fired = true;
                     written += 1;
                     continue;
                 }
                 consider_sample(samples, &row, written);
-                let row = stage_mutation(row);
+                let row = stage_mutation(row, fault, &mut fault_fired);
                 spill.write(&row, written)?;
                 written += 1;
             }
@@ -361,23 +460,20 @@ fn stream_hour(
     })
 }
 
-/// Test seams that change the staged row after the sample and the file tally are recorded.
-#[cfg(test)]
-fn stage_mutation(mut row: Snapshot) -> Snapshot {
-    if seams::take_if(seams::CountSeam::PerFile) {
+/// Apply the staged-row faults after the sample and the file tally are recorded. Each fires
+/// once, exactly where the shared seam used to.
+fn stage_mutation(mut row: Snapshot, fault: Fault, fired: &mut bool) -> Snapshot {
+    if fault == Fault::PerFile && !*fired {
+        *fired = true;
         row.coin = "mutated".to_owned();
     }
-    if seams::take_if(seams::CountSeam::Sample) {
+    if fault == Fault::Sample && !*fired {
+        *fired = true;
         row.bid_px[0] = Some(match row.bid_px[0] {
             Some(0.0) => 1.0,
             _ => 0.0,
         });
     }
-    row
-}
-
-#[cfg(not(test))]
-fn stage_mutation(row: Snapshot) -> Snapshot {
     row
 }
 
@@ -479,7 +575,7 @@ impl Spill {
     }
 }
 
-struct Pending {
+pub struct Pending {
     tmp: PathBuf,
     final_path: PathBuf,
     relative: String,
@@ -852,15 +948,31 @@ fn under_out(out: &Path, relative: &str) -> Result<PathBuf, StoreError> {
     Ok(out.join(relative))
 }
 
-/// Open the in-memory writer: pinned DuckDB, the caller's thread and memory caps.
+/// What one worker connection was configured with, reported through [`Prepared`].
+#[derive(Clone, Debug)]
+pub struct WriterSettings {
+    /// `current_setting('threads')`.
+    pub threads: String,
+    /// `current_setting('memory_limit')`.
+    pub memory_limit: String,
+}
+
+/// Open the in-memory writer: pinned DuckDB, the caller's thread and memory caps. Each worker
+/// gets its own connection and its own spill directory; DuckDB itself is never shared, which
+/// is what AGENTS.md's one-owner rule requires of an in-memory database.
 ///
 /// # Errors
 ///
 /// DuckDB is not 1.4.5, or a setting is rejected.
-pub fn open_writer(out: &Path, threads: u32, memory_limit: &str) -> Result<Connection, StoreError> {
+pub fn open_writer(
+    out: &Path,
+    worker: u32,
+    threads: u32,
+    memory_limit: &str,
+) -> Result<(Connection, WriterSettings), StoreError> {
     let conn = crate::store::memory_connection(&threads.to_string(), memory_limit)?;
     crate::decoder::parquet::require_connection_duckdb(&conn)?;
-    let temp = out.join(".tmp-duckdb");
+    let temp = out.join(format!(".tmp-duckdb-{worker}"));
     let _ = std::fs::remove_dir_all(&temp);
     create_dir_all_durable(&temp)?;
     conn.execute_batch(&format!(
@@ -868,7 +980,15 @@ pub fn open_writer(out: &Path, threads: u32, memory_limit: &str) -> Result<Conne
         sql_string(memory_limit),
         sql_string(&temp.to_string_lossy())
     ))?;
-    Ok(conn)
+    let threads = current_setting(&conn, "threads")?;
+    let memory_limit = current_setting(&conn, "memory_limit")?;
+    Ok((
+        conn,
+        WriterSettings {
+            threads,
+            memory_limit,
+        },
+    ))
 }
 
 /// `current_setting` value.
@@ -887,48 +1007,15 @@ pub fn current_setting(conn: &Connection, name: &str) -> Result<String, StoreErr
         .ok_or_else(|| StoreError::Check(format!("missing setting {name}")))
 }
 
-/// Test-only count faults and the receipt fsync hook.
+/// The receipt fsync hook, the only test seam left as thread-local state: `seal_hour` runs on
+/// the main thread, the same thread the test arms the hook from. The count faults ride the
+/// job as [`Fault`] instead, because `prepare_hour` runs in a worker thread.
 #[cfg(test)]
 pub(crate) mod seams {
     use std::cell::Cell;
 
-    /// Which guard a test is pinning.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum CountSeam {
-        /// Drop the decoded row before the per-line length check.
-        Line,
-        /// Count a snapshot that is never staged.
-        Hour,
-        /// Report one more staged row than the JSONL contains.
-        Staged,
-        /// Stage the row under a different coin than the file tally.
-        PerFile,
-        /// Change a sampled price after the sample is recorded.
-        Sample,
-    }
-
     thread_local! {
-        static COUNT: Cell<Option<CountSeam>> = const { Cell::new(None) };
         static BEFORE_RECEIPT: Cell<Option<fn()>> = const { Cell::new(None) };
-    }
-
-    pub fn set_count_seam(seam: CountSeam) {
-        COUNT.with(|slot| slot.set(Some(seam)));
-    }
-
-    pub fn take_if(want: CountSeam) -> bool {
-        COUNT.with(|slot| {
-            if slot.get() == Some(want) {
-                slot.set(None);
-                true
-            } else {
-                false
-            }
-        })
-    }
-
-    pub fn clear_count_seam() {
-        COUNT.with(|slot| slot.set(None));
     }
 
     /// `hook` runs once, immediately before the receipt's durable write.

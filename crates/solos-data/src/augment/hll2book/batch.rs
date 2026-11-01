@@ -44,6 +44,12 @@ pub struct Request<'a> {
     /// Ratio guard: an hour whose Parquet bytes exceed its `.lz4` bytes times this is still
     /// converted and verified, but its raw files are kept and counted `kept_ratio`.
     pub max_ratio: f64,
+    /// Hour workers: how many hours are decoded and staged at once. Commit order, the
+    /// watermark, and the raw delete stay sequential. Each worker opens its own in-memory
+    /// DuckDB with the same `--threads` and `--memory` caps, so the totals multiply.
+    pub jobs: u32,
+    /// Injected count fault for the guard tests. The CLI always passes [`publish::Fault::None`].
+    pub fault: publish::Fault,
 }
 
 /// Why `run` returned.
@@ -92,6 +98,8 @@ pub struct Report {
     pub hours_kept_ratio: u64,
     /// The run's `--max-ratio`.
     pub max_ratio: f64,
+    /// Hour workers the run used.
+    pub jobs: u32,
     /// One line per hour the run saw, in order, for the run summary.
     pub hours: Vec<HourLine>,
 }
@@ -156,6 +164,7 @@ impl Report {
             .with("threads", self.threads.clone())
             .with("memoryLimit", self.memory_limit.clone())
             .with("maxRatio", json_f64(Some(self.max_ratio)))
+            .with("jobs", self.jobs)
             .with("hoursKeptRatio", self.hours_kept_ratio)
             .with_rows(
                 "hours",
@@ -178,11 +187,11 @@ impl Report {
             )
             .to_json()
     }
-
 }
 
 fn json_f64(value: Option<f64>) -> serde_json::Value {
-    value.and_then(serde_json::Number::from_f64)
+    value
+        .and_then(serde_json::Number::from_f64)
         .map_or(serde_json::Value::Null, serde_json::Value::from)
 }
 
@@ -219,6 +228,9 @@ pub fn run(
             "--max-ratio must be positive and finite".into(),
         ));
     }
+    if !(1..=256).contains(&request.jobs) {
+        return Err(StoreError::Check("--jobs must be 1..=256".into()));
+    }
     let memory_limit = super::parse_memory_limit(&request.memory_limit)?;
     if let (Some(since), Some(until)) = (&request.since, &request.until)
         && since > until
@@ -254,6 +266,7 @@ pub fn run(
         memory_limit: memory_limit.clone(),
         hours_kept_ratio: 0,
         max_ratio: request.max_ratio,
+        jobs: request.jobs,
         hours: Vec::new(),
     };
     match space(request.out, request.min_free_bytes, &mut free_bytes)? {
@@ -291,125 +304,184 @@ pub fn run(
     } else {
         request.git_sha.trim().to_owned()
     };
-    let mut conn: Option<duckdb::Connection> = None;
+    // Hours whose on-disk coins are not covered by the manifest never dispatch; every other
+    // hour dispatches in order and commits in the same order. A worker stages an hour (read,
+    // hash, decode, COPY to .tmp, every check); only the main thread seals hours, moves the
+    // watermark, and deletes raw files.
+    let mut tasks = Vec::new();
     for hour in hours {
-        let key = hour.key.clone();
-        if uncovered.contains(&key) {
-            // Pending, not failed: the hour is re-run once the manifest covers its coins.
+        if uncovered.contains(&hour.key) {
             report.hours_pending += 1;
             report.hours_uncovered += 1;
-            report.hours.push(pending_line(&key, "pending-uncovered"));
+            report
+                .hours
+                .push(pending_line(&hour.key, "pending-uncovered"));
             continue;
         }
-        let ready = match locate_hour(request.input, &hour.entries)? {
-            HourFiles::Partial => {
-                if watermark.contains(&key) {
-                    let identity = identity_of(&hour.entries);
-                    if let Some(receipt) =
-                        verified_receipt(request.out, &key, &identity, &hash, &watermark)?
-                    {
-                        skip_verified(request, &receipt, &mut report)?;
-                        continue;
-                    }
-                    return Err(StoreError::Check(format!(
-                        "{key}: verified hour is incomplete and its output does not match the receipt"
-                    )));
-                }
-                report.hours_pending += 1;
-                report.hours.push(pending_line(&key, "pending"));
-                continue;
-            }
-            HourFiles::Ready(ready) => ready,
-        };
-        match space(request.out, request.min_free_bytes, &mut free_bytes)? {
-            Space::Floor(free) => {
-                report.stop = Stop::DiskFloor;
-                report.free_bytes = Some(free);
-                return Ok(report);
-            }
-            Space::Ok(free) => report.free_bytes = Some(free),
-        }
-        let loaded = match read_ready(&ready)? {
-            ReadReady::Partial => {
-                report.hours_pending += 1;
-                report.hours.push(pending_line(&key, "pending"));
-                continue;
-            }
-            ReadReady::Ready(loaded) => loaded,
-        };
-        let identity = identity_of_inputs(&loaded);
-        if let Some(receipt) = verified_receipt(request.out, &key, &identity, &hash, &watermark)? {
-            skip_verified(request, &receipt, &mut report)?;
-            continue;
-        }
-        if conn.is_none() {
-            let opened = publish::open_writer(request.out, request.threads, &memory_limit)?;
-            report.threads = publish::current_setting(&opened, "threads")?;
-            report.memory_limit = publish::current_setting(&opened, "memory_limit")?;
-            conn = Some(opened);
-        }
-        let Some(conn) = conn.as_ref() else {
-            return Err(StoreError::Check(
-                "internal: writer connection missing".into(),
-            ));
-        };
-        let files: Vec<FileBytes<'_>> = loaded
-            .iter()
-            .map(|file| FileBytes {
-                coin: file.coin.as_str(),
-                relative: file.relative.as_str(),
-                sha256: file.sha256.as_str(),
-                bytes: file.bytes.as_slice(),
-            })
-            .collect();
-        let job = HourJob {
-            hour_key: &key,
-            files: &files,
-            git_sha: &git,
-            config_hash: &hash,
-        };
-        let started = std::time::Instant::now();
-        let output = publish::publish_hour(conn, request.out, &job)
-            .map_err(|error| StoreError::Check(format!("{key}: {error}")))?;
-        if output.input_snapshots != output.output_rows + output.dup_identical {
-            return Err(StoreError::Check(format!(
-                "{key}: hour total {} != kept {} + identical re-sends {}",
-                output.input_snapshots, output.output_rows, output.dup_identical
-            )));
-        }
-        if output.inputs.is_empty() && output.input_snapshots != 0 {
-            return Err(StoreError::Check(format!(
-                "{key}: snapshots were counted but no input was recorded"
-            )));
-        }
-        watermark.insert(key.clone());
-        write_watermark(request.out, &watermark)?;
-        let ratio = hour_ratio(output.parquet_bytes, output.lz4_bytes);
-        let kept_ratio = ratio > request.max_ratio;
-        if kept_ratio {
-            report.hours_kept_ratio += 1;
-        }
-        if request.drop_raw && !kept_ratio {
-            report.raw_bytes_dropped += drop_raw(request.input, request.out, &key)?;
-        }
-        report.hours_verified += 1;
-        report.rows += output.output_rows;
-        report.dup_identical += output.dup_identical;
-        report.dup_distinct += output.dup_distinct;
-        report.hours.push(HourLine {
-            hour: key,
-            status: "verified",
-            rows: output.output_rows,
-            dup_identical: output.dup_identical,
-            dup_distinct: output.dup_distinct,
-            lz4_bytes: output.lz4_bytes,
-            parquet_bytes: output.parquet_bytes,
-            ratio: Some(ratio),
-            kept_ratio,
-            seconds: Some(started.elapsed().as_secs_f64()),
-        });
+        tasks.push(hour);
     }
-    // An hour whose on-disk coins have no manifest row at all never entered the loop above.
+    let (task_tx, task_rx) = std::sync::mpsc::channel::<usize>();
+    let task_rx = std::sync::Arc::new(std::sync::Mutex::new(task_rx));
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<(usize, WorkerOutcome)>();
+    let watermark_start = watermark.clone();
+    let started: std::sync::Arc<std::sync::Mutex<BTreeMap<String, std::time::Instant>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    std::thread::scope(|scope| -> Result<(), StoreError> {
+        // The task sender is owned by this closure so every return path drops it: the workers
+        // block on `recv`, and a sender left alive past the commit loop would keep the scope
+        // from joining. This was a real deadlock.
+        let task_tx = task_tx;
+        for worker in 0..request.jobs {
+            let task_rx = std::sync::Arc::clone(&task_rx);
+            let done_tx = done_tx.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            let started = std::sync::Arc::clone(&started);
+            let tasks = &tasks;
+            let hash = &hash;
+            let git = &git;
+            let watermark_start = &watermark_start;
+            scope.spawn(move || -> Result<(), StoreError> {
+                let mut conn: Option<duckdb::Connection> = None;
+                loop {
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    let next = {
+                        let receiver = task_rx.lock().expect("task lock");
+                        receiver.recv()
+                    };
+                    let Ok(index) = next else {
+                        return Ok(());
+                    };
+                    started
+                        .lock()
+                        .expect("start lock")
+                        .insert(tasks[index].key.clone(), std::time::Instant::now());
+                    let outcome = match work_one(
+                        request,
+                        worker,
+                        &tasks[index],
+                        hash,
+                        git,
+                        watermark_start,
+                        &mut conn,
+                    ) {
+                        Ok(outcome) => outcome,
+                        Err(error) => WorkerOutcome::Failed(error),
+                    };
+                    if matches!(outcome, WorkerOutcome::Failed(_)) {
+                        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    if done_tx.send((index, outcome)).is_err() {
+                        return Ok(());
+                    }
+                }
+            });
+        }
+        drop(done_tx);
+        // The main thread owns dispatch (after the disk floor) and commit (in order).
+        let mut ready: BTreeMap<usize, WorkerOutcome> = BTreeMap::new();
+        let mut sent = 0usize;
+        let mut next = 0usize;
+        dispatch_more(
+            request,
+            &mut free_bytes,
+            &mut report,
+            tasks.len(),
+            &mut sent,
+            next,
+            &task_tx,
+        )?;
+        while next < sent {
+            let Ok((index, outcome)) = done_rx.recv() else {
+                break;
+            };
+            if let WorkerOutcome::Failed(error) = outcome {
+                // Hours already staged clean their own temporaries when this map drops.
+                drop(ready);
+                return Err(error);
+            }
+            ready.insert(index, outcome);
+            while let Some(outcome) = ready.remove(&next) {
+                match outcome {
+                    WorkerOutcome::Pending => {
+                        report.hours_pending += 1;
+                        report.hours.push(pending_line(&tasks[next].key, "pending"));
+                    }
+                    WorkerOutcome::Skip(receipt) => {
+                        skip_verified(request, &receipt, &mut report)?;
+                    }
+                    WorkerOutcome::Prepared(prepared) => {
+                        let key = prepared.hour_key.clone();
+                        if report.threads == request.threads.to_string() {
+                            report.threads = prepared.threads.clone();
+                            report.memory_limit = prepared.memory_limit.clone();
+                        }
+                        let output = publish::seal_hour(request.out, prepared)
+                            .map_err(|error| StoreError::Check(format!("{key}: {error}")))?;
+                        if output.input_snapshots != output.output_rows + output.dup_identical {
+                            return Err(StoreError::Check(format!(
+                                "{key}: hour total {} != kept {} + identical re-sends {}",
+                                output.input_snapshots, output.output_rows, output.dup_identical
+                            )));
+                        }
+                        if output.inputs.is_empty() && output.input_snapshots != 0 {
+                            return Err(StoreError::Check(format!(
+                                "{key}: snapshots were counted but no input was recorded"
+                            )));
+                        }
+                        watermark.insert(key.clone());
+                        write_watermark(request.out, &watermark)?;
+                        let ratio = hour_ratio(output.parquet_bytes, output.lz4_bytes);
+                        let kept_ratio = ratio > request.max_ratio;
+                        if kept_ratio {
+                            report.hours_kept_ratio += 1;
+                        }
+                        if request.drop_raw && !kept_ratio {
+                            report.raw_bytes_dropped += drop_raw(request.input, request.out, &key)?;
+                        }
+                        report.hours_verified += 1;
+                        report.rows += output.output_rows;
+                        report.dup_identical += output.dup_identical;
+                        report.dup_distinct += output.dup_distinct;
+                        let seconds = started
+                            .lock()
+                            .expect("start lock")
+                            .remove(&key)
+                            .map(|instant| instant.elapsed().as_secs_f64());
+                        report.hours.push(HourLine {
+                            hour: key,
+                            status: "verified",
+                            rows: output.output_rows,
+                            dup_identical: output.dup_identical,
+                            dup_distinct: output.dup_distinct,
+                            lz4_bytes: output.lz4_bytes,
+                            parquet_bytes: output.parquet_bytes,
+                            ratio: Some(ratio),
+                            kept_ratio,
+                            seconds,
+                        });
+                    }
+                    WorkerOutcome::Failed(_) => unreachable!("failed outcomes stop the run"),
+                }
+                next += 1;
+                if !dispatch_more(
+                    request,
+                    &mut free_bytes,
+                    &mut report,
+                    tasks.len(),
+                    &mut sent,
+                    next,
+                    &task_tx,
+                )? {
+                    break;
+                }
+            }
+        }
+        Ok(())
+    })?;
+    // An hour whose on-disk coins have no manifest row at all never entered the task list.
     for key in &uncovered {
         if !hour_keys.contains(key) {
             report.hours_pending += 1;
@@ -418,6 +490,119 @@ pub fn run(
         }
     }
     Ok(report)
+}
+
+/// What a worker produced for one hour.
+enum WorkerOutcome {
+    /// A manifest file is missing or short, or the hour's coins are not covered yet.
+    Pending,
+    /// The hour was already verified and still matches; the receipt carries the numbers.
+    Skip(Receipt),
+    /// The hour is staged, checked, and waiting for its ordered seal.
+    Prepared(publish::Prepared),
+    /// The hour fails; the run stops.
+    Failed(StoreError),
+}
+
+/// One hour in a worker: locate, verify inputs, skip if the receipt still matches, otherwise
+/// stage the hour.
+fn work_one(
+    request: &Request<'_>,
+    worker: u32,
+    task: &HourGroup,
+    hash: &str,
+    git: &str,
+    watermark: &BTreeSet<String>,
+    conn: &mut Option<duckdb::Connection>,
+) -> Result<WorkerOutcome, StoreError> {
+    let key = &task.key;
+    let ready = match locate_hour(request.input, &task.entries)? {
+        HourFiles::Partial => {
+            if watermark.contains(key) {
+                let identity = identity_of(&task.entries);
+                if let Some(receipt) =
+                    verified_receipt(request.out, key, &identity, hash, watermark)?
+                {
+                    return Ok(WorkerOutcome::Skip(receipt));
+                }
+                return Err(StoreError::Check(format!(
+                    "{key}: verified hour is incomplete and its output does not match the receipt"
+                )));
+            }
+            return Ok(WorkerOutcome::Pending);
+        }
+        HourFiles::Ready(ready) => ready,
+    };
+    let loaded = match read_ready(&ready)? {
+        ReadReady::Partial => return Ok(WorkerOutcome::Pending),
+        ReadReady::Ready(loaded) => loaded,
+    };
+    let identity = identity_of_inputs(&loaded);
+    if let Some(receipt) = verified_receipt(request.out, key, &identity, hash, watermark)? {
+        return Ok(WorkerOutcome::Skip(receipt));
+    }
+    if conn.is_none() {
+        let (opened, _) =
+            publish::open_writer(request.out, worker, request.threads, &request.memory_limit)?;
+        *conn = Some(opened);
+    }
+    let Some(conn) = conn.as_ref() else {
+        return Err(StoreError::Check(
+            "internal: writer connection missing".into(),
+        ));
+    };
+    let files: Vec<FileBytes<'_>> = loaded
+        .iter()
+        .map(|file| FileBytes {
+            coin: file.coin.as_str(),
+            relative: file.relative.as_str(),
+            sha256: file.sha256.as_str(),
+            bytes: file.bytes.as_slice(),
+        })
+        .collect();
+    let job = HourJob {
+        hour_key: key,
+        files: &files,
+        git_sha: git,
+        config_hash: hash,
+        fault: request.fault,
+    };
+    // `seal_hour` needs the settings the report should show; read them from the connection.
+    let settings = publish::WriterSettings {
+        threads: publish::current_setting(conn, "threads")?,
+        memory_limit: publish::current_setting(conn, "memory_limit")?,
+    };
+    let prepared = publish::prepare_hour(conn, request.out, &job, &settings)
+        .map_err(|error| StoreError::Check(format!("{key}: {error}")))?;
+    Ok(WorkerOutcome::Prepared(prepared))
+}
+
+/// Send more hours to the workers, up to `jobs` in flight, after the disk floor. Returns
+/// false when the floor stopped the run.
+fn dispatch_more(
+    request: &Request<'_>,
+    free_bytes: &mut impl FnMut(&Path) -> Result<u64, String>,
+    report: &mut Report,
+    tasks_len: usize,
+    sent: &mut usize,
+    next: usize,
+    task_tx: &std::sync::mpsc::Sender<usize>,
+) -> Result<bool, StoreError> {
+    while *sent < tasks_len && *sent - next < request.jobs as usize {
+        match space(request.out, request.min_free_bytes, free_bytes)? {
+            Space::Floor(free) => {
+                report.stop = Stop::DiskFloor;
+                report.free_bytes = Some(free);
+                return Ok(false);
+            }
+            Space::Ok(free) => report.free_bytes = Some(free),
+        }
+        task_tx
+            .send(*sent)
+            .map_err(|_| StoreError::Check("a worker stopped".into()))?;
+        *sent += 1;
+    }
+    Ok(true)
 }
 
 fn pending_line(hour: &str, status: &'static str) -> HourLine {
@@ -437,7 +622,11 @@ fn pending_line(hour: &str, status: &'static str) -> HourLine {
 
 /// The shared skip path of an hour the watermark already lists: honor the ratio guard before
 /// any raw delete, then count the hour as skipped.
-fn skip_verified(request: &Request<'_>, receipt: &Receipt, report: &mut Report) -> Result<(), StoreError> {
+fn skip_verified(
+    request: &Request<'_>,
+    receipt: &Receipt,
+    report: &mut Report,
+) -> Result<(), StoreError> {
     let ratio = hour_ratio(receipt.parquet_bytes, receipt.lz4_bytes);
     let kept_ratio = ratio > request.max_ratio;
     if kept_ratio {
@@ -1083,6 +1272,8 @@ mod tests {
             until: None,
             drop_raw: false,
             max_ratio: 1.0,
+            jobs: 1,
+            fault: publish::Fault::None,
         };
         let hours = group_hours(&entries, &request);
         assert_eq!(

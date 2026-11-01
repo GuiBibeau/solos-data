@@ -1185,6 +1185,7 @@ fn hl_l2book_manifest_cli(args: &[String]) -> i32 {
         tsv: &tsv,
         out: &out,
         jobs,
+        fail_after: None,
     };
     match crate::augment::hll2book::manifest::run(&request) {
         Ok(report) => {
@@ -1280,6 +1281,10 @@ fn hl_l2book_cli(args: &[String]) -> i32 {
                     "maxRatio",
                     "--max-ratio (default 1.0): an hour whose parquet bytes exceed its lz4 bytes times the ratio is still verified but keeps its raw files (hoursKeptRatio)"
                 )
+                .with(
+                    "jobs",
+                    "--jobs (default 1): hours decoded and staged in parallel. Commit order, the watermark, and raw deletes stay sequential. Each worker opens its own in-memory DuckDB with the same --threads and --memory caps, so the totals multiply"
+                )
                 .to_json()
         );
         return 0;
@@ -1333,9 +1338,9 @@ fn hl_l2book_run(args: &[String]) -> Result<i32, StoreError> {
     let memory = crate::augment::hll2book::parse_memory_limit(
         flag(args, "--memory").unwrap_or(crate::augment::hll2book::DEFAULT_MEMORY),
     )?;
-    let max_ratio = crate::augment::hll2book::parse_ratio(
-        flag(args, "--max-ratio").unwrap_or("1.0"),
-    )?;
+    let max_ratio =
+        crate::augment::hll2book::parse_ratio(flag(args, "--max-ratio").unwrap_or("1.0"))?;
+    let jobs = jobs_flag(args)?;
     let request = crate::augment::hll2book::Request {
         input: Path::new(required_flag(args, "--input")?),
         out: Path::new(required_flag(args, "--out")?),
@@ -1349,6 +1354,8 @@ fn hl_l2book_run(args: &[String]) -> Result<i32, StoreError> {
         until,
         drop_raw: has(args, "--drop-raw-after-verify"),
         max_ratio,
+        jobs,
+        fault: crate::augment::hll2book::Fault::None,
     };
     let report = crate::augment::hll2book::run(&request, filesystem_free)?;
     println!("{}", report.to_json());

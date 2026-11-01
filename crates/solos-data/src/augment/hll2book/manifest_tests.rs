@@ -42,7 +42,9 @@ fn write_book(input: &Path, date: &str, hour: u32, coin: &str, body: &[u8]) -> S
 fn tsv(rows: &[(String, u64, String)]) -> String {
     let mut text = String::from("order\tkey\tsize\tetag\tcoin\tdate\tsplit\tpresent\n");
     for (index, (key, size, etag)) in rows.iter().enumerate() {
-        text.push_str(&format!("{index}\t{key}\t{size}\t{etag}\tX\t20261022\ttrain\t1\n"));
+        text.push_str(&format!(
+            "{index}\t{key}\t{size}\t{etag}\tX\t20261022\ttrain\t1\n"
+        ));
     }
     text
 }
@@ -56,7 +58,29 @@ fn row(path: &str, body: &[u8]) -> (String, u64, String) {
 }
 
 fn build(input: &Path, tsv: &Path, out: &Path, jobs: u32) -> Result<manifest::Report, StoreError> {
-    manifest::run(&Request { input, tsv, out, jobs })
+    manifest::run(&Request {
+        input,
+        tsv,
+        out,
+        jobs,
+        fail_after: None,
+    })
+}
+
+fn build_failing(
+    input: &Path,
+    tsv: &Path,
+    out: &Path,
+    jobs: u32,
+    fail_after: u64,
+) -> Result<manifest::Report, StoreError> {
+    manifest::run(&Request {
+        input,
+        tsv,
+        out,
+        jobs,
+        fail_after: Some(fail_after),
+    })
 }
 
 fn body_a() -> Vec<u8> {
@@ -209,8 +233,7 @@ fn an_interrupted_run_resumes_and_never_leaves_a_torn_manifest() {
     let out = root.0.join("MANIFEST");
 
     // A kill in the middle of a batch, before any write of it.
-    manifest::fail_after_hashing(2);
-    let error = build(&input, &tsv_path, &out, 3).unwrap_err();
+    let error = build_failing(&input, &tsv_path, &out, 3, 2).unwrap_err();
     assert!(error.to_string().contains("injected"), "{error}");
     assert!(!out.exists(), "a stopped run wrote a partial manifest");
 
@@ -247,7 +270,7 @@ fn a_rewritten_file_with_the_same_size_is_rehashed() {
     // Same bytes, same size, new mtime: the reuse rule must not fire. The sleep crosses the
     // coarsest mtime clock a filesystem reports.
     std::thread::sleep(std::time::Duration::from_millis(20));
-    std::fs::write(input.join(&path), &body_a()).unwrap();
+    std::fs::write(input.join(&path), body_a()).unwrap();
     let report = build(&input, &tsv_path, &out, 1).unwrap();
     assert_eq!(report.newly_hashed, 1);
     assert_eq!(report.reused, 0);
@@ -320,6 +343,8 @@ fn the_converter_publishes_from_a_built_manifest() {
         until: None,
         drop_raw: false,
         max_ratio: 1e12,
+        jobs: 1,
+        fault: super::publish::Fault::None,
     };
     let report = super::run(&request, |_| Ok(u64::MAX)).unwrap();
     assert_eq!(report.hours_verified, 1);

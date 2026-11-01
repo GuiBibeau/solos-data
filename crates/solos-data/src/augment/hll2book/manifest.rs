@@ -37,6 +37,9 @@ pub struct Request<'a> {
     pub out: &'a Path,
     /// Hashing threads, `1..=256`.
     pub jobs: u32,
+    /// Test seam: fail once after this many hashed files, like a kill mid-batch, before any
+    /// write of it. The CLI always passes `None`.
+    pub fail_after: Option<u64>,
 }
 
 /// How many new hashed bytes trigger an intermediate durable write, so a crash costs at most
@@ -149,8 +152,14 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let mut manifest = load_manifest(request.out)?;
     let mut state = load_state(&sidecar(request.out))?;
     let mut hashed_since_flush: u64 = 0;
+    // Counts down hashed files to the injected stop; 0 means off. Atomic because hashing
+    // threads share it, and a request field rather than a global so concurrent tests (and
+    // runs) cannot trip each other's stop.
+    let fail_after = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+        request.fail_after.map_or(0, |files| files + 1),
+    ));
     for batch in walked.books.chunks(BATCH) {
-        for outcome in hash_batch(request, batch, &tsv, &manifest, &state)? {
+        for outcome in hash_batch(request, batch, &tsv, &manifest, &state, &fail_after)? {
             match outcome.body {
                 OutcomeBody::Covered { sha256, reused } => {
                     report.covered += 1;
@@ -225,14 +234,13 @@ fn hash_batch(
     tsv: &HashMap<String, TsvRow>,
     manifest: &HashMap<String, Line>,
     state: &std::collections::BTreeMap<String, FileState>,
+    fail_after: &std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> Result<Vec<Outcome>, StoreError> {
     let relative: Vec<String> = batch
         .iter()
         .map(|path| {
             path.strip_prefix(request.input)
-                .map_err(|_| {
-                    StoreError::Check(format!("{} escapes the input dir", path.display()))
-                })
+                .map_err(|_| StoreError::Check(format!("{} escapes the input dir", path.display())))
                 .map(|rest| rest.to_string_lossy().replace('\\', "/"))
         })
         .collect::<Result<_, _>>()?;
@@ -244,6 +252,7 @@ fn hash_batch(
             let sender = sender.clone();
             let next = &next;
             let relative = &relative;
+            let fail_after = std::sync::Arc::clone(fail_after);
             handles.push(scope.spawn(move || -> Result<(), StoreError> {
                 let mut buffer: Vec<u8> = Vec::new();
                 loop {
@@ -253,7 +262,16 @@ fn hash_batch(
                     };
                     let outcome =
                         classify(path, &relative[index], tsv, manifest, state, &mut buffer)?;
-                    fail_mid_run()?;
+                    if matches!(outcome.body, OutcomeBody::Covered { .. }) {
+                        let remaining = fail_after.fetch_sub(1, Ordering::SeqCst);
+                        if remaining == 1 {
+                            fail_after.store(0, Ordering::SeqCst);
+                            return Err(StoreError::Check("injected manifest-builder stop".into()));
+                        }
+                        if remaining <= 1 {
+                            fail_after.store(0, Ordering::SeqCst);
+                        }
+                    }
                     if sender.send(outcome).is_err() {
                         return Ok(());
                     }
@@ -388,9 +406,15 @@ fn load_tsv(path: &Path) -> Result<HashMap<String, TsvRow>, StoreError> {
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let column = |name: &str| -> Result<usize, StoreError> {
-        header.iter().position(|column| column == name).ok_or_else(|| {
-            StoreError::Check(format!("tsv header has no {name} column: {}", header.join(",")))
-        })
+        header
+            .iter()
+            .position(|column| column == name)
+            .ok_or_else(|| {
+                StoreError::Check(format!(
+                    "tsv header has no {name} column: {}",
+                    header.join(",")
+                ))
+            })
     };
     let (key_at, size_at, etag_at) = (column("key")?, column("size")?, column("etag")?);
     let mut rows: HashMap<String, TsvRow> = HashMap::new();
@@ -484,8 +508,7 @@ fn load_manifest(out: &Path) -> Result<HashMap<String, Line>, StoreError> {
             continue;
         }
         let mut parts = line.split_whitespace();
-        let (Some(sha256), Some(size), Some(path)) =
-            (parts.next(), parts.next(), parts.next())
+        let (Some(sha256), Some(size), Some(path)) = (parts.next(), parts.next(), parts.next())
         else {
             return Err(StoreError::Check(format!(
                 "manifest line {}: expected sha256, size, and path",
@@ -523,7 +546,7 @@ fn load_state(path: &Path) -> Result<std::collections::BTreeMap<String, FileStat
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(std::collections::BTreeMap::new())
+            return Ok(std::collections::BTreeMap::new());
         }
         Err(error) => return Err(error.into()),
     };
@@ -551,7 +574,10 @@ fn write_manifest(out: &Path, lines: &HashMap<String, Line>) -> Result<(), Store
     Ok(())
 }
 
-fn write_state(path: &Path, files: &std::collections::BTreeMap<String, FileState>) -> Result<(), StoreError> {
+fn write_state(
+    path: &Path,
+    files: &std::collections::BTreeMap<String, FileState>,
+) -> Result<(), StoreError> {
     let state = StateFile {
         schema: STATE_SCHEMA.to_owned(),
         files: files.clone(),
@@ -559,38 +585,5 @@ fn write_state(path: &Path, files: &std::collections::BTreeMap<String, FileState
     let mut body = serde_json::to_vec(&state).map_err(|e| StoreError::Check(e.to_string()))?;
     body.push(b'\n');
     write_durable(path, &body)?;
-    Ok(())
-}
-
-/// Test hook, process-wide so worker threads see it: the run fails once after `hashed`
-/// successfully hashed files, like a kill in the middle of a batch, before any flush of it.
-#[cfg(test)]
-static FAIL_AFTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-#[cfg(test)]
-pub(crate) fn fail_after_hashing(files: u64) {
-    FAIL_AFTER.store(files + 1, Ordering::SeqCst);
-}
-
-#[cfg(test)]
-pub(crate) fn clear_fail_after() {
-    FAIL_AFTER.store(0, Ordering::SeqCst);
-}
-
-#[cfg(test)]
-fn fail_mid_run() -> Result<(), StoreError> {
-    let remaining = FAIL_AFTER.fetch_sub(1, Ordering::SeqCst);
-    if remaining == 1 {
-        FAIL_AFTER.store(0, Ordering::SeqCst);
-        return Err(StoreError::Check("injected manifest-builder stop".into()));
-    }
-    if remaining <= 1 {
-        FAIL_AFTER.store(0, Ordering::SeqCst);
-    }
-    Ok(())
-}
-
-#[cfg(not(test))]
-fn fail_mid_run() -> Result<(), StoreError> {
     Ok(())
 }

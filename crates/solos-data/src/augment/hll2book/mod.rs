@@ -19,6 +19,7 @@ mod behavior;
 mod manifest_tests;
 
 pub use batch::{Report, Request, Stop, run};
+pub use publish::Fault;
 
 use serde_json::Value;
 

@@ -1,7 +1,7 @@
 //! Behavior of one offline hour: counts, the forward split, checksums, partial files, raw
 //! delete, fsync, and the measured Parquet layout.
 
-use super::publish::seams::CountSeam;
+use super::publish::Fault;
 use super::{FORWARD_START_MS, Report, Request, Stop};
 use crate::jsonout::Obj;
 use serde_json::{Value, json};
@@ -78,6 +78,8 @@ struct Opts {
     /// which has its own both-directions test: a one-snapshot fixture is nearly all Parquet
     /// overhead and legitimately exceeds 1.0.
     max_ratio: f64,
+    /// The injected count fault, or none.
+    fault: Fault,
 }
 
 impl Default for Opts {
@@ -89,6 +91,7 @@ impl Default for Opts {
             since: None,
             until: None,
             max_ratio: 1e12,
+            fault: Fault::None,
         }
     }
 }
@@ -113,18 +116,14 @@ fn run_with(
         until: opts.until,
         drop_raw: opts.drop_raw,
         max_ratio: opts.max_ratio,
+        jobs: 1,
+        fault: opts.fault,
     };
     super::run(&request, free)
 }
 
 fn run_ok(input: &Path, out: &Path, checksums: &Path) -> Result<Report, crate::store::StoreError> {
-    run_with(
-        input,
-        out,
-        checksums,
-        Opts::default(),
-        |_| Ok(u64::MAX),
-    )
+    run_with(input, out, checksums, Opts::default(), |_| Ok(u64::MAX))
 }
 
 fn read_rows(path: &Path) -> Vec<Obj> {
@@ -212,7 +211,6 @@ struct Reset;
 
 impl Reset {
     fn arm() -> Self {
-        super::publish::seams::clear_count_seam();
         super::publish::seams::clear_before_receipt();
         super::batch::clear_before_watermark();
         super::batch::clear_drop_fault();
@@ -223,7 +221,6 @@ impl Reset {
 
 impl Drop for Reset {
     fn drop(&mut self) {
-        super::publish::seams::clear_count_seam();
         super::publish::seams::clear_before_receipt();
         super::batch::clear_before_watermark();
         super::batch::clear_drop_fault();
@@ -300,7 +297,7 @@ fn the_ratio_guard_decides_the_drop_in_both_directions() {
     assert_eq!(under.hours_verified, 1);
     assert_eq!(under.hours_kept_ratio, 0, "ratio under the max");
     assert!(!raw.exists(), "an hour at or under the max drops its raw");
-    assert_eq!(under.hours[0].kept_ratio, false);
+    assert!(!under.hours[0].kept_ratio);
     assert!(under.hours[0].ratio.unwrap() > 1.0);
 
     // Same hour shape, a max the fixture cannot meet: converted and verified, raw kept.
@@ -318,8 +315,14 @@ fn the_ratio_guard_decides_the_drop_in_both_directions() {
         |_| Ok(u64::MAX),
     )
     .unwrap();
-    assert_eq!(over.hours_verified, 1, "the hour is still converted and verified");
-    assert_eq!(over.hours_kept_ratio, 1, "the hour is reported as kept_ratio");
+    assert_eq!(
+        over.hours_verified, 1,
+        "the hour is still converted and verified"
+    );
+    assert_eq!(
+        over.hours_kept_ratio, 1,
+        "the hour is reported as kept_ratio"
+    );
     assert!(raw.is_file(), "an hour over the max keeps its raw");
     assert_eq!(watermark(&out2), vec!["20261022/0".to_owned()]);
     let receipt: Value = serde_json::from_str(
@@ -349,7 +352,10 @@ fn the_ratio_guard_decides_the_drop_in_both_directions() {
     .unwrap();
     assert_eq!(again.hours_skipped, 1);
     assert_eq!(again.hours_kept_ratio, 1);
-    assert!(raw.is_file(), "the skip path does not drop a kept-ratio hour");
+    assert!(
+        raw.is_file(),
+        "the skip path does not drop a kept-ratio hour"
+    );
 }
 
 /// One input, four lines: an identical re-send is dropped, a distinct book at the same
@@ -505,7 +511,8 @@ fn an_hour_with_an_uncovered_file_is_pending_not_an_abort() {
         "an uncovered raw file is never touched"
     );
     assert!(
-        !out.join("train/date=2026-10-22/hour=20261022-0.parquet").exists(),
+        !out.join("train/date=2026-10-22/hour=20261022-0.parquet")
+            .exists(),
         "the uncovered hour stays pending, half-converted"
     );
     assert_eq!(report.exit_code(), 0, "pending is not a failure");
@@ -595,20 +602,29 @@ fn a_partial_input_file_is_not_processed() {
 /// delete `rows != file.rows` (Staged).
 #[test]
 fn a_short_write_fails_each_count_guard_without_a_watermark() {
-    for seam in [CountSeam::Line, CountSeam::Hour, CountSeam::Staged] {
+    for fault in [Fault::Line, Fault::Hour, Fault::Staged] {
         let _reset = Reset::arm();
-        super::publish::seams::set_count_seam(seam);
         let root = Tmp::new("short");
         let (input, out, sums) = stage_one(&root, &book("BTC", 1_792_627_200_000, 1, "1"));
-        let error = run_ok(&input, &out, &sums).unwrap_err();
+        let error = run_with(
+            &input,
+            &out,
+            &sums,
+            Opts {
+                fault,
+                ..Opts::default()
+            },
+            |_| Ok(u64::MAX),
+        )
+        .unwrap_err();
         let message = error.to_string();
-        match seam {
-            CountSeam::Line => assert!(message.contains("line "), "{seam:?}: {message}"),
-            CountSeam::Hour => assert!(message.contains("hour kept"), "{seam:?}: {message}"),
-            CountSeam::Staged => assert!(message.contains("staged"), "{seam:?}: {message}"),
+        match fault {
+            Fault::Line => assert!(message.contains("line "), "{fault:?}: {message}"),
+            Fault::Hour => assert!(message.contains("hour kept"), "{fault:?}: {message}"),
+            Fault::Staged => assert!(message.contains("staged"), "{fault:?}: {message}"),
             _ => unreachable!(),
         }
-        assert!(watermark(&out).is_empty(), "{seam:?}: watermark moved");
+        assert!(watermark(&out).is_empty(), "{fault:?}: watermark moved");
     }
 }
 
@@ -616,10 +632,19 @@ fn a_short_write_fails_each_count_guard_without_a_watermark() {
 #[test]
 fn a_per_file_count_mismatch_fails_the_hour() {
     let _reset = Reset::arm();
-    super::publish::seams::set_count_seam(CountSeam::PerFile);
     let root = Tmp::new("per-file");
     let (input, out, sums) = stage_one(&root, &book("BTC", 1_792_627_200_000, 1, "1"));
-    let error = run_ok(&input, &out, &sums).unwrap_err();
+    let error = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            fault: Fault::PerFile,
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("file snapshots"), "{}", error);
     assert!(watermark(&out).is_empty());
 }
@@ -628,10 +653,19 @@ fn a_per_file_count_mismatch_fails_the_hour() {
 #[test]
 fn a_sample_value_mismatch_fails_the_hour() {
     let _reset = Reset::arm();
-    super::publish::seams::set_count_seam(CountSeam::Sample);
     let root = Tmp::new("sample");
     let (input, out, sums) = stage_one(&root, &book("BTC", 1_792_627_200_000, 1, "4.5"));
-    let error = run_ok(&input, &out, &sums).unwrap_err();
+    let error = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            fault: Fault::Sample,
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("sample mismatch"), "{error}");
     assert!(watermark(&out).is_empty());
 }
