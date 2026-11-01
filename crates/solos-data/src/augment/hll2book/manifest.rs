@@ -5,7 +5,8 @@
 //! finished `.lz4` on disk whose size equals the TSV size and whose local MD5 equals the etag,
 //! the builder writes `sha256 size path`, where the sha256 is of the local bytes: the MD5 etag
 //! is a gate that ties the local file to the TSV row, never the checksum. The converter reads
-//! the same three-field listing, so its manifest can be this file.
+//! the same three-field listing, so its manifest can be this file. MD5 itself is the `md-5`
+//! crate: a vetted implementation for a gate that is not a checksum.
 //!
 //! Resume: the manifest and its sidecar state file are written whole through
 //! `write_durable` (temp, fsync, rename, directory fsync), so a crash leaves the previous
@@ -16,9 +17,9 @@
 //! entry the manifest had for that path. `.part` files are never read.
 
 use super::checksum;
-use super::md5::md5_hex;
 use crate::fsutil::write_durable;
 use crate::store::StoreError;
+use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
@@ -586,4 +587,10 @@ fn write_state(
     body.push(b'\n');
     write_durable(path, &body)?;
     Ok(())
+}
+
+/// Lowercase MD5 hex of the bytes, through the `md-5` crate: the downloader etag gate only.
+#[must_use]
+pub(crate) fn md5_hex(bytes: &[u8]) -> String {
+    hex::encode(Md5::digest(bytes))
 }

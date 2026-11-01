@@ -15,9 +15,11 @@ use sha2::{Digest, Sha256};
 /// 208 were byte-identical re-sends, one was a different book. The rule:
 ///
 /// * [`DuplicateRule::Identical`]: the books are the same (both sides' `px`, `sz`, and `n`,
-///   all [`BOOK_LEVELS`] levels, compared as exact `f64` bits). The later line is a re-send:
-///   it is dropped and counted `dup_identical`. `recv_time_ms` is envelope metadata, not
-///   book identity; the first line's value stays.
+///   all [`BOOK_LEVELS`] levels, compared as exact `f64` bits). The later line is a re-send
+///   of the same observation: it is dropped and counted `dup_identical`. This is book
+///   identity, not byte identity: `recv_time_ms` is envelope metadata and is excluded, so a
+///   re-send under a later envelope time is still `Identical`, and the first line's value
+///   stays.
 /// * [`DuplicateRule::Distinct`]: the books differ. Both rows are kept, in archive line
 ///   order (the staged `_seq` key), and the extra row is counted `dup_distinct`.
 ///

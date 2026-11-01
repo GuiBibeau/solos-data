@@ -50,11 +50,7 @@ fn tsv(rows: &[(String, u64, String)]) -> String {
 }
 
 fn row(path: &str, body: &[u8]) -> (String, u64, String) {
-    (
-        path.to_owned(),
-        body.len() as u64,
-        super::md5::md5_hex(body),
-    )
+    (path.to_owned(), body.len() as u64, manifest::md5_hex(body))
 }
 
 fn build(input: &Path, tsv: &Path, out: &Path, jobs: u32) -> Result<manifest::Report, StoreError> {
@@ -215,7 +211,7 @@ fn the_checksum_is_sha256_of_the_local_bytes() {
         line.starts_with(&crate::fsutil::sha256_hex(&body_a())),
         "the manifest records sha256 of the local bytes, not the md5 etag: {line}"
     );
-    assert!(!line.contains(&super::md5::md5_hex(&body_a())));
+    assert!(!line.contains(&manifest::md5_hex(&body_a())));
 }
 
 #[test]
@@ -381,4 +377,24 @@ fn a_relative_single_component_manifest_out_is_durable() {
     let written = crate::fsutil::write_durable(&path, b"line\n");
     let _ = std::fs::remove_file(&path);
     written.expect("a bare relative out path is durable");
+}
+
+/// The `md-5` crate called the way the gate calls it, cross-checked against DuckDB's own
+/// `md5` scalar so a misuse of the API cannot pass silently.
+#[test]
+fn the_etag_gate_hashes_like_duckdb_md5() {
+    let conn = crate::store::memory_connection("1", "256MB").unwrap();
+    for probe in ["", "abc", "the money is gone"] {
+        let rows = crate::store::query_rows(
+            &conn,
+            &format!("SELECT md5({}) AS digest", crate::store::sql_string(probe)),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            manifest::md5_hex(probe.as_bytes()),
+            rows[0].str("digest").unwrap_or_default(),
+            "{probe}"
+        );
+    }
 }

@@ -10,7 +10,6 @@ mod batch;
 mod checksum;
 mod decode;
 pub mod manifest;
-mod md5;
 mod publish;
 
 #[cfg(test)]
