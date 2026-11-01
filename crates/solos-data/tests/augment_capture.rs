@@ -27,6 +27,9 @@ fn ctx(server: &Server, root: &std::path::Path) -> (Ctx, solos_data::db::DbThrea
     let (db, thread) = Db::spawn(store);
     let http = Http::new(50.0).unwrap();
     http.set_host_rate(&server.base, 50.0);
+    // The Http gate and capped() read this clock. The fixture restores the meter at
+    // NOW_MS; leaving the gate on the wall clock rolls that month away.
+    http.set_now_ms(NOW_MS);
     (
         Ctx {
             http,
@@ -617,6 +620,38 @@ fn the_monthly_cap_stops_every_elfa_request() {
     restarted.restore(Some(&saved), 0, NOW_MS);
     assert!(!restarted.allows(0, NOW_MS));
     let store = thread.join(ctx.db.clone());
+    store.close().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A production capture `Ctx` leaves `now_ms` at 0 and does not pin the Http clock.
+/// The cap must still see the wall-clock month. Using `ctx.now_ms` here rolls the meter
+/// to 1970-01 and clears `spent`.
+#[test]
+fn the_cap_holds_when_the_lane_clock_is_zero() {
+    use solos_data::augment::meter::CreditMeter;
+    let root = tempdir("solos-cap-zero");
+    let store = ledger::open(&root, Lane::Capture).unwrap();
+    let (db, thread) = Db::spawn(store);
+    let now = chrono::Utc::now().timestamp_millis();
+    let meter = Arc::new(CreditMeter::new("https://api.elfa.ai", 100));
+    meter.restore(None, 100, now);
+    let before = meter.snapshot();
+    let http = Http::new(50.0).unwrap();
+    http.set_meter(Arc::clone(&meter));
+    let ctx = Ctx {
+        http,
+        db,
+        root: root.clone(),
+        lane: Lane::Capture,
+        start: solos_data::augment::periods::parse_date("2026-10-01").unwrap(),
+        now_ms: 0,
+        stop: Arc::new(AtomicBool::new(false)),
+        disk_budget_bytes: 0,
+    };
+    assert!(solos_data::augment::elfa::capped(&ctx));
+    assert_eq!(meter.snapshot(), before);
+    let store = thread.join(ctx.db);
     store.close().unwrap();
     let _ = std::fs::remove_dir_all(&root);
 }

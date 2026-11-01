@@ -78,6 +78,10 @@ pub struct Http {
     counts: Mutex<HashMap<String, (u64, u64)>>,
     attempts: u32,
     meter: OnceLock<Arc<CreditMeter>>,
+    /// Fixture clock for the credit meter. Only present in test builds. Release builds
+    /// have no setter, so this stays unset and [`Http::now_ms`] is the wall clock.
+    #[cfg(feature = "failpoints")]
+    fixed_now_ms: Mutex<Option<i64>>,
 }
 
 impl Http {
@@ -106,7 +110,26 @@ impl Http {
             counts: Mutex::new(HashMap::new()),
             attempts: 6,
             meter: OnceLock::new(),
+            #[cfg(feature = "failpoints")]
+            fixed_now_ms: Mutex::new(None),
         })
+    }
+
+    /// The instant the credit meter uses: the wall clock, or the fixture clock a test pinned.
+    #[must_use]
+    pub(crate) fn now_ms(&self) -> i64 {
+        #[cfg(feature = "failpoints")]
+        if let Some(pinned) = *self.fixed_now_ms.lock().expect("http now") {
+            return pinned;
+        }
+        chrono::Utc::now().timestamp_millis()
+    }
+
+    /// Pin the credit-meter clock. Compiled only with the `failpoints` feature, which release
+    /// builds do not enable, so there is no `set_now_ms` on the production API.
+    #[cfg(feature = "failpoints")]
+    pub fn set_now_ms(&self, now_ms: i64) {
+        *self.fixed_now_ms.lock().expect("http now") = Some(now_ms);
     }
 
     /// A slower (or faster) pace for one host, from a URL on that host.
@@ -131,7 +154,7 @@ impl Http {
     /// Refuse a request to the metered host once its cap is reached.
     fn gate(&self, url: &str) -> Result<(), HttpError> {
         match self.meter.get() {
-            Some(meter) if meter.covers(url) && !meter.allows(0, now_ms()) => {
+            Some(meter) if meter.covers(url) && !meter.allows(0, self.now_ms()) => {
                 Err(HttpError::CreditCap)
             }
             _ => Ok(()),
@@ -145,7 +168,7 @@ impl Http {
                 .headers()
                 .get("x-elfa-credits")
                 .and_then(|v| v.to_str().ok());
-            meter.record(url, header, now_ms());
+            meter.record(url, header, self.now_ms());
         }
     }
 
@@ -367,10 +390,6 @@ impl Http {
             headers,
         })
     }
-}
-
-fn now_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
 }
 
 /// A response head: success, a final failure, or a reason to retry.
