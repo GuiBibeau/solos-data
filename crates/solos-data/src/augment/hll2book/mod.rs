@@ -333,14 +333,24 @@ mod tests {
 
     #[test]
     fn git_sha_is_embedded_by_the_build() {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(env!("CARGO_MANIFEST_DIR"))
+            .args(["rev-parse", "HEAD"])
+            .output();
+        let Ok(output) = output else {
+            eprintln!("skipped: git is unavailable, a source export");
+            return;
+        };
+        if !output.status.success() {
+            eprintln!("skipped: no repository at the crate, a source export");
+            return;
+        }
+        let head = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let sha = git_sha();
-        let in_repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(".git")
-            .exists();
-        let embedded = sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit());
-        assert!(
-            embedded || (sha == "unknown" && !in_repo),
-            "git_sha() is '{sha}': build.rs did not embed the commit of this checkout"
+        assert_eq!(
+            sha, head,
+            "git_sha() is '{sha}' but this checkout is '{head}': build.rs did not embed the commit"
         );
     }
 }
