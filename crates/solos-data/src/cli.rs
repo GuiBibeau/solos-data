@@ -1030,7 +1030,7 @@ fn offline_or_live(
 // ---------------------------------------------------------------------------------------------
 // augment
 
-const AUGMENT_COMMANDS: [(&str, &str); 8] = [
+const AUGMENT_COMMANDS: [(&str, &str); 9] = [
     (
         "sync",
         "Backfill and catch up dated files and paged histories, then exit: [--source name] [--symbol SYM]",
@@ -1055,7 +1055,11 @@ const AUGMENT_COMMANDS: [(&str, &str); 8] = [
     ),
     (
         "hl-l2book",
-        "Offline l2Book hours to Parquet (no download, no collector): --input <dir> --out <root> --checksums <MANIFEST> [--coins BTC,ETH] [--since YYYYMMDD] [--until YYYYMMDD] [--drop-raw-after-verify] [--min-free-tb 1.0] [--threads 4] [--memory 8GB]",
+        "Offline l2Book hours to Parquet (no download, no collector): --input <dir> --out <root> --checksums <MANIFEST> [--coins BTC,ETH] [--since YYYYMMDD] [--until YYYYMMDD] [--drop-raw-after-verify] [--max-ratio 1.0] [--min-free-tb 1.0] [--threads 4] [--memory 8GB]",
+    ),
+    (
+        "hl-l2book-manifest",
+        "Build the sha256 manifest from the downloader TSV and the local bytes (MD5 etag is a gate, never the checksum): --input <dir> --tsv <MANIFEST.tsv.gz> --out <MANIFEST> [--jobs 4]",
     ),
 ];
 
@@ -1084,6 +1088,9 @@ fn augment(args: &[String]) -> i32 {
     if command == "hl-l2book" {
         return hl_l2book_cli(&args[1..]);
     }
+    if command == "hl-l2book-manifest" {
+        return hl_l2book_manifest_cli(&args[1..]);
+    }
     match augment_command(command, args) {
         Ok(code) => code,
         Err(error) => {
@@ -1094,6 +1101,118 @@ fn augment(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+fn hl_l2book_manifest_cli(args: &[String]) -> i32 {
+    if args.is_empty()
+        || args
+            .first()
+            .is_some_and(|arg| arg == "help" || arg == "--help")
+    {
+        println!(
+            "{}",
+            Obj::new()
+                .with(
+                    "command",
+                    "solos-data augment hl-l2book-manifest --input <dir> --tsv <downloader.tsv.gz> --out <MANIFEST> [--jobs 4]"
+                )
+                .with(
+                    "input",
+                    "YYYYMMDD/H/<COIN>.lz4 or market_data/YYYYMMDD/H/l2Book/<COIN>.lz4; .part files are never read"
+                )
+                .with(
+                    "tsv",
+                    "the downloader listing with key, size, and etag columns, gzip or plain; the etag is MD5 and only gates that the local bytes are the object"
+                )
+                .with(
+                    "out",
+                    "the manifest written as '<sha256> <size> <path>' lines, plus a <out>.state.json sidecar for resume; solos-data augment hl-l2book --checksums reads it directly"
+                )
+                .with(
+                    "resume",
+                    "an entry is not re-hashed when the manifest has the path with the same size and the sidecar still records those bytes and an unchanged mtime; writes are temp, fsync, rename, dir fsync"
+                )
+                .with(
+                    "counts",
+                    "present, covered, newlyHashed, reused, skippedPart, mismatched, notInTsv"
+                )
+                .to_json()
+        );
+        return 0;
+    }
+    let input = match flag(args, "--input") {
+        Some(value) => Path::new(value).to_path_buf(),
+        None => {
+            log(
+                "hl_l2book_manifest_failed",
+                Obj::new().with("error", "--input is required"),
+            );
+            return 1;
+        }
+    };
+    let tsv = match flag(args, "--tsv") {
+        Some(value) => Path::new(value).to_path_buf(),
+        None => {
+            log(
+                "hl_l2book_manifest_failed",
+                Obj::new().with("error", "--tsv is required"),
+            );
+            return 1;
+        }
+    };
+    let out = match flag(args, "--out") {
+        Some(value) => Path::new(value).to_path_buf(),
+        None => {
+            log(
+                "hl_l2book_manifest_failed",
+                Obj::new().with("error", "--out is required"),
+            );
+            return 1;
+        }
+    };
+    let jobs = match jobs_flag(args) {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            log(
+                "hl_l2book_manifest_failed",
+                Obj::new().with("error", safe_error(&error.to_string())),
+            );
+            return 1;
+        }
+    };
+    let request = crate::augment::hll2book::manifest::Request {
+        input: &input,
+        tsv: &tsv,
+        out: &out,
+        jobs,
+        fail_after: None,
+    };
+    match crate::augment::hll2book::manifest::run(&request) {
+        Ok(report) => {
+            println!("{}", report.to_json());
+            0
+        }
+        Err(error) => {
+            log(
+                "hl_l2book_manifest_failed",
+                Obj::new().with("error", safe_error(&error.to_string())),
+            );
+            1
+        }
+    }
+}
+
+fn jobs_flag(args: &[String]) -> Result<u32, StoreError> {
+    let Some(text) = flag(args, "--jobs") else {
+        return Ok(4);
+    };
+    let jobs: u32 = text
+        .parse()
+        .map_err(|_| StoreError::Check("--jobs is not an integer".into()))?;
+    if !(1..=256).contains(&jobs) {
+        return Err(StoreError::Check("--jobs must be 1..=256".into()));
+    }
+    Ok(jobs)
 }
 
 fn hl_fills_cli(args: &[String]) -> i32 {
@@ -1158,6 +1277,14 @@ fn hl_l2book_cli(args: &[String]) -> i32 {
                     "drop",
                     "--drop-raw-after-verify deletes the hour's .lz4 only after watermark.json is durable, and writes drops/YYYYMMDD/H.json (path, bytes, sha256, s3). A rerun overwrites that file"
                 )
+                .with(
+                    "maxRatio",
+                    "--max-ratio (default 1.0): an hour whose parquet bytes exceed its lz4 bytes times the ratio is still verified but keeps its raw files (hoursKeptRatio)"
+                )
+                .with(
+                    "jobs",
+                    "--jobs (default 1): hours decoded and staged in parallel. Commit order, the watermark, and raw deletes stay sequential. Each worker opens its own in-memory DuckDB with the same --threads and --memory caps, so the totals multiply"
+                )
                 .to_json()
         );
         return 0;
@@ -1211,6 +1338,9 @@ fn hl_l2book_run(args: &[String]) -> Result<i32, StoreError> {
     let memory = crate::augment::hll2book::parse_memory_limit(
         flag(args, "--memory").unwrap_or(crate::augment::hll2book::DEFAULT_MEMORY),
     )?;
+    let max_ratio =
+        crate::augment::hll2book::parse_ratio(flag(args, "--max-ratio").unwrap_or("1.0"))?;
+    let jobs = jobs_flag(args)?;
     let request = crate::augment::hll2book::Request {
         input: Path::new(required_flag(args, "--input")?),
         out: Path::new(required_flag(args, "--out")?),
@@ -1223,6 +1353,9 @@ fn hl_l2book_run(args: &[String]) -> Result<i32, StoreError> {
         since,
         until,
         drop_raw: has(args, "--drop-raw-after-verify"),
+        max_ratio,
+        jobs,
+        fault: crate::augment::hll2book::Fault::None,
     };
     let report = crate::augment::hll2book::run(&request, filesystem_free)?;
     println!("{}", report.to_json());

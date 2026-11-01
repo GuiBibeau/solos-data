@@ -9,12 +9,16 @@
 mod batch;
 mod checksum;
 mod decode;
+pub mod manifest;
 mod publish;
 
 #[cfg(test)]
 mod behavior;
+#[cfg(test)]
+mod manifest_tests;
 
 pub use batch::{Report, Request, Stop, run};
+pub use publish::Fault;
 
 use serde_json::Value;
 
@@ -42,15 +46,23 @@ pub const DEFAULT_THREADS: u32 = 4;
 /// Default DuckDB memory cap for one hour's sort and write.
 pub const DEFAULT_MEMORY: &str = "8GB";
 
+/// Default ratio guard (ADR-0021): an hour whose Parquet bytes exceed its `.lz4` bytes times
+/// this keeps its raw files even under `--drop-raw-after-verify`.
+pub const DEFAULT_MAX_RATIO: f64 = 1.0;
+
 /// Parquet writer settings for this lane.
 ///
-/// `PARQUET_VERSION 'V2'` is what makes DuckDB 1.4.5 write `BYTE_STREAM_SPLIT` on floats and
-/// `DELTA_BINARY_PACKED` on integers. ZSTD level 9 is the compression that produced the
-/// measured ratio against the `.lz4` bytes. These options are not the decoder's V1 pin
-/// (ADR-0017); this lane does not share that golden hash.
+/// `PARQUET_VERSION 'V1'`: DuckDB 1.4.5 writes `BYTE_STREAM_SPLIT` on the DOUBLE child of a
+/// LIST column under V2, and that page-granular split defeats ZSTD on real book sizes. On the
+/// real 20251001/0 BTC+ETH hour the array file is 1.13x the `.lz4` under V2 and 0.58x under
+/// V1, where `sz` is PLAIN (ZSTD) and `px` keeps its dictionary. `DELTA_BINARY_PACKED` is also
+/// V2-only; `time_ms` is small either way. ZSTD level 16, not 9: the 2023-era hour is the
+/// hardest (its lz4 compresses best) and 16 is what holds it near 0.70x while 9 sits at
+/// 0.75x. These options are not the decoder's V1 pin (ADR-0017); this lane does not share
+/// that golden hash.
 pub const COPY_OPTIONS: &str = concat!(
-    "FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 9, ",
-    "ROW_GROUP_SIZE 122880, PARQUET_VERSION 'V2', WRITE_BLOOM_FILTER true"
+    "FORMAT PARQUET, COMPRESSION ZSTD, COMPRESSION_LEVEL 16, ",
+    "ROW_GROUP_SIZE 122880, PARQUET_VERSION 'V1', WRITE_BLOOM_FILTER true"
 );
 
 /// How many snapshots are re-read from Parquet and compared to the source line.
@@ -139,7 +151,7 @@ pub fn s3_url(date: &str, hour: u32, coin: &str) -> String {
 }
 
 /// Pinned [`config_hash`]. A schema or writer change has to update this on purpose.
-pub const CONFIG_HASH: &str = "8ee22a0a01176a78d3a976d83f528e335cff766cb93474dd2a6a380d8260c442";
+pub const CONFIG_HASH: &str = "2b25aaa389f415966ae6b4192528fb17fbb8ea3976e62bbc4230b09619c0032e";
 
 /// SHA-256 of the writer settings that change row bytes.
 ///
@@ -155,7 +167,8 @@ pub fn config_hash() -> String {
     let body = serde_json::json!({
         "schema": SCHEMA,
         "columns": columns,
-        "sort": ["coin", "time_ms"],
+        "sort": ["coin", "time_ms", "_seq"],
+        "duplicateRule": "identical resend dropped, distinct kept in archive line order",
         "forwardStartSecs": FORWARD_START_SECS,
         "levels": BOOK_LEVELS,
         "decimals": "double",
@@ -170,31 +183,15 @@ fn stable_json(value: &Value) -> String {
     value.to_string()
 }
 
-/// `git rev-parse HEAD`, or `SOLOS_DATA_GIT_SHA` when that is set and non-empty.
+/// The git commit embedded by `build.rs` at build time.
+///
+/// Precedence there: a non-empty `SOLOS_DATA_GIT_SHA` in the build environment (verbatim),
+/// then `git rev-parse HEAD` of the repository, then `unknown` when git is unavailable.
+/// A runtime override is deliberately absent: a receipt names the binary that wrote it, not
+/// the shell that happened to start it.
 #[must_use]
 pub fn git_sha() -> String {
-    if let Ok(value) = std::env::var("SOLOS_DATA_GIT_SHA") {
-        let value = value.trim();
-        if !value.is_empty() {
-            return value.to_owned();
-        }
-    }
-    let Ok(output) = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .output()
-    else {
-        return "unknown".to_owned();
-    };
-    if !output.status.success() {
-        return "unknown".to_owned();
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let text = text.trim();
-    if text.len() == 40 && text.bytes().all(|b| b.is_ascii_hexdigit()) {
-        text.to_owned()
-    } else {
-        "unknown".to_owned()
-    }
+    env!("SOLOS_DATA_GIT_SHA").to_owned()
 }
 
 /// A DuckDB size: digits plus `KB`, `MB`, `GB`, or `TB`.
@@ -264,6 +261,23 @@ pub fn parse_day(value: &str) -> Result<String, crate::store::StoreError> {
     Ok(value.to_owned())
 }
 
+/// `--max-ratio`: a positive, finite ratio.
+///
+/// # Errors
+///
+/// The text is not a number, or it is zero, negative, or not finite.
+pub fn parse_ratio(value: &str) -> Result<f64, crate::store::StoreError> {
+    let parsed: f64 = value.parse().map_err(|_| {
+        crate::store::StoreError::Check(format!("--max-ratio '{value}' is not a number"))
+    })?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(crate::store::StoreError::Check(format!(
+            "--max-ratio {parsed} must be positive and finite"
+        )));
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,5 +321,35 @@ mod tests {
         assert_eq!(parse_day("20261022").unwrap(), "20261022");
         assert!(parse_day("20261301").is_err());
         assert!(parse_day("2026102").is_err());
+        assert_eq!(parse_ratio("1.0").unwrap(), 1.0);
+        assert_eq!(parse_ratio("0.7").unwrap(), 0.7);
+        assert!(parse_ratio("0").is_err());
+        assert!(parse_ratio("-1").is_err());
+        assert!(parse_ratio("inf").is_err());
+        assert!(parse_ratio("nan").is_err());
+        assert!(parse_ratio("half").is_err());
+    }
+
+    #[test]
+    fn git_sha_is_embedded_by_the_build() {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(env!("CARGO_MANIFEST_DIR"))
+            .args(["rev-parse", "HEAD"])
+            .output();
+        let Ok(output) = output else {
+            eprintln!("skipped: git is unavailable, a source export");
+            return;
+        };
+        if !output.status.success() {
+            eprintln!("skipped: no repository at the crate, a source export");
+            return;
+        }
+        let head = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let sha = git_sha();
+        assert_eq!(
+            sha, head,
+            "git_sha() is '{sha}' but this checkout is '{head}': build.rs did not embed the commit"
+        );
     }
 }

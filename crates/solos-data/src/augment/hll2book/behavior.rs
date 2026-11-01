@@ -1,7 +1,7 @@
 //! Behavior of one offline hour: counts, the forward split, checksums, partial files, raw
 //! delete, fsync, and the measured Parquet layout.
 
-use super::publish::seams::CountSeam;
+use super::publish::Fault;
 use super::{FORWARD_START_MS, Report, Request, Stop};
 use crate::jsonout::Obj;
 use serde_json::{Value, json};
@@ -74,6 +74,29 @@ struct Opts {
     coins: Option<BTreeSet<String>>,
     since: Option<String>,
     until: Option<String>,
+    /// Very high here by default so the drop-mechanics tests are not about the ratio guard,
+    /// which has its own both-directions test: a one-snapshot fixture is nearly all Parquet
+    /// overhead and legitimately exceeds 1.0.
+    max_ratio: f64,
+    /// The injected count fault, or none.
+    fault: Fault,
+    /// Hour workers.
+    jobs: u32,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Self {
+            floor: 0,
+            drop_raw: false,
+            coins: None,
+            since: None,
+            until: None,
+            max_ratio: 1e12,
+            fault: Fault::None,
+            jobs: 1,
+        }
+    }
 }
 
 fn run_with(
@@ -95,24 +118,15 @@ fn run_with(
         since: opts.since,
         until: opts.until,
         drop_raw: opts.drop_raw,
+        max_ratio: opts.max_ratio,
+        jobs: opts.jobs,
+        fault: opts.fault,
     };
     super::run(&request, free)
 }
 
 fn run_ok(input: &Path, out: &Path, checksums: &Path) -> Result<Report, crate::store::StoreError> {
-    run_with(
-        input,
-        out,
-        checksums,
-        Opts {
-            floor: 0,
-            drop_raw: false,
-            coins: None,
-            since: None,
-            until: None,
-        },
-        |_| Ok(u64::MAX),
-    )
+    run_with(input, out, checksums, Opts::default(), |_| Ok(u64::MAX))
 }
 
 fn read_rows(path: &Path) -> Vec<Obj> {
@@ -200,7 +214,6 @@ struct Reset;
 
 impl Reset {
     fn arm() -> Self {
-        super::publish::seams::clear_count_seam();
         super::publish::seams::clear_before_receipt();
         super::batch::clear_before_watermark();
         super::batch::clear_drop_fault();
@@ -211,7 +224,6 @@ impl Reset {
 
 impl Drop for Reset {
     fn drop(&mut self) {
-        super::publish::seams::clear_count_seam();
         super::publish::seams::clear_before_receipt();
         super::batch::clear_before_watermark();
         super::batch::clear_drop_fault();
@@ -262,6 +274,155 @@ fn flat_rows_nulls_sort_and_a_rerun_skips() {
     assert_eq!(again.hours_skipped, 1);
     assert_eq!(again.hours_verified, 0);
     assert_eq!(watermark(&out), vec!["20261022/0".to_owned()]);
+}
+
+/// Mutations: delete the `kept_ratio` branch so `--drop-raw-after-verify` always drops; make
+/// `skip_verified` ignore the receipt ratio on the rerun path.
+#[test]
+fn the_ratio_guard_decides_the_drop_in_both_directions() {
+    let root = Tmp::new("ratio-guard");
+    let body = book("BTC", 1_792_627_200_000, 1, "1");
+    let (input, out, sums) = stage_one(&root, &body);
+    let raw = input.join("20261022/0/BTC.lz4");
+    // A one-snapshot hour is nearly all Parquet overhead, so its ratio is far above 1.
+    let under = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            drop_raw: true,
+            max_ratio: 100.0,
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap();
+    assert_eq!(under.hours_verified, 1);
+    assert_eq!(under.hours_kept_ratio, 0, "ratio under the max");
+    assert!(!raw.exists(), "an hour at or under the max drops its raw");
+    assert!(!under.hours[0].kept_ratio);
+    assert!(under.hours[0].ratio.unwrap() > 1.0);
+
+    // Same hour shape, a max the fixture cannot meet: converted and verified, raw kept.
+    std::fs::write(&raw, lz4_frame(body.as_bytes())).unwrap();
+    let out2 = root.0.join("out2");
+    let over = run_with(
+        &input,
+        &out2,
+        &sums,
+        Opts {
+            drop_raw: true,
+            max_ratio: 1.0,
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap();
+    assert_eq!(
+        over.hours_verified, 1,
+        "the hour is still converted and verified"
+    );
+    assert_eq!(
+        over.hours_kept_ratio, 1,
+        "the hour is reported as kept_ratio"
+    );
+    assert!(raw.is_file(), "an hour over the max keeps its raw");
+    assert_eq!(watermark(&out2), vec!["20261022/0".to_owned()]);
+    let receipt: Value = serde_json::from_str(
+        &std::fs::read_to_string(out2.join("receipts/20261022/0.json")).unwrap(),
+    )
+    .unwrap();
+    let lz4 = std::fs::metadata(&raw).unwrap().len();
+    assert_eq!(receipt["lz4_bytes"], lz4);
+    assert!(receipt["parquet_bytes"].as_u64().unwrap() > lz4);
+    let json: Value = serde_json::from_str(&over.to_json()).unwrap();
+    assert_eq!(json["hoursKeptRatio"], 1);
+    assert_eq!(json["hours"][0]["keptRatio"], true);
+    assert_eq!(json["hours"][0]["status"], "verified");
+
+    // A rerun that skips the verified hour keeps honoring the guard.
+    let again = run_with(
+        &input,
+        &out2,
+        &sums,
+        Opts {
+            drop_raw: true,
+            max_ratio: 1.0,
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap();
+    assert_eq!(again.hours_skipped, 1);
+    assert_eq!(again.hours_kept_ratio, 1);
+    assert!(
+        raw.is_file(),
+        "the skip path does not drop a kept-ratio hour"
+    );
+}
+
+/// One input, four lines: an identical re-send is dropped, a distinct book at the same
+/// `time_ms` is kept in archive line order, and the counts reach the report and the receipt.
+#[test]
+fn duplicates_follow_the_duplicate_rule() {
+    let root = Tmp::new("dups");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let time = 1_792_627_200_000_i64;
+    let first = book("BTC", time, 1, "100.0");
+    // The same book re-sent under a later envelope time: dropped, dup_identical.
+    let resend = book("BTC", time, 1, "100.0");
+    // A different book at the same time_ms: kept, dup_distinct.
+    let distinct = book("BTC", time, 1, "101.0");
+    let later = book("BTC", time + 5_000, 1, "102.0");
+    let body = lines(&[first.clone(), resend, distinct.clone(), later.clone()]);
+    let file = write_coin(&input, "20261022", 0, "BTC", &body);
+    let sums = root.0.join("MANIFEST.json");
+    std::fs::write(&sums, manifest(std::slice::from_ref(&file))).unwrap();
+    let report = run_ok(&input, &out, &sums).unwrap();
+    assert_eq!(report.hours_verified, 1);
+    assert_eq!(report.rows, 3, "3 of 4 lines are kept rows");
+    assert_eq!(report.dup_identical, 1);
+    assert_eq!(report.dup_distinct, 1);
+    let path = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+    // No ORDER BY: the physical file order is the deterministic (coin, time_ms, _seq) order.
+    let conn = crate::store::memory_connection("1", "512MB").unwrap();
+    let in_order = crate::store::query_rows(
+        &conn,
+        &format!(
+            "SELECT bid_px[1] AS px FROM read_parquet({})",
+            crate::store::sql_string(&path.to_string_lossy())
+        ),
+        &[],
+    )
+    .unwrap();
+    let prices: Vec<f64> = in_order
+        .iter()
+        .map(|row| row.get("px").and_then(|v| v.as_f64()).unwrap_or(f64::NAN))
+        .collect();
+    assert_eq!(prices, vec![100.0, 101.0, 102.0], "archive line order");
+    let receipt: Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("receipts/20261022/0.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["input_snapshots"], 4);
+    assert_eq!(receipt["output_rows"], 3);
+    assert_eq!(receipt["dup_identical"], 1);
+    assert_eq!(receipt["dup_distinct"], 1);
+    // The identical re-send can also repeat a book kept earlier in the same hour.
+    let again = write_coin(
+        &input,
+        "20261022",
+        0,
+        "BTC",
+        &lines(&[first.clone(), distinct, first, later]),
+    );
+    let out2 = root.0.join("out2");
+    std::fs::write(&sums, manifest(std::slice::from_ref(&again))).unwrap();
+    let report = run_ok(&input, &out2, &sums).unwrap();
+    assert_eq!(report.rows, 3);
+    assert_eq!(report.dup_identical, 1, "a repeat of the first book");
+    assert_eq!(report.dup_distinct, 1);
 }
 
 /// Mutation: change `>=` in `Corpus::of_time_ms` to `>`.
@@ -319,9 +480,56 @@ fn decimal_strings_round_trip_as_identical_f64_bits() {
     );
 }
 
-/// Mutation: replace the missing-checksum `return Err` with `continue`.
+/// The archive line order of tied rows is the output order, not any value order. The books
+/// at one `time_ms` arrive as 300, 100, 200 and must come back out in exactly that order.
+/// DuckDB keeps input order for ties at this scale by accident of its sort, so the sort key
+/// itself is pinned separately in publish::tests.
 #[test]
-fn an_hour_missing_from_the_manifest_fails_the_hour() {
+fn tied_distinct_books_keep_the_archive_line_order_not_a_value_order() {
+    let root = Tmp::new("tie-order");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let time = 1_792_627_200_000_i64;
+    let rows = [
+        book("BTC", time, 1, "300.0"),
+        book("BTC", time, 1, "100.0"),
+        book("BTC", time, 1, "200.0"),
+        book("BTC", time + 5_000, 1, "150.0"),
+    ]
+    .map(String::from)
+    .to_vec();
+    let file = write_coin(&input, "20261022", 0, "BTC", &lines(&rows));
+    let sums = root.0.join("MANIFEST.json");
+    std::fs::write(&sums, manifest(std::slice::from_ref(&file))).unwrap();
+    let report = run_ok(&input, &out, &sums).unwrap();
+    assert_eq!(report.rows, 4);
+    assert_eq!(report.dup_distinct, 2, "two extra books at one time_ms");
+    let path = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+    // No ORDER BY: physical file order is the deterministic (coin, time_ms, _seq) order.
+    let conn = crate::store::memory_connection("1", "512MB").unwrap();
+    let found = crate::store::query_rows(
+        &conn,
+        &format!(
+            "SELECT bid_px[1] AS px FROM read_parquet({})",
+            crate::store::sql_string(&path.to_string_lossy())
+        ),
+        &[],
+    )
+    .unwrap();
+    let prices: Vec<f64> = found
+        .iter()
+        .map(|row| row.get("px").and_then(|v| v.as_f64()).unwrap_or(f64::NAN))
+        .collect();
+    assert_eq!(
+        prices,
+        vec![300.0, 100.0, 200.0, 150.0],
+        "the tied books must keep their arrival order, not a value order"
+    );
+}
+
+/// Mutation: replace the `uncovered.contains` skip with the old `no checksum` abort.
+#[test]
+fn an_hour_with_an_uncovered_file_is_pending_not_an_abort() {
     let root = Tmp::new("no-sum");
     let input = root.0.join("in");
     let out = root.0.join("out");
@@ -332,6 +540,7 @@ fn an_hour_missing_from_the_manifest_fails_the_hour() {
         "BTC",
         &book("BTC", 1_792_627_200_000, 1, "1"),
     );
+    // ETH's finished .lz4 is on disk and in scope, but the manifest has no row for it.
     let _missing = write_coin(
         &input,
         "20261022",
@@ -341,15 +550,92 @@ fn an_hour_missing_from_the_manifest_fails_the_hour() {
     );
     let sums = root.0.join("MANIFEST.json");
     std::fs::write(&sums, manifest(&[listed])).unwrap();
-    let error = run_ok(&input, &out, &sums).unwrap_err();
+    let report = run_ok(&input, &out, &sums).unwrap();
+    assert_eq!(report.stop, Stop::Done);
+    assert_eq!(report.hours_uncovered, 1);
+    assert_eq!(report.hours_pending, 1);
+    assert_eq!(report.hours_verified, 1, "the covered hour still converts");
+    assert_eq!(watermark(&out), vec!["20261022/1".to_owned()]);
     assert!(
-        error.to_string().contains("20261022/0/ETH: no checksum"),
-        "{error}"
+        input.join("20261022/0/ETH.lz4").is_file(),
+        "an uncovered raw file is never touched"
     );
     assert!(
-        watermark(&out).is_empty(),
-        "a missing checksum must not be skipped"
+        !out.join("train/date=2026-10-22/hour=20261022-0.parquet")
+            .exists(),
+        "the uncovered hour stays pending, half-converted"
     );
+    assert_eq!(report.exit_code(), 0, "pending is not a failure");
+}
+
+/// Mutation: replace the `uncovered.contains(&hour.key)` skip in the task loop with `if
+/// false`. A mixed hour (one covered coin, one uncovered coin on disk) must stay pending at
+/// any job count, and no raw file of it may be deleted.
+#[test]
+fn a_mixed_hour_with_an_uncovered_coin_stays_pending_at_any_jobs() {
+    for jobs in [1, 4] {
+        let root = Tmp::new(&format!("mixed-{jobs}"));
+        let input = root.0.join("in");
+        let out = root.0.join("out");
+        // BTC is in the manifest; ETH is finished on disk with no manifest row.
+        let btc = write_coin(
+            &input,
+            "20261022",
+            0,
+            "BTC",
+            &book("BTC", 1_792_627_200_000, 1, "1"),
+        );
+        let _eth = write_coin(
+            &input,
+            "20261022",
+            0,
+            "ETH",
+            &book("ETH", 1_792_627_205_000, 1, "2"),
+        );
+        let sums = root.0.join("MANIFEST.json");
+        std::fs::write(&sums, manifest(std::slice::from_ref(&btc))).unwrap();
+        let report = run_with(
+            &input,
+            &out,
+            &sums,
+            Opts {
+                drop_raw: true,
+                jobs,
+                ..Opts::default()
+            },
+            |_| Ok(u64::MAX),
+        )
+        .unwrap();
+        assert_eq!(jobs, report.jobs, "the run used the requested workers");
+        assert_eq!(report.hours_pending, 1, "jobs={jobs}");
+        assert_eq!(report.hours_uncovered, 1, "jobs={jobs}");
+        assert_eq!(
+            report.hours_verified, 0,
+            "jobs={jobs}: half-converted is not verified"
+        );
+        assert_eq!(report.hours_skipped, 0, "jobs={jobs}");
+        assert!(
+            watermark(&out).is_empty(),
+            "jobs={jobs}: the watermark moved for a pending hour"
+        );
+        assert!(
+            input.join("20261022/0/BTC.lz4").is_file(),
+            "jobs={jobs}: the covered coin's raw was deleted from a pending hour"
+        );
+        assert!(
+            input.join("20261022/0/ETH.lz4").is_file(),
+            "jobs={jobs}: the uncovered coin's raw was touched"
+        );
+        assert!(
+            !out.join("drops/20261022/0.json").is_file(),
+            "jobs={jobs}: a drop record exists for a pending hour"
+        );
+        assert!(
+            !out.join("train/date=2026-10-22/hour=20261022-0.parquet")
+                .exists(),
+            "jobs={jobs}: the pending hour was written anyway"
+        );
+    }
 }
 
 /// Mutation: delete the `--checksums` is-file check so a missing manifest is an IO error.
@@ -436,20 +722,29 @@ fn a_partial_input_file_is_not_processed() {
 /// delete `rows != file.rows` (Staged).
 #[test]
 fn a_short_write_fails_each_count_guard_without_a_watermark() {
-    for seam in [CountSeam::Line, CountSeam::Hour, CountSeam::Staged] {
+    for fault in [Fault::Line, Fault::Hour, Fault::Staged] {
         let _reset = Reset::arm();
-        super::publish::seams::set_count_seam(seam);
         let root = Tmp::new("short");
         let (input, out, sums) = stage_one(&root, &book("BTC", 1_792_627_200_000, 1, "1"));
-        let error = run_ok(&input, &out, &sums).unwrap_err();
+        let error = run_with(
+            &input,
+            &out,
+            &sums,
+            Opts {
+                fault,
+                ..Opts::default()
+            },
+            |_| Ok(u64::MAX),
+        )
+        .unwrap_err();
         let message = error.to_string();
-        match seam {
-            CountSeam::Line => assert!(message.contains("line "), "{seam:?}: {message}"),
-            CountSeam::Hour => assert!(message.contains("hour total"), "{seam:?}: {message}"),
-            CountSeam::Staged => assert!(message.contains("staged"), "{seam:?}: {message}"),
+        match fault {
+            Fault::Line => assert!(message.contains("line "), "{fault:?}: {message}"),
+            Fault::Hour => assert!(message.contains("hour kept"), "{fault:?}: {message}"),
+            Fault::Staged => assert!(message.contains("staged"), "{fault:?}: {message}"),
             _ => unreachable!(),
         }
-        assert!(watermark(&out).is_empty(), "{seam:?}: watermark moved");
+        assert!(watermark(&out).is_empty(), "{fault:?}: watermark moved");
     }
 }
 
@@ -457,10 +752,19 @@ fn a_short_write_fails_each_count_guard_without_a_watermark() {
 #[test]
 fn a_per_file_count_mismatch_fails_the_hour() {
     let _reset = Reset::arm();
-    super::publish::seams::set_count_seam(CountSeam::PerFile);
     let root = Tmp::new("per-file");
     let (input, out, sums) = stage_one(&root, &book("BTC", 1_792_627_200_000, 1, "1"));
-    let error = run_ok(&input, &out, &sums).unwrap_err();
+    let error = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            fault: Fault::PerFile,
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("file snapshots"), "{}", error);
     assert!(watermark(&out).is_empty());
 }
@@ -469,10 +773,19 @@ fn a_per_file_count_mismatch_fails_the_hour() {
 #[test]
 fn a_sample_value_mismatch_fails_the_hour() {
     let _reset = Reset::arm();
-    super::publish::seams::set_count_seam(CountSeam::Sample);
     let root = Tmp::new("sample");
     let (input, out, sums) = stage_one(&root, &book("BTC", 1_792_627_200_000, 1, "4.5"));
-    let error = run_ok(&input, &out, &sums).unwrap_err();
+    let error = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            fault: Fault::Sample,
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("sample mismatch"), "{error}");
     assert!(watermark(&out).is_empty());
 }
@@ -570,11 +883,8 @@ fn drop_raw_waits_until_the_watermark_is_durable() {
         &out,
         &sums,
         Opts {
-            floor: 0,
             drop_raw: true,
-            coins: None,
-            since: None,
-            until: None,
+            ..Opts::default()
         },
         |_| Ok(u64::MAX),
     )
@@ -592,11 +902,8 @@ fn drop_raw_waits_until_the_watermark_is_durable() {
         &out,
         &sums,
         Opts {
-            floor: 0,
             drop_raw: true,
-            coins: None,
-            since: None,
-            until: None,
+            ..Opts::default()
         },
         |_| Ok(u64::MAX),
     )
@@ -650,11 +957,8 @@ fn drop_raw_refuses_a_link_outside_the_input_dir() {
         &out,
         &sums,
         Opts {
-            floor: 0,
             drop_raw: true,
-            coins: None,
-            since: None,
-            until: None,
+            ..Opts::default()
         },
         |_| Ok(u64::MAX),
     )
@@ -732,10 +1036,7 @@ fn disk_floor_stops_between_hours() {
         &sums,
         Opts {
             floor: u64::MAX,
-            drop_raw: false,
-            coins: None,
-            since: None,
-            until: None,
+            ..Opts::default()
         },
         |_| Ok(0),
     )
@@ -750,10 +1051,7 @@ fn disk_floor_stops_between_hours() {
         &sums,
         Opts {
             floor: 1_000,
-            drop_raw: false,
-            coins: None,
-            since: None,
-            until: None,
+            ..Opts::default()
         },
         |_| {
             calls += 1;
@@ -805,11 +1103,10 @@ fn coins_and_dates_filter_the_hours() {
         &out,
         &sums,
         Opts {
-            floor: 0,
-            drop_raw: false,
             coins: Some(coins),
             since: Some("20261022".into()),
             until: Some("20261022".into()),
+            ..Opts::default()
         },
         |_| Ok(u64::MAX),
     )
@@ -826,8 +1123,13 @@ fn coins_and_dates_filter_the_hours() {
     );
 }
 
+/// The layout and encoding pin, on the fixture and against the alternative flat layout.
+/// On real hours (ADR-0021) this layout under `PARQUET_VERSION 'V1'` measures 0.58x of the
+/// `.lz4`; V2's `BYTE_STREAM_SPLIT` on the array child measures 1.13x, and 120 flat columns
+/// measure 0.81x. This test pins the encoding DuckDB must pick (`px` dictionary, ZSTD) and
+/// that the arrays stay at or below the flat-column file of the same rows.
 #[test]
-fn side_arrays_are_smaller_than_flat_columns_and_the_lz4() {
+fn side_arrays_with_v1_dictionaries_beat_the_flat_columns_and_the_lz4() {
     let root = Tmp::new("ratio");
     let mut rows = Vec::new();
     for i in 0..720 {
@@ -944,17 +1246,13 @@ fn side_arrays_are_smaller_than_flat_columns_and_the_lz4() {
             )
         })
         .collect();
+    // V1 has no BYTE_STREAM_SPLIT. That encoding on the array child is what made real
+    // hours larger than the lz4 (1.13x under V2, 0.58x under V1); which encoding DuckDB
+    // picks for a column is data-dependent (dictionary when prices repeat, PLAIN when they
+    // do not, as on this smooth walk), so the pin is its absence, plus ZSTD compression.
     assert!(
-        encoded("bid_px", "BYTE_STREAM_SPLIT"),
-        "bid_px encodings {paths:?}"
-    );
-    assert!(
-        encoded("ask_px", "BYTE_STREAM_SPLIT"),
-        "ask_px encodings {paths:?}"
-    );
-    assert!(
-        encoded("time_ms", "DELTA_BINARY_PACKED"),
-        "time_ms encodings {paths:?}"
+        !encoded("", "BYTE_STREAM_SPLIT"),
+        "V2 byte-stream-split on the array child is what made real hours larger than the lz4: {paths:?}"
     );
     let compression = meta
         .iter()
@@ -969,11 +1267,9 @@ fn side_arrays_are_smaller_than_flat_columns_and_the_lz4() {
 
 fn drop_opts() -> Opts {
     Opts {
-        floor: 0,
         drop_raw: true,
-        coins: None,
-        since: None,
-        until: None,
+        max_ratio: 1000.0,
+        ..Opts::default()
     }
 }
 
@@ -1091,6 +1387,28 @@ fn a_crash_mid_drop_retries_and_keeps_the_drop_record() {
     assert!(!input.join("20261022/0/ETH.lz4").exists());
     let value: Value = serde_json::from_str(&std::fs::read_to_string(&record).unwrap()).unwrap();
     assert_eq!(value["files"].as_array().unwrap().len(), 2);
+}
+
+/// Mutations: delete the parent-directory fsync loop after the raw unlinks in `drop_raw`.
+/// The last fsync of a clean drop run must be the input directory the files were unlinked
+/// from, not the drop record's directory.
+#[test]
+fn the_raw_unlink_dirs_are_fsynced() {
+    let _reset = Reset::arm();
+    let root = Tmp::new("drop-fsync");
+    let (input, out, sums) = stage_pair(&root);
+    run_ok(&input, &out, &sums).unwrap();
+    let dropped = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(dropped.hours_verified + dropped.hours_skipped, 1);
+    assert!(!input.join("20261022/0/BTC.lz4").exists());
+    let last = crate::fsutil::last_fsync_path().expect("the drop ran fsyncs");
+    assert!(
+        last.starts_with(&input),
+        "the last fsync was {} and left the unlink un-durable",
+        last.display()
+    );
+    let again = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(again.stop, Stop::Done);
 }
 
 /// Mutation: delete the `LockExclusiveNonblock` arm that returns "already owned".

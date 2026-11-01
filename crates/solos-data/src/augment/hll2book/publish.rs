@@ -5,7 +5,7 @@
 //! watermark alone. The caller writes the watermark after this returns, and only then may
 //! delete raw inputs.
 
-use super::decode::{self, Snapshot};
+use super::decode::{self, DuplicateRule, Snapshot};
 use super::{
     BOOK_LEVELS, COPY_OPTIONS, Corpus, FORWARD_START_MS, SAMPLE_CAP, SCHEMA, column_specs,
     output_relative, utc_date,
@@ -33,6 +33,26 @@ pub struct FileBytes<'a> {
     pub bytes: &'a [u8],
 }
 
+/// An injected count fault for the guard tests (ADR-0021 verification). It rides the job, so
+/// a worker thread reads no shared state and one test's fault cannot touch another's run.
+/// Production always passes [`Fault::None`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Fault {
+    /// No fault: the normal path.
+    #[default]
+    None,
+    /// Drop the decoded row before the per-line length check.
+    Line,
+    /// Count a snapshot that is never staged.
+    Hour,
+    /// Report one more staged row than the JSONL contains.
+    Staged,
+    /// Stage the row under a different coin than the file tally.
+    PerFile,
+    /// Change a sampled price after the sample is recorded.
+    Sample,
+}
+
 /// What the batch asked to publish.
 pub struct HourJob<'a> {
     /// `YYYYMMDD/H`.
@@ -43,6 +63,8 @@ pub struct HourJob<'a> {
     pub git_sha: &'a str,
     /// [`super::config_hash`].
     pub config_hash: &'a str,
+    /// Injected fault for the count-guard tests.
+    pub fault: Fault,
 }
 
 /// One sealed Parquet file, paths relative to the output root.
@@ -69,17 +91,26 @@ pub struct InputFile {
     pub sha256: String,
     /// Byte size.
     pub bytes: u64,
-    /// Snapshots counted in the file.
+    /// Rows kept from the file: identical re-sends excluded, distinct duplicates included.
     pub snapshots: u64,
 }
 
 /// What one verified hour wrote.
 #[derive(Clone, Debug)]
 pub struct HourOutput {
-    /// Independent snapshot count.
+    /// Independent snapshot count of every line, duplicates included.
     pub input_snapshots: u64,
-    /// Rows read back from Parquet.
+    /// Rows read back from Parquet: kept rows, identical re-sends excluded.
     pub output_rows: u64,
+    /// Re-sends with an identical book (same coin, `time_ms` and levels; `recv_time_ms`
+    /// ignored, so not byte identity) dropped by [`DuplicateRule`] (`dup_identical`).
+    pub dup_identical: u64,
+    /// Extra rows kept for a distinct book at a repeated `time_ms` (`dup_distinct`).
+    pub dup_distinct: u64,
+    /// Sum of the hour's `.lz4` input bytes (the ratio guard's denominator).
+    pub lz4_bytes: u64,
+    /// Sum of the hour's Parquet output bytes (the ratio guard's numerator).
+    pub parquet_bytes: u64,
     /// Inputs the receipt recorded.
     pub inputs: Vec<InputFile>,
 }
@@ -93,10 +124,19 @@ pub struct Receipt {
     pub hour: String,
     /// SHA-256 of the sorted `coin sha256` lines. Resume compares this, not a single file.
     pub input_sha256: String,
-    /// Independent snapshot count.
+    /// Independent snapshot count of every line, duplicates included.
     pub input_snapshots: u64,
-    /// Rows read back from Parquet.
+    /// Rows read back from Parquet: kept rows, identical re-sends excluded.
     pub output_rows: u64,
+    /// Re-sends with an identical book (same coin, `time_ms` and levels; `recv_time_ms`
+    /// ignored, so not byte identity) dropped by [`DuplicateRule`] (`dup_identical`).
+    pub dup_identical: u64,
+    /// Extra rows kept for a distinct book at a repeated `time_ms` (`dup_distinct`).
+    pub dup_distinct: u64,
+    /// Sum of the hour's `.lz4` input bytes (the ratio guard's denominator).
+    pub lz4_bytes: u64,
+    /// Sum of the hour's Parquet output bytes (the ratio guard's numerator).
+    pub parquet_bytes: u64,
     /// Rows under `train/`.
     pub train_rows: u64,
     /// Rows under `forward/`.
@@ -111,31 +151,33 @@ pub struct Receipt {
     pub config_hash: String,
 }
 
-/// Decode `job` and seal its Parquet files.
+/// Decode `job`, stage its Parquet files, and run every check that can read a temporary.
+///
+/// Nothing final is touched: the hour's files stay `.tmp` siblings of their final paths, and
+/// [`Prepared`] deletes them and the staging directory when it is dropped without
+/// [`seal_hour`]. A worker thread may call this concurrently with other hours; the commit
+/// order is the caller's.
 ///
 /// # Errors
 ///
 /// A frame is short or corrupt, a line does not parse, a count or sample check fails, or a
-/// sealed file fails a range check. No final path is replaced in those cases unless a rename
-/// itself fails after an earlier rename in the same hour; the watermark is still not moved.
-pub fn publish_hour(
+/// staged file fails a range check.
+pub fn prepare_hour(
     conn: &Connection,
     out: &Path,
     job: &HourJob<'_>,
-) -> Result<HourOutput, StoreError> {
+    settings: &WriterSettings,
+) -> Result<Prepared, StoreError> {
     let staging = out.join(".staging").join(job.hour_key.replace('/', "-"));
     let _ = std::fs::remove_dir_all(&staging);
     create_dir_all_durable(&staging)?;
     let cleaner = DirClean(staging.clone());
-    let mut spill = Spill::new(staging);
+    let mut spill = Spill::new(staging.clone());
     let mut samples = Vec::new();
     let mut tallies = BTreeMap::new();
-    let input_snapshots = stream_hour(job.files, &mut spill, &mut samples, &mut tallies)?;
-    let parts = spill.finish()?;
-    #[cfg(test)]
-    let mut parts = parts;
-    #[cfg(test)]
-    if seams::take_if(seams::CountSeam::Staged)
+    let streamed = stream_hour(job.files, &mut spill, &mut samples, &mut tallies, job.fault)?;
+    let mut parts = spill.finish()?;
+    if job.fault == Fault::Staged
         && let Some(part) = parts.first_mut()
     {
         part.rows = part.rows.saturating_add(1);
@@ -148,17 +190,99 @@ pub fn publish_hour(
     for file in &pending {
         output_rows += check_tmp(conn, file)?;
     }
-    if output_rows != input_snapshots {
+    if output_rows != streamed.written {
         drop_tmps(&pending);
         return Err(StoreError::Check(format!(
-            "hour total {input_snapshots} != parquet rows {output_rows}"
+            "hour kept {} rows != parquet rows {output_rows}",
+            streamed.written
+        )));
+    }
+    // Every line the independent count saw is either kept or was an identical re-send.
+    if streamed.counted != streamed.written + streamed.dup_identical {
+        drop_tmps(&pending);
+        return Err(StoreError::Check(format!(
+            "snapshot count {} != kept {} + identical re-sends {}",
+            streamed.counted, streamed.written, streamed.dup_identical
         )));
     }
     check_coins(conn, &pending, &tallies)?;
     check_samples(conn, &pending, &samples)?;
-    let outputs = rename_all(&pending)?;
+    let inputs = input_files(job, &tallies);
     drop(cleaner);
-    let stale = stale_paths(out, job.hour_key, &outputs);
+    Ok(Prepared {
+        hour_key: job.hour_key.to_owned(),
+        git_sha: job.git_sha.to_owned(),
+        config_hash: job.config_hash.to_owned(),
+        pending,
+        staging,
+        input_snapshots: streamed.counted,
+        output_rows,
+        dup_identical: streamed.dup_identical,
+        dup_distinct: streamed.dup_distinct,
+        lz4_bytes: inputs.iter().map(|file| file.bytes).sum(),
+        train_rows: parts.iter().map(|part| part.train_rows).sum(),
+        forward_rows: parts.iter().map(|part| part.forward_rows).sum(),
+        inputs,
+        threads: settings.threads.clone(),
+        memory_limit: settings.memory_limit.clone(),
+    })
+}
+
+/// One hour staged by [`prepare_hour`], waiting for its ordered commit.
+pub struct Prepared {
+    /// `YYYYMMDD/H`.
+    pub hour_key: String,
+    /// Receipt field.
+    pub git_sha: String,
+    /// Receipt field.
+    pub config_hash: String,
+    /// Staged `.tmp` files, one per output.
+    pub pending: Vec<Pending>,
+    /// The staging directory of this hour, removed when this is dropped unsealed.
+    pub staging: PathBuf,
+    /// Independent snapshot count of every line, duplicates included.
+    pub input_snapshots: u64,
+    /// Rows read back from Parquet.
+    pub output_rows: u64,
+    /// Identical re-sends dropped by [`DuplicateRule`].
+    pub dup_identical: u64,
+    /// Extra rows kept for a distinct book at a repeated `time_ms`.
+    pub dup_distinct: u64,
+    /// Sum of the hour's `.lz4` input bytes.
+    pub lz4_bytes: u64,
+    /// Rows under `train/`.
+    pub train_rows: u64,
+    /// Rows under `forward/`.
+    pub forward_rows: u64,
+    /// The coin files this hour verified.
+    pub inputs: Vec<InputFile>,
+    /// `threads` of the connection that staged the hour, for the run report.
+    pub threads: String,
+    /// `memory_limit` of the connection that staged the hour, for the run report.
+    pub memory_limit: String,
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.staging);
+        for file in &self.pending {
+            let _ = std::fs::remove_file(&file.tmp);
+        }
+    }
+}
+
+/// Seal one prepared hour: fsync, rename, hash, stale cleanup, then the durable receipt.
+/// This is the ordered commit step; the caller writes the watermark after it returns.
+///
+/// # Errors
+///
+/// A rename or its directory fsync fails, the sealed file cannot be hashed, or the receipt
+/// cannot be written. A rename failure after an earlier rename in the same hour leaves that
+/// earlier file in place; the watermark is still not moved.
+pub fn seal_hour(out: &Path, prepared: Prepared) -> Result<HourOutput, StoreError> {
+    let mut prepared = prepared;
+    let outputs = rename_all(&prepared.pending)?;
+    let stale = stale_paths(out, &prepared.hour_key, &outputs);
     for relative in stale {
         let path = under_out(out, &relative)?;
         if path.is_file() {
@@ -168,26 +292,36 @@ pub fn publish_hour(
             }
         }
     }
-    let inputs = input_files(job, &tallies);
     let receipt = Receipt {
         schema: SCHEMA.to_owned(),
-        hour: job.hour_key.to_owned(),
-        input_sha256: input_identity(&inputs),
-        input_snapshots,
+        hour: prepared.hour_key.clone(),
+        input_sha256: input_identity(&prepared.inputs),
+        input_snapshots: prepared.input_snapshots,
         output_rows: outputs.iter().map(|file| file.rows).sum(),
-        train_rows: parts.iter().map(|part| part.train_rows).sum(),
-        forward_rows: parts.iter().map(|part| part.forward_rows).sum(),
+        dup_identical: prepared.dup_identical,
+        dup_distinct: prepared.dup_distinct,
+        lz4_bytes: prepared.lz4_bytes,
+        parquet_bytes: outputs.iter().map(|file| file.bytes).sum(),
+        train_rows: prepared.train_rows,
+        forward_rows: prepared.forward_rows,
         outputs: outputs.clone(),
-        inputs: inputs.clone(),
-        git_sha: job.git_sha.to_owned(),
-        config_hash: job.config_hash.to_owned(),
+        inputs: prepared.inputs.clone(),
+        git_sha: prepared.git_sha.clone(),
+        config_hash: prepared.config_hash.clone(),
     };
     #[cfg(test)]
     seams::fire_before_receipt();
     write_receipt(out, &receipt)?;
+    prepared.pending.clear();
+    let _ = std::fs::remove_dir_all(&prepared.staging);
+    let inputs = std::mem::take(&mut prepared.inputs);
     Ok(HourOutput {
-        input_snapshots,
-        output_rows,
+        input_snapshots: prepared.input_snapshots,
+        output_rows: prepared.output_rows,
+        dup_identical: prepared.dup_identical,
+        dup_distinct: prepared.dup_distinct,
+        lz4_bytes: prepared.lz4_bytes,
+        parquet_bytes: outputs.iter().map(|file| file.bytes).sum(),
         inputs,
     })
 }
@@ -224,16 +358,38 @@ impl Drop for DirClean {
     }
 }
 
+/// What streaming one hour produced.
+struct Streamed {
+    /// Lines the independent count saw, duplicates included.
+    counted: u64,
+    /// Rows staged for Parquet.
+    written: u64,
+    /// Identical re-sends dropped by [`DuplicateRule`].
+    dup_identical: u64,
+    /// Extra rows kept for a distinct book at a repeated `time_ms`.
+    dup_distinct: u64,
+}
+
 fn stream_hour(
     files: &[FileBytes<'_>],
     spill: &mut Spill,
     samples: &mut Vec<Snapshot>,
     tallies: &mut BTreeMap<String, u64>,
-) -> Result<u64, StoreError> {
+    fault: Fault,
+) -> Result<Streamed, StoreError> {
     let mut counted = 0u64;
     let mut written = 0u64;
-    let mut seen = BTreeSet::new();
+    let mut dup_identical = 0u64;
+    let mut dup_distinct = 0u64;
+    // One file per coin per hour, so the duplicate state is per file keyed by `time_ms`
+    // alone: no per-row String key, and clearing between files cannot merge two coins. A
+    // later line that repeats a kept digest is an identical re-send and is dropped; a new
+    // digest is a distinct book and is kept. DuplicateRule never fails the hour.
+    let mut seen: std::collections::HashMap<i64, Vec<[u8; 32]>> = std::collections::HashMap::new();
+    let mut tally: u64 = 0;
+    let mut fault_fired = false;
     for file in files {
+        seen.clear();
         if !file.bytes.starts_with(&crate::augment::hls3::LZ4_MAGIC) {
             return Err(StoreError::Check(format!(
                 "{}: lz4: not an lz4 frame",
@@ -254,11 +410,9 @@ fn stream_hour(
                 .map_err(|e| StoreError::Check(format!("{} line {}: {e}", file.coin, index + 1)))?;
             let snapshot = decode::snapshot_of_line(line, file.coin)
                 .map_err(|e| StoreError::Check(format!("{} line {}: {e}", file.coin, index + 1)))?;
-            let rows = vec![snapshot];
-            #[cfg(test)]
-            let mut rows = rows;
-            #[cfg(test)]
-            if seams::take_if(seams::CountSeam::Line) {
+            let mut rows = vec![snapshot];
+            if fault == Fault::Line && !fault_fired {
+                fault_fired = true;
                 rows.pop();
             }
             let got =
@@ -271,51 +425,61 @@ fn stream_hour(
                 )));
             }
             for row in rows {
-                if !seen.insert((row.coin.clone(), row.time_ms)) {
-                    return Err(StoreError::Check(format!(
-                        "{} {} duplicate time_ms",
-                        row.coin, row.time_ms
-                    )));
+                counted += 1;
+                let digest = decode::book_digest(&row);
+                let kept = seen.entry(row.time_ms).or_default();
+                if !kept.is_empty() {
+                    match DuplicateRule::classify(kept, &digest) {
+                        DuplicateRule::Identical => {
+                            dup_identical += 1;
+                            continue;
+                        }
+                        DuplicateRule::Distinct => dup_distinct += 1,
+                    }
                 }
-                *tallies.entry(file.coin.to_owned()).or_default() += 1;
-                #[cfg(test)]
-                if seams::take_if(seams::CountSeam::Hour) {
+                kept.push(digest);
+                tally += 1;
+                if fault == Fault::Hour && !fault_fired {
+                    fault_fired = true;
                     written += 1;
                     continue;
                 }
                 consider_sample(samples, &row, written);
-                let row = stage_mutation(row);
-                spill.write(&row)?;
+                let row = stage_mutation(row, fault, &mut fault_fired);
+                spill.write(&row, written)?;
                 written += 1;
             }
-            counted += events;
         }
+        tallies.insert(file.coin.to_owned(), tally);
+        tally = 0;
     }
-    if counted != written {
+    if counted != written + dup_identical {
         return Err(StoreError::Check(format!(
-            "snapshot count {counted} diverged from {written} rows"
+            "snapshot count {counted} diverged from {written} rows + {dup_identical} identical re-sends"
         )));
     }
-    Ok(counted)
+    Ok(Streamed {
+        counted,
+        written,
+        dup_identical,
+        dup_distinct,
+    })
 }
 
-/// Test seams that change the staged row after the sample and the file tally are recorded.
-#[cfg(test)]
-fn stage_mutation(mut row: Snapshot) -> Snapshot {
-    if seams::take_if(seams::CountSeam::PerFile) {
+/// Apply the staged-row faults after the sample and the file tally are recorded. Each fires
+/// once, exactly where the shared seam used to.
+fn stage_mutation(mut row: Snapshot, fault: Fault, fired: &mut bool) -> Snapshot {
+    if fault == Fault::PerFile && !*fired {
+        *fired = true;
         row.coin = "mutated".to_owned();
     }
-    if seams::take_if(seams::CountSeam::Sample) {
+    if fault == Fault::Sample && !*fired {
+        *fired = true;
         row.bid_px[0] = Some(match row.bid_px[0] {
             Some(0.0) => 1.0,
             _ => 0.0,
         });
     }
-    row
-}
-
-#[cfg(not(test))]
-fn stage_mutation(row: Snapshot) -> Snapshot {
     row
 }
 
@@ -367,7 +531,7 @@ impl Spill {
         }
     }
 
-    fn write(&mut self, row: &Snapshot) -> Result<(), StoreError> {
+    fn write(&mut self, row: &Snapshot, seq: u64) -> Result<(), StoreError> {
         let date = utc_date(row.time_ms)
             .ok_or_else(|| StoreError::Check("time is out of range".into()))?;
         let corpus = Corpus::of_time_ms(row.time_ms);
@@ -389,8 +553,8 @@ impl Spill {
             .files
             .get_mut(&(corpus, date))
             .ok_or_else(|| StoreError::Check("spill file missing".into()))?;
-        let line =
-            decode::snapshot_line(row).map_err(|e| StoreError::Check(format!("row json: {e}")))?;
+        let line = decode::snapshot_line(row, seq)
+            .map_err(|e| StoreError::Check(format!("row json: {e}")))?;
         std::io::Write::write_all(&mut entry.writer, &line)?;
         entry.rows += 1;
         match corpus {
@@ -417,7 +581,7 @@ impl Spill {
     }
 }
 
-struct Pending {
+pub struct Pending {
     tmp: PathBuf,
     final_path: PathBuf,
     relative: String,
@@ -439,11 +603,7 @@ fn write_tmp(
     }
     let tmp = tmp_path(&final_path);
     let _ = std::fs::remove_file(&tmp);
-    let select = format!(
-        "SELECT {cols} FROM {src} ORDER BY coin, time_ms",
-        cols = select_list(),
-        src = ndjson(&part.path)
-    );
+    let select = copy_select(&ndjson(&part.path));
     if let Err(error) = conn.execute_batch(&copy_statement(&select, &tmp)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error.into());
@@ -464,6 +624,18 @@ fn select_list() -> String {
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The COPY's query: the output columns only, sorted by `coin`, `time_ms`, and the staged
+/// `_seq`. `_seq` is the archive line order and the tiebreak that keeps distinct books at a
+/// repeated `time_ms` in arrival order and the file bytes deterministic. It is pinned
+/// behaviorally only: `the_copy_sorts_tied_books_into_archive_line_order` stages tied books
+/// in reverse `_seq` order and goes red without the tiebreak.
+fn copy_select(src: &str) -> String {
+    format!(
+        "SELECT {cols} FROM {src} ORDER BY coin, time_ms, _seq",
+        cols = select_list()
+    )
 }
 
 /// Project fixed arrays back to `bid_px_0` names. DuckDB arrays are 1-indexed.
@@ -487,15 +659,18 @@ fn sample_select() -> String {
 }
 
 fn ndjson(path: &Path) -> String {
-    let columns = column_specs()
+    let mut columns = column_specs()
         .iter()
         .map(|(name, kind)| format!("{}: '{kind}'", sql_string(name)))
-        .collect::<Vec<_>>()
-        .join(", ");
+        .collect::<Vec<_>>();
+    // `_seq` is the archive line order of the hour. It is the tiebreak of the COPY's ORDER BY
+    // so two distinct books at one `time_ms` keep their arrival order (DuplicateRule), and
+    // the file bytes stay deterministic. It is not a column of the output.
+    columns.push("\"_seq\": 'BIGINT'".to_owned());
     format!(
         "read_json({}, format='newline_delimited', columns={{{}}})",
         sql_string(&path.to_string_lossy()),
-        columns
+        columns.join(", ")
     )
 }
 
@@ -620,22 +795,37 @@ fn check_samples(
     samples: &[Snapshot],
 ) -> Result<(), StoreError> {
     for sample in samples {
-        let row = find_sample(conn, pending, sample)?;
-        if let Err(field) = row_matches(sample, &row) {
+        let found = find_sample(conn, pending, sample)?;
+        if found.is_empty() {
             return Err(StoreError::Check(format!(
-                "sample mismatch {field} for {} {}",
+                "sample mismatch missing row for {} {}",
                 sample.coin, sample.time_ms
+            )));
+        }
+        // A distinct book kept at a repeated `time_ms` (DuplicateRule) shares the key with
+        // another row, so exactly one of the tied rows must match the sample bit for bit.
+        let matched = found
+            .iter()
+            .filter(|row| row_matches(sample, row).is_ok())
+            .count();
+        if matched != 1 {
+            return Err(StoreError::Check(format!(
+                "sample mismatch matched {matched} of {} rows for {} {}",
+                found.len(),
+                sample.coin,
+                sample.time_ms
             )));
         }
     }
     Ok(())
 }
 
+/// Every staged row with the sample's `(coin, time_ms)`, in file order.
 fn find_sample(
     conn: &Connection,
     pending: &[Pending],
     sample: &Snapshot,
-) -> Result<crate::jsonout::Obj, StoreError> {
+) -> Result<Vec<crate::jsonout::Obj>, StoreError> {
     let mut found = Vec::new();
     for file in pending {
         let sql = format!(
@@ -647,17 +837,7 @@ fn find_sample(
         );
         found.extend(query_rows(conn, &sql, &[])?);
     }
-    match found.len() {
-        1 => Ok(found.remove(0)),
-        0 => Err(StoreError::Check(format!(
-            "sample mismatch missing row for {} {}",
-            sample.coin, sample.time_ms
-        ))),
-        _ => Err(StoreError::Check(format!(
-            "sample mismatch ambiguous row for {} {}",
-            sample.coin, sample.time_ms
-        ))),
-    }
+    Ok(found)
 }
 
 fn row_matches(sample: &Snapshot, row: &crate::jsonout::Obj) -> Result<(), String> {
@@ -782,15 +962,31 @@ fn under_out(out: &Path, relative: &str) -> Result<PathBuf, StoreError> {
     Ok(out.join(relative))
 }
 
-/// Open the in-memory writer: pinned DuckDB, the caller's thread and memory caps.
+/// What one worker connection was configured with, reported through [`Prepared`].
+#[derive(Clone, Debug)]
+pub struct WriterSettings {
+    /// `current_setting('threads')`.
+    pub threads: String,
+    /// `current_setting('memory_limit')`.
+    pub memory_limit: String,
+}
+
+/// Open the in-memory writer: pinned DuckDB, the caller's thread and memory caps. Each worker
+/// gets its own connection and its own spill directory; DuckDB itself is never shared, which
+/// is what AGENTS.md's one-owner rule requires of an in-memory database.
 ///
 /// # Errors
 ///
 /// DuckDB is not 1.4.5, or a setting is rejected.
-pub fn open_writer(out: &Path, threads: u32, memory_limit: &str) -> Result<Connection, StoreError> {
+pub fn open_writer(
+    out: &Path,
+    worker: u32,
+    threads: u32,
+    memory_limit: &str,
+) -> Result<(Connection, WriterSettings), StoreError> {
     let conn = crate::store::memory_connection(&threads.to_string(), memory_limit)?;
     crate::decoder::parquet::require_connection_duckdb(&conn)?;
-    let temp = out.join(".tmp-duckdb");
+    let temp = out.join(format!(".tmp-duckdb-{worker}"));
     let _ = std::fs::remove_dir_all(&temp);
     create_dir_all_durable(&temp)?;
     conn.execute_batch(&format!(
@@ -798,7 +994,15 @@ pub fn open_writer(out: &Path, threads: u32, memory_limit: &str) -> Result<Conne
         sql_string(memory_limit),
         sql_string(&temp.to_string_lossy())
     ))?;
-    Ok(conn)
+    let threads = current_setting(&conn, "threads")?;
+    let memory_limit = current_setting(&conn, "memory_limit")?;
+    Ok((
+        conn,
+        WriterSettings {
+            threads,
+            memory_limit,
+        },
+    ))
 }
 
 /// `current_setting` value.
@@ -817,48 +1021,15 @@ pub fn current_setting(conn: &Connection, name: &str) -> Result<String, StoreErr
         .ok_or_else(|| StoreError::Check(format!("missing setting {name}")))
 }
 
-/// Test-only count faults and the receipt fsync hook.
+/// The receipt fsync hook, the only test seam left as thread-local state: `seal_hour` runs on
+/// the main thread, the same thread the test arms the hook from. The count faults ride the
+/// job as [`Fault`] instead, because `prepare_hour` runs in a worker thread.
 #[cfg(test)]
 pub(crate) mod seams {
     use std::cell::Cell;
 
-    /// Which guard a test is pinning.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub enum CountSeam {
-        /// Drop the decoded row before the per-line length check.
-        Line,
-        /// Count a snapshot that is never staged.
-        Hour,
-        /// Report one more staged row than the JSONL contains.
-        Staged,
-        /// Stage the row under a different coin than the file tally.
-        PerFile,
-        /// Change a sampled price after the sample is recorded.
-        Sample,
-    }
-
     thread_local! {
-        static COUNT: Cell<Option<CountSeam>> = const { Cell::new(None) };
         static BEFORE_RECEIPT: Cell<Option<fn()>> = const { Cell::new(None) };
-    }
-
-    pub fn set_count_seam(seam: CountSeam) {
-        COUNT.with(|slot| slot.set(Some(seam)));
-    }
-
-    pub fn take_if(want: CountSeam) -> bool {
-        COUNT.with(|slot| {
-            if slot.get() == Some(want) {
-                slot.set(None);
-                true
-            } else {
-                false
-            }
-        })
-    }
-
-    pub fn clear_count_seam() {
-        COUNT.with(|slot| slot.set(None));
     }
 
     /// `hook` runs once, immediately before the receipt's durable write.
@@ -874,5 +1045,120 @@ pub(crate) mod seams {
 
     pub fn clear_before_receipt() {
         BEFORE_RECEIPT.with(|slot| slot.set(None));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{memory_connection, query_rows};
+
+    /// One book line for a fixture, with a distinctive price.
+    fn snapshot(coin: &str, time_ms: i64, px: f64) -> Snapshot {
+        let line = serde_json::json!({
+            "time": "2026-10-22T00:00:00.5",
+            "raw": {"channel": "l2Book", "data": {
+                "coin": coin,
+                "time": time_ms,
+                "levels": [
+                    [{"px": format!("{px}"), "sz": "1", "n": 1}],
+                    [{"px": "2", "sz": "1", "n": 1}]
+                ]
+            }}
+        })
+        .to_string();
+        decode::snapshot_of_line(&line, coin).expect("a valid book")
+    }
+
+    /// The real COPY path, on a staging file whose physical order differs from `_seq`:
+    /// distinct books of one `(coin, time_ms)` are staged in reverse `_seq` order. The sort
+    /// must put them back in archive line order. Mutation: drop `_seq` from the ORDER BY in
+    /// `copy_select`; the ties then keep the reversed physical order and this goes red.
+    #[test]
+    fn the_copy_sorts_tied_books_into_archive_line_order() {
+        let root = std::env::temp_dir().join(format!(
+            "hl-l2-copy-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _clean = DirClean(root.clone());
+        let staging = root.join("staged.jsonl");
+        let parquet = root.join("out.parquet");
+        // Three coins, forty times, three distinct books each: 360 rows, every tie group
+        // staged physically in reverse `_seq` order.
+        let mut rows = Vec::new();
+        for coin in ["BTC", "ETH", "SOL"] {
+            for step in 0..40i64 {
+                let time_ms = 1_792_627_200_000 + step * 5_000;
+                for book in 0..3i64 {
+                    let seq = (step * 3 + book) as u64;
+                    rows.push((seq, snapshot(coin, time_ms, 100.0 + book as f64)));
+                }
+            }
+        }
+        rows.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+        let mut body = Vec::new();
+        for (seq, row) in &rows {
+            body.extend_from_slice(&decode::snapshot_line(row, *seq).expect("a staged line"));
+        }
+        std::fs::write(&staging, &body).unwrap();
+
+        let conn = memory_connection("1", "512MB").unwrap();
+        conn.execute_batch(&copy_statement(&copy_select(&ndjson(&staging)), &parquet))
+            .expect("the COPY runs");
+
+        // The staging key never reaches the output.
+        let described = query_rows(
+            &conn,
+            &format!(
+                "SELECT column_name AS name FROM (DESCRIBE SELECT * FROM read_parquet({}))",
+                sql_string(&parquet.to_string_lossy())
+            ),
+            &[],
+        )
+        .unwrap();
+        let columns: Vec<String> = described
+            .iter()
+            .map(|row| row.str("name").unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(
+            columns,
+            column_specs()
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+        );
+        assert!(!columns.iter().any(|name| name == "_seq"));
+
+        // File order (no ORDER BY): every tie group must come back in `_seq` order, which is
+        // the reverse of how it was staged.
+        let found = query_rows(
+            &conn,
+            &format!(
+                "SELECT coin, time_ms, bid_px[1] AS px FROM read_parquet({})",
+                sql_string(&parquet.to_string_lossy())
+            ),
+            &[],
+        )
+        .unwrap();
+        let mut groups: BTreeMap<(String, i64), Vec<f64>> = BTreeMap::new();
+        for row in &found {
+            let coin = row.str("coin").unwrap_or_default().to_owned();
+            let time = row.int("time_ms").unwrap_or_default();
+            let px = row.get("px").and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
+            groups.entry((coin, time)).or_default().push(px);
+        }
+        assert_eq!(groups.len(), 120, "three coins times forty times");
+        for ((coin, time), books) in &groups {
+            assert_eq!(
+                books,
+                &vec![100.0, 101.0, 102.0],
+                "{coin} {time}: tied books must come back in archive line order, not the staged physical order"
+            );
+        }
     }
 }

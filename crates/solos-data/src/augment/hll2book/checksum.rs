@@ -53,6 +53,16 @@ pub fn load_entries(path: &Path) -> Result<Vec<Entry>, StoreError> {
             ingest_line(&mut out, line, index + 1)?;
         }
     }
+    // One hash-set pass, not a scan per row: the full-archive manifest is millions of lines.
+    let mut seen = std::collections::HashSet::with_capacity(out.len());
+    for entry in &out {
+        if !seen.insert((entry.date.clone(), entry.hour, entry.coin.clone())) {
+            return Err(StoreError::Check(format!(
+                "duplicate checksum for {}/{}/{}",
+                entry.date, entry.hour, entry.coin
+            )));
+        }
+    }
     Ok(out)
 }
 
@@ -182,14 +192,6 @@ fn ingest(
     if sha.len() != 64 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(StoreError::Check(format!(
             "{date}/{hour}/{coin}: checksum is not sha256"
-        )));
-    }
-    if out
-        .iter()
-        .any(|entry| entry.date == date && entry.hour == hour && entry.coin == coin)
-    {
-        return Err(StoreError::Check(format!(
-            "duplicate checksum for {date}/{hour}/{coin}"
         )));
     }
     out.push(Entry {
@@ -350,6 +352,47 @@ mod tests {
                 .to_string()
                 .contains("no size")
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_many_row_listing_loads_and_still_names_the_duplicate() {
+        let root = std::env::temp_dir().join(format!(
+            "hl-l2-many-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let sha = "cd".repeat(32);
+        let mut body = String::new();
+        for hour in 0..24u32 {
+            for coin in 0..1250usize {
+                body.push_str(&format!(
+                    "{sha}  {}  market_data/20261022/{hour}/l2Book/C{coin:04}.lz4\n",
+                    100 + coin
+                ));
+            }
+        }
+        body.push_str(&format!(
+            "{sha}  9  market_data/20261022/0/l2Book/C0007.lz4\n"
+        ));
+        let sums = root.join("MANIFEST");
+        std::fs::write(&sums, &body).unwrap();
+        let error = load_entries(&sums).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate checksum for 20261022/0/C0007"),
+            "{error}"
+        );
+        body.pop();
+        body.pop();
+        std::fs::write(&sums, &body).unwrap();
+        let loaded = load_entries(&sums).unwrap();
+        assert_eq!(loaded.len(), 30_000);
         let _ = std::fs::remove_dir_all(&root);
     }
 }
