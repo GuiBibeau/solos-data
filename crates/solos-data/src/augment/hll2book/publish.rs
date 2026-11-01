@@ -281,6 +281,17 @@ impl Drop for Prepared {
 /// earlier file in place; the watermark is still not moved.
 pub fn seal_hour(out: &Path, prepared: Prepared) -> Result<HourOutput, StoreError> {
     let mut prepared = prepared;
+    // Defensive re-check at the commit point: an existing receipt for this hour must be a
+    // subset of the staged inputs. Sealing a subset would replace the hour Parquet, stale
+    // cleanup would remove the missing coins' files, and the later raw drop would delete
+    // their `.lz4`: refuse instead, and delete nothing. `Prepared`'s Drop removes the
+    // staged temporaries when this returns.
+    if let Some(previous) = read_receipt(out, &prepared.hour_key) {
+        let missing = missing_inputs(&previous, &prepared.inputs);
+        if !missing.is_empty() {
+            return Err(StoreError::Check(refusing_reseal(&missing)));
+        }
+    }
     let outputs = rename_all(&prepared.pending)?;
     let stale = stale_paths(out, &prepared.hour_key, &outputs);
     for relative in stale {
@@ -324,6 +335,47 @@ pub fn seal_hour(out: &Path, prepared: Prepared) -> Result<HourOutput, StoreErro
         parquet_bytes: outputs.iter().map(|file| file.bytes).sum(),
         inputs,
     })
+}
+
+/// Inputs of `previous` the current set does not have, as `(coin, sha256)` pairs: a coin
+/// with a changed sha256 counts as missing. Sorted by coin.
+#[must_use]
+pub fn missing_inputs(previous: &Receipt, current: &[InputFile]) -> Vec<InputFile> {
+    let have: BTreeSet<(&str, &str)> = current
+        .iter()
+        .map(|file| (file.coin.as_str(), file.sha256.as_str()))
+        .collect();
+    let mut missing: Vec<InputFile> = previous
+        .inputs
+        .iter()
+        .filter(|file| !have.contains(&(file.coin.as_str(), file.sha256.as_str())))
+        .cloned()
+        .collect();
+    missing.sort_by(|a, b| a.coin.cmp(&b.coin));
+    missing
+}
+
+/// How many missing inputs [`refusing_reseal`] names before it truncates with a count.
+const REFUSAL_LIST_CAP: usize = 8;
+
+/// The refusal message for a shrinking re-seal, without the hour prefix the callers add.
+#[must_use]
+pub fn refusing_reseal(missing: &[InputFile]) -> String {
+    let mut parts: Vec<String> = missing
+        .iter()
+        .take(REFUSAL_LIST_CAP)
+        .map(|file| {
+            let sha = file.sha256.get(..8).unwrap_or(&file.sha256);
+            format!("{} (sha256 {sha}...)", file.coin)
+        })
+        .collect();
+    if missing.len() > REFUSAL_LIST_CAP {
+        parts.push(format!("and {} more", missing.len() - REFUSAL_LIST_CAP));
+    }
+    format!(
+        "refusing to re-seal: current inputs are not a superset of the sealed receipt; missing {}",
+        parts.join(", ")
+    )
 }
 
 /// SHA-256 of sorted `coin sha256` lines.

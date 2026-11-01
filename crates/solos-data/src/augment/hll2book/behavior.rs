@@ -974,10 +974,10 @@ fn drop_raw_refuses_a_link_outside_the_input_dir() {
     assert_eq!(std::fs::read(&outside).unwrap(), frame);
 }
 
-/// Mutations: drop the output `file_hash` compare; drop `receipt.input_sha256 == identity`;
-/// drop `receipt.config_hash == config`.
+/// Mutations: drop the output `file_hash` compare; drop the superset guard; drop
+/// `receipt.input_sha256 == identity`; drop `receipt.config_hash == config`.
 #[test]
-fn a_changed_output_or_input_or_config_hash_is_rewritten() {
+fn a_changed_output_or_config_hash_is_rewritten_and_a_shrinking_input_is_refused() {
     let root = Tmp::new("redo");
     let (input, out, sums) = stage_one(&root, &book("BTC", 1_792_627_200_000, 1, "1"));
     run_ok(&input, &out, &sums).unwrap();
@@ -989,15 +989,6 @@ fn a_changed_output_or_input_or_config_hash_is_rewritten() {
     assert_eq!(redone.hours_verified, 1, "truncated output was skipped");
     assert!(parquet.metadata().unwrap().len() > 8);
 
-    let replacement = book("BTC", 1_792_627_200_000, 1, "9");
-    let pair = write_coin(&input, "20261022", 0, "BTC", &replacement);
-    std::fs::write(&sums, manifest(std::slice::from_ref(&pair))).unwrap();
-    let redone = run_ok(&input, &out, &sums).unwrap();
-    assert_eq!(redone.hours_verified, 1, "changed input was skipped");
-    let receipt: Value =
-        serde_json::from_str(&std::fs::read_to_string(&receipt_path).unwrap()).unwrap();
-    assert_eq!(receipt["inputs"][0]["sha256"], pair.1);
-
     let mut edited: Value =
         serde_json::from_str(&std::fs::read_to_string(&receipt_path).unwrap()).unwrap();
     edited["config_hash"] = json!("0".repeat(64));
@@ -1007,6 +998,30 @@ fn a_changed_output_or_input_or_config_hash_is_rewritten() {
     let receipt: Value =
         serde_json::from_str(&std::fs::read_to_string(&receipt_path).unwrap()).unwrap();
     assert_eq!(receipt["config_hash"], super::config_hash());
+
+    // The same coin with new bytes is not a superset of the sealed receipt: the rerun
+    // refuses, and the hour's outputs and receipt keep their exact bytes.
+    let replacement = book("BTC", 1_792_627_200_000, 1, "9");
+    let pair = write_coin(&input, "20261022", 0, "BTC", &replacement);
+    std::fs::write(&sums, manifest(std::slice::from_ref(&pair))).unwrap();
+    let parquet_sha = crate::fsutil::file_hash(&parquet).unwrap();
+    let receipt_before = std::fs::read(&receipt_path).unwrap();
+    let error = run_ok(&input, &out, &sums).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("20261022/0"), "{message}");
+    assert!(message.contains("refusing to re-seal"), "{message}");
+    assert!(message.contains("not a superset"), "{message}");
+    assert!(message.contains("BTC"), "{message}");
+    assert_eq!(
+        crate::fsutil::file_hash(&parquet).unwrap(),
+        parquet_sha,
+        "the hour Parquet was rewritten"
+    );
+    assert_eq!(
+        std::fs::read(&receipt_path).unwrap(),
+        receipt_before,
+        "the receipt was rewritten"
+    );
 }
 
 #[test]
@@ -1495,4 +1510,316 @@ fn market_data_manifest_layout_is_found() {
     let report = run_ok(&input, &out, &sums).unwrap();
     assert_eq!(report.hours_verified, 1);
     assert_eq!(report.rows, 1);
+}
+
+/// A coin that arrives late makes the current inputs a strict superset of the sealed
+/// receipt: the hour re-seals, the receipt records N+1 inputs, and the output keeps every
+/// earlier coin's rows plus the late coin's.
+#[test]
+fn late_coin_superset_reseals() {
+    let root = Tmp::new("late-coin");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("MANIFEST.json");
+    let time = 1_792_627_200_000_i64;
+    let btc = write_coin(&input, "20261022", 0, "BTC", &book("BTC", time, 1, "1"));
+    let eth = write_coin(
+        &input,
+        "20261022",
+        0,
+        "ETH",
+        &book("ETH", time + 5_000, 1, "2"),
+    );
+    std::fs::write(&sums, manifest(&[btc.clone(), eth.clone()])).unwrap();
+    let first = run_ok(&input, &out, &sums).unwrap();
+    assert_eq!(first.hours_verified, 1);
+    let parquet = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+    assert_eq!(read_rows(&parquet).len(), 2);
+
+    // SOL's file and its manifest row arrive after the hour is verified.
+    let sol = write_coin(
+        &input,
+        "20261022",
+        0,
+        "SOL",
+        &book("SOL", time + 10_000, 1, "3"),
+    );
+    std::fs::write(&sums, manifest(&[btc, eth, sol])).unwrap();
+    let again = run_ok(&input, &out, &sums).unwrap();
+    assert_eq!(again.hours_verified, 1, "the superset hour re-seals");
+    assert_eq!(again.hours_skipped, 0);
+    assert_eq!(watermark(&out), vec!["20261022/0".to_owned()]);
+    let receipt: Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("receipts/20261022/0.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["inputs"].as_array().unwrap().len(), 3);
+    let coins: Vec<String> = read_rows(&parquet)
+        .iter()
+        .filter_map(|row| row.str("coin").map(str::to_owned))
+        .collect();
+    assert_eq!(
+        coins,
+        vec!["BTC", "ETH", "SOL"],
+        "the late coin's rows joined the earlier coins"
+    );
+}
+
+/// A rerun whose scope shrank below the sealed receipt is refused before any work: the run
+/// fails, the hour Parquet and receipt keep their exact bytes, every raw file stays, no
+/// drop record appears, and the watermark is unchanged.
+#[test]
+fn shrinking_inputs_refused() {
+    let root = Tmp::new("shrink");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("MANIFEST.json");
+    let time = 1_792_627_200_000_i64;
+    let btc = write_coin(&input, "20261022", 0, "BTC", &book("BTC", time, 1, "1"));
+    let eth = write_coin(
+        &input,
+        "20261022",
+        0,
+        "ETH",
+        &book("ETH", time + 5_000, 1, "2"),
+    );
+    let sol = write_coin(
+        &input,
+        "20261022",
+        0,
+        "SOL",
+        &book("SOL", time + 10_000, 1, "3"),
+    );
+    std::fs::write(&sums, manifest(&[btc.clone(), eth.clone(), sol.clone()])).unwrap();
+    let first = run_ok(&input, &out, &sums).unwrap();
+    assert_eq!(first.hours_verified, 1);
+    let parquet = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+    let parquet_sha = crate::fsutil::file_hash(&parquet).unwrap();
+    let receipt = std::fs::read(out.join("receipts/20261022/0.json")).unwrap();
+    let watermark_before = watermark(&out);
+
+    // The same manifest, but the rerun only claims BTC and ETH: SOL is missing from the
+    // current inputs, and drop-raw is on.
+    let mut coins = BTreeSet::new();
+    coins.insert("BTC".to_owned());
+    coins.insert("ETH".to_owned());
+    let error = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            coins: Some(coins),
+            drop_raw: true,
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("20261022/0"), "{message}");
+    assert!(message.contains("refusing to re-seal"), "{message}");
+    assert!(message.contains("not a superset"), "{message}");
+    assert!(message.contains("SOL"), "{message}");
+    assert_eq!(
+        crate::fsutil::file_hash(&parquet).unwrap(),
+        parquet_sha,
+        "the hour Parquet was replaced with the subset"
+    );
+    assert_eq!(
+        std::fs::read(out.join("receipts/20261022/0.json")).unwrap(),
+        receipt,
+        "the receipt was rewritten"
+    );
+    for file in [&btc, &eth, &sol] {
+        assert!(input.join(&file.0).is_file(), "{} was touched", file.0);
+    }
+    assert!(
+        !out.join("drops/20261022/0.json").exists(),
+        "a drop record appeared for the refused hour"
+    );
+    assert_eq!(watermark(&out), watermark_before, "the watermark moved");
+}
+
+/// The drop record of a rerun unions the earlier record: entries already on file stay, a
+/// path that reappears with a different sha256 keeps both entries, sorted by path then
+/// sha256, and a foreign or unparsable record is an error rather than an overwrite.
+#[test]
+fn drop_record_merge_keeps_earlier_entries() {
+    let root = Tmp::new("drop-merge");
+    let out = root.0.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let path = out.join("drops/20261022/0.json");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let earlier = json!({
+        "schema": super::DROP_SCHEMA,
+        "hour": "20261022/0",
+        "files": [{
+            "path": "20261022/0/BTC.lz4",
+            "bytes": 10u64,
+            "sha256": "aa".repeat(32),
+            "s3": super::s3_url("20261022", 0, "BTC"),
+        }],
+    });
+    std::fs::write(&path, earlier.to_string()).unwrap();
+
+    // A superset re-seal re-downloaded BTC under different bytes and added SOL.
+    let receipt = receipt_with_inputs(&[
+        ("BTC", "20261022/0/BTC.lz4", "bb", 12),
+        ("SOL", "20261022/0/SOL.lz4", "cc", 14),
+    ]);
+    super::batch::write_drop_record(&out, "20261022/0", "20261022", 0, &receipt).unwrap();
+
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(value["schema"], super::DROP_SCHEMA);
+    assert_eq!(value["hour"], "20261022/0");
+    let keys: Vec<(String, String)> = value["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap().to_owned(),
+                file["sha256"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            ("20261022/0/BTC.lz4".to_owned(), "aa".repeat(32)),
+            ("20261022/0/BTC.lz4".to_owned(), "bb".repeat(32)),
+            ("20261022/0/SOL.lz4".to_owned(), "cc".repeat(32)),
+        ],
+        "the earlier entry, the new sha, and SOL, sorted by path then sha256"
+    );
+
+    // A record for another hour is an error, never an overwrite.
+    std::fs::write(
+        &path,
+        json!({"schema": super::DROP_SCHEMA, "hour": "20261022/1", "files": []}).to_string(),
+    )
+    .unwrap();
+    let error =
+        super::batch::write_drop_record(&out, "20261022/0", "20261022", 0, &receipt).unwrap_err();
+    assert!(error.to_string().contains("20261022/1"), "{error}");
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(
+        value["hour"], "20261022/1",
+        "the foreign record was replaced"
+    );
+
+    // So is an unparsable one.
+    std::fs::write(&path, "not json").unwrap();
+    let error =
+        super::batch::write_drop_record(&out, "20261022/0", "20261022", 0, &receipt).unwrap_err();
+    assert!(
+        error.to_string().contains("drops/20261022/0.json"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "not json");
+}
+
+/// The commit-point re-check in `seal_hour`: when the hour already has a receipt whose
+/// inputs the staged hour no longer covers, the seal is refused and nothing final is
+/// touched, including the staged temporaries.
+#[test]
+fn seal_hour_refuses_to_shrink_a_sealed_hour() {
+    let root = Tmp::new("seal-guard");
+    let out = root.0.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let time = 1_792_627_200_000_i64;
+    let btc_body = lz4_frame(book("BTC", time, 1, "1").as_bytes());
+    let sol_body = lz4_frame(book("SOL", time + 5_000, 1, "3").as_bytes());
+    let hash = super::config_hash();
+    let settings = super::publish::WriterSettings {
+        threads: "1".to_owned(),
+        memory_limit: "512MB".to_owned(),
+    };
+    let stage = |files: &[(&str, &Vec<u8>)]| {
+        let (conn, _) = super::publish::open_writer(&out, 0, 1, "512MB").unwrap();
+        let relatives: Vec<String> = files
+            .iter()
+            .map(|(coin, _)| format!("20261022/0/{coin}.lz4"))
+            .collect();
+        let shas: Vec<String> = files
+            .iter()
+            .map(|(_, body)| crate::fsutil::sha256_hex(body))
+            .collect();
+        let owned: Vec<super::publish::FileBytes> = files
+            .iter()
+            .enumerate()
+            .map(|(index, (coin, body))| super::publish::FileBytes {
+                coin,
+                relative: &relatives[index],
+                sha256: &shas[index],
+                bytes: body.as_slice(),
+            })
+            .collect();
+        let job = super::publish::HourJob {
+            hour_key: "20261022/0",
+            files: &owned,
+            git_sha: GIT,
+            config_hash: &hash,
+            fault: Fault::None,
+        };
+        super::publish::prepare_hour(&conn, &out, &job, &settings).unwrap()
+    };
+
+    let first = stage(&[("BTC", &btc_body), ("SOL", &sol_body)]);
+    super::publish::seal_hour(&out, first).unwrap();
+    let parquet = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+    let parquet_sha = crate::fsutil::file_hash(&parquet).unwrap();
+    let receipt = std::fs::read(out.join("receipts/20261022/0.json")).unwrap();
+
+    // Stage the same hour without SOL, against the receipt that still records it.
+    let second = stage(&[("BTC", &btc_body)]);
+    let error = super::publish::seal_hour(&out, second).unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("refusing to re-seal"), "{message}");
+    assert!(message.contains("SOL"), "{message}");
+    assert_eq!(
+        crate::fsutil::file_hash(&parquet).unwrap(),
+        parquet_sha,
+        "the hour Parquet was replaced"
+    );
+    assert_eq!(
+        std::fs::read(out.join("receipts/20261022/0.json")).unwrap(),
+        receipt,
+        "the receipt was rewritten"
+    );
+    assert_eq!(
+        parquet_files(&out),
+        vec!["train/date=2026-10-22/hour=20261022-0.parquet"],
+        "a staged temporary survived the refusal"
+    );
+}
+
+/// A receipt for one hour with the named inputs, for direct `write_drop_record` calls.
+fn receipt_with_inputs(files: &[(&str, &str, &str, u64)]) -> super::publish::Receipt {
+    super::publish::Receipt {
+        schema: super::SCHEMA.to_owned(),
+        hour: "20261022/0".to_owned(),
+        input_sha256: String::new(),
+        input_snapshots: 0,
+        output_rows: 0,
+        dup_identical: 0,
+        dup_distinct: 0,
+        lz4_bytes: 0,
+        parquet_bytes: 0,
+        train_rows: 0,
+        forward_rows: 0,
+        outputs: Vec::new(),
+        inputs: files
+            .iter()
+            .map(|(coin, path, sha, bytes)| super::publish::InputFile {
+                coin: (*coin).to_owned(),
+                path: (*path).to_owned(),
+                sha256: sha.repeat(32),
+                bytes: *bytes,
+                snapshots: 0,
+            })
+            .collect(),
+        git_sha: "x".to_owned(),
+        config_hash: super::config_hash(),
+    }
 }

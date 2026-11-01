@@ -567,6 +567,21 @@ fn work_one(
     if let Some(receipt) = verified_receipt(request.out, key, &identity, hash, watermark)? {
         return Ok(WorkerOutcome::Skip(receipt));
     }
+    // A watermarked hour whose identity differs is about to be re-sealed. If the current
+    // inputs lost a coin or content the receipt recorded, sealing would replace the hour
+    // Parquet with the subset, stale cleanup would remove the missing coins' files, and
+    // the later raw drop would delete their `.lz4`: refuse before any work instead.
+    if watermark.contains(key)
+        && let Some(previous) = publish::read_receipt(request.out, key)
+    {
+        let missing = publish::missing_inputs(&previous, &inputs_of(&loaded));
+        if !missing.is_empty() {
+            return Err(StoreError::Check(format!(
+                "{key}: {}",
+                publish::refusing_reseal(&missing)
+            )));
+        }
+    }
     if conn.is_none() {
         let (opened, _) =
             publish::open_writer(request.out, worker, request.threads, &request.memory_limit)?;
@@ -727,8 +742,8 @@ fn identity_of(entries: &[Entry]) -> String {
     publish::input_identity(&inputs)
 }
 
-fn identity_of_inputs(files: &[LoadedFile]) -> String {
-    let inputs: Vec<InputFile> = files
+fn inputs_of(files: &[LoadedFile]) -> Vec<InputFile> {
+    files
         .iter()
         .map(|file| InputFile {
             coin: file.coin.clone(),
@@ -737,8 +752,11 @@ fn identity_of_inputs(files: &[LoadedFile]) -> String {
             bytes: u64::try_from(file.bytes.len()).unwrap_or(0),
             snapshots: 0,
         })
-        .collect();
-    publish::input_identity(&inputs)
+        .collect()
+}
+
+fn identity_of_inputs(files: &[LoadedFile]) -> String {
+    publish::input_identity(&inputs_of(files))
 }
 
 enum Space {
@@ -1078,31 +1096,58 @@ fn under_input(input: &Path, relative: &str) -> Result<PathBuf, StoreError> {
     Ok(input.join(relative))
 }
 
-fn write_drop_record(
+pub(crate) fn write_drop_record(
     out: &Path,
     hour_key: &str,
     date: &str,
     hour: u32,
     receipt: &Receipt,
 ) -> Result<(), StoreError> {
-    let files: Vec<DropFile> = receipt
-        .inputs
-        .iter()
-        .map(|file| DropFile {
-            path: file.path.clone(),
-            bytes: file.bytes,
-            sha256: file.sha256.clone(),
-            s3: s3_url(date, hour, &file.coin),
-        })
-        .collect();
+    let path = under_out_drop(out, &format!("drops/{hour_key}.json"))?;
+    // An earlier record for this hour may already name files: a crash mid-drop, or a
+    // previous, wider hour. Union by `(path, sha256)` so nothing already recorded is lost;
+    // a path that reappears with a different sha256 keeps both entries, so either copy can
+    // be fetched again. A foreign or unparsable record is an error, never an overwrite.
+    let mut merged: BTreeMap<(String, String), DropFile> = BTreeMap::new();
+    if path.is_file() {
+        let text = std::fs::read_to_string(&path)?;
+        let earlier: DropRecord = serde_json::from_str(&text)
+            .map_err(|e| StoreError::Check(format!("drops/{hour_key}.json: {e}")))?;
+        if earlier.schema != DROP_SCHEMA {
+            return Err(StoreError::Check(format!(
+                "drops/{hour_key}.json: schema is {}, this command writes {DROP_SCHEMA}",
+                earlier.schema
+            )));
+        }
+        if earlier.hour != hour_key {
+            return Err(StoreError::Check(format!(
+                "drops/{hour_key}.json: record is for hour {}, not {hour_key}",
+                earlier.hour
+            )));
+        }
+        for file in earlier.files {
+            merged.insert((file.path.clone(), file.sha256.clone()), file);
+        }
+    }
+    for file in &receipt.inputs {
+        merged.insert(
+            (file.path.clone(), file.sha256.clone()),
+            DropFile {
+                path: file.path.clone(),
+                bytes: file.bytes,
+                sha256: file.sha256.clone(),
+                s3: s3_url(date, hour, &file.coin),
+            },
+        );
+    }
+    // A `BTreeMap` keyed `(path, sha256)` writes the union sorted by path, then sha256.
     let record = DropRecord {
         schema: DROP_SCHEMA.to_owned(),
         hour: hour_key.to_owned(),
-        files,
+        files: merged.into_values().collect(),
     };
     let mut body = serde_json::to_vec(&record).map_err(|e| StoreError::Check(e.to_string()))?;
     body.push(b'\n');
-    let path = under_out_drop(out, &format!("drops/{hour_key}.json"))?;
     if let Some(parent) = path.parent() {
         create_dir_all_durable(parent)?;
     }
@@ -1110,14 +1155,14 @@ fn write_drop_record(
     Ok(())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct DropRecord {
     schema: String,
     hour: String,
     files: Vec<DropFile>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct DropFile {
     path: String,
     bytes: u64,
