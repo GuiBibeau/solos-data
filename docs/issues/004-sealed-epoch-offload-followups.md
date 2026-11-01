@@ -20,3 +20,11 @@ specified. They are not part of the seal and offload acceptance in
   tested. This reader is not.
 - [ ] `seal` refuses an epoch that has coverage and a settled lag but no active transactions
   file (`no transactions`).
+- [ ] Once rows are r2-only, nothing regularly checks that the objects still exist.
+  `backup-gap` should head-check r2 rows too.
+- [ ] `confirm_remote` trusts the stored `head.sha256` metadata when it is present and only
+  streams the body when it is missing. Either stream the body before `--drop-local`, or
+  document this in ADR-0022.
+- [ ] Restore containment checks the path text only, so a symlinked directory could escape
+  it. Canonicalize the path.
+- [ ] The `safe_error` host match is case-sensitive.
