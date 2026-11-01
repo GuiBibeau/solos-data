@@ -1049,27 +1049,114 @@ pub(crate) mod seams {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::{memory_connection, query_rows};
 
-    /// Mutation: drop `_seq` from the COPY's ORDER BY. Distinct books at one `time_ms` keep
-    /// their archive line order only through this key; DuckDB's tie behavior at fixture
-    /// scale is not a guarantee, so the clause itself is the pin.
+    /// One book line for a fixture, with a distinctive price.
+    fn snapshot(coin: &str, time_ms: i64, px: f64) -> Snapshot {
+        let line = serde_json::json!({
+            "time": "2026-10-22T00:00:00.5",
+            "raw": {"channel": "l2Book", "data": {
+                "coin": coin,
+                "time": time_ms,
+                "levels": [
+                    [{"px": format!("{px}"), "sz": "1", "n": 1}],
+                    [{"px": "2", "sz": "1", "n": 1}]
+                ]
+            }}
+        })
+        .to_string();
+        decode::snapshot_of_line(&line, coin).expect("a valid book")
+    }
+
+    /// The real COPY path, on a staging file whose physical order differs from `_seq`:
+    /// distinct books of one `(coin, time_ms)` are staged in reverse `_seq` order. The sort
+    /// must put them back in archive line order. Mutation: drop `_seq` from the ORDER BY in
+    /// `copy_select`; the ties then keep the reversed physical order and this goes red.
     #[test]
-    fn the_copy_sorts_by_the_archive_line_order_key() {
-        let select = copy_select("SRC");
-        assert!(
-            select.ends_with("ORDER BY coin, time_ms, _seq"),
-            "the COPY's sort lost its tiebreak: {select}"
+    fn the_copy_sorts_tied_books_into_archive_line_order() {
+        let root = std::env::temp_dir().join(format!(
+            "hl-l2-copy-order-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let _clean = DirClean(root.clone());
+        let staging = root.join("staged.jsonl");
+        let parquet = root.join("out.parquet");
+        // Three coins, forty times, three distinct books each: 360 rows, every tie group
+        // staged physically in reverse `_seq` order.
+        let mut rows = Vec::new();
+        for coin in ["BTC", "ETH", "SOL"] {
+            for step in 0..40i64 {
+                let time_ms = 1_792_627_200_000 + step * 5_000;
+                for book in 0..3i64 {
+                    let seq = (step * 3 + book) as u64;
+                    rows.push((seq, snapshot(coin, time_ms, 100.0 + book as f64)));
+                }
+            }
+        }
+        rows.sort_by_key(|(seq, _)| std::cmp::Reverse(*seq));
+        let mut body = Vec::new();
+        for (seq, row) in &rows {
+            body.extend_from_slice(&decode::snapshot_line(row, *seq).expect("a staged line"));
+        }
+        std::fs::write(&staging, &body).unwrap();
+
+        let conn = memory_connection("1", "512MB").unwrap();
+        conn.execute_batch(&copy_statement(&copy_select(&ndjson(&staging)), &parquet))
+            .expect("the COPY runs");
+
+        // The staging key never reaches the output.
+        let described = query_rows(
+            &conn,
+            &format!(
+                "SELECT column_name AS name FROM (DESCRIBE SELECT * FROM read_parquet({}))",
+                sql_string(&parquet.to_string_lossy())
+            ),
+            &[],
+        )
+        .unwrap();
+        let columns: Vec<String> = described
+            .iter()
+            .map(|row| row.str("name").unwrap_or_default().to_owned())
+            .collect();
+        assert_eq!(
+            columns,
+            column_specs()
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
         );
-        let columns = &select["SELECT ".len()..select.find(" FROM ").expect("a FROM")];
-        for (name, _) in column_specs() {
-            assert!(
-                columns.contains(&name.clone()),
-                "{name} missing from the output"
+        assert!(!columns.iter().any(|name| name == "_seq"));
+
+        // File order (no ORDER BY): every tie group must come back in `_seq` order, which is
+        // the reverse of how it was staged.
+        let found = query_rows(
+            &conn,
+            &format!(
+                "SELECT coin, time_ms, bid_px[1] AS px FROM read_parquet({})",
+                sql_string(&parquet.to_string_lossy())
+            ),
+            &[],
+        )
+        .unwrap();
+        let mut groups: BTreeMap<(String, i64), Vec<f64>> = BTreeMap::new();
+        for row in &found {
+            let coin = row.str("coin").unwrap_or_default().to_owned();
+            let time = row.int("time_ms").unwrap_or_default();
+            let px = row.get("px").and_then(|v| v.as_f64()).unwrap_or(f64::NAN);
+            groups.entry((coin, time)).or_default().push(px);
+        }
+        assert_eq!(groups.len(), 120, "three coins times forty times");
+        for ((coin, time), books) in &groups {
+            assert_eq!(
+                books,
+                &vec![100.0, 101.0, 102.0],
+                "{coin} {time}: tied books must come back in archive line order, not the staged physical order"
             );
         }
-        assert!(
-            !columns.contains("_seq"),
-            "the staging key leaked into the output columns: {select}"
-        );
     }
 }
