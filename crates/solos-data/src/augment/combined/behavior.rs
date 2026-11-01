@@ -786,9 +786,15 @@ fn a_failed_output_write_leaves_no_receipt() {
     );
     assert!(!receipt::receipt_path(&out, "mapping", "mapping").exists());
     assert!(!out.join("catalog.json").exists());
-    // A rerun without the fault succeeds and writes everything.
+    // A rerun without the fault succeeds and writes everything, and the failed
+    // attempt's temp file is gone (the rename consumed it).
     mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
     assert!(receipt::receipt_path(&out, "mapping", "mapping").exists());
+    assert!(out.join("mapping/assets.csv").exists());
+    assert!(
+        !out.join("mapping/assets.csv.tmp").exists(),
+        "no temp file left behind"
+    );
 }
 
 #[test]
@@ -970,7 +976,13 @@ fn an_empty_phoenix_dir_refuses() {
     let mut req = request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS);
     req.phoenix_fills = &empty;
     let error = mapping::run(&req).unwrap_err();
-    assert!(error.to_string().contains("no parquet files"), "{error}");
+    // The exact guard text: a later "no parquet files to read" from the query
+    // layer must not satisfy this test.
+    assert_eq!(
+        error.to_string(),
+        "--phoenix-fills has no parquet files",
+        "{error}"
+    );
 }
 
 #[test]
