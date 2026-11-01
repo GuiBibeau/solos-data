@@ -8,7 +8,8 @@
 //!
 //! - `l2Book`: `hyperliquid-archive/market_data/<YYYYMMDD>/<H>/l2Book/<COIN>.lz4`, the hour's
 //!   book snapshots (JSON lines) of `bookSymbols`, one Parquet day per coin, ten levels a side
-//!   plus the level count and size totals.
+//!   plus the level count and size totals. All-coin 20-level books are the offline
+//!   `augment hl-l2book` command (ADR-0021), which does not call [`book_row`].
 //! - `asset_ctxs`: `hyperliquid-archive/asset_ctxs/<YYYYMMDD>.csv.lz4`, every coin's context
 //!   (funding, open interest, prices), one Parquet day.
 //! - `fills`: `hl-mainnet-node-data/node_fills_by_block/hourly/<YYYYMMDD>/<H>.lz4`, every fill of

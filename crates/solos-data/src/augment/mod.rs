@@ -3,7 +3,8 @@
 //! decoded roots, and kept current. `augment sync` is the idempotent backfill and catch-up of
 //! dated files and paged histories; `augment capture` is the long-running lane for streams that
 //! cannot be fetched later. `augment hl-fills` is an offline batch over local
-//! `node_fills_by_block` hours (ADR-0020); it does not run inside `augment sync`.
+//! `node_fills_by_block` hours (ADR-0020). `augment hl-l2book` is an offline batch over local
+//! `l2Book` hours (ADR-0021). Neither runs inside `augment sync`.
 
 pub mod alternative;
 pub mod auto;
@@ -19,6 +20,7 @@ pub mod dumps;
 pub mod elfa;
 pub mod episodes;
 pub mod hlfills;
+pub mod hll2book;
 pub mod hls3;
 pub mod http;
 pub mod hyperliquid;
