@@ -628,7 +628,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             "since": since.map(|day| day.to_string()),
             "until": until.map(|day| day.to_string()),
             "lockbox_sha256": checked_lockbox_sha,
-            "lockbox_hours_dropped": lockbox_hours.len() as u64,
+            "lockbox_hours_dropped": report.lockbox_hours_dropped,
+            "lockbox_hours_excluded": lockbox_hours.len() as u64,
         }),
     );
     cat.save(request.out)?;
@@ -2325,13 +2326,27 @@ mod tests {
             !fx.root.join(VENUE_TABLE).exists(),
             "no venue month with only lockbox hours"
         );
-        let run_receipt =
-            std::fs::read_to_string(fx.root.join(MINT_TABLE).join("receipt-spotdex-hours.json"))
-                .expect("run receipt");
-        assert!(
-            run_receipt.contains("\"rows\":0"),
-            "no rows published: {run_receipt}"
+        let run_receipt: Value = serde_json::from_str(
+            &std::fs::read_to_string(fx.root.join(MINT_TABLE).join("receipt-spotdex-hours.json"))
+                .expect("run receipt"),
+        )
+        .expect("run receipt json");
+        assert_eq!(run_receipt["rows"], 0, "no rows published");
+        // Dropped is the data-derived count of in-range hours the lockbox
+        // removed; excluded is the size of the whole v2 set. The two are
+        // different numbers and must never be swapped.
+        assert_eq!(run_receipt["lockbox_hours_dropped"], 12);
+        assert_eq!(run_receipt["lockbox_hours_excluded"], 864);
+        assert_eq!(run_receipt["inputs"]["lockbox_hours_dropped"], 12);
+        let catalog: Value = serde_json::from_str(
+            &std::fs::read_to_string(fx.root.join("catalog.json")).expect("catalog"),
+        )
+        .expect("catalog json");
+        assert_eq!(
+            catalog["watermarks"][UNIT]["lockbox_hours_dropped"], 12,
+            "dropped stays data-derived in the catalog"
         );
+        assert_eq!(catalog["watermarks"][UNIT]["lockbox_hours_excluded"], 864);
     }
 
     #[test]
