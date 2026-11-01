@@ -423,7 +423,7 @@ pub async fn cycle(ctx: &Ctx, lane: &ElfaLane, now_s: i64) -> Outcome {
 pub fn capped(ctx: &Ctx) -> bool {
     ctx.http
         .meter()
-        .is_some_and(|m| !m.allows(0, chrono::Utc::now().timestamp_millis()))
+        .is_some_and(|m| !m.allows(0, ctx.http.now_ms()))
 }
 
 /// The meter's month total and its count of answers without a header, for one cycle's reading.
