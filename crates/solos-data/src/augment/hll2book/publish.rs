@@ -601,11 +601,7 @@ fn write_tmp(
     }
     let tmp = tmp_path(&final_path);
     let _ = std::fs::remove_file(&tmp);
-    let select = format!(
-        "SELECT {cols} FROM {src} ORDER BY coin, time_ms, _seq",
-        cols = select_list(),
-        src = ndjson(&part.path)
-    );
+    let select = copy_select(&ndjson(&part.path));
     if let Err(error) = conn.execute_batch(&copy_statement(&select, &tmp)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(error.into());
@@ -626,6 +622,18 @@ fn select_list() -> String {
         .map(|(name, _)| name.clone())
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The COPY's query: the output columns only, sorted by `coin`, `time_ms`, and the staged
+/// `_seq`. `_seq` is the archive line order and the tiebreak that keeps distinct books at a
+/// repeated `time_ms` in arrival order and the file bytes deterministic; DuckDB happens to
+/// preserve input order for ties at fixture scale, so the clause is pinned structurally in
+/// the tests below as well as behaviorally.
+fn copy_select(src: &str) -> String {
+    format!(
+        "SELECT {cols} FROM {src} ORDER BY coin, time_ms, _seq",
+        cols = select_list()
+    )
 }
 
 /// Project fixed arrays back to `bid_px_0` names. DuckDB arrays are 1-indexed.
@@ -1035,5 +1043,33 @@ pub(crate) mod seams {
 
     pub fn clear_before_receipt() {
         BEFORE_RECEIPT.with(|slot| slot.set(None));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Mutation: drop `_seq` from the COPY's ORDER BY. Distinct books at one `time_ms` keep
+    /// their archive line order only through this key; DuckDB's tie behavior at fixture
+    /// scale is not a guarantee, so the clause itself is the pin.
+    #[test]
+    fn the_copy_sorts_by_the_archive_line_order_key() {
+        let select = copy_select("SRC");
+        assert!(
+            select.ends_with("ORDER BY coin, time_ms, _seq"),
+            "the COPY's sort lost its tiebreak: {select}"
+        );
+        let columns = &select["SELECT ".len()..select.find(" FROM ").expect("a FROM")];
+        for (name, _) in column_specs() {
+            assert!(
+                columns.contains(&name.clone()),
+                "{name} missing from the output"
+            );
+        }
+        assert!(
+            !columns.contains("_seq"),
+            "the staging key leaked into the output columns: {select}"
+        );
     }
 }

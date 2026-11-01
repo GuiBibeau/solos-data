@@ -480,6 +480,53 @@ fn decimal_strings_round_trip_as_identical_f64_bits() {
     );
 }
 
+/// The archive line order of tied rows is the output order, not any value order. The books
+/// at one `time_ms` arrive as 300, 100, 200 and must come back out in exactly that order.
+/// DuckDB keeps input order for ties at this scale by accident of its sort, so the sort key
+/// itself is pinned separately in publish::tests.
+#[test]
+fn tied_distinct_books_keep_the_archive_line_order_not_a_value_order() {
+    let root = Tmp::new("tie-order");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let time = 1_792_627_200_000_i64;
+    let rows = [
+        book("BTC", time, 1, "300.0"),
+        book("BTC", time, 1, "100.0"),
+        book("BTC", time, 1, "200.0"),
+        book("BTC", time + 5_000, 1, "150.0"),
+    ]
+    .map(String::from)
+    .to_vec();
+    let file = write_coin(&input, "20261022", 0, "BTC", &lines(&rows));
+    let sums = root.0.join("MANIFEST.json");
+    std::fs::write(&sums, manifest(std::slice::from_ref(&file))).unwrap();
+    let report = run_ok(&input, &out, &sums).unwrap();
+    assert_eq!(report.rows, 4);
+    assert_eq!(report.dup_distinct, 2, "two extra books at one time_ms");
+    let path = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+    // No ORDER BY: physical file order is the deterministic (coin, time_ms, _seq) order.
+    let conn = crate::store::memory_connection("1", "512MB").unwrap();
+    let found = crate::store::query_rows(
+        &conn,
+        &format!(
+            "SELECT bid_px[1] AS px FROM read_parquet({})",
+            crate::store::sql_string(&path.to_string_lossy())
+        ),
+        &[],
+    )
+    .unwrap();
+    let prices: Vec<f64> = found
+        .iter()
+        .map(|row| row.get("px").and_then(|v| v.as_f64()).unwrap_or(f64::NAN))
+        .collect();
+    assert_eq!(
+        prices,
+        vec![300.0, 100.0, 200.0, 150.0],
+        "the tied books must keep their arrival order, not a value order"
+    );
+}
+
 /// Mutation: replace the `uncovered.contains` skip with the old `no checksum` abort.
 #[test]
 fn an_hour_with_an_uncovered_file_is_pending_not_an_abort() {
