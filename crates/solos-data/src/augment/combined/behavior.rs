@@ -9,6 +9,7 @@ use super::receipt;
 use crate::fsutil::FsyncStep;
 use crate::store::{memory_connection, sql_string};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Check days the fixtures have data for (outside the lockbox weeks).
@@ -703,6 +704,37 @@ fn mapping_rules_lockbox_filters_and_receipt() {
     assert_eq!(
         catalog["watermarks"]["mapping"]["lockbox_hours_excluded"],
         864
+    );
+}
+
+#[test]
+fn the_hl_price_scan_reads_only_check_day_files() {
+    let tmp = Tmp::new("hlfiles");
+    let fixtures = build_fixtures(tmp.dir());
+    let conn = memory_connection("1", "512MB").unwrap();
+    let check_days: Vec<chrono::NaiveDate> = CHECK_DAYS
+        .split(',')
+        .map(|day| super::grid::parse_date(day).unwrap())
+        .collect();
+    let ranges = super::lockbox::tests::v2_ranges_for_test();
+    let hl = super::mapping::HlInput::scan(&conn, &fixtures.hl, &check_days, &ranges).unwrap();
+    let window_start =
+        super::grid::day_start_secs(chrono::NaiveDate::from_ymd_opt(2026, 10, 15).unwrap());
+    let window_end = window_start + 3 * 86_400;
+    // The watermark holds 72 check-day hours plus three lockbox-week hours; the
+    // price scan must read only the check-day files, so SOL has exactly the
+    // check-day hours and the lockbox-only coin has no prices at all.
+    assert_eq!(hl.prices.get("SOL").map(BTreeMap::len), Some(72));
+    assert!(
+        hl.prices
+            .get("SOL")
+            .unwrap()
+            .keys()
+            .all(|hour| *hour >= window_start && *hour < window_end)
+    );
+    assert!(
+        !hl.prices.contains_key("LOCKCOIN"),
+        "lockbox-only coin has no prices"
     );
 }
 

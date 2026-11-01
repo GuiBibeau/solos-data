@@ -783,23 +783,23 @@ fn parquet_one(root: &Path, file: &FileRef) -> Result<String, StoreError> {
 }
 
 /// The hl-fills-v1 input: watermark, receipted files, universe, check-day prices.
-struct HlInput {
-    schema: String,
+pub(crate) struct HlInput {
+    pub(crate) schema: String,
     check_days: Vec<NaiveDate>,
-    hours: BTreeSet<String>,
+    pub(crate) hours: BTreeSet<String>,
     hours_sha256: String,
     files: Vec<FileRef>,
     /// coin, (coin_class, first/last fill second).
     universe: BTreeMap<String, (String, Universe)>,
     /// coin, hour start, last price of the hour (check days only).
-    prices: BTreeMap<String, BTreeMap<i64, f64>>,
+    pub(crate) prices: BTreeMap<String, BTreeMap<i64, f64>>,
 }
 
 impl HlInput {
     /// Read the watermark, check every receipted hour's files exist, and scan
     /// the universe plus the check-day hourly last prices. The universe span
     /// excludes the lockbox hours: a coin trading only inside them vanishes.
-    fn scan(
+    pub(crate) fn scan(
         conn: &duckdb::Connection,
         root: &Path,
         check_days: &[NaiveDate],
