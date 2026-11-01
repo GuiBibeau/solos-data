@@ -51,8 +51,9 @@ Triggers: a rebuilt or fresh manifest with fewer rows for that hour, a
 different `--checksums` file, a different `--out` pointing at an existing
 root, or a rerun of the same root with a narrower `--coins`.
 
-Then: `seal_hour` (`crates/solos-data/src/augment/hll2book/publish.rs:282`)
-renames the new Parquet over the hour's file, and `stale_paths` (`publish.rs:938`) removes
+Then: `seal_hour`
+(`crates/solos-data/src/augment/hll2book/publish.rs:282`) renames the new
+Parquet over the hour's file, and `stale_paths` (`publish.rs:938`) removes
 any earlier output path not in the new set, so the earlier coins' rows are
 gone. `drop_raw` deletes the remaining raw for the subset. And
 `write_drop_record` (`batch.rs:1081`) overwrites `drops/<hour>.json` instead
@@ -78,9 +79,12 @@ silent re-seal; only a config-hash change or a strict superset re-seals.
 The escape hatch for a corrected re-download is the new
 `--reseal <YYYYMMDD/H>` flag in #104: it bypasses the guard for that hour,
 refuses unless every receipt input's raw file is still on disk, and uses
-the old receipt so `stale_paths` removes old outputs. Without it, the only
-manual way is deleting `receipts/<hour>.json`. That works only while the
-raw is on disk (otherwise the hour goes Partial and fails at
+the old receipt so `stale_paths` removes old outputs. It is validated
+before any work, and refuses an hour not in the watermark, without a
+receipt, outside `--since`/`--until`, or whose in-scope manifest group
+lacks any receipt coin, so a narrowed `--coins` cannot shrink it. Without
+it, the only manual way is deleting `receipts/<hour>.json`. That works
+only while the raw is on disk (otherwise the hour goes Partial and fails at
 `batch.rs:555`), and it leaves `stale_paths` no receipt to clean old
 outputs with, so do not do that.
 
@@ -166,9 +170,8 @@ the listing time as possibly incomplete.
   hours were never sealed, and every rerun stops at the refused hour.
   Consider a pending-refused status that lets other hours seal and exits 1
   at the end.
-- [ ] Tests still worth having if not in #104: a wrong-schema drop record, a
-  drop record durability fault, and the `work_one` guard alone (today it
-  survives a mutation because the `seal_hour` re-check also refuses;
-  documented).
+- [x] Tests added in #104: `drop_record_wrong_schema_is_refused`,
+  `drop_record_durable_write_fault`, and `work_one_guard_alone` (the
+  `work_one` guard is covered on its own).
 - [ ] The guard compares coin and sha256 only, not path or bytes. Low risk;
   noted.
