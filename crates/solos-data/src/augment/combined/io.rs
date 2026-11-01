@@ -347,11 +347,6 @@ pub fn read_hour_receipt(root: &Path, table: &str, hour: i64) -> Option<HourRece
     serde_json::from_str(&text).ok()
 }
 
-/// The per-run receipt path: `<root>/<table>/receipt-<unit>.json`.
-pub fn run_receipt_path(root: &Path, table: &str, unit: &str) -> PathBuf {
-    root.join(table).join(format!("receipt-{unit}.json"))
-}
-
 /// The build plan of one run: the hours to build (closed by the watermark,
 /// minus the lockbox) and the counters the receipts record.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -450,6 +445,10 @@ pub struct RunSummary<'a> {
     pub hours_skipped: u64,
     /// Lockbox hours inside the requested range (never written).
     pub lockbox_dropped: u64,
+    /// Distinct UTC hours in the lockbox exclusion set (864 for v2).
+    pub lockbox_excluded: u64,
+    /// SHA-256 of the lockbox bytes, as checked against `--lockbox-sha256`.
+    pub lockbox_sha256: &'a str,
     /// Input watermark facts (file lists, max timestamp, closure).
     pub watermark: &'a Value,
     /// Digest of the input facts; equal inputs produce equal outputs.
@@ -470,27 +469,36 @@ pub struct RunSummary<'a> {
 /// The receipt write or the catalog rewrite fails.
 pub fn finish_run(out: &Path, summary: &RunSummary<'_>) -> Result<(), StoreError> {
     let rows: u64 = summary.outputs.iter().map(|file| file.rows).sum();
-    write_run_receipt(
-        out,
-        summary.table,
-        summary.unit,
-        &json!({
-            "unit": summary.unit,
-            "unit_version": summary.unit_version,
-            "table": summary.table,
-            "rows": rows,
+    let receipt = crate::augment::combined::receipt::Receipt {
+        unit: summary.unit.to_owned(),
+        unit_version: summary.unit_version,
+        rows,
+        outputs: summary
+            .outputs
+            .iter()
+            .map(|file| crate::augment::combined::receipt::OutputFile {
+                path: file.relative.clone(),
+                rows: file.rows,
+                bytes: file.bytes,
+                sha256: file.sha256.clone(),
+            })
+            .collect(),
+        inputs: json!({
+            "watermark": summary.watermark,
+            "inputs_sha256": summary.inputs_sha256,
             "hours_written": summary.outputs.len(),
             "hours_skipped": summary.hours_skipped,
-            "lockbox_hours_dropped": summary.lockbox_dropped,
-            "outputs": summary.outputs,
-            "inputs": summary.watermark,
-            "inputs_sha256": summary.inputs_sha256,
-            "config_sha256": summary.config_sha256,
-            "provenance": summary.provenance,
-            "started_utc": summary.started_utc,
-            "finished_utc": crate::augment::combined::grid::now_rfc3339(),
+            "table": summary.table,
         }),
-    )?;
+        lockbox_sha256: summary.lockbox_sha256.to_ascii_lowercase(),
+        lockbox_hours_dropped: summary.lockbox_dropped,
+        lockbox_hours_excluded: summary.lockbox_excluded,
+        config_sha256: summary.config_sha256.to_owned(),
+        provenance: summary.provenance.clone(),
+        started_utc: summary.started_utc.to_owned(),
+        finished_utc: crate::augment::combined::grid::now_rfc3339(),
+    };
+    crate::augment::combined::receipt::write(out, summary.table, &receipt)?;
     let mut cat = crate::augment::combined::catalog::load(out)?;
     for file in summary.outputs {
         cat.upsert(
@@ -507,28 +515,6 @@ pub fn finish_run(out: &Path, summary: &RunSummary<'_>) -> Result<(), StoreError
         );
     }
     cat.save(out)?;
-    Ok(())
-}
-
-/// Write the per-run receipt durably under the unit's table directory.
-///
-/// # Errors
-///
-/// Serialization or the durable write fails.
-pub fn write_run_receipt<T: Serialize>(
-    root: &Path,
-    table: &str,
-    unit: &str,
-    receipt: &T,
-) -> Result<(), StoreError> {
-    let mut body =
-        serde_json::to_vec_pretty(receipt).map_err(|e| StoreError::Check(e.to_string()))?;
-    body.push(b'\n');
-    let path = run_receipt_path(root, table, unit);
-    if let Some(parent) = path.parent() {
-        create_dir_all_durable(parent)?;
-    }
-    write_durable(&path, &body)?;
     Ok(())
 }
 
