@@ -61,8 +61,14 @@ pub struct Report {
     pub hours_verified: u64,
     /// Hours already verified and left unchanged.
     pub hours_skipped: u64,
-    /// Hours skipped because a manifest file was missing or the wrong size.
+    /// Hours skipped as incomplete: a manifest file is missing on disk or the wrong size, or
+    /// an in-scope `.lz4` on disk has no manifest row yet (those are also in
+    /// [`Report::hours_uncovered`]).
     pub hours_pending: u64,
+    /// Hours skipped because an in-scope `.lz4` on disk has no manifest row (a subset of
+    /// [`Report::hours_pending`]). The manifest builder covers those hours; the run does not
+    /// abort on them.
+    pub hours_uncovered: u64,
     /// Rows in the hours verified on this call.
     pub rows: u64,
     /// Raw bytes deleted on this call.
@@ -102,6 +108,7 @@ impl Report {
             .with("hoursVerified", self.hours_verified)
             .with("hoursSkipped", self.hours_skipped)
             .with("hoursPending", self.hours_pending)
+            .with("hoursUncovered", self.hours_uncovered)
             .with("rows", self.rows)
             .with("rawBytesDropped", self.raw_bytes_dropped)
             .with("freeBytes", json_u64(self.free_bytes))
@@ -120,10 +127,10 @@ fn json_u64(value: Option<u64>) -> serde_json::Value {
 ///
 /// # Errors
 ///
-/// A checksum is missing for a file that is in scope, a size-matched file's sha256 does not
-/// match, a frame is short or corrupt, a count or sample check fails, or the output lock is
-/// already held. The watermark does not gain that hour. A size mismatch is not an error: the
-/// hour is counted as pending.
+/// A size-matched file's sha256 does not match the manifest, a frame is short or corrupt, a
+/// count or sample check fails, or the output lock is already held. The watermark does not
+/// gain that hour. An incomplete hour is not an error: a short or missing file, or a finished
+/// `.lz4` with no manifest row, is counted as pending and the run continues.
 pub fn run(
     request: &Request<'_>,
     mut free_bytes: impl FnMut(&Path) -> Result<u64, String>,
@@ -155,6 +162,7 @@ pub fn run(
         hours_verified: 0,
         hours_skipped: 0,
         hours_pending: 0,
+        hours_uncovered: 0,
         rows: 0,
         raw_bytes_dropped: 0,
         free_bytes: None,
@@ -172,20 +180,24 @@ pub fn run(
     }
     let entries = checksum::load_entries(request.checksums)?;
     let on_disk = scan_books(request.input)?;
+    // A finished `.lz4` in scope with no manifest row makes that hour pending, never an abort:
+    // the sha256 manifest lags the downloader, and the builder subcommand closes the gap.
+    // `.part` files never match a book path, so a downloading file is invisible here.
+    let covered: BTreeSet<(String, u32, String)> = entries
+        .iter()
+        .map(|entry| (entry.date.clone(), entry.hour, entry.coin.clone()))
+        .collect();
+    let mut uncovered: BTreeSet<String> = BTreeSet::new();
     for (date, hour, coin) in &on_disk {
         if !in_scope(request, date, coin) {
             continue;
         }
-        let listed = entries
-            .iter()
-            .any(|entry| entry.date == *date && entry.hour == *hour && entry.coin == *coin);
-        if !listed {
-            return Err(StoreError::Check(format!(
-                "{date}/{hour}/{coin}: no checksum"
-            )));
+        if !covered.contains(&(date.clone(), *hour, coin.clone())) {
+            uncovered.insert(format!("{date}/{hour}"));
         }
     }
     let hours = group_hours(&entries, request);
+    let hour_keys: BTreeSet<String> = hours.iter().map(|hour| hour.key.clone()).collect();
     let mut watermark = load_watermark(request.out)?;
     let hash = config_hash();
     let git = if request.git_sha.trim().is_empty() {
@@ -196,6 +208,12 @@ pub fn run(
     let mut conn: Option<duckdb::Connection> = None;
     for hour in hours {
         let key = hour.key.clone();
+        if uncovered.contains(&key) {
+            // Pending, not failed: the hour is re-run once the manifest covers its coins.
+            report.hours_pending += 1;
+            report.hours_uncovered += 1;
+            continue;
+        }
         let ready = match locate_hour(request.input, &hour.entries)? {
             HourFiles::Partial => {
                 if watermark.contains(&key) {
@@ -284,6 +302,13 @@ pub fn run(
         report.rows += output.output_rows;
         if request.drop_raw {
             report.raw_bytes_dropped += drop_raw(request.input, request.out, &key)?;
+        }
+    }
+    // An hour whose on-disk coins have no manifest row at all never entered the loop above.
+    for key in &uncovered {
+        if !hour_keys.contains(key) {
+            report.hours_pending += 1;
+            report.hours_uncovered += 1;
         }
     }
     Ok(report)

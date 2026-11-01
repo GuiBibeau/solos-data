@@ -319,9 +319,9 @@ fn decimal_strings_round_trip_as_identical_f64_bits() {
     );
 }
 
-/// Mutation: replace the missing-checksum `return Err` with `continue`.
+/// Mutation: replace the `uncovered.contains` skip with the old `no checksum` abort.
 #[test]
-fn an_hour_missing_from_the_manifest_fails_the_hour() {
+fn an_hour_with_an_uncovered_file_is_pending_not_an_abort() {
     let root = Tmp::new("no-sum");
     let input = root.0.join("in");
     let out = root.0.join("out");
@@ -332,6 +332,7 @@ fn an_hour_missing_from_the_manifest_fails_the_hour() {
         "BTC",
         &book("BTC", 1_792_627_200_000, 1, "1"),
     );
+    // ETH's finished .lz4 is on disk and in scope, but the manifest has no row for it.
     let _missing = write_coin(
         &input,
         "20261022",
@@ -341,15 +342,21 @@ fn an_hour_missing_from_the_manifest_fails_the_hour() {
     );
     let sums = root.0.join("MANIFEST.json");
     std::fs::write(&sums, manifest(&[listed])).unwrap();
-    let error = run_ok(&input, &out, &sums).unwrap_err();
+    let report = run_ok(&input, &out, &sums).unwrap();
+    assert_eq!(report.stop, Stop::Done);
+    assert_eq!(report.hours_uncovered, 1);
+    assert_eq!(report.hours_pending, 1);
+    assert_eq!(report.hours_verified, 1, "the covered hour still converts");
+    assert_eq!(watermark(&out), vec!["20261022/1".to_owned()]);
     assert!(
-        error.to_string().contains("20261022/0/ETH: no checksum"),
-        "{error}"
+        input.join("20261022/0/ETH.lz4").is_file(),
+        "an uncovered raw file is never touched"
     );
     assert!(
-        watermark(&out).is_empty(),
-        "a missing checksum must not be skipped"
+        !out.join("train/date=2026-10-22/hour=20261022-0.parquet").exists(),
+        "the uncovered hour stays pending, half-converted"
     );
+    assert_eq!(report.exit_code(), 0, "pending is not a failure");
 }
 
 /// Mutation: delete the `--checksums` is-file check so a missing manifest is an IO error.
