@@ -80,6 +80,8 @@ struct Opts {
     max_ratio: f64,
     /// The injected count fault, or none.
     fault: Fault,
+    /// Hour workers.
+    jobs: u32,
 }
 
 impl Default for Opts {
@@ -92,6 +94,7 @@ impl Default for Opts {
             until: None,
             max_ratio: 1e12,
             fault: Fault::None,
+            jobs: 1,
         }
     }
 }
@@ -116,7 +119,7 @@ fn run_with(
         until: opts.until,
         drop_raw: opts.drop_raw,
         max_ratio: opts.max_ratio,
-        jobs: 1,
+        jobs: opts.jobs,
         fault: opts.fault,
     };
     super::run(&request, free)
@@ -516,6 +519,76 @@ fn an_hour_with_an_uncovered_file_is_pending_not_an_abort() {
         "the uncovered hour stays pending, half-converted"
     );
     assert_eq!(report.exit_code(), 0, "pending is not a failure");
+}
+
+/// Mutation: replace the `uncovered.contains(&hour.key)` skip in the task loop with `if
+/// false`. A mixed hour (one covered coin, one uncovered coin on disk) must stay pending at
+/// any job count, and no raw file of it may be deleted.
+#[test]
+fn a_mixed_hour_with_an_uncovered_coin_stays_pending_at_any_jobs() {
+    for jobs in [1, 4] {
+        let root = Tmp::new(&format!("mixed-{jobs}"));
+        let input = root.0.join("in");
+        let out = root.0.join("out");
+        // BTC is in the manifest; ETH is finished on disk with no manifest row.
+        let btc = write_coin(
+            &input,
+            "20261022",
+            0,
+            "BTC",
+            &book("BTC", 1_792_627_200_000, 1, "1"),
+        );
+        let _eth = write_coin(
+            &input,
+            "20261022",
+            0,
+            "ETH",
+            &book("ETH", 1_792_627_205_000, 1, "2"),
+        );
+        let sums = root.0.join("MANIFEST.json");
+        std::fs::write(&sums, manifest(std::slice::from_ref(&btc))).unwrap();
+        let report = run_with(
+            &input,
+            &out,
+            &sums,
+            Opts {
+                drop_raw: true,
+                jobs,
+                ..Opts::default()
+            },
+            |_| Ok(u64::MAX),
+        )
+        .unwrap();
+        assert_eq!(jobs, report.jobs, "the run used the requested workers");
+        assert_eq!(report.hours_pending, 1, "jobs={jobs}");
+        assert_eq!(report.hours_uncovered, 1, "jobs={jobs}");
+        assert_eq!(
+            report.hours_verified, 0,
+            "jobs={jobs}: half-converted is not verified"
+        );
+        assert_eq!(report.hours_skipped, 0, "jobs={jobs}");
+        assert!(
+            watermark(&out).is_empty(),
+            "jobs={jobs}: the watermark moved for a pending hour"
+        );
+        assert!(
+            input.join("20261022/0/BTC.lz4").is_file(),
+            "jobs={jobs}: the covered coin's raw was deleted from a pending hour"
+        );
+        assert!(
+            input.join("20261022/0/ETH.lz4").is_file(),
+            "jobs={jobs}: the uncovered coin's raw was touched"
+        );
+        assert!(
+            !out.join("drops/20261022/0.json").is_file(),
+            "jobs={jobs}: a drop record exists for a pending hour"
+        );
+        assert!(
+            !out.join("train/date=2026-10-22/hour=20261022-0.parquet")
+                .exists(),
+            "jobs={jobs}: the pending hour was written anyway"
+        );
+    }
 }
 
 /// Mutation: delete the `--checksums` is-file check so a missing manifest is an IO error.
