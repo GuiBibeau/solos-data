@@ -1269,6 +1269,28 @@ fn a_crash_mid_drop_retries_and_keeps_the_drop_record() {
     assert_eq!(value["files"].as_array().unwrap().len(), 2);
 }
 
+/// Mutations: delete the parent-directory fsync loop after the raw unlinks in `drop_raw`.
+/// The last fsync of a clean drop run must be the input directory the files were unlinked
+/// from, not the drop record's directory.
+#[test]
+fn the_raw_unlink_dirs_are_fsynced() {
+    let _reset = Reset::arm();
+    let root = Tmp::new("drop-fsync");
+    let (input, out, sums) = stage_pair(&root);
+    run_ok(&input, &out, &sums).unwrap();
+    let dropped = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(dropped.hours_verified + dropped.hours_skipped, 1);
+    assert!(!input.join("20261022/0/BTC.lz4").exists());
+    let last = crate::fsutil::last_fsync_path().expect("the drop ran fsyncs");
+    assert!(
+        last.starts_with(&input),
+        "the last fsync was {} and left the unlink un-durable",
+        last.display()
+    );
+    let again = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(again.stop, Stop::Done);
+}
+
 /// Mutation: delete the `LockExclusiveNonblock` arm that returns "already owned".
 #[test]
 fn a_held_lock_refuses_the_run() {

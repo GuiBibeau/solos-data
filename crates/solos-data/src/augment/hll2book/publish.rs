@@ -379,12 +379,15 @@ fn stream_hour(
     let mut written = 0u64;
     let mut dup_identical = 0u64;
     let mut dup_distinct = 0u64;
-    // Every `(coin, time_ms)` seen so far maps to the book digests kept for it. A later line
-    // that repeats one of them is an identical re-send and is dropped; a new digest is a
-    // distinct book and is kept. DuplicateRule never fails the hour.
-    let mut seen: BTreeMap<(String, i64), Vec<[u8; 32]>> = BTreeMap::new();
+    // One file per coin per hour, so the duplicate state is per file keyed by `time_ms`
+    // alone: no per-row String key, and clearing between files cannot merge two coins. A
+    // later line that repeats a kept digest is an identical re-send and is dropped; a new
+    // digest is a distinct book and is kept. DuplicateRule never fails the hour.
+    let mut seen: std::collections::HashMap<i64, Vec<[u8; 32]>> = std::collections::HashMap::new();
+    let mut tally: u64 = 0;
     let mut fault_fired = false;
     for file in files {
+        seen.clear();
         if !file.bytes.starts_with(&crate::augment::hls3::LZ4_MAGIC) {
             return Err(StoreError::Check(format!(
                 "{}: lz4: not an lz4 frame",
@@ -421,9 +424,8 @@ fn stream_hour(
             }
             for row in rows {
                 counted += 1;
-                let key = (row.coin.clone(), row.time_ms);
                 let digest = decode::book_digest(&row);
-                let kept = seen.entry(key).or_default();
+                let kept = seen.entry(row.time_ms).or_default();
                 if !kept.is_empty() {
                     match DuplicateRule::classify(kept, &digest) {
                         DuplicateRule::Identical => {
@@ -434,7 +436,7 @@ fn stream_hour(
                     }
                 }
                 kept.push(digest);
-                *tallies.entry(file.coin.to_owned()).or_default() += 1;
+                tally += 1;
                 if fault == Fault::Hour && !fault_fired {
                     fault_fired = true;
                     written += 1;
@@ -446,6 +448,8 @@ fn stream_hour(
                 written += 1;
             }
         }
+        tallies.insert(file.coin.to_owned(), tally);
+        tally = 0;
     }
     if counted != written + dup_identical {
         return Err(StoreError::Check(format!(

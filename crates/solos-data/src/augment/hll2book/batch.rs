@@ -381,9 +381,12 @@ pub fn run(
         }
         drop(done_tx);
         // The main thread owns dispatch (after the disk floor) and commit (in order).
+        // Refill happens on every completion and after every commit, so a slow hour cannot
+        // idle the workers behind the ordering gap; in flight counts sent minus committed.
         let mut ready: BTreeMap<usize, WorkerOutcome> = BTreeMap::new();
         let mut sent = 0usize;
         let mut next = 0usize;
+        let mut floored = false;
         dispatch_more(
             request,
             &mut free_bytes,
@@ -393,7 +396,7 @@ pub fn run(
             next,
             &task_tx,
         )?;
-        while next < sent {
+        while next < tasks.len() {
             let Ok((index, outcome)) = done_rx.recv() else {
                 break;
             };
@@ -403,6 +406,17 @@ pub fn run(
                 return Err(error);
             }
             ready.insert(index, outcome);
+            if !dispatch_more(
+                request,
+                &mut free_bytes,
+                &mut report,
+                tasks.len(),
+                &mut sent,
+                next,
+                &task_tx,
+            )? {
+                floored = true;
+            }
             while let Some(outcome) = ready.remove(&next) {
                 match outcome {
                     WorkerOutcome::Pending => {
@@ -466,7 +480,9 @@ pub fn run(
                     WorkerOutcome::Failed(_) => unreachable!("failed outcomes stop the run"),
                 }
                 next += 1;
-                if !dispatch_more(
+            }
+            if !floored
+                && !dispatch_more(
                     request,
                     &mut free_bytes,
                     &mut report,
@@ -474,9 +490,19 @@ pub fn run(
                     &mut sent,
                     next,
                     &task_tx,
-                )? {
-                    break;
-                }
+                )?
+            {
+                floored = true;
+            }
+            // Nothing in flight and hours left unsent can only mean the floor stopped the
+            // dispatch: waiting for an outcome would hang the run.
+            if sent == next && next < tasks.len() {
+                floored = true;
+            }
+            if floored {
+                // In-flight hours already committed above stay verified; hours dispatched
+                // but not sealed are left for a rerun, like a crash.
+                break;
             }
         }
         Ok(())
@@ -1008,13 +1034,22 @@ fn drop_raw(input: &Path, out: &Path, hour_key: &str) -> Result<u64, StoreError>
     // that are already gone.
     write_drop_record(out, hour_key, date, hour, &receipt)?;
     let mut removed = 0u64;
+    let mut parents = BTreeSet::new();
     for (target, len) in pending {
         std::fs::remove_file(&target)?;
         removed += len;
+        if let Some(parent) = target.parent() {
+            parents.insert(parent.to_path_buf());
+        }
         #[cfg(test)]
         if take_drop_fault() {
             return Err(StoreError::Check("injected drop stop".into()));
         }
+    }
+    // The unlinks are durable: without this fsync a crash can bring a deleted file back, and
+    // only the retry would delete it again.
+    for parent in parents {
+        crate::fsutil::sync_dir_after_rename(&parent)?;
     }
     Ok(removed)
 }
