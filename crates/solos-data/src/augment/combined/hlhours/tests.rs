@@ -6,9 +6,10 @@
 //! a real lz4-framed CSV. No provider URLs, no shared state.
 
 use super::{
-    GUARD_HOURS, HL_TRAIN_CODE_SHA, Request, SCHEMA, STAGE1_VERSION, UNIT_VERSION, grid, lockbox,
-    run,
+    GUARD_HOURS, HL_TRAIN_CODE_SHA, Request, SCHEMA, STAGE1_VERSION, TABLE, UNIT, UNIT_VERSION,
+    grid, lockbox, run,
 };
+use crate::augment::combined::receipt;
 
 /// Seconds in one hour (mirror of `grid::HOUR_SECS`).
 const HOUR: i64 = 3_600;
@@ -676,6 +677,14 @@ fn lockbox_hours_are_dropped() {
     assert_eq!(report.built, 0);
     assert_eq!(report.lockbox_hours_dropped, 1);
     assert!(!output_path(fx.root.path(), h).exists());
+    // The receipt keeps the two apart: dropped is the one input hour this run
+    // actually lost to the lockbox, excluded is the v2 set's own size.
+    let receipt: Value = serde_json::from_str(
+        &std::fs::read_to_string(receipt::receipt_path(fx.root.path(), TABLE, UNIT)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["lockbox_hours_dropped"], 1);
+    assert_eq!(receipt["lockbox_hours_excluded"], 864);
 }
 
 /// A lockbox sha mismatch refuses the whole run.
