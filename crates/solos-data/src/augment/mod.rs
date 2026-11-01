@@ -2,7 +2,8 @@
 //! dataset, downloaded from public venues and APIs, stored as Parquet next to the raw and
 //! decoded roots, and kept current. `augment sync` is the idempotent backfill and catch-up of
 //! dated files and paged histories; `augment capture` is the long-running lane for streams that
-//! cannot be fetched later.
+//! cannot be fetched later. `augment hl-fills` is an offline batch over local
+//! `node_fills_by_block` hours (ADR-0020); it does not run inside `augment sync`.
 
 pub mod alternative;
 pub mod auto;
@@ -17,6 +18,7 @@ pub mod deribit;
 pub mod dumps;
 pub mod elfa;
 pub mod episodes;
+pub mod hlfills;
 pub mod hls3;
 pub mod http;
 pub mod hyperliquid;

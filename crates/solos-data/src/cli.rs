@@ -1013,7 +1013,7 @@ fn offline_or_live(
 // ---------------------------------------------------------------------------------------------
 // augment
 
-const AUGMENT_COMMANDS: [(&str, &str); 6] = [
+const AUGMENT_COMMANDS: [(&str, &str); 7] = [
     (
         "sync",
         "Backfill and catch up dated files and paged histories, then exit: [--source name] [--symbol SYM]",
@@ -1031,6 +1031,10 @@ const AUGMENT_COMMANDS: [(&str, &str); 6] = [
     (
         "query",
         "Read-only SQL over the catalogued files: --sql SELECT ... FROM <source>_<dataset>",
+    ),
+    (
+        "hl-fills",
+        "Offline all-coin node_fills_by_block hours to Parquet (no download, no collector): --input <hourly-dir> --out <root> --checksums <SHA256SUMS-or-MANIFEST> [--min-free-tb 1.0] [--threads 4] [--memory 8GB]",
     ),
 ];
 
@@ -1053,6 +1057,9 @@ fn augment(args: &[String]) -> i32 {
         );
         return 0;
     }
+    if command == "hl-fills" {
+        return hl_fills_cli(&args[1..]);
+    }
     match augment_command(command, args) {
         Ok(code) => code,
         Err(error) => {
@@ -1063,6 +1070,102 @@ fn augment(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+fn hl_fills_cli(args: &[String]) -> i32 {
+    if args.is_empty()
+        || args
+            .first()
+            .is_some_and(|arg| arg == "help" || arg == "--help")
+    {
+        println!(
+            "{}",
+            Obj::new()
+                .with(
+                    "command",
+                    "solos-data augment hl-fills --input <hourly-dir> --out <root> --checksums <SHA256SUMS-or-MANIFEST> [--min-free-tb 1.0] [--threads 4] [--memory 8GB]"
+                )
+                .with(
+                    "input",
+                    "node_fills_by_block/hourly with YYYYMMDD/H.lz4 (H unpadded, 0..23)"
+                )
+                .with(
+                    "out",
+                    "train/ and forward/ Parquet, receipts/, watermark.json. Forward rows are date >= 2026-10-23 UTC"
+                )
+                .to_json()
+        );
+        return 0;
+    }
+    match hl_fills_run(args) {
+        Ok(code) => code,
+        Err(error) => {
+            log(
+                "hl_fills_failed",
+                Obj::new().with("error", safe_error(&error.to_string())),
+            );
+            1
+        }
+    }
+}
+
+fn hl_fills_run(args: &[String]) -> Result<i32, StoreError> {
+    let input = required_flag(args, "--input")?;
+    let out = required_flag(args, "--out")?;
+    let checksums = required_flag(args, "--checksums")?;
+    let memory = crate::augment::hlfills::parse_memory_limit(
+        flag(args, "--memory").unwrap_or(crate::augment::hlfills::DEFAULT_MEMORY),
+    )?;
+    let request = crate::augment::hlfills::Request {
+        input: Path::new(input),
+        out: Path::new(out),
+        checksums: Path::new(checksums),
+        min_free_bytes: min_free_bytes(args)?,
+        threads: threads_flag(args)?,
+        memory_limit: memory,
+        git_sha: crate::augment::hlfills::git_sha(),
+    };
+    let report = crate::augment::hlfills::run(&request, filesystem_free)?;
+    println!("{}", report.to_json());
+    Ok(report.exit_code())
+}
+
+fn required_flag<'a>(args: &'a [String], name: &str) -> Result<&'a str, StoreError> {
+    flag(args, name).ok_or_else(|| StoreError::Check(format!("{name} is required")))
+}
+
+fn threads_flag(args: &[String]) -> Result<u32, StoreError> {
+    let Some(text) = flag(args, "--threads") else {
+        return Ok(crate::augment::hlfills::DEFAULT_THREADS);
+    };
+    let threads: u32 = text
+        .parse()
+        .map_err(|_| StoreError::Check("--threads is not an integer".into()))?;
+    if !(1..=256).contains(&threads) {
+        return Err(StoreError::Check("--threads must be 1..=256".into()));
+    }
+    Ok(threads)
+}
+
+fn min_free_bytes(args: &[String]) -> Result<u64, StoreError> {
+    let Some(text) = flag(args, "--min-free-tb") else {
+        return Ok(crate::augment::hlfills::DEFAULT_MIN_FREE_BYTES);
+    };
+    let tb: f64 = text
+        .parse()
+        .map_err(|_| StoreError::Check("--min-free-tb is not a number".into()))?;
+    if !tb.is_finite() || !(0.0..=1_000_000.0).contains(&tb) {
+        return Err(StoreError::Check("--min-free-tb is out of range".into()));
+    }
+    let bytes = (tb * 1_000_000_000_000.0).round();
+    if !bytes.is_finite() || bytes < 0.0 {
+        return Err(StoreError::Check("--min-free-tb is out of range".into()));
+    }
+    Ok(bytes as u64)
+}
+
+fn filesystem_free(path: &Path) -> Result<u64, String> {
+    crate::health::disk_free(path).ok_or_else(|| "statvfs failed".to_owned())
 }
 
 fn augment_command(command: &str, args: &[String]) -> Result<i32, StoreError> {

@@ -12,7 +12,9 @@
 //! - `asset_ctxs`: `hyperliquid-archive/asset_ctxs/<YYYYMMDD>.csv.lz4`, every coin's context
 //!   (funding, open interest, prices), one Parquet day.
 //! - `fills`: `hl-mainnet-node-data/node_fills_by_block/hourly/<YYYYMMDD>/<H>.lz4`, every fill of
-//!   the chain by block, kept for the mapped coins, one Parquet day per coin.
+//!   the chain by block, kept for the mapped coins, one Parquet day per coin. That filter stays
+//!   on this disabled live path. All-coin training tables are the offline `augment hl-fills`
+//!   command (ADR-0020), which does not call [`fill_rows`].
 //!
 //! Hyperliquid uploads the archive about once a month with no guarantee, so a day without files
 //! younger than `UPLOAD_LAG_DAYS` is asked for again; an older one is recorded as absent.
