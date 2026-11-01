@@ -556,6 +556,12 @@ without files is absent only after 45 days. The `l2Book` and fill line formats a
 Hyperliquid's documented shapes and checked by unit fixtures, not yet against a downloaded file;
 an unparseable day is an error and nothing is registered for it.
 
+The mapped-coin, one-file-per-coin fill layout stays this disabled live path (`enabled` false,
+`estimateOnly` true, `fills` false). All-coin training tables are a separate offline command,
+`solos-data augment hl-fills`, over local `node_fills_by_block` hours (ADR-0020). It does not
+download, does not open the collector checkpoint, and does not register files in the augment
+ledger.
+
 Cost: transfer out of S3 to the internet is $0.09/GB from us-east-1 and $0.114/GB from
 ap-northeast-1 (AWS list prices, first 10 TB a month), plus $0.0004 per 1,000 GETs and $0.005
 per 1,000 listings. Nothing public states the archive's size, and listing it needs the
