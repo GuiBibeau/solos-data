@@ -26,6 +26,11 @@ tried:
   decode, digest, and spill of a 49-coin hour can run across coins, not just
   across hours. This is the lever that helps the tail hours (the last worker
   finishing a 43 MB hour while others idle).
+- [ ] Close the gap to the download rate: 14.1 MB/s of lz4 against the
+  downloader's 19.3 MiB/s (about 20 MB/s), so a converter running beside a
+  live download falls behind by about 6 MB/s. Done when a measured run on the
+  same fourteen hours reaches 20 MB/s, or the brief's target is lowered on
+  the record.
 
 ## Resolved on this branch
 
@@ -78,3 +83,9 @@ tried:
 - [ ] The builder aborts if a file vanishes between the walk and the open.
   The converter treats a missing file as pending, so the retry heals, but the
   builder could count it instead.
+- [ ] The `lint:text` docs size guard counts `split('\n')` elements, so a
+  file ending in a newline counts one extra line: the real limit is 4,999
+  lines, not 5,000. Count newline characters instead.
+- [ ] Extend the size guard beyond `docs/` to `README.md`, `AGENTS.md`, and
+  the crates' `.md` files.
+- [ ] The text lint catches em-dashes (U+2014) but not en-dashes (U+2013).
