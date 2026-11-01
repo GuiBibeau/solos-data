@@ -42,6 +42,10 @@ pub const DEFAULT_THREADS: u32 = 4;
 /// Default DuckDB memory cap for one hour's sort and write.
 pub const DEFAULT_MEMORY: &str = "8GB";
 
+/// Default ratio guard (ADR-0021): an hour whose Parquet bytes exceed its `.lz4` bytes times
+/// this keeps its raw files even under `--drop-raw-after-verify`.
+pub const DEFAULT_MAX_RATIO: f64 = 1.0;
+
 /// Parquet writer settings for this lane.
 ///
 /// `PARQUET_VERSION 'V1'`: DuckDB 1.4.5 writes `BYTE_STREAM_SPLIT` on the DOUBLE child of a
@@ -251,6 +255,23 @@ pub fn parse_day(value: &str) -> Result<String, crate::store::StoreError> {
     Ok(value.to_owned())
 }
 
+/// `--max-ratio`: a positive, finite ratio.
+///
+/// # Errors
+///
+/// The text is not a number, or it is zero, negative, or not finite.
+pub fn parse_ratio(value: &str) -> Result<f64, crate::store::StoreError> {
+    let parsed: f64 = value.parse().map_err(|_| {
+        crate::store::StoreError::Check(format!("--max-ratio '{value}' is not a number"))
+    })?;
+    if !parsed.is_finite() || parsed <= 0.0 {
+        return Err(crate::store::StoreError::Check(format!(
+            "--max-ratio {parsed} must be positive and finite"
+        )));
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +315,13 @@ mod tests {
         assert_eq!(parse_day("20261022").unwrap(), "20261022");
         assert!(parse_day("20261301").is_err());
         assert!(parse_day("2026102").is_err());
+        assert_eq!(parse_ratio("1.0").unwrap(), 1.0);
+        assert_eq!(parse_ratio("0.7").unwrap(), 0.7);
+        assert!(parse_ratio("0").is_err());
+        assert!(parse_ratio("-1").is_err());
+        assert!(parse_ratio("inf").is_err());
+        assert!(parse_ratio("nan").is_err());
+        assert!(parse_ratio("half").is_err());
     }
 
     #[test]

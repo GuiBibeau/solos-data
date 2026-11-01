@@ -1055,7 +1055,7 @@ const AUGMENT_COMMANDS: [(&str, &str); 8] = [
     ),
     (
         "hl-l2book",
-        "Offline l2Book hours to Parquet (no download, no collector): --input <dir> --out <root> --checksums <MANIFEST> [--coins BTC,ETH] [--since YYYYMMDD] [--until YYYYMMDD] [--drop-raw-after-verify] [--min-free-tb 1.0] [--threads 4] [--memory 8GB]",
+        "Offline l2Book hours to Parquet (no download, no collector): --input <dir> --out <root> --checksums <MANIFEST> [--coins BTC,ETH] [--since YYYYMMDD] [--until YYYYMMDD] [--drop-raw-after-verify] [--max-ratio 1.0] [--min-free-tb 1.0] [--threads 4] [--memory 8GB]",
     ),
 ];
 
@@ -1158,6 +1158,10 @@ fn hl_l2book_cli(args: &[String]) -> i32 {
                     "drop",
                     "--drop-raw-after-verify deletes the hour's .lz4 only after watermark.json is durable, and writes drops/YYYYMMDD/H.json (path, bytes, sha256, s3). A rerun overwrites that file"
                 )
+                .with(
+                    "maxRatio",
+                    "--max-ratio (default 1.0): an hour whose parquet bytes exceed its lz4 bytes times the ratio is still verified but keeps its raw files (hoursKeptRatio)"
+                )
                 .to_json()
         );
         return 0;
@@ -1211,6 +1215,9 @@ fn hl_l2book_run(args: &[String]) -> Result<i32, StoreError> {
     let memory = crate::augment::hll2book::parse_memory_limit(
         flag(args, "--memory").unwrap_or(crate::augment::hll2book::DEFAULT_MEMORY),
     )?;
+    let max_ratio = crate::augment::hll2book::parse_ratio(
+        flag(args, "--max-ratio").unwrap_or("1.0"),
+    )?;
     let request = crate::augment::hll2book::Request {
         input: Path::new(required_flag(args, "--input")?),
         out: Path::new(required_flag(args, "--out")?),
@@ -1223,6 +1230,7 @@ fn hl_l2book_run(args: &[String]) -> Result<i32, StoreError> {
         since,
         until,
         drop_raw: has(args, "--drop-raw-after-verify"),
+        max_ratio,
     };
     let report = crate::augment::hll2book::run(&request, filesystem_free)?;
     println!("{}", report.to_json());

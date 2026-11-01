@@ -41,6 +41,9 @@ pub struct Request<'a> {
     pub until: Option<String>,
     /// Delete verified raw files after the watermark entry is durable.
     pub drop_raw: bool,
+    /// Ratio guard: an hour whose Parquet bytes exceed its `.lz4` bytes times this is still
+    /// converted and verified, but its raw files are kept and counted `kept_ratio`.
+    pub max_ratio: f64,
 }
 
 /// Why `run` returned.
@@ -53,7 +56,7 @@ pub enum Stop {
 }
 
 /// The run's outcome. Printed by the CLI.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Report {
     /// [`Stop::Done`] or [`Stop::DiskFloor`].
     pub stop: Stop,
@@ -85,6 +88,37 @@ pub struct Report {
     pub threads: String,
     /// DuckDB `memory_limit` actually set, or the request when no hour was opened.
     pub memory_limit: String,
+    /// Hours whose ratio exceeded [`Request::max_ratio`]: converted and verified, raw kept.
+    pub hours_kept_ratio: u64,
+    /// The run's `--max-ratio`.
+    pub max_ratio: f64,
+    /// One line per hour the run saw, in order, for the run summary.
+    pub hours: Vec<HourLine>,
+}
+
+/// One hour's outcome in [`Report::hours`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct HourLine {
+    /// `YYYYMMDD/H`.
+    pub hour: String,
+    /// `verified`, `skipped` (already done), `pending`, or `pending-uncovered`.
+    pub status: &'static str,
+    /// Rows kept (kept rows, identical re-sends excluded).
+    pub rows: u64,
+    /// `dup_identical` of this hour.
+    pub dup_identical: u64,
+    /// `dup_distinct` of this hour.
+    pub dup_distinct: u64,
+    /// The hour's `.lz4` input bytes.
+    pub lz4_bytes: u64,
+    /// The hour's Parquet bytes.
+    pub parquet_bytes: u64,
+    /// Parquet over lz4, when the hour was converted or skipped.
+    pub ratio: Option<f64>,
+    /// True when the ratio exceeded the run's `--max-ratio`.
+    pub kept_ratio: bool,
+    /// Wall seconds the hour took, when it converted on this run.
+    pub seconds: Option<f64>,
 }
 
 impl Report {
@@ -121,12 +155,48 @@ impl Report {
             .with("floorBytes", self.floor_bytes)
             .with("threads", self.threads.clone())
             .with("memoryLimit", self.memory_limit.clone())
+            .with("maxRatio", json_f64(Some(self.max_ratio)))
+            .with("hoursKeptRatio", self.hours_kept_ratio)
+            .with_rows(
+                "hours",
+                self.hours
+                    .iter()
+                    .map(|line| {
+                        crate::jsonout::Obj::new()
+                            .with("hour", line.hour.clone())
+                            .with("status", line.status)
+                            .with("rows", line.rows)
+                            .with("dupIdentical", line.dup_identical)
+                            .with("dupDistinct", line.dup_distinct)
+                            .with("lz4Bytes", line.lz4_bytes)
+                            .with("parquetBytes", line.parquet_bytes)
+                            .with("ratio", json_f64(line.ratio))
+                            .with("keptRatio", line.kept_ratio)
+                            .with("seconds", json_f64(line.seconds))
+                    })
+                    .collect(),
+            )
             .to_json()
     }
+
+}
+
+fn json_f64(value: Option<f64>) -> serde_json::Value {
+    value.and_then(serde_json::Number::from_f64)
+        .map_or(serde_json::Value::Null, serde_json::Value::from)
 }
 
 fn json_u64(value: Option<u64>) -> serde_json::Value {
     value.map_or(serde_json::Value::Null, serde_json::Value::from)
+}
+
+/// Parquet over lz4. An hour with no input bytes reads as infinite, which keeps its raw.
+fn hour_ratio(parquet_bytes: u64, lz4_bytes: u64) -> f64 {
+    if lz4_bytes == 0 {
+        f64::INFINITY
+    } else {
+        parquet_bytes as f64 / lz4_bytes as f64
+    }
 }
 
 /// Decode every complete hour under `request.input`.
@@ -143,6 +213,11 @@ pub fn run(
 ) -> Result<Report, StoreError> {
     if !(1..=256).contains(&request.threads) {
         return Err(StoreError::Check("--threads must be 1..=256".into()));
+    }
+    if !request.max_ratio.is_finite() || request.max_ratio <= 0.0 {
+        return Err(StoreError::Check(
+            "--max-ratio must be positive and finite".into(),
+        ));
     }
     let memory_limit = super::parse_memory_limit(&request.memory_limit)?;
     if let (Some(since), Some(until)) = (&request.since, &request.until)
@@ -177,6 +252,9 @@ pub fn run(
         floor_bytes: request.min_free_bytes,
         threads: request.threads.to_string(),
         memory_limit: memory_limit.clone(),
+        hours_kept_ratio: 0,
+        max_ratio: request.max_ratio,
+        hours: Vec::new(),
     };
     match space(request.out, request.min_free_bytes, &mut free_bytes)? {
         Space::Floor(free) => {
@@ -220,17 +298,17 @@ pub fn run(
             // Pending, not failed: the hour is re-run once the manifest covers its coins.
             report.hours_pending += 1;
             report.hours_uncovered += 1;
+            report.hours.push(pending_line(&key, "pending-uncovered"));
             continue;
         }
         let ready = match locate_hour(request.input, &hour.entries)? {
             HourFiles::Partial => {
                 if watermark.contains(&key) {
                     let identity = identity_of(&hour.entries);
-                    if already_done(request.out, &key, &identity, &hash, &watermark)? {
-                        if request.drop_raw {
-                            report.raw_bytes_dropped += drop_raw(request.input, request.out, &key)?;
-                        }
-                        report.hours_skipped += 1;
+                    if let Some(receipt) =
+                        verified_receipt(request.out, &key, &identity, &hash, &watermark)?
+                    {
+                        skip_verified(request, &receipt, &mut report)?;
                         continue;
                     }
                     return Err(StoreError::Check(format!(
@@ -238,6 +316,7 @@ pub fn run(
                     )));
                 }
                 report.hours_pending += 1;
+                report.hours.push(pending_line(&key, "pending"));
                 continue;
             }
             HourFiles::Ready(ready) => ready,
@@ -253,16 +332,14 @@ pub fn run(
         let loaded = match read_ready(&ready)? {
             ReadReady::Partial => {
                 report.hours_pending += 1;
+                report.hours.push(pending_line(&key, "pending"));
                 continue;
             }
             ReadReady::Ready(loaded) => loaded,
         };
         let identity = identity_of_inputs(&loaded);
-        if already_done(request.out, &key, &identity, &hash, &watermark)? {
-            if request.drop_raw {
-                report.raw_bytes_dropped += drop_raw(request.input, request.out, &key)?;
-            }
-            report.hours_skipped += 1;
+        if let Some(receipt) = verified_receipt(request.out, &key, &identity, &hash, &watermark)? {
+            skip_verified(request, &receipt, &mut report)?;
             continue;
         }
         if conn.is_none() {
@@ -291,6 +368,7 @@ pub fn run(
             git_sha: &git,
             config_hash: &hash,
         };
+        let started = std::time::Instant::now();
         let output = publish::publish_hour(conn, request.out, &job)
             .map_err(|error| StoreError::Check(format!("{key}: {error}")))?;
         if output.input_snapshots != output.output_rows + output.dup_identical {
@@ -306,22 +384,82 @@ pub fn run(
         }
         watermark.insert(key.clone());
         write_watermark(request.out, &watermark)?;
+        let ratio = hour_ratio(output.parquet_bytes, output.lz4_bytes);
+        let kept_ratio = ratio > request.max_ratio;
+        if kept_ratio {
+            report.hours_kept_ratio += 1;
+        }
+        if request.drop_raw && !kept_ratio {
+            report.raw_bytes_dropped += drop_raw(request.input, request.out, &key)?;
+        }
         report.hours_verified += 1;
         report.rows += output.output_rows;
         report.dup_identical += output.dup_identical;
         report.dup_distinct += output.dup_distinct;
-        if request.drop_raw {
-            report.raw_bytes_dropped += drop_raw(request.input, request.out, &key)?;
-        }
+        report.hours.push(HourLine {
+            hour: key,
+            status: "verified",
+            rows: output.output_rows,
+            dup_identical: output.dup_identical,
+            dup_distinct: output.dup_distinct,
+            lz4_bytes: output.lz4_bytes,
+            parquet_bytes: output.parquet_bytes,
+            ratio: Some(ratio),
+            kept_ratio,
+            seconds: Some(started.elapsed().as_secs_f64()),
+        });
     }
     // An hour whose on-disk coins have no manifest row at all never entered the loop above.
     for key in &uncovered {
         if !hour_keys.contains(key) {
             report.hours_pending += 1;
             report.hours_uncovered += 1;
+            report.hours.push(pending_line(key, "pending-uncovered"));
         }
     }
     Ok(report)
+}
+
+fn pending_line(hour: &str, status: &'static str) -> HourLine {
+    HourLine {
+        hour: hour.to_owned(),
+        status,
+        rows: 0,
+        dup_identical: 0,
+        dup_distinct: 0,
+        lz4_bytes: 0,
+        parquet_bytes: 0,
+        ratio: None,
+        kept_ratio: false,
+        seconds: None,
+    }
+}
+
+/// The shared skip path of an hour the watermark already lists: honor the ratio guard before
+/// any raw delete, then count the hour as skipped.
+fn skip_verified(request: &Request<'_>, receipt: &Receipt, report: &mut Report) -> Result<(), StoreError> {
+    let ratio = hour_ratio(receipt.parquet_bytes, receipt.lz4_bytes);
+    let kept_ratio = ratio > request.max_ratio;
+    if kept_ratio {
+        report.hours_kept_ratio += 1;
+    }
+    if request.drop_raw && !kept_ratio {
+        report.raw_bytes_dropped += drop_raw(request.input, request.out, &receipt.hour)?;
+    }
+    report.hours_skipped += 1;
+    report.hours.push(HourLine {
+        hour: receipt.hour.clone(),
+        status: "skipped",
+        rows: receipt.output_rows,
+        dup_identical: receipt.dup_identical,
+        dup_distinct: receipt.dup_distinct,
+        lz4_bytes: receipt.lz4_bytes,
+        parquet_bytes: receipt.parquet_bytes,
+        ratio: Some(ratio),
+        kept_ratio,
+        seconds: None,
+    });
+    Ok(())
 }
 
 struct LoadedFile {
@@ -867,26 +1005,28 @@ fn take_drop_fault() -> bool {
     })
 }
 
-fn already_done(
+/// The receipt of an hour that is already verified and still matches its outputs, or `None`
+/// when the hour must be rewritten.
+fn verified_receipt(
     out: &Path,
     key: &str,
     identity: &str,
     config: &str,
     watermark: &BTreeSet<String>,
-) -> Result<bool, StoreError> {
+) -> Result<Option<Receipt>, StoreError> {
     if !watermark.contains(key) {
-        return Ok(false);
+        return Ok(None);
     }
     let Some(receipt) = publish::read_receipt(out, key) else {
-        return Ok(false);
+        return Ok(None);
     };
     if receipt.schema != SCHEMA
         || receipt.hour != key
         || receipt.input_sha256 != identity
         || receipt.config_hash != config
-        || receipt.output_rows != receipt.input_snapshots
+        || receipt.output_rows + receipt.dup_identical != receipt.input_snapshots
     {
-        return Ok(false);
+        return Ok(None);
     }
     let mut rows = 0u64;
     for output in &receipt.outputs {
@@ -895,15 +1035,15 @@ fn already_done(
             .split('/')
             .any(|part| part.is_empty() || part == "..")
         {
-            return Ok(false);
+            return Ok(None);
         }
         let path = out.join(&output.path);
         if !path.is_file() || file_hash(&path)? != output.sha256 {
-            return Ok(false);
+            return Ok(None);
         }
         rows += output.rows;
     }
-    Ok(rows == receipt.output_rows)
+    Ok((rows == receipt.output_rows).then_some(receipt))
 }
 
 #[cfg(test)]
@@ -942,6 +1082,7 @@ mod tests {
             since: None,
             until: None,
             drop_raw: false,
+            max_ratio: 1.0,
         };
         let hours = group_hours(&entries, &request);
         assert_eq!(

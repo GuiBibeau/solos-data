@@ -74,6 +74,23 @@ struct Opts {
     coins: Option<BTreeSet<String>>,
     since: Option<String>,
     until: Option<String>,
+    /// Very high here by default so the drop-mechanics tests are not about the ratio guard,
+    /// which has its own both-directions test: a one-snapshot fixture is nearly all Parquet
+    /// overhead and legitimately exceeds 1.0.
+    max_ratio: f64,
+}
+
+impl Default for Opts {
+    fn default() -> Self {
+        Self {
+            floor: 0,
+            drop_raw: false,
+            coins: None,
+            since: None,
+            until: None,
+            max_ratio: 1e12,
+        }
+    }
 }
 
 fn run_with(
@@ -95,6 +112,7 @@ fn run_with(
         since: opts.since,
         until: opts.until,
         drop_raw: opts.drop_raw,
+        max_ratio: opts.max_ratio,
     };
     super::run(&request, free)
 }
@@ -104,13 +122,7 @@ fn run_ok(input: &Path, out: &Path, checksums: &Path) -> Result<Report, crate::s
         input,
         out,
         checksums,
-        Opts {
-            floor: 0,
-            drop_raw: false,
-            coins: None,
-            since: None,
-            until: None,
-        },
+        Opts::default(),
         |_| Ok(u64::MAX),
     )
 }
@@ -262,6 +274,82 @@ fn flat_rows_nulls_sort_and_a_rerun_skips() {
     assert_eq!(again.hours_skipped, 1);
     assert_eq!(again.hours_verified, 0);
     assert_eq!(watermark(&out), vec!["20261022/0".to_owned()]);
+}
+
+/// Mutations: delete the `kept_ratio` branch so `--drop-raw-after-verify` always drops; make
+/// `skip_verified` ignore the receipt ratio on the rerun path.
+#[test]
+fn the_ratio_guard_decides_the_drop_in_both_directions() {
+    let root = Tmp::new("ratio-guard");
+    let body = book("BTC", 1_792_627_200_000, 1, "1");
+    let (input, out, sums) = stage_one(&root, &body);
+    let raw = input.join("20261022/0/BTC.lz4");
+    // A one-snapshot hour is nearly all Parquet overhead, so its ratio is far above 1.
+    let under = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            drop_raw: true,
+            max_ratio: 100.0,
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap();
+    assert_eq!(under.hours_verified, 1);
+    assert_eq!(under.hours_kept_ratio, 0, "ratio under the max");
+    assert!(!raw.exists(), "an hour at or under the max drops its raw");
+    assert_eq!(under.hours[0].kept_ratio, false);
+    assert!(under.hours[0].ratio.unwrap() > 1.0);
+
+    // Same hour shape, a max the fixture cannot meet: converted and verified, raw kept.
+    std::fs::write(&raw, lz4_frame(body.as_bytes())).unwrap();
+    let out2 = root.0.join("out2");
+    let over = run_with(
+        &input,
+        &out2,
+        &sums,
+        Opts {
+            drop_raw: true,
+            max_ratio: 1.0,
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap();
+    assert_eq!(over.hours_verified, 1, "the hour is still converted and verified");
+    assert_eq!(over.hours_kept_ratio, 1, "the hour is reported as kept_ratio");
+    assert!(raw.is_file(), "an hour over the max keeps its raw");
+    assert_eq!(watermark(&out2), vec!["20261022/0".to_owned()]);
+    let receipt: Value = serde_json::from_str(
+        &std::fs::read_to_string(out2.join("receipts/20261022/0.json")).unwrap(),
+    )
+    .unwrap();
+    let lz4 = std::fs::metadata(&raw).unwrap().len();
+    assert_eq!(receipt["lz4_bytes"], lz4);
+    assert!(receipt["parquet_bytes"].as_u64().unwrap() > lz4);
+    let json: Value = serde_json::from_str(&over.to_json()).unwrap();
+    assert_eq!(json["hoursKeptRatio"], 1);
+    assert_eq!(json["hours"][0]["keptRatio"], true);
+    assert_eq!(json["hours"][0]["status"], "verified");
+
+    // A rerun that skips the verified hour keeps honoring the guard.
+    let again = run_with(
+        &input,
+        &out2,
+        &sums,
+        Opts {
+            drop_raw: true,
+            max_ratio: 1.0,
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap();
+    assert_eq!(again.hours_skipped, 1);
+    assert_eq!(again.hours_kept_ratio, 1);
+    assert!(raw.is_file(), "the skip path does not drop a kept-ratio hour");
 }
 
 /// One input, four lines: an identical re-send is dropped, a distinct book at the same
@@ -641,11 +729,8 @@ fn drop_raw_waits_until_the_watermark_is_durable() {
         &out,
         &sums,
         Opts {
-            floor: 0,
             drop_raw: true,
-            coins: None,
-            since: None,
-            until: None,
+            ..Opts::default()
         },
         |_| Ok(u64::MAX),
     )
@@ -663,11 +748,8 @@ fn drop_raw_waits_until_the_watermark_is_durable() {
         &out,
         &sums,
         Opts {
-            floor: 0,
             drop_raw: true,
-            coins: None,
-            since: None,
-            until: None,
+            ..Opts::default()
         },
         |_| Ok(u64::MAX),
     )
@@ -721,11 +803,8 @@ fn drop_raw_refuses_a_link_outside_the_input_dir() {
         &out,
         &sums,
         Opts {
-            floor: 0,
             drop_raw: true,
-            coins: None,
-            since: None,
-            until: None,
+            ..Opts::default()
         },
         |_| Ok(u64::MAX),
     )
@@ -803,10 +882,7 @@ fn disk_floor_stops_between_hours() {
         &sums,
         Opts {
             floor: u64::MAX,
-            drop_raw: false,
-            coins: None,
-            since: None,
-            until: None,
+            ..Opts::default()
         },
         |_| Ok(0),
     )
@@ -821,10 +897,7 @@ fn disk_floor_stops_between_hours() {
         &sums,
         Opts {
             floor: 1_000,
-            drop_raw: false,
-            coins: None,
-            since: None,
-            until: None,
+            ..Opts::default()
         },
         |_| {
             calls += 1;
@@ -876,11 +949,10 @@ fn coins_and_dates_filter_the_hours() {
         &out,
         &sums,
         Opts {
-            floor: 0,
-            drop_raw: false,
             coins: Some(coins),
             since: Some("20261022".into()),
             until: Some("20261022".into()),
+            ..Opts::default()
         },
         |_| Ok(u64::MAX),
     )
@@ -1041,11 +1113,9 @@ fn side_arrays_with_v1_dictionaries_beat_the_flat_columns_and_the_lz4() {
 
 fn drop_opts() -> Opts {
     Opts {
-        floor: 0,
         drop_raw: true,
-        coins: None,
-        since: None,
-        until: None,
+        max_ratio: 1000.0,
+        ..Opts::default()
     }
 }
 

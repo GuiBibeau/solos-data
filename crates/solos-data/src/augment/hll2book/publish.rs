@@ -69,7 +69,7 @@ pub struct InputFile {
     pub sha256: String,
     /// Byte size.
     pub bytes: u64,
-    /// Snapshots counted in the file.
+    /// Rows kept from the file: identical re-sends excluded, distinct duplicates included.
     pub snapshots: u64,
 }
 
@@ -84,6 +84,10 @@ pub struct HourOutput {
     pub dup_identical: u64,
     /// Extra rows kept for a distinct book at a repeated `time_ms` (`dup_distinct`).
     pub dup_distinct: u64,
+    /// Sum of the hour's `.lz4` input bytes (the ratio guard's denominator).
+    pub lz4_bytes: u64,
+    /// Sum of the hour's Parquet output bytes (the ratio guard's numerator).
+    pub parquet_bytes: u64,
     /// Inputs the receipt recorded.
     pub inputs: Vec<InputFile>,
 }
@@ -105,6 +109,10 @@ pub struct Receipt {
     pub dup_identical: u64,
     /// Extra rows kept for a distinct book at a repeated `time_ms` (`dup_distinct`).
     pub dup_distinct: u64,
+    /// Sum of the hour's `.lz4` input bytes (the ratio guard's denominator).
+    pub lz4_bytes: u64,
+    /// Sum of the hour's Parquet output bytes (the ratio guard's numerator).
+    pub parquet_bytes: u64,
     /// Rows under `train/`.
     pub train_rows: u64,
     /// Rows under `forward/`.
@@ -194,6 +202,8 @@ pub fn publish_hour(
         output_rows: outputs.iter().map(|file| file.rows).sum(),
         dup_identical: streamed.dup_identical,
         dup_distinct: streamed.dup_distinct,
+        lz4_bytes: inputs.iter().map(|file| file.bytes).sum(),
+        parquet_bytes: outputs.iter().map(|file| file.bytes).sum(),
         train_rows: parts.iter().map(|part| part.train_rows).sum(),
         forward_rows: parts.iter().map(|part| part.forward_rows).sum(),
         outputs: outputs.clone(),
@@ -209,6 +219,8 @@ pub fn publish_hour(
         output_rows,
         dup_identical: streamed.dup_identical,
         dup_distinct: streamed.dup_distinct,
+        lz4_bytes: inputs.iter().map(|file| file.bytes).sum(),
+        parquet_bytes: outputs.iter().map(|file| file.bytes).sum(),
         inputs,
     })
 }
