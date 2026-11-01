@@ -171,19 +171,15 @@ impl Report {
     }
 }
 
-/// One walked lane: the files of one directory, tagged with the lane index.
-struct Lane {
-    files: Vec<FileRef>,
-}
+/// One walked lane: the directory (the lane's identity) and its files.
+type Lane = (PathBuf, Vec<FileRef>);
 
 /// Walk every lane directory; empty lanes are allowed (flash live has almost
 /// no rows) but at least one lane per venue must have files.
 fn walk_lanes(dirs: &[PathBuf]) -> Result<Vec<Lane>, StoreError> {
     let mut lanes = Vec::new();
     for dir in dirs {
-        lanes.push(Lane {
-            files: io::walk_parquet(dir)?,
-        });
+        lanes.push((dir.clone(), io::walk_parquet(dir)?));
     }
     Ok(lanes)
 }
@@ -327,13 +323,11 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let flash_lanes = walk_lanes(request.flash_events)?;
     let jupiter_files: Vec<(&Path, &FileRef)> = jupiter_lanes
         .iter()
-        .zip(request.jupiter_events.iter())
-        .flat_map(|(lane, dir)| lane.files.iter().map(move |file| (dir.as_path(), file)))
+        .flat_map(|(dir, files)| files.iter().map(move |file| (dir.as_path(), file)))
         .collect();
     let flash_files: Vec<(&Path, &FileRef)> = flash_lanes
         .iter()
-        .zip(request.flash_events.iter())
-        .flat_map(|(lane, dir)| lane.files.iter().map(move |file| (dir.as_path(), file)))
+        .flat_map(|(dir, files)| files.iter().map(move |file| (dir.as_path(), file)))
         .collect();
     if jupiter_files.is_empty() {
         return Err(StoreError::Check("no jupiter event parquet files".into()));
@@ -361,7 +355,9 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
 
     // Closure: the watermark is the max block_time over all lane files, read
     // from Parquet statistics (no data pages).
-    let watermark_max_block_time = lane_watermark(&conn, &jupiter_files, &flash_files)?;
+    let mut all_lanes = jupiter_lanes.clone();
+    all_lanes.extend(flash_lanes.iter().cloned());
+    let watermark_max_block_time = lane_watermark(&conn, &all_lanes)?;
     let last_closed_hour = grid::floor_div(
         watermark_max_block_time - grid::HOUR_SECS - HOUR_GUARD_SECS,
         grid::HOUR_SECS,
@@ -392,8 +388,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     if !pending.is_empty() {
         build_event_views(
             &conn,
-            &jupiter_files,
-            &flash_files,
+            &jupiter_lanes,
+            &flash_lanes,
             grid::hour_start(first_hour),
             grid::hour_start(requested_last) + grid::HOUR_SECS,
         )?;
@@ -506,21 +502,19 @@ fn scalar(conn: &duckdb::Connection, sql: &str, column: &str) -> Result<u64, Sto
 }
 
 /// Max block_time over every lane file, from Parquet statistics.
-fn lane_watermark(
-    conn: &duckdb::Connection,
-    jupiter: &[(&Path, &FileRef)],
-    flash: &[(&Path, &FileRef)],
-) -> Result<i64, StoreError> {
+fn lane_watermark(conn: &duckdb::Connection, lanes: &[Lane]) -> Result<i64, StoreError> {
     let mut max: Option<i64> = None;
-    for (dir, file) in jupiter.iter().chain(flash.iter()) {
-        let table = parquet_list(&[dir.join(&file.relative).to_string_lossy().to_string()])?;
-        let rows = query_rows(
-            conn,
-            &format!("SELECT max(block_time) AS hi FROM {table}"),
-            &[],
-        )?;
-        if let Some(hi) = rows.first().and_then(|row| row.int("hi")) {
-            max = Some(max.map_or(hi, |current| current.max(hi)));
+    for (dir, files) in lanes {
+        for file in files {
+            let table = parquet_list(&[dir.join(&file.relative).to_string_lossy().to_string()])?;
+            let rows = query_rows(
+                conn,
+                &format!("SELECT max(block_time) AS hi FROM {table}"),
+                &[],
+            )?;
+            if let Some(hi) = rows.first().and_then(|row| row.int("hi")) {
+                max = Some(max.map_or(hi, |current| current.max(hi)));
+            }
         }
     }
     max.ok_or_else(|| StoreError::Check("lane files have no block_time".into()))
@@ -531,21 +525,32 @@ fn lane_watermark(
 /// position-event tables `jup_pos` and `flash_pos`.
 fn build_event_views(
     conn: &duckdb::Connection,
-    jupiter: &[(&Path, &FileRef)],
-    flash: &[(&Path, &FileRef)],
+    jupiter: &[Lane],
+    flash: &[Lane],
     window_lo: i64,
     window_hi: i64,
 ) -> Result<(), StoreError> {
-    // One union over all lanes of one venue: the lane index is the position in
-    // the argument list, so a later (live) lane outranks an earlier one.
-    let union_of = |files: &[(&Path, &FileRef)]| -> Result<String, StoreError> {
+    // One union arm per lane (never per file: thousands of union arms exceed
+    // DuckDB's expression depth). The lane index is the position in the
+    // argument list, so a later (live) lane outranks an earlier one.
+    let union_of = |lanes: &[Lane]| -> Result<String, StoreError> {
         let mut parts = Vec::new();
-        for (lane, (dir, file)) in files.iter().enumerate() {
-            let table = parquet_list(&[dir.join(&file.relative).to_string_lossy().to_string()])?;
+        for (lane, (dir, files)) in lanes.iter().enumerate() {
+            if files.is_empty() {
+                continue;
+            }
+            let list: Vec<String> = files
+                .iter()
+                .map(|file| dir.join(&file.relative).to_string_lossy().to_string())
+                .collect();
+            let table = parquet_list(&list)?;
             parts.push(format!(
                 "SELECT *, {lane} AS lane FROM {table}
                  WHERE block_time >= {window_lo} AND block_time < {window_hi}"
             ));
+        }
+        if parts.is_empty() {
+            return Err(StoreError::Check("all lanes are empty".into()));
         }
         Ok(parts.join(" UNION ALL BY NAME "))
     };
