@@ -27,17 +27,21 @@ Two cases, depending on whether the hour's raw files are still on disk.
 Raw dropped (`--drop-raw-after-verify` on and the hour passed the ratio
 guard): add a coin's `.lz4` and its manifest row and rerun. The hour's
 manifest rows now include files no longer on disk, so `locate_hour`
-(batch.rs) sees the hour as Partial. The hour is watermarked, the receipt
-identity no longer matches, and the run exits 1 with `verified hour is
-incomplete and its output does not match the receipt` (reproduced on scratch
-at 8ceca2a). No data is lost, but every later run stops at that hour.
+(`crates/solos-data/src/augment/hll2book/batch.rs:865`; line numbers are as
+of main 447c95e) sees the hour as Partial. The Partial branch of `work_one`
+(`batch.rs:547`) then finds the hour watermarked, the receipt identity no
+longer matches, and the run exits 1 with `verified hour is incomplete and
+its output does not match the receipt` (`batch.rs:555`; reproduced on
+scratch at 8ceca2a). No data is lost, but every later run stops at that
+hour.
 
 Raw still on disk (drop-raw off, or the ratio guard held the hour and kept
 its raw): every manifest file is present at the right size, so the hour is
-Ready with a new input identity, `verified_receipt` returns `None`, and the
-hour re-seals cleanly from every coin, the late one included. Note that if
-that later run uses drop-raw, it then deletes all of that hour's raw,
-including the late coin's file, because the new receipt lists every input.
+Ready with a new input identity, the `verified_receipt` call in the Ready
+path (`batch.rs:567`) returns `None`, and the hour re-seals cleanly from
+every coin, the late one included. Note that if that later run uses
+drop-raw, it then deletes all of that hour's raw, including the late
+coin's file, because the new receipt lists every input.
 
 ## Shrinking re-seal: silent data loss
 
@@ -47,13 +51,14 @@ Triggers: a rebuilt or fresh manifest with fewer rows for that hour, a
 different `--checksums` file, a different `--out` pointing at an existing
 root, or a rerun of the same root with a narrower `--coins`.
 
-Then: the new Parquet replaces the hour's file, and `stale_paths`
-(publish.rs) removes any earlier output path not in the new set, so the
-earlier coins' rows are gone. `drop_raw` deletes the remaining raw for the
-subset. And `write_drop_record` (batch.rs) overwrites `drops/<hour>.json`
-instead of merging, so the re-download record of the earlier coins is lost
-too. The verification gates all pass, because each one checks the subset
-against itself.
+Then: `seal_hour` (`crates/solos-data/src/augment/hll2book/publish.rs:282`)
+renames the new Parquet over the hour's file, and `stale_paths` (`publish.rs:938`) removes
+any earlier output path not in the new set, so the earlier coins' rows are
+gone. `drop_raw` deletes the remaining raw for the subset. And
+`write_drop_record` (`batch.rs:1081`) overwrites `drops/<hour>.json` instead
+of merging, so the re-download record of the earlier coins is lost too. The
+verification gates all pass, because each one checks the subset against
+itself.
 
 Required code guard, regardless of which proposal below wins: refuse to
 re-seal a watermarked hour unless its current inputs are a superset of the
@@ -63,7 +68,21 @@ Parquet, no raw, no drop record change. `write_drop_record` must also merge
 with an existing `drops/<hour>.json` rather than overwrite. Tests: a late
 coin (a superset) is allowed and re-seals with every coin; shrinking inputs
 are refused with no Parquet deleted and no raw dropped; a drop record merge
-keeps earlier entries. A separate code PR implements this.
+keeps earlier entries. PR #104
+(https://github.com/GuiBibeau/solos-data/pull/104) implements the guard and
+the drop record merge.
+
+#104's behavior: a changed sha256 for a coin already in the receipt is
+refused too (it counts as a missing input), so a changed file is not a
+silent re-seal; only a config-hash change or a strict superset re-seals.
+The escape hatch for a corrected re-download is the new
+`--reseal <YYYYMMDD/H>` flag in #104: it bypasses the guard for that hour,
+refuses unless every receipt input's raw file is still on disk, and uses
+the old receipt so `stale_paths` removes old outputs. Without it, the only
+manual way is deleting `receipts/<hour>.json`. That works only while the
+raw is on disk (otherwise the hour goes Partial and fails at
+`batch.rs:555`), and it leaves `stale_paths` no receipt to clean old
+outputs with, so do not do that.
 
 ## Coin-batch roots
 
@@ -88,18 +107,17 @@ files, no later full root can complete those coins for those hours: the raw
 is gone, and the manifest rows for the dropped files would make the hour
 Partial. The batch roots are the record for those coins.
 
-## Operating rules until the guard lands
+## Operating rules
 
-The three rules below are mandatory for every l2Book root until the superset
-guard lands.
-
-- Coin sets are disjoint across roots. Each root has its coin list recorded
-  as a file, and disjointness is checked before launch.
-- A root is never rerun with a different `--coins`, and no full run (without
-  `--coins`) ever points at a batch root.
-- Every run of a root passes the same manifest file, and nothing rebuilds or
-  rewrites that manifest while a run is live (the manifest builder and the
-  downloader are stopped).
+- Permanent: coin sets are disjoint across roots. Each root has its coin
+  list recorded as a file, and disjointness is checked before launch. The
+  guard stops shrinking re-seals, not overlapping roots: two roots holding
+  the same coin would duplicate that coin's rows in the reader union.
+- Until #104 merges: a root is never rerun with a different `--coins`, and
+  no full run (without `--coins`) ever points at a batch root.
+- Until #104 merges: every run of a root passes the same manifest file, and
+  nothing rebuilds or rewrites that manifest while a run is live (the
+  manifest builder and the downloader are stopped).
 
 Batch-01 was checked against these rules on 2026-11-01 while running: one
 root, its coin list file matches the process `--coins`, the manifest was last
@@ -132,11 +150,25 @@ the listing time as possibly incomplete.
 - [ ] Superset guard: refuse to re-seal a watermarked hour whose inputs are
   not a superset of the receipt's inputs, naming the hour and the missing
   inputs, with the three tests above (late coin allowed, shrink refused with
-  nothing deleted, drop record merge keeps earlier entries).
+  nothing deleted, drop record merge keeps earlier entries). PR #104; tick
+  when it merges.
 - [ ] `write_drop_record` merges with an existing `drops/<hour>.json` instead
-  of overwriting.
+  of overwriting. PR #104; tick when it merges.
 - [ ] Hour-window downloader: bounded windows of hours, every coin, convert
   and drop raw before the next window.
 - [ ] Listing gate: an hour stays pending until every listed key for it is
   covered, and hours near the listing time are treated as possibly
   incomplete.
+
+## Follow-ups (non-blocking)
+
+- [ ] One refused hour aborts the whole run: in a jobs=4 probe, 3 valid
+  hours were never sealed, and every rerun stops at the refused hour.
+  Consider a pending-refused status that lets other hours seal and exits 1
+  at the end.
+- [ ] Tests still worth having if not in #104: a wrong-schema drop record, a
+  drop record durability fault, and the `work_one` guard alone (today it
+  survives a mutation because the `seal_hour` re-check also refuses;
+  documented).
+- [ ] The guard compares coin and sha256 only, not path or bytes. Low risk;
+  noted.
