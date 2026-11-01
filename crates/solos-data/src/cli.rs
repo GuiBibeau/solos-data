@@ -1013,7 +1013,7 @@ fn offline_or_live(
 // ---------------------------------------------------------------------------------------------
 // augment
 
-const AUGMENT_COMMANDS: [(&str, &str); 7] = [
+const AUGMENT_COMMANDS: [(&str, &str); 8] = [
     (
         "sync",
         "Backfill and catch up dated files and paged histories, then exit: [--source name] [--symbol SYM]",
@@ -1035,6 +1035,10 @@ const AUGMENT_COMMANDS: [(&str, &str); 7] = [
     (
         "hl-fills",
         "Offline all-coin node_fills_by_block hours to Parquet (no download, no collector): --input <hourly-dir> --out <root> --checksums <SHA256SUMS-or-MANIFEST> [--min-free-tb 1.0] [--threads 4] [--memory 8GB]",
+    ),
+    (
+        "hl-l2book",
+        "Offline l2Book hours to Parquet (no download, no collector): --input <dir> --out <root> --checksums <MANIFEST> [--coins BTC,ETH] [--since YYYYMMDD] [--until YYYYMMDD] [--drop-raw-after-verify] [--min-free-tb 1.0] [--threads 4] [--memory 8GB]",
     ),
 ];
 
@@ -1059,6 +1063,9 @@ fn augment(args: &[String]) -> i32 {
     }
     if command == "hl-fills" {
         return hl_fills_cli(&args[1..]);
+    }
+    if command == "hl-l2book" {
+        return hl_l2book_cli(&args[1..]);
     }
     match augment_command(command, args) {
         Ok(code) => code,
@@ -1109,6 +1116,47 @@ fn hl_fills_cli(args: &[String]) -> i32 {
     }
 }
 
+fn hl_l2book_cli(args: &[String]) -> i32 {
+    if args.is_empty()
+        || args
+            .first()
+            .is_some_and(|arg| arg == "help" || arg == "--help")
+    {
+        println!(
+            "{}",
+            Obj::new()
+                .with(
+                    "command",
+                    "solos-data augment hl-l2book --input <dir> --out <root> --checksums <MANIFEST> [--coins BTC,ETH] [--since YYYYMMDD] [--until YYYYMMDD] [--drop-raw-after-verify] [--min-free-tb 1.0] [--threads 4] [--memory 8GB]"
+                )
+                .with(
+                    "input",
+                    "YYYYMMDD/H/<COIN>.lz4 or market_data/YYYYMMDD/H/l2Book/<COIN>.lz4. The manifest paths select the layout"
+                )
+                .with(
+                    "out",
+                    "train/ and forward/ hour Parquet, receipts/, watermark.json. time_ms >= 1792713600000 is forward"
+                )
+                .with(
+                    "drop",
+                    "--drop-raw-after-verify deletes the hour's .lz4 only after watermark.json is durable, and writes drops/YYYYMMDD/H.json (path, bytes, sha256, s3). A rerun overwrites that file"
+                )
+                .to_json()
+        );
+        return 0;
+    }
+    match hl_l2book_run(args) {
+        Ok(code) => code,
+        Err(error) => {
+            log(
+                "hl_l2book_failed",
+                Obj::new().with("error", safe_error(&error.to_string())),
+            );
+            1
+        }
+    }
+}
+
 fn hl_fills_run(args: &[String]) -> Result<i32, StoreError> {
     let input = required_flag(args, "--input")?;
     let out = required_flag(args, "--out")?;
@@ -1126,6 +1174,40 @@ fn hl_fills_run(args: &[String]) -> Result<i32, StoreError> {
         git_sha: crate::augment::hlfills::git_sha(),
     };
     let report = crate::augment::hlfills::run(&request, filesystem_free)?;
+    println!("{}", report.to_json());
+    Ok(report.exit_code())
+}
+
+fn hl_l2book_run(args: &[String]) -> Result<i32, StoreError> {
+    let coins = match flag(args, "--coins") {
+        Some(value) => Some(crate::augment::hll2book::parse_coins(value)?),
+        None => None,
+    };
+    let since = match flag(args, "--since") {
+        Some(value) => Some(crate::augment::hll2book::parse_day(value)?),
+        None => None,
+    };
+    let until = match flag(args, "--until") {
+        Some(value) => Some(crate::augment::hll2book::parse_day(value)?),
+        None => None,
+    };
+    let memory = crate::augment::hll2book::parse_memory_limit(
+        flag(args, "--memory").unwrap_or(crate::augment::hll2book::DEFAULT_MEMORY),
+    )?;
+    let request = crate::augment::hll2book::Request {
+        input: Path::new(required_flag(args, "--input")?),
+        out: Path::new(required_flag(args, "--out")?),
+        checksums: Path::new(required_flag(args, "--checksums")?),
+        min_free_bytes: min_free_bytes(args)?,
+        threads: threads_flag(args)?,
+        memory_limit: memory,
+        git_sha: crate::augment::hll2book::git_sha(),
+        coins,
+        since,
+        until,
+        drop_raw: has(args, "--drop-raw-after-verify"),
+    };
+    let report = crate::augment::hll2book::run(&request, filesystem_free)?;
     println!("{}", report.to_json());
     Ok(report.exit_code())
 }

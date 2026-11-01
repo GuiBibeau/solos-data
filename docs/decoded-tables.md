@@ -78,3 +78,37 @@ see the collector's offline `relocate` command.
 Decoder staging tables are recreated for each batch so temporary storage remains
 bounded. `SOLOS_DATA_QUERY_MEMORY` sets the native query working-memory limit
 (default 4GB). Stop the decoder before `repack` or `verify-storage`.
+
+## hl_l2book
+
+Offline Hyperliquid `l2Book` snapshots, written by `solos-data augment hl-l2book`
+(ADR-0021). This is not a Phoenix decoded table and it is not in `catalog.json`.
+Readers use the hour Parquet files under `train/` and `forward/` and keep only
+hours listed in that output root's `watermark.json`.
+
+One file is every coin of one source hour whose snapshot time falls on that UTC
+date, sorted by `coin`, `time_ms`:
+
+```
+<out>/train/date=<YYYY-MM-DD>/hour=<YYYYMMDD-H>.parquet
+<out>/forward/date=<YYYY-MM-DD>/hour=<YYYYMMDD-H>.parquet
+```
+
+`time_ms >= 1792713600000` (2026-10-23 00:00:00 UTC) is `forward/` and is eval-only.
+Prices and sizes are DOUBLE (the decimal string's `f64` bits). Missing levels are
+NULL, not zero. Twenty levels a side; element 1 (`bid_px[1]`) is the best bid or
+ask. DuckDB arrays are 1-indexed.
+
+| column | type |
+| --- | --- |
+| coin | VARCHAR |
+| time_ms | BIGINT |
+| recv_time_ms | BIGINT, null when the envelope has no time |
+| bid_px, ask_px | DOUBLE[20] |
+| bid_sz, ask_sz | DOUBLE[20] |
+| bid_n, ask_n | BIGINT[20] |
+
+Files are Parquet V2, ZSTD level 9, so floats use BYTE_STREAM_SPLIT and integers
+use delta encoding. Side-wide arrays are smaller than 120 flat columns on the
+fixture, and a per-coin file of one hour is well under 10 MB, which is why the
+hour is one file instead of `hour=<YYYYMMDD-H>/coin=<COIN>.parquet`.
