@@ -706,6 +706,7 @@ fn watermark_hours(out: &Path) -> Vec<String> {
     watermark(out)
 }
 
+/// Mutation: replace the missing-checksum `return Err` with `continue`.
 #[test]
 fn an_hour_missing_from_the_manifest_fails_the_hour() {
     let root = Tmp::new("no-sum");
@@ -726,6 +727,7 @@ fn an_hour_missing_from_the_manifest_fails_the_hour() {
     );
 }
 
+/// Mutation: delete the `--checksums` is-file check so a missing manifest is an IO error.
 #[test]
 fn a_missing_manifest_file_fails_closed() {
     let root = Tmp::new("no-manifest");
@@ -744,6 +746,9 @@ fn a_missing_manifest_file_fails_closed() {
     assert!(parquet_files(&out).is_empty());
 }
 
+/// Mutations: delete `sync_tmp_file` (TempFile); delete `sync_dir_after_rename` in
+/// `rename_all` (DirAfterRename); replace the receipt `write_durable` with `std::fs::write`;
+/// replace the watermark `write_durable` with `std::fs::write`.
 #[test]
 fn fsync_failures_leave_the_watermark_and_a_rerun_succeeds() {
     use crate::fsutil::{FsyncStep, inject_fsync_failure};
@@ -822,6 +827,8 @@ fn fsync_failures_leave_the_watermark_and_a_rerun_succeeds() {
     }
 }
 
+/// Mutations: delete `got != events` (Line); delete `output_rows != input_fills` (Hour);
+/// delete `rows != file.rows` (Staged).
 #[test]
 fn a_dropped_row_fails_each_count_guard_without_a_watermark() {
     use super::publish::seams::{CountSeam, set_count_seam};
@@ -844,6 +851,8 @@ fn a_dropped_row_fails_each_count_guard_without_a_watermark() {
     }
 }
 
+/// Mutations: drop the output `file_hash` compare; drop `receipt.input_sha256 == sha`;
+/// drop `receipt.config_hash == config`.
 #[test]
 fn a_changed_output_or_input_or_config_hash_is_rewritten() {
     let root = Tmp::new("redo");
@@ -881,16 +890,59 @@ fn a_changed_output_or_input_or_config_hash_is_rewritten() {
 #[test]
 fn decimal_strings_round_trip_as_identical_f64_bits() {
     let root = Tmp::new("bits");
-    let (input, out, sums) = stage(&root, &one_fill("0.1", "0.3"));
+    let body = block(
+        1,
+        "2026-10-22T00:00:00.000000000",
+        vec![
+            json!([
+                "0xa",
+                {
+                    "coin": "BTC",
+                    "px": "0.1",
+                    "sz": "0.3",
+                    "side": "B",
+                    "time": 1_792_627_200_000_i64,
+                    "tid": 1,
+                    "oid": 1
+                }
+            ]),
+            json!([
+                "0xb",
+                {
+                    "coin": "ETH",
+                    "px": "3411232.9300000002",
+                    "sz": "1",
+                    "side": "A",
+                    "time": 1_792_627_200_001_i64,
+                    "tid": 2,
+                    "oid": 2
+                }
+            ]),
+        ],
+    )
+    .to_string();
+    let (input, out, sums) = stage(&root, &body);
     run_with(&input, &out, &sums, 1, |_| Ok(u64::MAX)).unwrap();
     let rows = read_rows(&out.join("train/date=2026-10-22/hour=20261022-0.parquet"));
-    assert_eq!(rows.len(), 1);
+    assert_eq!(rows.len(), 2);
+    let btc = rows
+        .iter()
+        .find(|row| row.str("coin") == Some("BTC"))
+        .unwrap();
+    let eth = rows
+        .iter()
+        .find(|row| row.str("coin") == Some("ETH"))
+        .unwrap();
     assert_eq!(
-        rows[0].get("px").unwrap().as_f64().unwrap().to_bits(),
+        btc.get("px").unwrap().as_f64().unwrap().to_bits(),
         "0.1".parse::<f64>().unwrap().to_bits()
     );
     assert_eq!(
-        rows[0].get("sz").unwrap().as_f64().unwrap().to_bits(),
+        btc.get("sz").unwrap().as_f64().unwrap().to_bits(),
         "0.3".parse::<f64>().unwrap().to_bits()
+    );
+    assert_eq!(
+        eth.get("px").unwrap().as_f64().unwrap().to_bits(),
+        "3411232.9300000002".parse::<f64>().unwrap().to_bits()
     );
 }

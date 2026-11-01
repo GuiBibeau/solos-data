@@ -166,7 +166,7 @@ keeps `hash` and `cloid`, so the planning figure is about 220 GB. `coin_class` r
 ## Consequences
 
 Readers train on `<out>/train/date=*/*.parquet` and keep `<out>/forward/` for eval. They
-must filter by `watermark.json` or the receipts. A crash after a Parquet rename and before
-the watermark write leaves a verified-looking file under `train/` or `forward/`; that file
-is not a verified hour until the watermark lists it. A schema change bumps
-`hl-fills-v1`; an old watermark is refused rather than mixed with new files.
+must filter by `watermark.json` only. A crash after a Parquet rename and before the
+watermark write leaves a file under `train/` or `forward/`; that file is not a verified
+hour until `watermark.json` lists it. A schema change bumps `hl-fills-v1`; an old
+watermark is refused rather than mixed with new files.
