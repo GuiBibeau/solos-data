@@ -371,3 +371,14 @@ fn lz4_frame(body: &str) -> Vec<u8> {
     result.unwrap();
     frame
 }
+
+/// Mutation: `write_durable` opening `path.parent()` (empty for a bare relative name) instead
+/// of `parent_or_dot`. The builder takes `--out MANIFEST` exactly like this.
+#[test]
+fn a_relative_single_component_manifest_out_is_durable() {
+    let name = format!("relative-manifest-out-{}", std::process::id());
+    let path = PathBuf::from(&name);
+    let written = crate::fsutil::write_durable(&path, b"line\n");
+    let _ = std::fs::remove_file(&path);
+    written.expect("a bare relative out path is durable");
+}

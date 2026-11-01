@@ -406,7 +406,9 @@ fn parent_dir(path: &Path) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Write `body` to `path` durably: `.tmp` sibling, fsync, rename, fsync the directory.
+/// Write `body` to `path` durably: `.tmp` sibling, fsync, rename, fsync the directory. A
+/// bare relative name (`MANIFEST`) has an empty textual parent; its directory is `.`, which
+/// was an `ENOENT` before `parent_or_dot` landed here.
 pub fn write_durable(path: &Path, body: &[u8]) -> io::Result<()> {
     guard_inside(path);
     let tmp = tmp_path(path);
@@ -423,9 +425,7 @@ pub fn write_durable(path: &Path, body: &[u8]) -> io::Result<()> {
         sync_handle(&file, FsyncStep::TempFile)?;
     }
     std::fs::rename(&tmp, path)?;
-    if let Some(parent) = path.parent() {
-        sync_handle(&File::open(parent)?, FsyncStep::DirAfterRename)?;
-    }
+    sync_handle(&File::open(parent_or_dot(path))?, FsyncStep::DirAfterRename)?;
     Ok(())
 }
 
