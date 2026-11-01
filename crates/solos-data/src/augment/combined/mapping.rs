@@ -124,6 +124,9 @@ pub struct Report {
     pub lockbox_hours_dropped: u64,
     /// Distinct UTC hours in the lockbox exclusion set (864 for v2).
     pub lockbox_hours_excluded: u64,
+    /// Per-venue count of symbols whose whole history lies inside the lockbox
+    /// and that therefore get no row at all. Counts only, never names.
+    pub lockbox_only_symbols: BTreeMap<String, u64>,
     /// Sealed outputs.
     pub outputs: Vec<receipt::OutputFile>,
 }
@@ -156,6 +159,13 @@ impl Report {
             .with("outcome", self.outcome)
             .with("lockboxHoursDropped", self.lockbox_hours_dropped)
             .with("lockboxHoursExcluded", self.lockbox_hours_excluded)
+            .with_obj("lockboxOnlySymbols", {
+                let mut only = crate::jsonout::Obj::new();
+                for (venue, count) in &self.lockbox_only_symbols {
+                    only.set(venue, *count);
+                }
+                only
+            })
             .with(
                 "outputs",
                 self.outputs
@@ -365,6 +375,13 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         .max(phoenix.lockbox_hours_dropped)
         .max(pyth.lockbox_hours_dropped);
     let lockbox_hours_excluded = lockbox_hours.len() as u64;
+    // Symbols the lockbox removed entirely, per venue: they have no row in any
+    // output table, so without this count they would vanish unaccounted.
+    let lockbox_only_symbols = lockbox_only_map(
+        hl.lockbox_only_symbols,
+        phoenix.lockbox_only_symbols,
+        pyth.lockbox_only_symbols,
+    );
 
     let mut rows = build_rows(&hl, &phoenix, &contexts, &pyth, &config);
     rows.sort_by(|a, b| (a.venue, &a.venue_symbol).cmp(&(b.venue, &b.venue_symbol)));
@@ -400,6 +417,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             phoenix: phoenix.lockbox_hours_dropped,
             pyth: pyth.lockbox_hours_dropped,
         },
+        &lockbox_only_symbols,
     );
     let finished = grid::now_rfc3339();
     let counts = count_per_venue(&rows);
@@ -441,6 +459,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             "lockbox_sha256": request.lockbox_sha256.trim().to_ascii_lowercase(),
             "lockbox_hours_dropped": lockbox_hours_dropped,
             "lockbox_hours_excluded": lockbox_hours_excluded,
+            "lockbox_only_symbols": lockbox_only_symbols,
         }),
     );
     cat.save(request.out)?;
@@ -456,6 +475,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         outcome: counters.outcome,
         lockbox_hours_dropped,
         lockbox_hours_excluded,
+        lockbox_only_symbols,
         outputs: vec![output],
     })
 }
@@ -656,6 +676,17 @@ struct DroppedHours {
     pyth: u64,
 }
 
+/// The per-venue map of lockbox-only symbols: fixed keys, counts only (a
+/// symbol whose whole history lies inside the lockbox has no row anywhere
+/// else), so the dropped symbols stay accounted for without being named.
+fn lockbox_only_map(hl: u64, phoenix: u64, pyth: u64) -> BTreeMap<String, u64> {
+    BTreeMap::from([
+        ("hl".to_owned(), hl),
+        ("phoenix".to_owned(), phoenix),
+        ("pyth".to_owned(), pyth),
+    ])
+}
+
 fn inputs_value(
     hl: &HlInput,
     phoenix_files: &[FileRef],
@@ -663,6 +694,7 @@ fn inputs_value(
     pyth_files: &[FileRef],
     request: &Request<'_>,
     dropped: DroppedHours,
+    lockbox_only_symbols: &BTreeMap<String, u64>,
 ) -> Value {
     json!({
         "check_days": hl.check_days.iter().map(|d| d.to_string()).collect::<Vec<_>>(),
@@ -673,17 +705,20 @@ fn inputs_value(
             "files": hl.files.len(),
             "files_sha256": file_list_sha256(&hl.files),
             "lockbox_hours_dropped": dropped.hl,
+            "lockbox_only_symbols": lockbox_only_symbols["hl"],
         },
         "phoenix_fills": {
             "files": phoenix_files.len(),
             "files_sha256": file_list_sha256(phoenix_files),
             "root": root_name(request.phoenix_fills),
             "lockbox_hours_dropped": dropped.phoenix,
+            "lockbox_only_symbols": lockbox_only_symbols["phoenix"],
         },
         "pyth_prices": {
             "files": pyth_files.len(),
             "files_sha256": file_list_sha256(pyth_files),
             "lockbox_hours_dropped": dropped.pyth,
+            "lockbox_only_symbols": lockbox_only_symbols["pyth"],
         },
         "asset_contexts": {
             "files": contexts.len(),
@@ -793,6 +828,8 @@ pub(crate) struct HlInput {
     universe: BTreeMap<String, (String, Universe)>,
     /// coin, hour start, last price of the hour (check days only).
     pub(crate) prices: BTreeMap<String, BTreeMap<i64, f64>>,
+    /// Coins whose every fill sits inside the lockbox hours.
+    pub(crate) lockbox_only_symbols: u64,
 }
 
 impl HlInput {
@@ -837,6 +874,7 @@ impl HlInput {
             &[],
         )?;
         let mut universe = BTreeMap::new();
+        let mut lockbox_only_symbols = 0u64;
         for row in rows {
             let coin = row
                 .str("coin")
@@ -845,7 +883,10 @@ impl HlInput {
             let class = row.str("coin_class").unwrap_or_default().to_owned();
             let (Some(first_ms), Some(last_ms)) = (row.int("first_ms"), row.int("last_ms")) else {
                 // Every fill of this coin sits in lockbox hours: it has no row
-                // in any output table, so it is not a mapping row either.
+                // in any output table, so it is not a mapping row either. It is
+                // counted (never named) so the store's universe accounting
+                // shows where the dropped symbols went.
+                lockbox_only_symbols += 1;
                 continue;
             };
             if universe.contains_key(&coin) {
@@ -897,6 +938,7 @@ impl HlInput {
             files,
             universe,
             prices,
+            lockbox_only_symbols,
         })
     }
 }
@@ -994,6 +1036,8 @@ pub(crate) struct PhoenixInput {
     pub(crate) prices: BTreeMap<String, BTreeMap<i64, f64>>,
     /// Distinct fill hours inside the lockbox that this input drops.
     lockbox_hours_dropped: u64,
+    /// Assets whose every fill sits inside the lockbox hours.
+    pub(crate) lockbox_only_symbols: u64,
 }
 
 pub(crate) fn scan_phoenix(
@@ -1018,13 +1062,16 @@ pub(crate) fn scan_phoenix(
     )?;
     let mut universe = BTreeMap::new();
     let mut market_id = BTreeMap::new();
+    let mut lockbox_only_symbols = 0u64;
     for row in rows {
         let symbol = row
             .str("asset_symbol")
             .ok_or_else(|| StoreError::Check("phoenix universe: null symbol".into()))?
             .to_owned();
         let (Some(first), Some(last)) = (row.int("first_s"), row.int("last_s")) else {
-            // Every fill of this asset sits in lockbox hours.
+            // Every fill of this asset sits in lockbox hours: counted (never
+            // named), and absent from every output table.
+            lockbox_only_symbols += 1;
             continue;
         };
         let id = match (row.int("id_min"), row.int("id_max")) {
@@ -1074,6 +1121,7 @@ pub(crate) fn scan_phoenix(
         market_id,
         prices,
         lockbox_hours_dropped,
+        lockbox_only_symbols,
     })
 }
 
@@ -1113,6 +1161,9 @@ struct PythInput {
     universe: BTreeMap<String, Universe>,
     /// Distinct publish hours inside the lockbox that this input drops.
     lockbox_hours_dropped: u64,
+    /// Feeds whose every publish sits inside the lockbox hours, merged over
+    /// all directories.
+    lockbox_only_symbols: u64,
 }
 
 fn scan_pyth(
@@ -1127,6 +1178,7 @@ fn scan_pyth(
     }
     let mut all: Vec<FileRef> = Vec::new();
     let mut universe: BTreeMap<String, Universe> = BTreeMap::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
     let free = lockbox_free_sql(lockbox_ranges, "(publish_time // 3600)");
     for (index, dir) in dirs.iter().enumerate() {
         let root_files = walk_parquet(dir)?;
@@ -1152,7 +1204,11 @@ fn scan_pyth(
         )?;
         for row in rows {
             let symbol = row.str("symbol").unwrap_or_default().to_owned();
+            seen.insert(symbol.clone());
             let (Some(first), Some(last)) = (row.int("first_s"), row.int("last_s")) else {
+                // Every publish of this feed in this directory sits inside the
+                // lockbox; if no other directory frees it either, the feed is
+                // counted below as lockbox-only.
                 continue;
             };
             let entry = universe.entry(symbol).or_insert(Universe {
@@ -1169,6 +1225,12 @@ fn scan_pyth(
             "--pyth-prices has no parquet files".into(),
         ));
     }
+    // Feeds that never escaped the lockbox in any directory: no universe span,
+    // no output row, only this count.
+    let lockbox_only_symbols = seen
+        .iter()
+        .filter(|feed| !universe.contains_key(*feed))
+        .count() as u64;
     // Distinct publish hours inside the lockbox, counted over every directory's
     // files in one pass (the live lane overlaps the history tail).
     let mut lockbox_hours_dropped = 0u64;
@@ -1198,6 +1260,7 @@ fn scan_pyth(
         PythInput {
             universe,
             lockbox_hours_dropped,
+            lockbox_only_symbols,
         },
     ))
 }

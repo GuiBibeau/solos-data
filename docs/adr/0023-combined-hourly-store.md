@@ -34,7 +34,12 @@ at all (it has no row in any output table). The receipt records two numbers:
 and `lockbox_hours_dropped`, the input hours the lockbox actually removed
 (hours each input covers that fall inside the set; exact for HL from its
 watermark, distinct covered hours for Phoenix and Pyth; the widest input is
-the store-wide number).
+the store-wide number). Symbols whose whole history lies inside the lockbox
+get no row in any output table; each receipt input records how many of them
+it dropped as `lockbox_only_symbols` (`inputs.hl_fills`,
+`inputs.phoenix_fills`, `inputs.pyth_prices`), the run report carries the
+same per-venue counts as `lockboxOnlySymbols`, and the catalog watermark
+repeats them, always as counts, never as symbol names.
 
 ## Outputs, receipts, catalog
 

@@ -218,23 +218,20 @@ fn build_fixtures(dir: &Path) -> Fixtures {
         write_hl_hour(&conn, hour, &mut watermark_hours, &rows);
     }
     // Three SOL hours inside the lockbox week: the universe and price filters
-    // must keep them out of first_ts/last_ts and out of the price check.
+    // must keep them out of first_ts/last_ts and out of the price check. The
+    // same hours carry LOCKCOIN and LOCKCOIN2, whose whole history lies inside
+    // the lockbox: they have no row left after the drop, must not appear in
+    // the mapping at all, and are counted as lockbox-only (never named).
     for offset in 1..=3 {
         write_hl_hour(
             &conn,
             june_hour + offset,
             &mut watermark_hours,
-            &vec![("SOL".to_owned(), "perp".to_owned(), 111.0)],
-        );
-    }
-    // A coin that trades only inside the lockbox week: it has no row left
-    // after the drop, so it must not appear in the mapping at all.
-    for offset in 1..=3 {
-        write_hl_hour(
-            &conn,
-            june_hour + offset,
-            &mut watermark_hours,
-            &vec![("LOCKCOIN".to_owned(), "perp".to_owned(), 7.0)],
+            &vec![
+                ("SOL".to_owned(), "perp".to_owned(), 111.0),
+                ("LOCKCOIN".to_owned(), "perp".to_owned(), 7.0),
+                ("LOCKCOIN2".to_owned(), "perp".to_owned(), 8.0),
+            ],
         );
     }
     std::fs::write(
@@ -262,13 +259,21 @@ fn build_fixtures(dir: &Path) -> Fixtures {
             ));
         }
     }
-    // SOL fills inside the lockbox week (price 111.0 = 11_100 ticks).
+    // SOL fills inside the lockbox week (price 111.0 = 11_100 ticks), plus
+    // PHOENIXLOCK fills whose whole history lies inside it: counted as
+    // lockbox-only, never named.
     for offset in 1..=3 {
         values.push(format!(
             "({}, {}, 11_100, 100, 2, 6, {})",
             sql_string("SOL"),
             (june_hour + offset) * 3600 + 120,
             market_of("SOL")
+        ));
+        values.push(format!(
+            "({}, {}, 6_100, 100, 2, 6, {})",
+            sql_string("PHOENIXLOCK"),
+            (june_hour + offset) * 3600 + 120,
+            market_of("PHOENIXLOCK")
         ));
     }
     // PHOENIXONLY fills outside the check days (2026-10-20), inside no lockbox
@@ -296,15 +301,32 @@ fn build_fixtures(dir: &Path) -> Fixtures {
     ))
     .unwrap();
 
-    // Pyth prices: one file, one row per feed.
+    // Pyth prices: one file, one row per feed, plus LOCKFEED and LOCKFEED2
+    // publishes whose whole history lies inside the lockbox week (counted as
+    // lockbox-only, never named).
     let pyth = dir.join("pyth-prices");
     std::fs::create_dir_all(&pyth).unwrap();
     let pyth_path = pyth.join("prices.parquet");
     let first_publish = super::grid::day_start_secs(super::grid::parse_date("2026-10-15").unwrap());
+    let mut pyth_rows = vec![
+        format!("SELECT 'SOL' AS symbol, {first_publish} AS publish_time"),
+        format!(
+            "SELECT 'BTC' AS symbol, {} AS publish_time",
+            first_publish + 3600
+        ),
+    ];
+    for offset in 1..=3 {
+        for feed in ["LOCKFEED", "LOCKFEED2"] {
+            pyth_rows.push(format!(
+                "SELECT {} AS symbol, {} AS publish_time",
+                sql_string(feed),
+                (june_hour + offset) * 3600
+            ));
+        }
+    }
     conn.execute_batch(&format!(
-        "COPY (SELECT 'SOL' AS symbol, {first_publish} AS publish_time UNION ALL
-               SELECT 'BTC' AS symbol, {} AS publish_time) TO {} (FORMAT PARQUET)",
-        first_publish + 3600,
+        "COPY ({}) TO {} (FORMAT PARQUET)",
+        pyth_rows.join(" UNION ALL "),
         sql_string(&pyth_path.to_string_lossy())
     ))
     .unwrap();
@@ -683,7 +705,8 @@ fn mapping_rules_lockbox_filters_and_receipt() {
         receipt["inputs"]["phoenix_fills"]["lockbox_hours_dropped"],
         3
     );
-    assert_eq!(receipt["inputs"]["pyth_prices"]["lockbox_hours_dropped"], 0);
+    // The Pyth lockbox-only feeds dropped three distinct publish hours.
+    assert_eq!(receipt["inputs"]["pyth_prices"]["lockbox_hours_dropped"], 3);
     assert_eq!(
         receipt["inputs"]["check_days"],
         serde_json::json!(["2026-10-15", "2026-10-16", "2026-10-17"])
@@ -705,6 +728,55 @@ fn mapping_rules_lockbox_filters_and_receipt() {
         catalog["watermarks"]["mapping"]["lockbox_hours_excluded"],
         864
     );
+    assert_eq!(
+        catalog["watermarks"]["mapping"]["lockbox_only_symbols"],
+        serde_json::json!({"hl": 2, "phoenix": 1, "pyth": 2})
+    );
+}
+
+/// Symbols whose whole history lies inside the lockbox have no row in any
+/// output table, so the per-venue counts are the only trace they leave. The
+/// fixture carries two such HL coins, one Phoenix asset and two Pyth feeds, so
+/// the counts are nonzero and distinct per venue, and the report, the receipt
+/// inputs and the catalog watermark all agree on them. Counts only, no names.
+#[test]
+fn lockbox_only_symbols_are_counted_per_venue() {
+    let tmp = Tmp::new("lockonly");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    let report =
+        mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
+    assert_eq!(report.lockbox_only_symbols["hl"], 2);
+    assert_eq!(report.lockbox_only_symbols["phoenix"], 1);
+    assert_eq!(report.lockbox_only_symbols["pyth"], 2);
+    let report_json: Value = serde_json::from_str(&report.to_json()).unwrap();
+    assert_eq!(
+        report_json["lockboxOnlySymbols"],
+        serde_json::json!({"hl": 2, "phoenix": 1, "pyth": 2})
+    );
+    let receipt: Value = serde_json::from_str(
+        &std::fs::read_to_string(receipt::receipt_path(&out, "mapping", "mapping")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["inputs"]["hl_fills"]["lockbox_only_symbols"], 2);
+    assert_eq!(
+        receipt["inputs"]["phoenix_fills"]["lockbox_only_symbols"],
+        1
+    );
+    assert_eq!(receipt["inputs"]["pyth_prices"]["lockbox_only_symbols"], 2);
+    let catalog: Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("catalog.json")).unwrap()).unwrap();
+    assert_eq!(
+        catalog["watermarks"]["mapping"]["lockbox_only_symbols"],
+        serde_json::json!({"hl": 2, "phoenix": 1, "pyth": 2})
+    );
+    // Counts only: the dropped symbols are named nowhere in the outputs.
+    let csv = std::fs::read_to_string(out.join("mapping/assets.csv")).unwrap();
+    for name in ["LOCKCOIN", "LOCKCOIN2", "PHOENIXLOCK", "LOCKFEED"] {
+        assert!(!csv.contains(name), "{name} must not be named in the CSV");
+        assert!(!receipt.to_string().contains(name), "{name} in receipt");
+        assert!(!catalog.to_string().contains(name), "{name} in catalog");
+    }
 }
 
 #[test]

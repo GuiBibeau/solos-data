@@ -1072,7 +1072,7 @@ fn augment(args: &[String]) -> i32 {
     if command == "help" || command == "--help" {
         let mut commands = Obj::new();
         for (name, text) in AUGMENT_COMMANDS {
-            commands.set(*name, *text);
+            commands.set(name, *text);
         }
         println!(
             "{}",
