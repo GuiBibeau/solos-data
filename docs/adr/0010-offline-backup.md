@@ -1,6 +1,11 @@
 # ADR-0010: Nightly off-box backup to Cloudflare R2
 
-Status: accepted, October 10, 2026.
+Status: accepted, October 10, 2026. ADR-0022 supersedes the rule that R2 is only a
+backup. After an epoch is sealed and each object's size and SHA-256 have been
+checked, R2 is the durable copy and the local file may be deleted. Until that
+code is running, this note still describes the disk: R2 is a copy, not the only
+copy. The nightly run also copies Parquet the catalog does not list yet, so a
+file that is durable on disk is uploaded before the next catalog rewrite.
 
 Every byte of the dataset lives on one disk in one server. The raw Phoenix archive is
 regenerable only at the cost of weeks of archive and RPC backfill, and parts of the augment root
@@ -19,10 +24,11 @@ October 10, 2026, as the backup half of the roadmap's first step.
   after checking the archive against the release's `SHA256SUMS`.
 - **What.** The raw table files the raw `catalog.json` lists (published Parquet, including the
   archive lane's files under `staging/`) with that catalog, `status.json` and
-  `capabilities.json`; the whole augment root except its DuckDB ledgers and `staging*/`; the
+  `capabilities.json`; every other `*.parquet` under the raw root, catalogued or not
+  (ADR-0022); the whole augment root except its DuckDB ledgers and `staging*/`; the
   checkout's `config/`; the `solos-*` user units and drop-ins. Not backed up: `phoenix_decoded`
-  (regenerable from raw), every `checkpoint.duckdb*`, raw Parquet the catalog does not list
-  (in-flight or retired), `.readers/`, `~/.config/solos-data/*.env`, `$HOME/research/`.
+  (regenerable from raw), every `checkpoint.duckdb*`, in-flight `*.tmp` files, `.readers/`,
+  `~/.config/solos-data/*.env`, `$HOME/research/`.
 - **Copy, never sync.** `rclone copy` adds and never deletes. Compaction retires superseded raw
   files on the box; their copies stay in the bucket, which therefore accumulates history. Raw
   file names are unique and immutable, so the raw pass compares sizes only and runs with

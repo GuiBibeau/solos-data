@@ -1,10 +1,13 @@
 # Continuous cleanup with a permanent raw archive
 
-Status: accepted.
+Status: accepted. ADR-0022 supersedes the rule that sealed raw epochs stay on the
+collector's disk. Unsealed epochs, checkpoint trimming, and decoded storage are
+unchanged.
 
 Keeping every published transaction in DuckDB as well as Parquet makes the writer
 grow with the entire history. Retained compaction inputs add another copy. The
-collector must keep the full history locally and continue live collection.
+collector keeps unsealed raw epochs locally and continues live collection. Sealed
+epochs may leave the disk once R2 holds a verified copy (ADR-0022).
 
 ## Decision
 

@@ -33,6 +33,7 @@ fn read_dataset(root: &Path, sql: &str) -> Result<Obj, StoreError> {
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    crate::collector::offload::refuse_r2_only(&files)?;
     conn.execute(
         "CREATE TABLE registrations AS SELECT value->>'path' AS path, value->>'created_at' AS created_at FROM json_each(?::JSON)",
         [Value::Array(files.clone()).to_string()],
@@ -95,6 +96,7 @@ pub fn range_rows(
         if selected.is_empty() {
             return Ok(Vec::new());
         }
+        crate::collector::offload::refuse_r2_only(&selected)?;
         let memory = std::env::var("SOLOS_DATA_QUERY_MEMORY").unwrap_or_else(|_| "4GB".into());
         let conn = memory_connection("4", &memory)?;
         conn.execute(

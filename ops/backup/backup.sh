@@ -65,13 +65,21 @@ run_step() {
 
 # Raw: the catalog defines the published files. A file retired mid-run (compaction) is absent
 # from the next catalog, so take a new snapshot and copy again, at most three times.
+# ADR-0022: also copy every durable Parquet under the raw root, catalogued or not. The catalog
+# is rewritten by maintenance after the file is already on disk, so a catalog-only pass left
+# recent files out of R2. `rclone copy` is size-only and immutable, so a file already copied
+# from the catalog list is not uploaded again. `.tmp` siblings are not Parquet names.
 mkdir -p "$work/raw-meta"
 raw_ok=0
 pass=0
 while [ "$pass" -lt 3 ] && [ "$raw_ok" = 0 ]; do
   pass=$((pass + 1))
   cp "$raw/catalog.json" "$work/raw-meta/catalog.json"
-  jq -r --arg root "$raw/" '.files[].path
+  # r2-only rows have no local file. The catalog copied above still lists them. This list
+  # drives the copy and the existence check, so an offloaded epoch must not count as missing.
+  jq -r --arg root "$raw/" '.files[]
+    | select(.location != "r2")
+    | .path
     | if startswith($root) then ltrimstr($root) else error("outside the raw root") end' \
     "$work/raw-meta/catalog.json" > "$work/raw-files.txt"
   rc=0
@@ -83,6 +91,11 @@ while [ "$pass" -lt 3 ] && [ "$raw_ok" = 0 ]; do
   done < "$work/raw-files.txt"
   if [ "$rc" = 0 ] && [ "$missing" = 0 ]; then raw_ok=1; fi
 done
+# Independent of the catalog snapshot above. A failure is a failed step (the summary still
+# runs, because the script continues) and the run does not report success.
+run_step raw-parquet 1 copy "$raw" "$dest/phoenix_raw" \
+  --filter '+ *.parquet' --filter '+ **/*.parquet' --filter '- *' \
+  --size-only --immutable --fast-list || true
 for f in status.json capabilities.json; do
   if [ -f "$raw/$f" ]; then cp "$raw/$f" "$work/raw-meta/$f"; fi
 done

@@ -21,6 +21,12 @@ pub struct CatalogFile {
     /// Compaction inputs, when the file is a merge.
     #[serde(default)]
     pub parents: Vec<Parent>,
+    /// `local`, `both`, or `r2`. Missing means the file is still local.
+    #[serde(default = "local_location")]
+    pub location: String,
+    /// Object key when the file has been verified in R2.
+    #[serde(default)]
+    pub r2_key: Option<String>,
 }
 
 /// A compaction input: its hash and row count.
@@ -47,6 +53,10 @@ pub struct Catalog {
 pub fn read_catalog(root: &std::path::Path) -> Result<Catalog, String> {
     let text = std::fs::read_to_string(root.join("catalog.json")).map_err(|e| e.to_string())?;
     serde_json::from_str(&text).map_err(|e| format!("invalid raw catalog: {e}"))
+}
+
+fn local_location() -> String {
+    "local".into()
 }
 
 fn number_or_string<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {

@@ -5,8 +5,10 @@
 //! own so the running collector keeps its headroom.
 
 use super::config::{Config, Lane};
+use super::offload::is_r2_file;
 use super::reader::range_files;
 use super::rpc::{Rpc, call_value};
+use super::seal::{epoch_of_file, sealed_epochs_in_catalog};
 use super::walker::{Walk, make_walk, walk_page};
 use crate::db::Db;
 use crate::jsonout::{Obj, log, now};
@@ -15,6 +17,7 @@ use crate::store::{Store, StoreError, memory_connection, query_rows, sql_string}
 use duckdb::Connection;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -313,22 +316,93 @@ pub fn files_digest(files: &[Value]) -> String {
     hex::encode(Sha256::digest(lines.concat().as_bytes()))
 }
 
+/// What [`load_archive`] found.
+#[derive(Debug)]
+pub enum ArchiveLoad {
+    /// Local files were read. The string is their [`files_digest`].
+    Loaded(String),
+    /// Every file is r2-only and its epoch is sealed. Nothing was opened.
+    SealedOffBox(String),
+}
+
+enum Offbox {
+    Read,
+    Skip,
+}
+
+fn offbox_gate(files: &[Value], sealed: &HashSet<i64>) -> Result<Offbox, StoreError> {
+    let cold = files.iter().filter(|file| is_r2_file(file)).count();
+    if cold == 0 {
+        return Ok(Offbox::Read);
+    }
+    let all_cold = cold == files.len();
+    let all_sealed = files
+        .iter()
+        .filter(|file| is_r2_file(file))
+        .all(|file| epoch_of_file(file).is_some_and(|epoch| sealed.contains(&epoch)));
+    if all_cold && all_sealed {
+        return Ok(Offbox::Skip);
+    }
+    Err(StoreError::Check(
+        "r2-only file; restore the epoch before reading".into(),
+    ))
+}
+
+fn catalog_value(root: &Path) -> Result<Value, StoreError> {
+    serde_json::from_str(&std::fs::read_to_string(root.join("catalog.json"))?)
+        .map_err(|error| StoreError::Check(error.to_string()))
+}
+
+/// `Some` when the range is sealed and r2-only, so the caller must not walk or open Parquet.
+fn prescan_offbox(root: &Path, from: i64, to: i64) -> Result<Option<Obj>, StoreError> {
+    let files = range_files(root, "transactions", from, to)?;
+    let sealed = sealed_epochs_in_catalog(&catalog_value(root)?);
+    match offbox_gate(&files, &sealed)? {
+        Offbox::Read => Ok(None),
+        Offbox::Skip => Ok(Some(skip_report(from, to, &files_digest(&files)))),
+    }
+}
+
+fn skip_report(from: i64, to: i64, digest: &str) -> Obj {
+    Obj::new()
+        .with("ok", true)
+        .with("skipped", "sealed-r2")
+        .with("from", from)
+        .with("to", to)
+        .with("range", json!([from, to]))
+        .with("archiveFiles", digest)
+        .with("missing", 0)
+        .with("unlisted", 0)
+        .with("archive", 0)
+        .with("manifest", 0)
+        .with("slotMismatch", 0)
+        .with("unordered", 0)
+        .with("badOrderingSlots", 0)
+        .with("walkPages", 0)
+        .with("walkReachedFloor", true)
+}
+
 /// The newest publication per signature of the published transactions in `[from, to]`, into
 /// `archive`, read from the files `range_files` selects; returns their [`files_digest`]. Call it
-/// under a reader lease.
+/// under a reader lease. A sealed r2-only range is not opened.
 pub fn load_archive(
     conn: &Connection,
     root: &Path,
     from: i64,
     to: i64,
-) -> Result<String, StoreError> {
+) -> Result<ArchiveLoad, StoreError> {
     let files = range_files(root, "transactions", from, to)?;
     let digest = files_digest(&files);
+    let sealed = sealed_epochs_in_catalog(&catalog_value(root)?);
+    match offbox_gate(&files, &sealed)? {
+        Offbox::Skip => return Ok(ArchiveLoad::SealedOffBox(digest)),
+        Offbox::Read => {}
+    }
     conn.execute_batch(
         "CREATE TABLE archive (signature VARCHAR, slot BIGINT, tx_index INTEGER, single_in_slot BOOLEAN)",
     )?;
     if files.is_empty() {
-        return Ok(digest);
+        return Ok(ArchiveLoad::Loaded(digest));
     }
     conn.execute(
         "CREATE TABLE registrations AS SELECT value->>'path' AS path, value->>'created_at' AS created_at FROM json_each(?::JSON)",
@@ -347,7 +421,7 @@ pub fn load_archive(
   QUALIFY row_number() OVER (PARTITION BY p.signature ORDER BY p.created_at DESC, p.filename DESC)=1",
         paths.join(",")
     ))?;
-    Ok(digest)
+    Ok(ArchiveLoad::Loaded(digest))
 }
 
 /// Add the ProgramData walk's rows in `[from, to]` (a JSON array of `{signature, slot}`) to
@@ -387,7 +461,11 @@ CREATE TABLE manifest AS SELECT signature, slot FROM walked.signatures WHERE slo
 DETACH walked;"
     ))?;
     add_programdata(&conn, programdata, from, to)?;
-    let digest = with_read_lease(raw, || load_archive(&conn, raw, from, to))?;
+    let loaded = with_read_lease(raw, || load_archive(&conn, raw, from, to))?;
+    let digest = match loaded {
+        ArchiveLoad::SealedOffBox(digest) => return Ok(skip_report(from, to, &digest)),
+        ArchiveLoad::Loaded(digest) => digest,
+    };
     let mut report = compare(&conn)?;
     report.set("archiveFiles", digest);
     for (name, sql, key) in [
@@ -473,13 +551,41 @@ async fn verify_range(
             Obj::new().with("from", window.0).with("to", window.1),
         );
     }
-    let above = super::reader::range_rows(
-        &config.data_dir,
-        "transactions",
-        "signature, slot, tx_index",
-        range.1 + 1,
-        range.1 + ANCHOR_WINDOW,
-    )?;
+    if let Some(mut report) = with_read_lease(&config.data_dir, || {
+        prescan_offbox(&config.data_dir, window.0, window.1)
+    })? {
+        std::fs::create_dir_all(&dir)?;
+        report.set("verifiedAt", now());
+        write_json(&report_path, &report)?;
+        log("reverify_range", report.clone());
+        return Ok(report);
+    }
+    let anchor_from = range.1 + 1;
+    let anchor_to = range.1 + ANCHOR_WINDOW;
+    let anchor_cold = with_read_lease(&config.data_dir, || {
+        range_files(&config.data_dir, "transactions", anchor_from, anchor_to)
+            .map(|files| files.iter().any(is_r2_file))
+    })?;
+    let above = if anchor_cold {
+        // An r2-only anchor cannot be opened. Leaving the window empty is visible in the log;
+        // the walk then starts without that anchor signature.
+        log(
+            "reverify_anchor_r2",
+            Obj::new()
+                .with("from", anchor_from)
+                .with("to", anchor_to)
+                .with("reason", "anchor file is r2-only"),
+        );
+        Vec::new()
+    } else {
+        super::reader::range_rows(
+            &config.data_dir,
+            "transactions",
+            "signature, slot, tx_index",
+            anchor_from,
+            anchor_to,
+        )?
+    };
     let mut initial = make_walk(
         &config.program_id,
         Lane::Backfill,
@@ -625,6 +731,16 @@ pub async fn reverify(
         .with("slotMismatch", sum("slotMismatch"))
         .with("unordered", sum("unordered"))
         .with("badOrderingSlots", sum("badOrderingSlots"))
+        .with(
+            "skippedSealed",
+            i64::try_from(
+                reports
+                    .iter()
+                    .filter(|report| report.str("skipped") == Some("sealed-r2"))
+                    .count(),
+            )
+            .unwrap_or(0),
+        )
         .with("walkPages", sum("walkPages"))
         .with(
             "programData",
@@ -1010,7 +1126,9 @@ CREATE TABLE archive (signature VARCHAR, slot BIGINT, tx_index INTEGER, single_i
         std::fs::write(root.join("catalog.json"), catalog.to_string()).unwrap();
         let conn = conn();
         conn.execute_batch("DROP TABLE archive").unwrap();
-        let digest = load_archive(&conn, &root, 100, 199).unwrap();
+        let ArchiveLoad::Loaded(digest) = load_archive(&conn, &root, 100, 199).unwrap() else {
+            panic!("local files were treated as sealed");
+        };
         assert_eq!(digest.len(), 64);
         let files = range_files(&root, "transactions", 100, 199).unwrap();
         assert_eq!(digest, files_digest(&files));
@@ -1025,6 +1143,69 @@ CREATE TABLE archive (signature VARCHAR, slot BIGINT, tx_index INTEGER, single_i
         let report = compare(&conn).unwrap();
         assert_eq!(report.get("ok"), Some(&Value::Bool(true)), "{report:?}");
         assert_eq!(report.int("archive"), Some(2));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Mutation: treat a sealed r2-only range as local bytes, or skip a range that still has a
+    /// local file or an unsealed r2-only file.
+    #[test]
+    fn sealed_r2_ranges_are_not_opened_and_unsealed_ones_are_not_skipped() {
+        let root = std::env::temp_dir().join(format!("solos-reverify-r2-{}", uuid::Uuid::new_v4()));
+        let dir = root.join("staging/transactions/epoch=0");
+        std::fs::create_dir_all(&dir).unwrap();
+        let missing = dir.join("0-10-a.parquet");
+        let file = json!({
+            "path": missing.to_string_lossy(),
+            "table_name": "transactions",
+            "sha256": "abc",
+            "row_count": "1",
+            "location": "r2",
+            "r2_key": "phoenix_raw/staging/transactions/epoch=0/0-10-a.parquet",
+            "epoch": 0
+        });
+        let write = |sealed: bool, extra: Option<Value>| {
+            let mut files = vec![file.clone()];
+            if let Some(extra) = extra {
+                files.push(extra);
+            }
+            let sealed_epochs = if sealed {
+                json!([{"epoch": 0, "sealedAt": "t", "checks": {"settled": true}}])
+            } else {
+                json!([])
+            };
+            std::fs::write(
+                root.join("catalog.json"),
+                json!({"files": files, "sealedEpochs": sealed_epochs}).to_string(),
+            )
+            .unwrap();
+        };
+        write(true, None);
+        let conn = conn();
+        match load_archive(&conn, &root, 0, 10).unwrap() {
+            ArchiveLoad::SealedOffBox(_) => {}
+            ArchiveLoad::Loaded(_) => panic!("opened a sealed r2-only file"),
+        }
+        let skipped = prescan_offbox(&root, 0, 10).unwrap().expect("skip");
+        assert_eq!(skipped.str("skipped"), Some("sealed-r2"));
+        write(false, None);
+        let err = load_archive(&conn, &root, 0, 10).unwrap_err();
+        assert!(err.to_string().contains("restore"), "{err}");
+        let local = dir.join("0-10-b.parquet");
+        write(
+            true,
+            Some(json!({
+                "path": local.to_string_lossy(),
+                "table_name": "transactions",
+                "sha256": "def",
+                "location": "local",
+                "epoch": 0
+            })),
+        );
+        let err = load_archive(&conn, &root, 0, 10).unwrap_err();
+        assert!(
+            err.to_string().contains("restore"),
+            "a mixed range must not be skipped: {err}"
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }

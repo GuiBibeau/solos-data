@@ -21,6 +21,7 @@ pub fn main(args: &[String]) -> i32 {
     match group {
         "decoder" => decoder(&args[1..]),
         "collector" => collector(&args[1..]),
+        "maintain" => crate::collector::offload::command(&args[1..]),
         "augment" => augment(&args[1..]),
         "dev" => dev(&args[1..]),
         "health" => health(&args[1..]),
@@ -35,6 +36,7 @@ pub fn main(args: &[String]) -> i32 {
                         json!([
                             "collector",
                             "decoder",
+                            "maintain",
                             "augment",
                             "venues",
                             "spot",
@@ -643,7 +645,7 @@ const COLLECTOR_COMMANDS: [(&str, &str); 17] = [
     ),
     (
         "verify-storage",
-        "Offline hash/count verification; stop the service first",
+        "Offline hash/count verification; r2-only files are skipped (--remote samples one per epoch). Stop the service first",
     ),
     (
         "maintain",
@@ -934,10 +936,25 @@ fn offline_or_live(
                 "{}",
                 crate::collector::diagnostics::storage_stats(store)?.to_json()
             ),
-            "verify-storage" => println!(
-                "{}",
-                crate::collector::writer::verify_files(store)?.to_json()
-            ),
+            "verify-storage" => {
+                let report = if has(args, "--remote") {
+                    let objects = crate::collector::object_store::RcloneStore::open_default()?;
+                    crate::collector::writer::verify_files_with(
+                        store,
+                        Some(&mut |sample| {
+                            crate::collector::offload::confirm_remote(
+                                &objects,
+                                &sample.key,
+                                sample.size,
+                                &sample.sha256,
+                            )
+                        }),
+                    )?
+                } else {
+                    crate::collector::writer::verify_files(store)?
+                };
+                println!("{}", report.to_json());
+            }
             "maintain" => println!(
                 "{}",
                 crate::collector::maintenance::maintain(

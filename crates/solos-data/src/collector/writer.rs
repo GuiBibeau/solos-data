@@ -2,6 +2,7 @@
 //! bounds and the lane checkpoint in one transaction. A port of `writer.ts` and
 //! `storage-space.ts`.
 
+use super::seal::sealed_epoch_ids;
 use crate::fsutil::{
     create_dir_all_durable, file_hash, manifest_path, sync_dir_after_rename, sync_tmp_file,
     tmp_path,
@@ -9,6 +10,7 @@ use crate::fsutil::{
 use crate::jsonout::{Obj, now};
 use crate::store::{Store, StoreError, sql_string};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Raw tables in publication order.
@@ -144,18 +146,25 @@ pub fn publish_range_with(
     mut on_progress: impl FnMut(Progress),
 ) -> Result<(), StoreError> {
     require_storage_space(root)?;
+    let sealed = sealed_epoch_ids(store)?;
     struct Published {
         path: String,
         table: &'static str,
         epoch: i64,
         count: i64,
         hash: String,
+        bytes: i64,
     }
     let mut files: Vec<Published> = Vec::new();
     for table in TABLES {
         let groups = store.rows(&format!("SELECT slot // 432000 AS epoch, count(*) AS n FROM {table} WHERE slot BETWEEN ? AND ? GROUP BY epoch ORDER BY epoch"), &[&from, &to])?;
         for item in groups {
             let epoch = item.int("epoch").unwrap_or(0);
+            if sealed.contains(&epoch) {
+                return Err(StoreError::Check(format!(
+                    "epoch {epoch} is sealed; no new writes"
+                )));
+            }
             let count = item.int("n").unwrap_or(0);
             let directory = root
                 .join("staging")
@@ -225,6 +234,7 @@ pub fn publish_range_with(
                 epoch,
                 count,
                 hash: file_hash(&path)?,
+                bytes: i64::try_from(std::fs::metadata(&path)?.len()).unwrap_or(0),
             });
         }
     }
@@ -236,16 +246,17 @@ pub fn publish_range_with(
     crate::crash_point!("publish/before-watermark-commit");
     store.transaction(|store| {
         for file in &files {
+            let created = now();
             store.exec(
-                "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO files (path, table_name, epoch, row_count, sha256, created_at, status, byte_size, location) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, 'local')",
                 &[
                     &file.path,
                     &file.table,
                     &file.epoch,
                     &file.count,
                     &file.hash,
-                    &now(),
-                    &"active",
+                    &created,
+                    &file.bytes,
                 ],
             )?;
         }
@@ -280,10 +291,61 @@ pub fn publish_range_with(
     })
 }
 
-/// Hash and count every active file.
+/// One r2-only file chosen for a remote sample.
+pub struct RemoteSample {
+    /// Object key in the raw bucket.
+    pub key: String,
+    /// Catalogued size in bytes.
+    pub size: u64,
+    /// Catalogued SHA-256.
+    pub sha256: String,
+    /// Epoch the file belongs to.
+    pub epoch: i64,
+}
+
+/// Hash and count every active file. r2-only files are not opened locally.
 pub fn verify_files(store: &mut Store) -> Result<Obj, StoreError> {
-    let files = store.rows("SELECT * FROM files WHERE status=?", &[&"active"])?;
+    verify_files_with(store, None)
+}
+
+/// [`verify_files`], and when `remote` is set, stream-check one r2-only file per epoch.
+pub fn verify_files_with(
+    store: &mut Store,
+    mut remote: Option<&mut dyn FnMut(RemoteSample) -> Result<(), StoreError>>,
+) -> Result<Obj, StoreError> {
+    let files = store.rows(
+        "SELECT * FROM files WHERE status=? ORDER BY epoch, path",
+        &[&"active"],
+    )?;
+    let mut skipped = 0i64;
+    let mut remote_checked = 0i64;
+    let mut sampled = HashSet::new();
     for file in &files {
+        let location = file.str("location").unwrap_or("local");
+        if location == "r2" {
+            skipped += 1;
+            if let Some(check) = remote.as_mut() {
+                let epoch = file.int("epoch").unwrap_or(0);
+                if sampled.insert(epoch) {
+                    let key = file.str("r2_key").unwrap_or("");
+                    if key.is_empty() {
+                        return Err(StoreError::Check("r2-only file has no r2 key".into()));
+                    }
+                    let size = file.int("byte_size").unwrap_or(-1);
+                    if size < 0 {
+                        return Err(StoreError::Check("r2-only file has no size".into()));
+                    }
+                    remote_checked += 1;
+                    check(RemoteSample {
+                        key: key.to_owned(),
+                        size: u64::try_from(size).unwrap_or(0),
+                        sha256: file.str("sha256").unwrap_or("").to_owned(),
+                        epoch,
+                    })?;
+                }
+            }
+            continue;
+        }
         let path = Path::new(file.str("path").unwrap_or(""));
         if file_hash(path)? != file.str("sha256").unwrap_or("") {
             return Err(StoreError::Check("V7: file hash mismatch".into()));
@@ -299,5 +361,9 @@ pub fn verify_files(store: &mut Store) -> Result<Obj, StoreError> {
             return Err(StoreError::Check("V7: file count mismatch".into()));
         }
     }
-    Ok(Obj::new().with("files", files.len()).with("ok", true))
+    Ok(Obj::new()
+        .with("files", files.len())
+        .with("ok", true)
+        .with("skippedR2", skipped)
+        .with("remoteChecked", remote_checked))
 }
