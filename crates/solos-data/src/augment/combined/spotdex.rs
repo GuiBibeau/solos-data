@@ -66,8 +66,9 @@ use super::receipt;
 /// The unit this module runs.
 pub const UNIT: &str = "spotdex-hours";
 
-/// Bumped on an output-shape change.
-pub const UNIT_VERSION: u32 = 1;
+/// Bumped on an output-shape change. 2: hour receipts and the run report
+/// carry the row-level USD total instead of the per-mint sum.
+pub const UNIT_VERSION: u32 = 2;
 
 /// Schema name in the receipts.
 pub const SCHEMA: &str = "spotdex-mint-hour-v1";
@@ -510,7 +511,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         venue_months
             .entry(month_of_hour(hour))
             .or_default()
-            .push((hour, venue));
+            .push((hour, venue.clone()));
         write_hour_receipt(
             request.out,
             &HourReceipt {
@@ -520,7 +521,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
                 hour,
                 hour_key: key.clone(),
                 rows: output.rows,
-                usd_micro: mint.usd_micro,
+                usd_micro: venue.usd_micro,
                 output: output.clone(),
                 input_files_sha256: inputs_sha,
                 lockbox_sha256: checked_lockbox_sha.clone(),
@@ -533,7 +534,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         report.hours_written += 1;
         report.mint_rows += output.rows;
         report.outputs += 1;
-        usd_micro_total = usd_micro_total.saturating_add(mint.usd_micro.unwrap_or(0));
+        usd_micro_total = usd_micro_total.saturating_add(venue.usd_micro.unwrap_or(0));
         sealed.push(output);
     }
     report.usd_volume = usd_micro_total as f64 / 1e6;
@@ -1226,7 +1227,6 @@ fn load_new_pools(
 /// Aggregated rows of one hour, the merge result before it is written.
 struct MintHour {
     rows: Vec<MintRow>,
-    usd_micro: Option<i64>,
 }
 
 /// One (mint, hour) row.
@@ -1242,7 +1242,10 @@ struct MintRow {
 }
 
 /// One venue hour row.
+#[derive(Clone)]
 struct VenueRow {
+    /// The hour's winsorized USD total (row-level, counted once).
+    usd_micro: Option<i64>,
     sd_log_volume: f64,
     sd_swaps: i64,
     sd_mints_active: i64,
@@ -1307,31 +1310,20 @@ fn merge_mint_hour(
         ),
         &[],
     )?;
-    let mut out = Vec::with_capacity(rows.len());
-    let mut usd_micro = 0i64;
-    let mut any_usd = false;
-    for row in rows {
-        let row_usd = row.int("usd_micro");
-        let row = MintRow {
+    let out = rows
+        .into_iter()
+        .map(|row| MintRow {
             mint: row.str("mint").unwrap_or_default().to_owned(),
             n_swaps: row.int("n_swaps").unwrap_or_default(),
             n_buy: row.int("n_buy").unwrap_or_default(),
             n_sell: row.int("n_sell").unwrap_or_default(),
             n_pools: row.int("n_pools").unwrap_or_default(),
             n_programs: row.int("n_programs").unwrap_or_default(),
-            usd_micro: row_usd,
+            usd_micro: row.int("usd_micro"),
             usd_n: row.int("usd_n").unwrap_or_default(),
-        };
-        if let Some(value) = row_usd {
-            any_usd = true;
-            usd_micro = usd_micro.saturating_add(value);
-        }
-        out.push(row);
-    }
-    Ok(Some(MintHour {
-        rows: out,
-        usd_micro: any_usd.then_some(usd_micro),
-    }))
+        })
+        .collect();
+    Ok(Some(MintHour { rows: out }))
 }
 
 /// Seal one hour's mint file through a checked staging write.
@@ -1491,6 +1483,7 @@ fn merge_venue_hour(
         None
     };
     Ok(VenueRow {
+        usd_micro: (u > 0).then_some(u),
         sd_log_volume: (1.0 + total / 1e6).ln(),
         sd_swaps: n,
         sd_mints_active: mints_active as i64,
