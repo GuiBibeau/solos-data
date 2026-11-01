@@ -303,7 +303,9 @@ fn build_fixtures(dir: &Path) -> Fixtures {
 
     // Pyth prices: one file, one row per feed, plus LOCKFEED and LOCKFEED2
     // publishes whose whole history lies inside the lockbox week (counted as
-    // lockbox-only, never named).
+    // lockbox-only, never named), and SOL publishes inside the lockbox week:
+    // SOL also publishes on the check days, so its span must stay put when
+    // the lockbox filter hides the June hours.
     let pyth = dir.join("pyth-prices");
     std::fs::create_dir_all(&pyth).unwrap();
     let pyth_path = pyth.join("prices.parquet");
@@ -316,6 +318,10 @@ fn build_fixtures(dir: &Path) -> Fixtures {
         ),
     ];
     for offset in 1..=3 {
+        pyth_rows.push(format!(
+            "SELECT 'SOL' AS symbol, {} AS publish_time",
+            (june_hour + offset) * 3600
+        ));
         for feed in ["LOCKFEED", "LOCKFEED2"] {
             pyth_rows.push(format!(
                 "SELECT {} AS symbol, {} AS publish_time",
@@ -777,6 +783,30 @@ fn lockbox_only_symbols_are_counted_per_venue() {
         assert!(!receipt.to_string().contains(name), "{name} in receipt");
         assert!(!catalog.to_string().contains(name), "{name} in catalog");
     }
+}
+
+/// The Pyth span filter is load-bearing: SOL publishes on the check days and
+/// again inside the lockbox week, so replacing the filtered min/max with a
+/// plain min/max (mutant N3) would drag SOL's first_ts back into June.
+#[test]
+fn the_pyth_span_excludes_lockbox_hours() {
+    let tmp = Tmp::new("pythspan");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
+    let lines = assets_lines(&out);
+    let publish0 = super::grid::day_start_secs(super::grid::parse_date("2026-10-15").unwrap());
+    let sol_feed = lines
+        .iter()
+        .find(|line| line.contains(",pyth,SOL/USD,"))
+        .expect("SOL feed row");
+    assert_eq!(
+        sol_feed,
+        &format!("SOL,pyth,SOL/USD,,price,feed-sol,{publish0},{publish0},venues_config,true,,,")
+    );
+    // The lockbox-only feeds stay out of the output entirely: the config's
+    // feeds are the only Pyth rows.
+    assert!(!lines.iter().any(|line| line.contains("LOCKFEED")));
 }
 
 #[test]
