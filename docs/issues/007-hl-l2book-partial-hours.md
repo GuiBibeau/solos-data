@@ -90,6 +90,9 @@ Partial. The batch roots are the record for those coins.
 
 ## Operating rules until the guard lands
 
+The three rules below are mandatory for every l2Book root until the superset
+guard lands.
+
 - Coin sets are disjoint across roots. Each root has its coin list recorded
   as a file, and disjointness is checked before launch.
 - A root is never rerun with a different `--coins`, and no full run (without
