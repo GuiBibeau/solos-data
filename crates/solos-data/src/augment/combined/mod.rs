@@ -6,13 +6,15 @@
 //! the root's `catalog.json` only after the checks pass. It never opens a DuckDB
 //! database file, never sends a transaction, and never touches the network.
 //!
-//! Units: `mapping` (U1) assigns canonical `asset_id`s across venues.
+//! Units: `mapping` (U1) assigns canonical `asset_id`s across venues;
+//! `spotdex-hours` (U2d) aggregates the spot DEX swaps per mint and hour.
 
 pub mod catalog;
 pub mod grid;
 pub mod lockbox;
 pub mod mapping;
 pub mod receipt;
+pub mod spotdex;
 
 #[cfg(test)]
 mod behavior;
