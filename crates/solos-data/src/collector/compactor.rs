@@ -2,6 +2,7 @@
 //! 250k rows and 256 MiB, keeping revision precedence. A port of `compactor.ts`.
 
 use super::catalog::write_catalog;
+use super::seal::sealed_epoch_ids;
 use crate::fsutil::{create_dir_all_durable, file_hash, sync_path, tmp_path};
 use crate::jsonout::now;
 use crate::store::{Store, StoreError, sql_string};
@@ -9,10 +10,14 @@ use std::path::Path;
 
 /// Consolidate registered revisions; the newest publication wins per signature.
 pub fn compact(store: &mut Store, root: &Path) -> Result<(), StoreError> {
+    let sealed = sealed_epoch_ids(store)?;
     let groups = store.rows("SELECT table_name, epoch FROM files WHERE status='active' GROUP BY table_name, epoch HAVING count(*)>=10", &[])?;
     for group in groups {
         let table = group.str("table_name").unwrap_or("").to_owned();
         let epoch = group.int("epoch").unwrap_or(0);
+        if sealed.contains(&epoch) {
+            continue;
+        }
         let candidates = store.rows("SELECT path, row_count,sha256 FROM files WHERE status='active' AND table_name=? AND epoch=? ORDER BY created_at DESC, path DESC", &[&table, &epoch])?;
         let mut paths: Vec<String> = Vec::new();
         let mut inputs = Vec::new();
@@ -92,9 +97,11 @@ pub fn compact(store: &mut Store, root: &Path) -> Result<(), StoreError> {
                     &[&path_text, sha, count],
                 )?;
             }
+            let created = now();
+            let bytes = i64::try_from(std::fs::metadata(&path)?.len()).unwrap_or(0);
             store.exec(
-                "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?, ?)",
-                &[&path_text, &table, &epoch, &n, &hash, &now(), &"active"],
+                "INSERT INTO files (path, table_name, epoch, row_count, sha256, created_at, status, byte_size, location) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, 'local')",
+                &[&path_text, &table, &epoch, &n, &hash, &created, &bytes],
             )?;
             store.exec(
                 "INSERT INTO file_bounds VALUES (?, ?, ?)",

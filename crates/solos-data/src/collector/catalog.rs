@@ -59,10 +59,29 @@ pub fn write_catalog(store: &mut Store, root: &Path) -> Result<Obj, StoreError> 
             file.set("parents", Value::Array(parents));
         }
     }
+    let sealed_rows = store.rows(
+        "SELECT epoch, sealed_at, checks::VARCHAR AS checks FROM sealed_epochs ORDER BY epoch",
+        &[],
+    )?;
+    let sealed: Vec<Value> = sealed_rows
+        .iter()
+        .map(|row| {
+            let checks = row
+                .str("checks")
+                .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                .unwrap_or(Value::Null);
+            json!({
+                "epoch": row.int("epoch").unwrap_or(0),
+                "sealedAt": row.str("sealed_at").unwrap_or(""),
+                "checks": checks,
+            })
+        })
+        .collect();
     let catalog = Obj::new()
         .with("at", now())
         .with_rows("files", files)
         .with("coverage", coverage_json(&merge_coverage(ranges)))
+        .with("sealedEpochs", Value::Array(sealed))
         .with(
             "acceptance",
             "published with fetch/order checks; independent validation and sealing pending",

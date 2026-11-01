@@ -55,16 +55,28 @@ pub fn pending_sources(store: &mut Store, raw_root: &Path) -> Result<Vec<NextSou
         }
     }
     let mut candidates: Vec<(CatalogFile, i64)> = Vec::new();
-    let unconsumed: Vec<CatalogFile> = catalog
+    let transactions: Vec<CatalogFile> = catalog
         .files
         .iter()
-        .filter(|f| {
-            f.table_name == "transactions"
-                && progress.get(&f.sha256).copied().unwrap_or(0) < f.row_count
-        })
+        .filter(|f| f.table_name == "transactions")
         .cloned()
         .collect();
-    for file in &unconsumed {
+    for file in &transactions {
+        let consumed = progress.get(&file.sha256).copied().unwrap_or(0) >= file.row_count;
+        // A sealed epoch's bytes may live only in R2. Fully decoded files have nothing left
+        // to read. An unfinished one is refused so a missing path is not a silent skip.
+        if file.location == "r2" {
+            if consumed {
+                continue;
+            }
+            return Err(StoreError::Check(format!(
+                "r2-only file is not fully decoded; restore the epoch before decoding ({})",
+                file.r2_key.as_deref().unwrap_or(file.path.as_str())
+            )));
+        }
+        if consumed {
+            continue;
+        }
         // A merge adds no new payload when all immutable input sources were consumed.
         if !file.parents.is_empty()
             && file

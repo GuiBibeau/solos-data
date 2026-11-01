@@ -123,7 +123,10 @@ pub fn maintain(
 /// Offline only: rebase registered absolute paths after the data root moved.
 pub fn relocate(store: &mut Store) -> Result<Obj, StoreError> {
     let root = store.root.clone();
-    let files = store.rows("SELECT path, sha256, row_count,status FROM files", &[])?;
+    let files = store.rows(
+        "SELECT path, sha256, row_count, status, location FROM files",
+        &[],
+    )?;
     let removed: std::collections::HashSet<String> = store
         .rows("SELECT path FROM garbage_removed", &[])?
         .iter()
@@ -144,6 +147,10 @@ pub fn relocate(store: &mut Store) -> Result<Obj, StoreError> {
             };
             let index = path.find(marker.as_str()).unwrap_or(0);
             path = root.join(&path[index + 1..]).to_string_lossy().into_owned();
+        }
+        if file.str("location") == Some("r2") && !Path::new(&path).is_file() {
+            replacements.push((old, path));
+            continue;
         }
         if file.str("status") != Some("deleted") && !removed.contains(&old) {
             if file_hash(Path::new(&path))? != file.str("sha256").unwrap_or("") {

@@ -28,7 +28,15 @@ CREATE TABLE IF NOT EXISTS cycles (
 );
 CREATE TABLE IF NOT EXISTS files (
  path VARCHAR PRIMARY KEY, table_name VARCHAR, epoch BIGINT, row_count BIGINT,
- sha256 VARCHAR, created_at VARCHAR, status VARCHAR DEFAULT 'active'
+ sha256 VARCHAR, created_at VARCHAR, status VARCHAR DEFAULT 'active',
+ byte_size BIGINT, location VARCHAR DEFAULT 'local', r2_key VARCHAR
+);
+ALTER TABLE files ADD COLUMN IF NOT EXISTS byte_size BIGINT;
+ALTER TABLE files ADD COLUMN IF NOT EXISTS location VARCHAR DEFAULT 'local';
+ALTER TABLE files ADD COLUMN IF NOT EXISTS r2_key VARCHAR;
+UPDATE files SET location='local' WHERE location IS NULL;
+CREATE TABLE IF NOT EXISTS sealed_epochs (
+ epoch BIGINT PRIMARY KEY, sealed_at VARCHAR, checks JSON
 );
 CREATE TABLE IF NOT EXISTS published_ranges (
  slot_from BIGINT, slot_to BIGINT, PRIMARY KEY(slot_from, slot_to)

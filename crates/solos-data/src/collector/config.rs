@@ -126,6 +126,9 @@ pub struct Config {
     /// Slots a routine retention pass may trim from the checkpoint (`maintain --all` is unbounded).
     #[serde(default = "d_retention_pass")]
     pub retention_slots_per_pass: i64,
+    /// Epochs kept hot behind the newest epoch. `0` still refuses to seal the current epoch.
+    #[serde(default = "d_seal_lag")]
+    pub seal_lag_epochs: i64,
     /// Whether the live tail lane runs. Off, the collector only backfills, and the archive lane's
     /// manifest check is the only steady compute-unit spend (ADR-0008).
     #[serde(default = "d_true")]
@@ -165,6 +168,9 @@ fn d_archive_sample() -> f64 {
 }
 fn d_retention_pass() -> i64 {
     16_000
+}
+fn d_seal_lag() -> i64 {
+    2
 }
 
 /// Load, apply `SOLOS_DATA_DIR` and `SOLOS_DATA_CU_PER_SECOND`, validate.
@@ -231,6 +237,9 @@ fn validate(config: &Config) -> Result<(), StoreError> {
     }
     if config.retention_slots_per_pass <= 0 {
         return Err(StoreError::Check("Invalid retentionSlotsPerPass".into()));
+    }
+    if config.seal_lag_epochs < 0 {
+        return Err(StoreError::Check("Invalid sealLagEpochs".into()));
     }
     if config.archive_chunk_slots <= 0 || !(0.0..=1.0).contains(&config.archive_ordering_sample) {
         return Err(StoreError::Check("Invalid archive settings".into()));

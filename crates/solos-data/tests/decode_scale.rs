@@ -36,6 +36,8 @@ fn deep_decoder_resume_uses_bounded_payload_memory_and_preserves_descending_curs
         sha256: file_hash(&path).unwrap(),
         created_at: "fixture".into(),
         parents: vec![],
+        location: "local".into(),
+        r2_key: None,
     };
     let expected: Vec<(String, String)> = store
         .rows(&format!("SELECT signature, slot FROM read_parquet({}) ORDER BY slot DESC, signature DESC LIMIT 25 OFFSET 800000", sql_string(&path.to_string_lossy())), &[])

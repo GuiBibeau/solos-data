@@ -186,7 +186,7 @@ fn publish_partition(store: &mut Store, path: &Path, slot_from: i64, slot_to: i6
     let path_text = path.to_string_lossy().into_owned();
     store
         .exec(
-            "INSERT INTO files VALUES (?, 'transactions', 0, ?, ?, '2026-10-29T00:00:00Z', 'active')",
+            "INSERT INTO files (path, table_name, epoch, row_count, sha256, created_at, status) VALUES (?, 'transactions', 0, ?, ?, '2026-10-29T00:00:00Z', 'active')",
             &[&path_text, &count, &hash],
         )
         .unwrap();
@@ -528,7 +528,7 @@ fn recover_files_keeps_registered_files_through_a_symlink_and_a_relative_path() 
     for path in ["staging/rel.parquet", absolute_path.as_str()] {
         store
             .exec(
-                "INSERT INTO files VALUES (?, 'transactions', 0, ?, ?, 't', 'active')",
+                "INSERT INTO files (path, table_name, epoch, row_count, sha256, created_at, status) VALUES (?, 'transactions', 0, ?, ?, 't', 'active')",
                 &[&path, &count, &hash],
             )
             .unwrap();

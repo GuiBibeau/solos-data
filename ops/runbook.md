@@ -794,11 +794,12 @@ if it has already grown past a few million published rows, stop the collector an
 
 ## Off-box backup
 
-A nightly `rclone copy` sends the raw Parquet the raw catalog lists, the augment root, `config/`
-and the `solos-*` user units to a private Cloudflare R2 bucket (ADR-0010). Not sent: decoded
-Parquet (regenerable from raw), DuckDB checkpoints, unlisted raw files, `.readers/`, staging,
-`*.env`, `$HOME/research/`. It never deletes anything in the bucket: files the box retires stay
-there. Bucket layout: `phoenix_raw/`, `augment/`, `config/`, `systemd-user/`, and
+A nightly `rclone copy` sends the raw Parquet (catalogued files, and every other `*.parquet`
+under the raw root), the augment root, `config/`
+and the `solos-*` user units to a private Cloudflare R2 bucket (ADR-0010, ADR-0020). Not sent:
+decoded Parquet (regenerable from raw), DuckDB checkpoints, in-flight `*.tmp` files, `.readers/`,
+augment `staging*/`, `*.env`, `$HOME/research/`. It never deletes anything in the bucket: files
+the box retires stay there. Bucket layout: `phoenix_raw/`, `augment/`, `config/`, `systemd-user/`, and
 `catalogs/<UTC date>/{phoenix_raw,augment}/` (each night's catalogs).
 
 Install once (rclone goes to `~/.local/bin`, checked against the release's `SHA256SUMS`):
@@ -864,6 +865,92 @@ checkpoint.
 `~/.local/bin/solos-backup-credentials` on the box to overwrite `backup.env`, run
 `systemctl --user start --no-block solos-data-backup.service` and check that it ends `ok`, then
 revoke the old token.
+
+## Sealed raw epochs (ADR-0020)
+
+Old settled epochs can leave the disk after R2 has a verified copy. The collector must be
+stopped for `seal`, `offload`, and `restore`: those commands open the raw checkpoint, and one
+process owns it. `seal` also opens the decoder checkpoint. `--drop-local` holds that decoder
+checkpoint for the whole run, so the decoder stays stopped until the run exits. `backup-gap`
+does not open either database and can run while both services are up.
+
+`seal` refuses the current epoch. An epoch seals only when it is older than the newest epoch
+by `--lag` (default `sealLagEpochs`, 2), `published_ranges` cover its whole span, every active
+file matches its SHA-256 and row count, and the decoder has consumed every transactions file.
+Nothing new is written into a sealed epoch. `offload --verify` records `location: both` only
+after the R2 object's size and SHA-256 match the catalog (a stored checksum when the listing
+has one, otherwise a streamed hash). `--drop-local` deletes the local file only after that
+catalog write is durable, and only for a sealed epoch. A crash between those two steps leaves
+the file on disk and the catalog at `both`; run the same command again. `restore --epochs`
+downloads an epoch and refuses a body whose SHA-256 does not match. `collector verify-storage`
+does not re-hash r2-only files; `--remote` streams one file per epoch.
+
+Order on the box, after the nightly backup has run:
+
+```sh
+systemctl --user stop solos-data-phoenix-decoder.service
+systemctl --user stop solos-data-phoenix.service
+cd "$HOME/solos-data"
+set -a
+. "$HOME/.config/solos-data/collector.env"
+set +a
+# Do not print collector.env or backup.env. The offload command reads backup.env itself.
+"$HOME/.local/share/solos-data/bin/solos-data" maintain seal \
+  --config config/phoenix.json \
+  --decoded-root "$HOME/.local/share/solos-data/phoenix_decoded/v1" \
+  --lag 2
+"$HOME/.local/share/solos-data/bin/solos-data" maintain offload \
+  --config config/phoenix.json \
+  --epochs sealed \
+  --verify
+"$HOME/.local/share/solos-data/bin/solos-data" maintain offload \
+  --config config/phoenix.json \
+  --decoded-root "$HOME/.local/share/solos-data/phoenix_decoded/v1" \
+  --epochs sealed \
+  --verify \
+  --drop-local
+systemctl --user start solos-data-phoenix.service
+systemctl --user start solos-data-phoenix-decoder.service
+```
+
+`--verify` without `--drop-local` does not take the decoder lock. Run it first and read the
+JSON (`verified`, `dropped`) before the delete pass. Deletions are `offload_deleted` lines
+(r2 key, sha256, size, epoch). To read a sealed epoch again:
+
+```sh
+systemctl --user stop solos-data-phoenix.service
+"$HOME/.local/share/solos-data/bin/solos-data" maintain restore \
+  --config config/phoenix.json \
+  --epochs 900-910
+systemctl --user start solos-data-phoenix.service
+```
+
+Restoring bytes does not unseal the epoch, so the collector still will not write into it.
+`maintain backup-gap --older-than 30` exits 2 when a local file older than 30 hours has no R2
+object. That includes Parquet the catalog has not listed yet.
+
+```sh
+set -a
+. "$HOME/.config/solos-data/collector.env"
+set +a
+"$HOME/.local/share/solos-data/bin/solos-data" maintain backup-gap \
+  --config config/phoenix.json \
+  --older-than 30
+```
+
+Optional sample of r2-only hashes, with the collector stopped:
+
+```sh
+systemctl --user stop solos-data-phoenix.service
+"$HOME/.local/share/solos-data/bin/solos-data" collector verify-storage \
+  --config config/phoenix.json \
+  --remote
+systemctl --user start solos-data-phoenix.service
+```
+
+The verify pass downloads each object that has no stored SHA-256. That is a one-time retrieval
+against the infrequent-access bucket. A later `offload --verify` does not download files whose
+catalog location is already `r2` and whose local copy is gone.
 
 ## Switch a running TypeScript deployment to the binary
 
