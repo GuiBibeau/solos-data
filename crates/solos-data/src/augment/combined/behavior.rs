@@ -47,6 +47,8 @@ fn hl_coins() -> Vec<(String, String, f64, f64, usize)> {
         ("TENH".into(), "perp".into(), 100.0, 100.0, 10),
         ("TWO".into(), "perp".into(), 100.0, 100.0, 72),
         ("xyz:TWO".into(), "hip3".into(), mid02_px(), mid02_px(), 72),
+        ("GHOST".into(), "perp".into(), 100.0, 100.0, 72),
+        ("SEEDED".into(), "perp".into(), 100.0, 100.0, 72),
     ]
 }
 
@@ -66,6 +68,7 @@ const PHOENIX_ASSETS: &[(&str, i64, usize)] = &[
     ("MID02", 10_000, 72),
     ("TENH", 10_000, 10),
     ("TWO", 10_000, 72),
+    ("SEEDED", 10_000, 72),
 ];
 
 struct Tmp(PathBuf);
@@ -337,13 +340,19 @@ fn build_fixtures(dir: &Path) -> Fixtures {
     ))
     .unwrap();
 
-    // asset_contexts: the seed that renames RENAMED to OLDNAME.
+    // asset_contexts: the seed that renames RENAMED to OLDNAME, plus seeds
+    // that miss Phoenix entirely: GHOST's seed names an asset Phoenix never
+    // had and GHOST itself is not on Phoenix either (no candidate at all);
+    // SEEDED's seed misses too, but SEEDED trades on Phoenix under its own
+    // base name (the pair must fall back to the base-name seed).
     let contexts = dir.join("asset_contexts");
     std::fs::create_dir_all(&contexts).unwrap();
     let contexts_path = contexts.join("2026-10-17.parquet");
     conn.execute_batch(&format!(
         "COPY (SELECT 'RENAMED' AS symbol, 'OLDNAME' AS phoenix_symbol UNION ALL
-               SELECT 'SOL' AS symbol, 'SOL' AS phoenix_symbol) TO {} (FORMAT PARQUET)",
+               SELECT 'SOL' AS symbol, 'SOL' AS phoenix_symbol UNION ALL
+               SELECT 'GHOST' AS symbol, 'NOSUCHPHX' AS phoenix_symbol UNION ALL
+               SELECT 'SEEDED' AS symbol, 'NOTINPHX' AS phoenix_symbol) TO {} (FORMAT PARQUET)",
         sql_string(&contexts_path.to_string_lossy())
     ))
     .unwrap();
@@ -504,15 +513,15 @@ fn mapping_rules_lockbox_filters_and_receipt() {
     let report =
         mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
     assert_eq!(report.exit_code(), 0);
-    // 15 HL + 12 phoenix + 2 pyth + 1 jup; the flash pool is skipped and
-    // LOCKCOIN (lockbox-only) has no row at all.
-    assert_eq!(report.rows, 30);
-    assert_eq!(report.per_venue["hl"], 15);
-    assert_eq!(report.per_venue["phoenix"], 12);
+    // 17 HL + 13 phoenix + 2 pyth + 1 jup; the flash pool is skipped and
+    // LOCKCOIN/LOCKCOIN2 (lockbox-only) have no row at all.
+    assert_eq!(report.rows, 33);
+    assert_eq!(report.per_venue["hl"], 17);
+    assert_eq!(report.per_venue["phoenix"], 13);
     assert_eq!(report.per_venue["pyth"], 2);
     assert_eq!(report.per_venue["jup"], 1);
-    assert_eq!(report.pairs_checked, 12);
-    assert_eq!(report.pairs_mapped, 6);
+    assert_eq!(report.pairs_checked, 13);
+    assert_eq!(report.pairs_mapped, 7);
     assert_eq!(report.price_divergence, 4);
     assert_eq!(report.thin, 2);
     assert_eq!(report.spot_unnamed, 1);
@@ -521,7 +530,7 @@ fn mapping_rules_lockbox_filters_and_receipt() {
     assert_eq!(report.lockbox_hours_excluded, 864);
 
     let lines = assets_lines(&out);
-    assert_eq!(lines.len(), 31, "header plus 30 rows");
+    assert_eq!(lines.len(), 34, "header plus 33 rows");
     let (day_start, first, last, phoenix_last) = check_bounds();
     // The sort the ADR states: venue, then venue symbol.
     assert_eq!(
@@ -531,11 +540,11 @@ fn mapping_rules_lockbox_filters_and_receipt() {
     assert!(lines[1].starts_with(",hl,#9,"), "outcomes sort first");
     assert!(lines[2].starts_with(",hl,@1,,spot,"));
     assert!(
-        lines[16].starts_with("SOL,jup,"),
+        lines[18].starts_with("SOL,jup,"),
         "jup follows the hl block"
     );
-    assert!(lines[17].starts_with("CL,phoenix,"));
-    assert!(lines[29].starts_with("BTC,pyth,"), "pyth closes the file");
+    assert!(lines[19].starts_with("CL,phoenix,"));
+    assert!(lines[32].starts_with("BTC,pyth,"), "pyth closes the file");
 
     // The lockbox-week fills (SOL 111.0 on both venues, June) are invisible:
     // SOL keeps its check-day span, its 72 common hours, and its price.
@@ -691,7 +700,7 @@ fn mapping_rules_lockbox_filters_and_receipt() {
     let receipt: Value = serde_json::from_str(&receipt_text).unwrap();
     assert_eq!(receipt["unit"], "mapping");
     assert_eq!(receipt["unit_version"], 1);
-    assert_eq!(receipt["rows"], 30);
+    assert_eq!(receipt["rows"], 33);
     assert_eq!(receipt["lockbox_hours_dropped"], 3);
     assert_eq!(receipt["lockbox_hours_excluded"], 864);
     assert_eq!(
@@ -807,6 +816,34 @@ fn the_pyth_span_excludes_lockbox_hours() {
     // The lockbox-only feeds stay out of the output entirely: the config's
     // feeds are the only Pyth rows.
     assert!(!lines.iter().any(|line| line.contains("LOCKFEED")));
+}
+
+/// The seed only counts when the seeded asset actually trades on Phoenix
+/// (mutant M20 forces that universe check to true). GHOST's seed names an
+/// asset Phoenix never had and GHOST's base name is not on Phoenix either, so
+/// the pair must be dropped entirely: no seed, no check, no reason. SEEDED's
+/// seed misses Phoenix too, but SEEDED trades there under its own base name,
+/// so the pair falls back to the base-name seed and maps.
+#[test]
+fn a_seeded_phoenix_symbol_missing_from_phoenix_is_not_a_candidate() {
+    let tmp = Tmp::new("ghostseed");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
+    let lines = assets_lines(&out);
+    let (_, first, last, _) = check_bounds();
+    assert_eq!(
+        line_of(&lines, "hl", "GHOST"),
+        format!("GHOST,hl,GHOST,,perp,,{first},{last},,false,,,")
+    );
+    assert_eq!(
+        line_of(&lines, "hl", "SEEDED"),
+        format!("SEEDED,hl,SEEDED,,perp,,{first},{last},base_name,true,,0.000000,72")
+    );
+    assert!(
+        line_of(&lines, "phoenix", "SEEDED").ends_with(",base_name,true,,0.000000,72"),
+        "the Phoenix side keeps the base-name pair outcome"
+    );
 }
 
 #[test]
