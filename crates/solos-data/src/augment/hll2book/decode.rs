@@ -82,7 +82,10 @@ fn tagged_i64(value: Option<i64>) -> [u8; 9] {
     tagged
 }
 
-/// Two snapshots hold the same book. `recv_time_ms` may differ.
+/// Two snapshots hold the same book. `recv_time_ms` may differ. The publish path compares
+/// digests it keeps per `(coin, time_ms)`; this is the same rule stated over rows, for tests
+/// and readers.
+#[cfg(test)]
 #[must_use]
 pub fn same_book(a: &Snapshot, b: &Snapshot) -> bool {
     book_digest(a) == book_digest(b)

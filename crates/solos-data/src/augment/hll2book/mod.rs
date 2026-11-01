@@ -9,10 +9,14 @@
 mod batch;
 mod checksum;
 mod decode;
+pub mod manifest;
+mod md5;
 mod publish;
 
 #[cfg(test)]
 mod behavior;
+#[cfg(test)]
+mod manifest_tests;
 
 pub use batch::{Report, Request, Stop, run};
 
