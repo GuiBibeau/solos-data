@@ -934,8 +934,9 @@ fn row_count(conn: &duckdb::Connection, path: &Path) -> Result<u64, StoreError> 
 
 /// Walk the Pyth directories, keep the SOL feed's hourly last price by
 /// `publish_time`, and load it into the `sol_px` temp table. The price of an
-/// hour is `max(price_f)` over the prints at that hour's max `publish_time`,
-/// which is order-independent (no argmax tie-breaking).
+/// hour is the `price_f` of the hour's latest `publish_time` (highest price
+/// breaking an exact tie), picked by a deterministic `row_number` so the
+/// result never depends on scan order.
 fn load_sol_px(conn: &duckdb::Connection, dirs: &[PathBuf]) -> Result<usize, StoreError> {
     let mut files: Vec<String> = Vec::new();
     for dir in dirs {
@@ -949,15 +950,21 @@ fn load_sol_px(conn: &duckdb::Connection, dirs: &[PathBuf]) -> Result<usize, Sto
     files.sort();
     conn.execute_batch(&format!(
         "CREATE OR REPLACE TEMP TABLE sol_px AS
-         SELECT px_hour, max(px) AS px
+         SELECT px_hour, px
          FROM (
-           SELECT CAST(floor(publish_time / 3600) * 3600 AS BIGINT) AS px_hour,
-                  publish_time AS pt,
-                  max(price_f) AS px
-           FROM {} WHERE symbol = 'SOL' AND price_f IS NOT NULL AND price_f > 0
-           GROUP BY 1, 2
+           SELECT px_hour, px,
+             row_number() OVER (
+               PARTITION BY px_hour ORDER BY pt DESC, px DESC
+             ) AS rn
+           FROM (
+             SELECT CAST(floor(publish_time / 3600) * 3600 AS BIGINT) AS px_hour,
+                    publish_time AS pt,
+                    max(price_f) AS px
+             FROM {} WHERE symbol = 'SOL' AND price_f IS NOT NULL AND price_f > 0
+             GROUP BY 1, 2
+           )
          )
-         GROUP BY 1",
+         WHERE rn = 1",
         parquet_list(&files)?
     ))?;
     Ok(scalar_i64(conn, "SELECT count(*) FROM sol_px")?.max(0) as usize)
