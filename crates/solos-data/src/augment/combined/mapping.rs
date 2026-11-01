@@ -1231,8 +1231,10 @@ fn scan_pyth(
         .iter()
         .filter(|feed| !universe.contains_key(*feed))
         .count() as u64;
-    // Distinct publish hours inside the lockbox, counted over every directory's
-    // files in one pass (the live lane overlaps the history tail).
+    // Distinct publish hours inside the lockbox: the MAX across directories,
+    // not their union, so it can undercount when the directories cover
+    // different lockbox hours (each directory is counted on its own, and only
+    // the widest number survives).
     let mut lockbox_hours_dropped = 0u64;
     for dir in dirs {
         let root_files = walk_parquet(dir)?;
