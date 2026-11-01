@@ -75,17 +75,17 @@ fn git_dir(dir: &Path) -> Option<PathBuf> {
         if dot.is_dir() {
             return Some(dot);
         }
-        if let Ok(text) = std::fs::read_to_string(&dot) {
-            if let Some(pointed) = text.trim().strip_prefix("gitdir:") {
-                let pointed = PathBuf::from(pointed.trim());
-                let resolved = if pointed.is_absolute() {
-                    pointed
-                } else {
-                    ancestor.join(pointed)
-                };
-                if resolved.is_dir() {
-                    return Some(resolved);
-                }
+        if let Ok(text) = std::fs::read_to_string(&dot)
+            && let Some(pointed) = text.trim().strip_prefix("gitdir:")
+        {
+            let pointed = PathBuf::from(pointed.trim());
+            let resolved = if pointed.is_absolute() {
+                pointed
+            } else {
+                ancestor.join(pointed)
+            };
+            if resolved.is_dir() {
+                return Some(resolved);
             }
         }
         ancestor = ancestor.parent()?.to_path_buf();
