@@ -119,6 +119,12 @@ pub(crate) fn assert_no_rows_in_lockbox(
 }
 
 /// [`assert_no_rows_in_lockbox`] over a sealed Parquet file.
+///
+/// U1's tests assert on the production output (assets.csv and the receipt),
+/// so nothing on main uses this today; the hourly units' tests (the U2
+/// branches, rebasing onto main) seal one parquet per hour and use it for
+/// every unit. Kept here so the shared helper stays the one definition.
+#[expect(dead_code)]
 pub(crate) fn assert_no_parquet_rows_in_lockbox(
     conn: &duckdb::Connection,
     path: &Path,

@@ -262,9 +262,11 @@ fn build_fixtures(dir: &Path) -> Fixtures {
             ));
         }
     }
-    // SOL fills inside the lockbox week (price 111.0 = 11_100 ticks), plus
+    // SOL fills inside the lockbox week (price 111.0 = 11_100 ticks), at the
+    // three shared locked hours and at a fourth one only Phoenix covers, plus
     // PHOENIXLOCK fills whose whole history lies inside it: counted as
-    // lockbox-only, never named.
+    // lockbox-only, never named. The extra hour is what makes the store-wide
+    // dropped-hours union strictly larger than any single venue's set.
     for offset in 1..=3 {
         values.push(format!(
             "({}, {}, 11_100, 100, 2, 6, {})",
@@ -279,6 +281,12 @@ fn build_fixtures(dir: &Path) -> Fixtures {
             market_of("PHOENIXLOCK")
         ));
     }
+    values.push(format!(
+        "({}, {}, 11_100, 100, 2, 6, {})",
+        sql_string("SOL"),
+        (june_hour + 5) * 3600 + 120,
+        market_of("SOL")
+    ));
     // PHOENIXONLY fills outside the check days (2026-10-20), inside no lockbox
     // week: the price window must keep them out of the price check.
     let oct20 = super::grid::hour_of_secs(super::grid::day_start_secs(
@@ -304,11 +312,14 @@ fn build_fixtures(dir: &Path) -> Fixtures {
     ))
     .unwrap();
 
-    // Pyth prices: one file, one row per feed, plus LOCKFEED, LOCKFEED2 and
-    // LOCKFEED3 publishes whose whole history lies inside the lockbox week
-    // (counted as lockbox-only, never named), and SOL publishes inside the
-    // lockbox week: SOL also publishes on the check days, so its span must
-    // stay put when the lockbox filter hides the June hours.
+    // Pyth prices: two directories, one file each, plus LOCKFEED, LOCKFEED2
+    // and LOCKFEED3 publishes whose whole history lies inside the lockbox
+    // week (counted as lockbox-only, never named), and SOL publishes inside
+    // the lockbox week: SOL also publishes on the check days, so its span
+    // must stay put when the lockbox filter hides the June hours. The first
+    // directory covers the shared locked hours plus one hour only Pyth dir 0
+    // sees, the second an hour only dir 1 sees: the venue's covered-hour set
+    // is the union over the directories, never a per-directory max.
     let pyth = dir.join("pyth-prices");
     std::fs::create_dir_all(&pyth).unwrap();
     let pyth_path = pyth.join("prices.parquet");
@@ -333,10 +344,23 @@ fn build_fixtures(dir: &Path) -> Fixtures {
             ));
         }
     }
+    pyth_rows.push(format!(
+        "SELECT 'SOL' AS symbol, {} AS publish_time",
+        (june_hour + 7) * 3600
+    ));
     conn.execute_batch(&format!(
         "COPY ({}) TO {} (FORMAT PARQUET)",
         pyth_rows.join(" UNION ALL "),
         sql_string(&pyth_path.to_string_lossy())
+    ))
+    .unwrap();
+    let pyth2 = dir.join("pyth-prices2");
+    std::fs::create_dir_all(&pyth2).unwrap();
+    let pyth2_path = pyth2.join("prices.parquet");
+    conn.execute_batch(&format!(
+        "COPY (SELECT 'SOL' AS symbol, {} AS publish_time) TO {} (FORMAT PARQUET)",
+        (june_hour + 9) * 3600,
+        sql_string(&pyth2_path.to_string_lossy())
     ))
     .unwrap();
 
@@ -361,7 +385,7 @@ fn build_fixtures(dir: &Path) -> Fixtures {
     Fixtures {
         hl,
         phoenix,
-        pyth_dirs: vec![pyth],
+        pyth_dirs: vec![pyth, pyth2],
         contexts,
         lockbox: lockbox_path,
         lockbox_sha,
@@ -526,7 +550,11 @@ fn mapping_rules_lockbox_filters_and_receipt() {
     assert_eq!(report.thin, 2);
     assert_eq!(report.spot_unnamed, 1);
     assert_eq!(report.outcome, 1);
-    assert_eq!(report.lockbox_hours_dropped, 3);
+    // The store-wide drop is the union of the venues' covered-hour sets: HL
+    // covers june+1..=3, Phoenix adds june+5, Pyth adds june+7 (dir 0) and
+    // june+9 (dir 1): six distinct hours, one more than any venue's own set
+    // (a max across venues would report Pyth's 5).
+    assert_eq!(report.lockbox_hours_dropped, 6);
     assert_eq!(report.lockbox_hours_excluded, 864);
 
     let lines = assets_lines(&out);
@@ -701,7 +729,7 @@ fn mapping_rules_lockbox_filters_and_receipt() {
     assert_eq!(receipt["unit"], "mapping");
     assert_eq!(receipt["unit_version"], 1);
     assert_eq!(receipt["rows"], 33);
-    assert_eq!(receipt["lockbox_hours_dropped"], 3);
+    assert_eq!(receipt["lockbox_hours_dropped"], 6);
     assert_eq!(receipt["lockbox_hours_excluded"], 864);
     assert_eq!(
         receipt["lockbox_sha256"], fixtures.lockbox_sha,
@@ -718,10 +746,11 @@ fn mapping_rules_lockbox_filters_and_receipt() {
     assert_eq!(receipt["inputs"]["hl_fills"]["lockbox_hours_dropped"], 3);
     assert_eq!(
         receipt["inputs"]["phoenix_fills"]["lockbox_hours_dropped"],
-        3
+        4
     );
-    // The Pyth lockbox-only feeds dropped three distinct publish hours.
-    assert_eq!(receipt["inputs"]["pyth_prices"]["lockbox_hours_dropped"], 3);
+    // Pyth's covered hours are the union over its directories: the shared
+    // three plus june+7 (dir 0) and june+9 (dir 1).
+    assert_eq!(receipt["inputs"]["pyth_prices"]["lockbox_hours_dropped"], 5);
     assert_eq!(
         receipt["inputs"]["check_days"],
         serde_json::json!(["2026-10-15", "2026-10-16", "2026-10-17"])
@@ -738,7 +767,7 @@ fn mapping_rules_lockbox_filters_and_receipt() {
     assert_eq!(catalog["schema"], "combined-v1");
     assert_eq!(catalog["files"][0]["path"], "mapping/assets.csv");
     assert_eq!(catalog["files"][0]["sha256"], file_sha.as_str());
-    assert_eq!(catalog["watermarks"]["mapping"]["lockbox_hours_dropped"], 3);
+    assert_eq!(catalog["watermarks"]["mapping"]["lockbox_hours_dropped"], 6);
     assert_eq!(
         catalog["watermarks"]["mapping"]["lockbox_hours_excluded"],
         864
@@ -913,32 +942,262 @@ fn the_phoenix_price_window_excludes_out_of_window_fills() {
 }
 
 /// The shared lockbox fixture with real data inside it: a Phoenix fill on a
-/// lockbox day (the fixture's mid hour) stays invisible to the universe span
-/// and the price map, and is counted in `lockbox_hours_dropped`. This is the
-/// U1 path of the fixture every U2 unit's tests reuse (`combined::testfix`).
+/// lockbox day (the fixture's mid hour) stays invisible in the unit's own
+/// outputs, and is counted in the receipt's lockbox numbers. This is the U1
+/// path of the fixture every U2 unit's tests reuse (`combined::testfix`),
+/// asserted on the production output (the written assets.csv and the unit
+/// receipt), not on a table the test filtered itself.
 #[test]
 fn a_fill_inside_the_lockbox_is_excluded_and_counted() {
     let tmp = Tmp::new("testfix");
+    let fixtures = build_fixtures(tmp.dir());
     let fix = super::testfix::v2_lockbox(tmp.dir());
     let conn = memory_connection("1", "512MB").unwrap();
-    let phoenix = tmp.dir().join("phoenix-fills");
+    let phoenix = tmp.dir().join("phoenix-fills-single");
     std::fs::create_dir_all(&phoenix).unwrap();
     let path = phoenix.join("fills.parquet");
     let check_day = super::grid::day_start_secs(super::grid::parse_date("2026-10-15").unwrap());
-    // SOL fills on the check day and on the lockbox day; LOCKED fills only on
-    // the lockbox day (same mid hour), so it is lockbox-only.
+    // SOL fills on every check-day hour and on the lockbox day (the fixture's
+    // mid hour); LOCKED fills only on the lockbox day (the next second, same
+    // hour), so it is lockbox-only.
+    let mut values: Vec<String> = (0..72)
+        .map(|offset| {
+            format!(
+                "('SOL', {}, 10_000, 100, 2, 6, 45)",
+                check_day + offset * 3600 + 120
+            )
+        })
+        .collect();
+    values.push(format!(
+        "('SOL', {}, 11_100, 100, 2, 6, 45)",
+        fix.secs(fix.mid_hour()) + 120
+    ));
+    values.push(format!(
+        "('LOCKED', {}, 6_100, 100, 2, 6, 77)",
+        fix.secs(fix.mid_hour()) + 121
+    ));
+    conn.execute_batch(&format!(
+        "CREATE TABLE pf(asset_symbol VARCHAR, block_time BIGINT, price_ticks UBIGINT,
+                        tick_size UBIGINT, base_lot_decimals SMALLINT, quote_lot_decimals SMALLINT,
+                        asset_id UBIGINT);
+         INSERT INTO pf VALUES {};
+         COPY pf TO {} (FORMAT PARQUET);",
+        values.join(", "),
+        sql_string(&path.to_string_lossy())
+    ))
+    .unwrap();
+    let fixtures = Fixtures {
+        phoenix,
+        ..fixtures
+    };
+    let out = tmp.dir().join("store");
+    let report =
+        mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
+    // The production receipt: Phoenix dropped exactly the mid hour, and the
+    // lockbox-only symbol is counted (never named).
+    let receipt_text =
+        std::fs::read_to_string(receipt::receipt_path(&out, "mapping", "mapping")).unwrap();
+    let receipt: Value = serde_json::from_str(&receipt_text).unwrap();
+    assert_eq!(
+        receipt["inputs"]["phoenix_fills"]["lockbox_hours_dropped"],
+        1
+    );
+    assert_eq!(
+        receipt["inputs"]["phoenix_fills"]["lockbox_only_symbols"],
+        1
+    );
+    assert_eq!(report.lockbox_only_symbols["phoenix"], 1);
+    // The production assets.csv: LOCKED, whose every fill sits inside the
+    // lockbox, has no row at all, and SOL's Phoenix span starts on the check
+    // day: the mid-hour fill never touched first_ts.
+    let lines = assets_lines(&out);
+    assert!(
+        !lines.iter().any(|line| line.contains("LOCKED")),
+        "a lockbox-only symbol has no row in the written assets.csv"
+    );
+    assert_eq!(
+        line_of(&lines, "phoenix", "SOL"),
+        format!(
+            "SOL,phoenix,SOL,,spot,45,{},{},asset_contexts,true,,0.000000,72",
+            check_day + 120,
+            check_day + 71 * 3600 + 120
+        )
+    );
+}
+
+/// The store-wide lockbox drop is the union of the venues' covered-hour sets
+/// (R-union: a max across venues undercounts). The fixture gives each venue
+/// a covered hour the others miss, so the union (six hours) is strictly
+/// larger than every venue's own set and than the max (Pyth's five).
+#[test]
+fn the_store_wide_drop_is_the_union_of_the_venue_hours() {
+    let tmp = Tmp::new("union");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    let report =
+        mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
+    let receipt: Value = serde_json::from_str(
+        &std::fs::read_to_string(receipt::receipt_path(&out, "mapping", "mapping")).unwrap(),
+    )
+    .unwrap();
+    let hl = receipt["inputs"]["hl_fills"]["lockbox_hours_dropped"]
+        .as_u64()
+        .unwrap();
+    let phoenix = receipt["inputs"]["phoenix_fills"]["lockbox_hours_dropped"]
+        .as_u64()
+        .unwrap();
+    let pyth = receipt["inputs"]["pyth_prices"]["lockbox_hours_dropped"]
+        .as_u64()
+        .unwrap();
+    // Each venue covers a different extra hour, so the max (5) cannot be the
+    // union (6): 3 + {+5} + {+7} + {+9}.
+    assert_eq!((hl, phoenix, pyth), (3, 4, 5));
+    assert_eq!(report.lockbox_hours_dropped, 6);
+    assert!(report.lockbox_hours_dropped > hl.max(phoenix).max(pyth));
+}
+
+/// HL hours exactly at the lockbox edges (R23), through U1's HL path: a
+/// watermark hour just inside the set's first or last hour is counted, a
+/// watermark hour just outside it is never counted. The test runs twice over
+/// the same tree with different watermarks, because a pure count cannot
+/// separate the edges when the hours either side are receipted together (a
+/// +-1 boundary shift moves one hour in and another out, leaving the count
+/// equal): run A receipts the two inside hours, run B the two outside ones,
+/// so any shift changes a count.
+#[test]
+fn hl_lockbox_edge_hours_count_only_when_inside() {
+    let tmp = Tmp::new("hledge");
+    let fixtures = build_fixtures(tmp.dir());
+    let fix = super::testfix::v2_lockbox(tmp.dir());
+    let conn = memory_connection("1", "512MB").unwrap();
+    // Extend the fixture HL tree with the four edge hours; every hour carries
+    // HLEDGE, the inside ones also LOCKEDGE, whose whole history lies inside
+    // the set.
+    let edge_hours = [
+        fix.hour_before(),
+        fix.first_hour(),
+        fix.last_hour(),
+        fix.hour_after(),
+    ];
+    let watermark_path = fixtures.hl.join("watermark.json");
+    let mut watermark: Value =
+        serde_json::from_str(&std::fs::read_to_string(&watermark_path).unwrap()).unwrap();
+    let hours: Vec<String> = watermark["hours"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_owned())
+        .collect();
+    let mut edge_keys = BTreeMap::new();
+    for hour in edge_hours {
+        let start = hour * 3600;
+        let dt = chrono::DateTime::from_timestamp(start, 0).unwrap();
+        edge_keys.insert(hour, format!("{}/{}", dt.format("%Y%m%d"), dt.format("%H")));
+        let dir_path = fixtures
+            .hl
+            .join(format!("train/date={}", dt.format("%Y-%m-%d")));
+        std::fs::create_dir_all(&dir_path).unwrap();
+        let path = dir_path.join(format!("hour={}.parquet", dt.format("%Y%m%d-%H")));
+        // LOCKEDGE only fills the hours inside the set: it must be
+        // lockbox-only, so the free edge hours carry HLEDGE alone.
+        let inside = fix.hours.contains(&hour);
+        let lockedge = if inside {
+            format!(
+                " UNION ALL SELECT 'LOCKEDGE', 'perp', {}, {hour}, CAST(7.0 AS DOUBLE)",
+                start * 1000 + 120_000
+            )
+        } else {
+            String::new()
+        };
+        conn.execute_batch(&format!(
+            "COPY (
+                SELECT 'HLEDGE' AS coin, 'perp' AS coin_class, {} AS time_ms, {hour} AS tid,
+                       CAST(100.0 AS DOUBLE) AS px{lockedge}
+            ) TO {} (FORMAT PARQUET)",
+            start * 1000 + 60_000,
+            sql_string(&path.to_string_lossy())
+        ))
+        .unwrap();
+    }
+    let mut run_with = |receipted: &[i64], label: &str| {
+        let mut keys = hours.clone();
+        for hour in receipted {
+            keys.push(edge_keys[hour].clone());
+        }
+        keys.sort();
+        watermark["hours"] = serde_json::json!(keys);
+        std::fs::write(&watermark_path, serde_json::to_vec(&watermark).unwrap()).unwrap();
+        let out = tmp.dir().join(format!("store-{label}"));
+        mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
+        let receipt: Value = serde_json::from_str(
+            &std::fs::read_to_string(receipt::receipt_path(&out, "mapping", "mapping")).unwrap(),
+        )
+        .unwrap();
+        (out, receipt)
+    };
+    // Run A: the two inside edge hours are receipted; both count, on top of
+    // the fixture's three shared June hours (a boundary +-1 mutant drops one
+    // of them or sweeps in an outside hour, and the count moves).
+    let (out_a, receipt_a) = run_with(&[fix.first_hour(), fix.last_hour()], "a");
+    assert_eq!(receipt_a["inputs"]["hl_fills"]["lockbox_hours_dropped"], 5);
+    // LOCKEDGE is lockbox-only on top of the fixture's LOCKCOIN/LOCKCOIN2,
+    // and HLEDGE, whose receipted fills all sit inside the set, joins them.
+    assert_eq!(receipt_a["inputs"]["hl_fills"]["lockbox_only_symbols"], 4);
+    let lines_a = assets_lines(&out_a);
+    assert!(!lines_a.iter().any(|line| line.contains("LOCKEDGE")));
+    assert!(!lines_a.iter().any(|line| line.contains(",hl,HLEDGE,")));
+    // Run B: the two outside edge hours are receipted; neither counts (the
+    // store-wide number stays the fixture's own), and HLEDGE keeps the free
+    // span its two outside fills give it.
+    let (out_b, receipt_b) = run_with(&[fix.hour_before(), fix.hour_after()], "b");
+    assert_eq!(receipt_b["inputs"]["hl_fills"]["lockbox_hours_dropped"], 3);
+    assert_eq!(receipt_b["inputs"]["hl_fills"]["lockbox_only_symbols"], 2);
+    let lines_b = assets_lines(&out_b);
+    assert!(!lines_b.iter().any(|line| line.contains("LOCKEDGE")));
+    let edge = lines_b
+        .iter()
+        .find(|line| line.contains(",hl,HLEDGE,"))
+        .expect("HLEDGE row");
+    assert_eq!(
+        edge,
+        &format!(
+            "HLEDGE,hl,HLEDGE,,perp,,{},{},,false,,,",
+            fix.secs(fix.hour_before()) + 60,
+            fix.secs(fix.hour_after()) + 60
+        )
+    );
+}
+
+/// Phoenix hour bucketing at the lockbox edges (R26): the bucket is
+/// `floor(block_time / 3600)`, so a fill at the last second of the free hour
+/// before the set stays out, a fill at the first second of the first inside
+/// hour is counted, the last second of the last inside hour is counted, and
+/// the first second after the set is out again. A ceil bucketing or a
+/// range off by one changes the counted set.
+#[test]
+fn the_phoenix_hour_bucket_counts_edge_fills_exactly() {
+    let tmp = Tmp::new("phxedge");
+    let fix = super::testfix::v2_lockbox(tmp.dir());
+    let conn = memory_connection("1", "512MB").unwrap();
+    let phoenix = tmp.dir().join("phoenix-fills-edges");
+    std::fs::create_dir_all(&phoenix).unwrap();
+    let path = phoenix.join("fills.parquet");
+    let last_second = |hour: i64| fix.secs(hour) + 3_599;
     conn.execute_batch(&format!(
         "COPY (
-            SELECT 'SOL' AS asset_symbol, {} AS block_time, 10_000 AS price_ticks,
-                   100 AS tick_size, 2 AS base_lot_decimals, 6 AS quote_lot_decimals, 45 AS asset_id
+            SELECT 'PHX' AS asset_symbol, {} AS block_time, 10_000 AS price_ticks,
+                   100 AS tick_size, 2 AS base_lot_decimals, 6 AS quote_lot_decimals, 91 AS asset_id
             UNION ALL
-            SELECT 'SOL', {}, 11_100, 100, 2, 6, 45
+            SELECT 'PHX', {}, 10_000, 100, 2, 6, 91
             UNION ALL
-            SELECT 'LOCKED', {}, 6_100, 100, 2, 6, 77
+            SELECT 'PHX', {}, 10_000, 100, 2, 6, 91
+            UNION ALL
+            SELECT 'PHX', {}, 10_000, 100, 2, 6, 91
         ) TO {} (FORMAT PARQUET)",
-        check_day + 120,
-        fix.secs(fix.mid_hour()) + 120,
-        fix.secs(fix.mid_hour()) + 121,
+        last_second(fix.hour_before()),
+        fix.secs(fix.first_hour()),
+        last_second(fix.last_hour()),
+        fix.secs(fix.hour_after()),
         sql_string(&path.to_string_lossy())
     ))
     .unwrap();
@@ -951,41 +1210,19 @@ fn a_fill_inside_the_lockbox_is_excluded_and_counted() {
         &fix.ranges,
     )
     .unwrap();
-    // The lockbox fill is invisible: SOL's span starts on the check day, and
-    // LOCKED, whose every fill sits inside the lockbox, is lockbox-only.
-    assert_eq!(scan.universe["SOL"].first_ts, check_day + 120);
-    assert!(!scan.universe.contains_key("LOCKED"));
-    assert_eq!(scan.lockbox_only_symbols, 1);
-    // And counted: exactly one distinct covered hour dropped.
-    assert_eq!(scan.lockbox_hours_dropped, 1);
-    // The shared no-rows-in-lockbox asserts, over a kept table and over a
-    // sealed parquet of the kept rows (the U2 units' output shape).
-    conn.execute_batch(&format!(
-        "CREATE TABLE kept AS SELECT * FROM read_parquet({}) WHERE (block_time // 3600) <> {}",
-        sql_string(&path.to_string_lossy()),
-        fix.mid_hour()
-    ))
-    .unwrap();
-    super::testfix::assert_no_rows_in_lockbox(
-        &conn,
-        "kept",
-        "block_time",
-        super::testfix::TsUnit::Secs,
-        &fix.hours,
+    // Counted: exactly the first and the last inside hour, never the
+    // neighbors (four fills, two inside buckets).
+    assert_eq!(
+        scan.lockbox_dropped_hours,
+        std::collections::BTreeSet::from([fix.first_hour(), fix.last_hour()])
     );
-    let sealed = tmp.dir().join("sealed.parquet");
-    conn.execute_batch(&format!(
-        "COPY (SELECT * FROM kept) TO {} (FORMAT PARQUET)",
-        sql_string(&sealed.to_string_lossy())
-    ))
-    .unwrap();
-    super::testfix::assert_no_parquet_rows_in_lockbox(
-        &conn,
-        &sealed,
-        "block_time",
-        super::testfix::TsUnit::Secs,
-        &fix.hours,
+    // The free edge fills stay visible in the universe span: the span is the
+    // last second before the set through the first second after it.
+    assert_eq!(
+        scan.universe["PHX"].first_ts,
+        last_second(fix.hour_before())
     );
+    assert_eq!(scan.universe["PHX"].last_ts, fix.secs(fix.hour_after()));
 }
 
 #[test]
