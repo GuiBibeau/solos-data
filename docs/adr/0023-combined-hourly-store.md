@@ -133,7 +133,93 @@ symbol, feed id) and Jupiter custodies (label, address) come from
 symbol. Pyth and Jupiter rows are `mapped=true` from the config alone: no
 price check, no exposure or decimals check, and feed ids are recorded as the
 config carries them, not normalized. Venue names are the store's: `hl`, `phoenix`,
-`jup`, `pyth`. `asset_id` is not unique within a venue on purpose: the perp
+`jup`, `pyth`. The perp hour tables spell the Jupiter venue `jupiter` in
+`venue` (the output grain, next to `flash`) while `mapping/assets.csv` keys
+the same venue `jup`; the perp join maps `jupiter` rows through `jup` and
+qualifies every lookup on the venue, so equal keys across venues never
+borrow each other's asset. `asset_id` is not unique within a venue on
+purpose: the perp
 `BTC` and the HIP-3 `dex:BTC` both map to `BTC` and stay separate rows.
 Unmapped or demoted
 assets keep their per-venue features and get no cross-venue block downstream.
+
+## Hourly units (U2b/U2c)
+
+`phoenix-hours`, `solana-perp-hours` and `pyth-hours` build one Parquet table
+each under the store root, hour-partitioned as
+`<table>/date=YYYY-MM-DD/hour=YYYYMMDD-H.parquet`, with a per-hour receipt
+under `<table>/receipts/` and the unit's run receipt in its own directory.
+Hours are planned over the requested range minus the lockbox; a run refuses a
+range its input watermark does not close (hour end plus a two-hour guard;
+per event lane the watermark is that lane's max input timestamp, and a venue
+is as arrived as its most-stalled lane).
+
+Lane closure for `solana-perp-hours` and `pyth-hours` (the lane units): per
+venue the LAST lane argument is the live capture and earlier lanes are the
+venues-history dumps. A history lane stops holding the venue's watermark back
+only when it is explicitly finished and continuously covered: explicitly means
+the operator's `--history-status <json>` file (top-level `running: false`,
+`sources.<venue>.done: true`) - never the lane's age - and continuously means
+the live lane's first record is at or before the history lane's last record.
+Under those two conditions the venue's watermark is the live lane's max;
+otherwise the minimum over all lanes' maxes holds (a stale or unfinished dump
+caps the venue, and `running: true`, a missing venue entry or an absent status
+file all mean not finished). A finished history lane whose live lane starts
+later leaves gap hours - the hours whose `[h, h+1h)` neither lane fully
+covers, from the hour containing the history max through the hour containing
+the live min, inclusive. Gap hours are never sealed as complete: the unit cuts
+them from the plan and records them as `gapHours` entries `{venue, from_hour,
+to_hour, reason: "history_lane_ended_before_live: history finished at <ts>,
+live starts at <ts>"}` in the run receipt and the catalog watermark; hours
+after the gap seal off the live lane. The undecoded entry's `to_hour` is the
+venue watermark hour (it can reach past the requested window) while its
+inserted hours are clamped to the plan - the entry states the full
+incompleteness, the plan only ever drops in-range hours.
+The two-hour trailing guard always applies to the sealing watermark (the live
+lane's max when the history is finished). The status file's sha256 and the
+per-venue done flags are part of every hour's skip key and are recorded in the
+receipt's watermark facts, so flipping a venue's done flag rebuilds instead of
+skipping. Completeness is per lane, not per event: when a venue's live lane holds any
+undecoded event (`name` NULL - the raw lane held events the decoder could not
+read), the venue's complete coverage ends at the hour of its earliest
+undecoded event, and that hour plus every hour after it, through the venue's
+watermark, is a gap hour with reason `undecoded_events` (the entry carries the
+venue, the hour range and the undecoded event count) and never seals, whatever
+decoded rows it holds; hours before the stop keep the existing rules, and a
+history lane's undecoded events never trigger the rule. The strictness is
+deliberate on both ends: a live lane starting even one second after a finished
+history lane's last record leaves the boundary hour a gap, and sparse
+undecoded events gap everything after them - a per-event check would still
+seal the empty hours between two undecoded events as complete.
+
+`phoenix_coin_hour` (per (asset, hour), ordered by `asset_id nulls last`,
+`asset_symbol`): `hour BIGINT`, `asset_symbol VARCHAR`, `asset_id VARCHAR`,
+`mapped BOOLEAN` (false when unmapped), `n_trades BIGINT`, `vol_usd DOUBLE`,
+`buy_usd DOUBLE` (ask-maker fills; the stored `taker_side` is a constant `Bid`
+parity quirk), `first_px DOUBLE`, `last_px DOUBLE` (order: the
+`(slot, tx_index, event_ordinal)` tuple), `first_ts BIGINT`, `last_ts BIGINT`,
+`rv2 DOUBLE` (squared 1-minute last-price log diffs inside the hour),
+`n_minutes BIGINT`, `ph_liq_usd DOUBLE` (always NULL: Phoenix fills carry no
+liquidation flag). Price is `price_ticks * tick_size *
+10^(base_lot_decimals - quote_lot_decimals)`, quantity `base_lots /
+10^base_lot_decimals`.
+
+`solana_perp_coin_hour` (per (venue, venue_key, hour), ordered by `venue`,
+`venue_key`; `venue` is `jupiter` or `flash`, `venue_key` the custody or
+market address): `hour BIGINT`, `venue VARCHAR`, `venue_key VARCHAR`,
+`asset_id VARCHAR`, `mapped BOOLEAN` (false when unmapped), `n_inc BIGINT`,
+`n_dec BIGINT`, `n_liq BIGINT`, `size_usd DOUBLE` (1e6-scaled input integers,
+liquidations excluded), `buy_share DOUBLE` (long increase share; NULL for
+flash, which has no side), `funding_fee_usd DOUBLE` (NULL for flash),
+`liq_usd DOUBLE`, `ret DOUBLE` (in-hour log return; event order the
+`(slot, signature, ordinal)` tuple; price `coalesce(exit, entry, oracle) *
+10^exponent` for flash), `present BOOLEAN`.
+
+`pyth_coin_hour` (per (feed, hour), ordered by `feed_id`): `hour BIGINT`,
+`feed_id VARCHAR`, `symbol VARCHAR`, `asset_id VARCHAR` (NULL when unmapped),
+`py_n BIGINT`, `py_last DOUBLE` (price at the hour's max `publish_time`),
+`py_ret DOUBLE`, `py_conf_rel DOUBLE` (mean `conf/price`), `py_stale_s BIGINT`
+(hour end minus the last publish). Ordering uses `publish_time` (the Pythnet
+clock), never `at_ms` (collector arrival); duplicates on
+`(feed_id, publish_time)` collapse with the later lane, then the later
+`at_ms`, winning.

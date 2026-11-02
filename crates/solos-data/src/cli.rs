@@ -1413,7 +1413,23 @@ fn combined_cli(args: &[String]) -> i32 {
             Obj::new()
                 .with(
                     "command",
-                    "solos-data augment combined mapping --out <root> --lockbox <json> --lockbox-sha256 <hex> --provenance <json> --hl-fills <hl-fills-v1 root> --phoenix-fills <fills dir> --pyth-prices <dir[,dir...]> --venues-config <config/venues.json> --asset-contexts <dir> --check-days YYYY-MM-DD,YYYY-MM-DD,YYYY-MM-DD [--threads 4] [--memory 8GB]"
+                    "solos-data augment combined <unit>: mapping | phoenix-hours | solana-perp-hours | pyth-hours. Common flags: --out <root> --lockbox <json> --lockbox-sha256 <hex> --provenance <json> [--threads 4] [--memory 8GB]; hour units also take --since/--until (inclusive UTC dates, bounded runs); the perp and pyth units take [--history-status <json>] (the venues-history status file: running=false + sources.<venue>.done=true is the only way a history lane stops holding the watermark back; absent means nothing is finished)"
+                )
+                .with(
+                    "mapping",
+                    "--hl-fills <hl-fills-v1 root> --phoenix-fills <fills dir> --pyth-prices <dir[,dir...]> --venues-config <config/venues.json> --asset-contexts <dir> --check-days YYYY-MM-DD,YYYY-MM-DD,YYYY-MM-DD"
+                )
+                .with(
+                    "phoenix-hours",
+                    "--phoenix-decoded <decoded root (catalog.json + tables)> --since YYYY-MM-DD --until YYYY-MM-DD; needs mapping/assets.csv"
+                )
+                .with(
+                    "solana-perp-hours",
+                    "--jupiter-events <dir[,dir...]> --flash-events <dir[,dir...]> --since --until; lanes in order, later wins the dedupe"
+                )
+                .with(
+                    "pyth-hours",
+                    "--pyth-prices <dir[,dir...]> --since --until"
                 )
                 .with(
                     "out",
@@ -1442,8 +1458,11 @@ fn combined_cli(args: &[String]) -> i32 {
     let result = match unit {
         "mapping" => combined_mapping_run(&args[1..]),
         "hl-hours" => combined_hl_hours_run(&args[1..]),
+        "phoenix-hours" => combined_phoenix_hours_run(&args[1..]),
+        "solana-perp-hours" => combined_solana_perp_hours_run(&args[1..]),
+        "pyth-hours" => combined_pyth_hours_run(&args[1..]),
         _ => Err(StoreError::Check(format!(
-            "unknown combined unit '{unit}' (units: mapping, hl-hours)"
+            "unknown combined unit '{unit}' (units: mapping, hl-hours, phoenix-hours, solana-perp-hours, pyth-hours)"
         ))),
     };
     match result {
@@ -1517,6 +1536,87 @@ pub(crate) fn combined_hl_hours_run(args: &[String]) -> Result<i32, StoreError> 
         git_sha: crate::augment::hlfills::git_sha(),
     };
     let report = crate::augment::combined::hlhours::run(&request)?;
+    println!("{}", report.to_json());
+    Ok(report.exit_code())
+}
+
+/// `augment combined phoenix-hours`: U2b, Phoenix fills to phoenix_coin_hour.
+fn combined_phoenix_hours_run(args: &[String]) -> Result<i32, StoreError> {
+    let memory = flag(args, "--memory").unwrap_or("8GB").to_owned();
+    let request = crate::augment::combined::phoenix_hours::Request {
+        out: Path::new(required_flag(args, "--out")?),
+        lockbox: Path::new(required_flag(args, "--lockbox")?),
+        lockbox_sha256: required_flag(args, "--lockbox-sha256")?,
+        provenance: Path::new(required_flag(args, "--provenance")?),
+        phoenix_decoded: Path::new(required_flag(args, "--phoenix-decoded")?),
+        since: required_flag(args, "--since")?,
+        until: required_flag(args, "--until")?,
+        threads: combined_threads_flag(args)?,
+        memory_limit: memory,
+    };
+    let report = crate::augment::combined::phoenix_hours::run(&request)?;
+    println!("{}", report.to_json());
+    Ok(report.exit_code())
+}
+
+/// `augment combined solana-perp-hours`: U2c, Jupiter + Flash events to
+/// solana_perp_coin_hour.
+fn combined_solana_perp_hours_run(args: &[String]) -> Result<i32, StoreError> {
+    let jupiter_events: Vec<PathBuf> = required_flag(args, "--jupiter-events")?
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let flash_events: Vec<PathBuf> = required_flag(args, "--flash-events")?
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let memory = flag(args, "--memory").unwrap_or("8GB").to_owned();
+    let history_status = flag(args, "--history-status").map(PathBuf::from);
+    let request = crate::augment::combined::solana_perp_hours::Request {
+        out: Path::new(required_flag(args, "--out")?),
+        lockbox: Path::new(required_flag(args, "--lockbox")?),
+        lockbox_sha256: required_flag(args, "--lockbox-sha256")?,
+        provenance: Path::new(required_flag(args, "--provenance")?),
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: history_status.as_deref(),
+        since: required_flag(args, "--since")?,
+        until: required_flag(args, "--until")?,
+        threads: combined_threads_flag(args)?,
+        memory_limit: memory,
+    };
+    let report = crate::augment::combined::solana_perp_hours::run(&request)?;
+    println!("{}", report.to_json());
+    Ok(report.exit_code())
+}
+
+/// `augment combined pyth-hours`: U2c, Pyth prices to pyth_coin_hour.
+fn combined_pyth_hours_run(args: &[String]) -> Result<i32, StoreError> {
+    let pyth_prices: Vec<PathBuf> = required_flag(args, "--pyth-prices")?
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let memory = flag(args, "--memory").unwrap_or("8GB").to_owned();
+    let history_status = flag(args, "--history-status").map(PathBuf::from);
+    let request = crate::augment::combined::pyth_hours::Request {
+        out: Path::new(required_flag(args, "--out")?),
+        lockbox: Path::new(required_flag(args, "--lockbox")?),
+        lockbox_sha256: required_flag(args, "--lockbox-sha256")?,
+        provenance: Path::new(required_flag(args, "--provenance")?),
+        pyth_prices: &pyth_prices,
+        history_status: history_status.as_deref(),
+        since: required_flag(args, "--since")?,
+        until: required_flag(args, "--until")?,
+        threads: combined_threads_flag(args)?,
+        memory_limit: memory,
+    };
+    let report = crate::augment::combined::pyth_hours::run(&request)?;
     println!("{}", report.to_json());
     Ok(report.exit_code())
 }

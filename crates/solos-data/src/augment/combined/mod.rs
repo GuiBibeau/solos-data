@@ -12,12 +12,18 @@
 pub mod catalog;
 pub mod grid;
 pub mod hlhours;
+pub mod io;
 pub mod lockbox;
 pub mod mapping;
+pub mod phoenix_hours;
+pub mod pyth_hours;
 pub mod receipt;
 pub mod seal;
+pub mod solana_perp_hours;
 
 #[cfg(test)]
 mod behavior;
+#[cfg(test)]
+mod behavior_hours;
 #[cfg(test)]
 mod testfix;
