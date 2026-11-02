@@ -374,7 +374,11 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let (jupiter_facts, flash_facts) = input_facts(&conn, &jupiter_lanes, &flash_lanes)?;
     let jupiter_spans = jupiter_facts.spans;
     let flash_spans = flash_facts.spans;
-    let covered = jupiter_facts.covered;
+    // The covered-hour set is the UNION of the venues' sets (ADR-0023,
+    // "Lockbox"): venues can cover different lockbox hours and a max or a
+    // single venue would hide the union. input_facts already folds jupiter's
+    // file spans into flash_facts.covered, so that field IS the union.
+    let covered = flash_facts.covered;
     let history_status = io::load_history_status(request.history_status)?;
     let jupiter_seal = io::venue_seal(
         &jupiter_spans[..jupiter_spans.len().saturating_sub(1)],

@@ -4503,3 +4503,102 @@ fn a_differently_spelled_out_root_still_skips_the_sealed_hours() {
     assert_eq!(skipped, 3);
     assert_eq!(shas_first, shas_fifth);
 }
+
+/// Flash covering a lockbox hour jupiter does not: the dropped count is the
+/// union of the venues' covered sets (ADR-0023), so flash's in-set coverage
+/// counts even when jupiter covers none of the set (R-UNION reads only
+/// jupiter's set and reports 0).
+#[test]
+fn solana_perp_flash_coverage_counts_toward_the_lockbox_drops() {
+    let tmp = Tmp::new("perp-union-drops");
+    let (lockbox, lockbox_sha, fix) = lockbox_fixture(tmp.dir());
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    // Jupiter: events only on the free day (its covered hours never touch
+    // the set), with both lanes reaching the sentinel so the venue closes.
+    let (jup_hist, jup_live) = write_two_lanes(
+        tmp.dir(),
+        "jupiter",
+        sentinel,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "jup")],
+    );
+    // Flash: one event inside the lockbox (the fixture's mid hour) plus the
+    // free-day and sentinel events; its covered span reaches into the set.
+    let flash = tmp.dir().join("flash");
+    write_event_lane(
+        &flash,
+        &[
+            perp_event(
+                "fIn",
+                432_100_010,
+                fix.secs(fix.mid_hour()) + 60,
+                0,
+                "IncreaseSizeLogUSDv1",
+                r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
+            ),
+            perp_event(
+                "fFree",
+                432_100_010,
+                h0 + 3_600 + 600,
+                0,
+                "IncreaseSizeLogUSDv1",
+                r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
+            ),
+            perp_event(
+                "fSent",
+                432_100_010,
+                sentinel,
+                0,
+                "IncreaseSizeLogUSDv1",
+                r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
+            ),
+        ],
+    );
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let jupiter_events = vec![jup_hist, jup_live];
+    let flash_events = vec![flash];
+    let request = PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: None,
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    };
+    let report = super::solana_perp_hours::run(&request).unwrap();
+    // The flash lane's covered span runs from its in-set event to the
+    // sentinel; the union's in-set size is computable from the fixture's own
+    // ranges. Jupiter contributes nothing (it covers no set hour).
+    let mid = fix.mid_hour();
+    let sentinel_hour = grid::hour_of_secs(sentinel);
+    let dropped_expected: i64 = fix
+        .ranges
+        .iter()
+        .map(|(lo, hi)| std::cmp::max(*lo, mid)..std::cmp::min(*hi, sentinel_hour + 1))
+        .map(|range| range.end - range.start)
+        .filter(|length| *length > 0)
+        .sum();
+    assert!(dropped_expected > 0, "the mid hour must sit inside the set");
+    assert_eq!(
+        report.lockbox_hours_dropped,
+        u64::try_from(dropped_expected).unwrap(),
+        "the union of the venues' covered sets, not jupiter's alone"
+    );
+    let receipt = unit_receipt(
+        tmp.dir(),
+        super::solana_perp_hours::TABLE,
+        super::solana_perp_hours::UNIT,
+    );
+    assert_eq!(
+        receipt["lockbox_hours_dropped"],
+        u64::try_from(dropped_expected).unwrap()
+    );
+    assert_eq!(receipt["lockbox_hours_excluded"], fix.hours.len());
+}
