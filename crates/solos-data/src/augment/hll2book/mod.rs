@@ -261,6 +261,45 @@ pub fn parse_day(value: &str) -> Result<String, crate::store::StoreError> {
     Ok(value.to_owned())
 }
 
+/// `--reseal` hour keys from one argument: `YYYYMMDD/H[,YYYYMMDD/H...]`.
+///
+/// # Errors
+///
+/// The list is empty, a token is empty or not a `YYYYMMDD/H` calendar hour (the hour is
+/// 0..=23), or a token repeats.
+pub fn parse_reseal(
+    value: &str,
+) -> Result<std::collections::BTreeSet<String>, crate::store::StoreError> {
+    let mut hours = std::collections::BTreeSet::new();
+    for token in value.split(',') {
+        let bad = || {
+            crate::store::StoreError::Check(format!("--reseal '{value}' is not a YYYYMMDD/H hour"))
+        };
+        let token = token.trim();
+        let Some((date, hour)) = token.split_once('/') else {
+            return Err(bad());
+        };
+        if checksum::calendar_date(date).is_none() {
+            return Err(bad());
+        }
+        let Ok(hour) = hour.parse::<u32>() else {
+            return Err(bad());
+        };
+        if hour > 23 {
+            return Err(bad());
+        }
+        if !hours.insert(token.to_owned()) {
+            return Err(crate::store::StoreError::Check(format!(
+                "--reseal lists {token} twice"
+            )));
+        }
+    }
+    if hours.is_empty() {
+        return Err(crate::store::StoreError::Check("--reseal is empty".into()));
+    }
+    Ok(hours)
+}
+
 /// `--max-ratio`: a positive, finite ratio.
 ///
 /// # Errors
@@ -328,6 +367,20 @@ mod tests {
         assert!(parse_ratio("inf").is_err());
         assert!(parse_ratio("nan").is_err());
         assert!(parse_ratio("half").is_err());
+    }
+
+    #[test]
+    fn parse_reseal_takes_comma_lists_and_rejects_bad_hours() {
+        let hours = parse_reseal("20261022/0, 20261022/23").unwrap();
+        assert_eq!(hours.len(), 2);
+        assert!(hours.contains("20261022/0") && hours.contains("20261022/23"));
+        assert!(parse_reseal("20261022").is_err());
+        assert!(parse_reseal("2026102/1").is_err());
+        assert!(parse_reseal("20261301/0").is_err());
+        assert!(parse_reseal("20261022/24").is_err());
+        assert!(parse_reseal("20261022/0,20261022/0").is_err());
+        assert!(parse_reseal("20261022/0,").is_err());
+        assert!(parse_reseal("").is_err());
     }
 
     #[test]

@@ -175,3 +175,9 @@ the listing time as possibly incomplete.
   `work_one` guard is covered on its own).
 - [ ] The guard compares coin and sha256 only, not path or bytes. Low risk;
   noted.
+- [ ] The `--reseal` parser accepts forms like `20261022/05` and
+  `20261022/+5` but stores them as typed, so they never match the watermark
+  key (`20261022/5`) and the refusal says "not in the watermark" for a real
+  hour, which is misleading: normalize the hour or reject non-canonical forms.
+- [ ] The `--reseal` receipt-readable check and the missing-manifest-row check
+  have no tests yet.

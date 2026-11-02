@@ -50,6 +50,12 @@ pub struct Request<'a> {
     pub jobs: u32,
     /// Injected count fault for the guard tests. The CLI always passes [`publish::Fault::None`].
     pub fault: publish::Fault,
+    /// Hours this run may re-seal past the superset guard (`--reseal`), for a corrected
+    /// re-download of a verified hour. Validated before any work: each named hour must be
+    /// in the watermark with a readable receipt, inside the run's scope, covered by
+    /// in-scope manifest entries for every receipt coin, and every receipt input's raw
+    /// file must be on disk.
+    pub reseal: BTreeSet<String>,
 }
 
 /// Why `run` returned.
@@ -304,6 +310,7 @@ pub fn run(
     } else {
         request.git_sha.trim().to_owned()
     };
+    validate_reseal(request, &request.reseal, &watermark, &hours, &uncovered)?;
     // Hours whose on-disk coins are not covered by the manifest never dispatch; every other
     // hour dispatches in order and commits in the same order. A worker stages an hour (read,
     // hash, decode, COPY to .tmp, every check); only the main thread seals hours, moves the
@@ -544,6 +551,11 @@ fn work_one(
     let key = &task.key;
     let ready = match locate_hour(request.input, &task.entries)? {
         HourFiles::Partial => {
+            if reseal_contains(request, key) {
+                return Err(StoreError::Check(format!(
+                    "{key}: refusing to re-seal: the hour's files are not all on disk at their manifest sizes"
+                )));
+            }
             if watermark.contains(key) {
                 let identity = identity_of(&task.entries);
                 if let Some(receipt) =
@@ -566,6 +578,24 @@ fn work_one(
     let identity = identity_of_inputs(&loaded);
     if let Some(receipt) = verified_receipt(request.out, key, &identity, hash, watermark)? {
         return Ok(WorkerOutcome::Skip(receipt));
+    }
+    // A watermarked hour whose identity differs is about to be re-sealed. If the current
+    // inputs lost a coin or content the receipt recorded, sealing would replace the hour
+    // Parquet with the subset, stale cleanup would remove the missing coins' files, and
+    // the later raw drop would delete their `.lz4`: refuse before any work instead. An
+    // hour named in `--reseal` was validated up front (watermark, receipt, scope, manifest
+    // coverage, raw on disk), so its corrected re-download is allowed through.
+    if watermark.contains(key)
+        && !reseal_contains(request, key)
+        && let Some(previous) = publish::read_receipt(request.out, key)
+    {
+        let missing = publish::missing_inputs(&previous, &inputs_of(&loaded));
+        if !missing.is_empty() {
+            return Err(StoreError::Check(format!(
+                "{key}: {}",
+                publish::refusing_reseal(key, &missing)
+            )));
+        }
     }
     if conn.is_none() {
         let (opened, _) =
@@ -592,6 +622,7 @@ fn work_one(
         git_sha: git,
         config_hash: hash,
         fault: request.fault,
+        allow_shrink: reseal_contains(request, key),
     };
     // `seal_hour` needs the settings the report should show; read them from the connection.
     let settings = publish::WriterSettings {
@@ -601,6 +632,87 @@ fn work_one(
     let prepared = publish::prepare_hour(conn, request.out, &job, &settings)
         .map_err(|error| StoreError::Check(format!("{key}: {error}")))?;
     Ok(WorkerOutcome::Prepared(prepared))
+}
+
+/// Whether `request` names this hour in `--reseal`.
+fn reseal_contains(request: &Request<'_>, key: &str) -> bool {
+    request.reseal.contains(key)
+}
+
+/// Validate every `--reseal` hour before any work happens: listed in the watermark, with a
+/// readable receipt, inside the run's date scope, covered by in-scope manifest entries for
+/// every receipt coin, and with every receipt input's raw file on disk. A typo or a raw
+/// that cannot rebuild the hour must fail loudly here, touching nothing.
+fn validate_reseal(
+    request: &Request<'_>,
+    reseal: &BTreeSet<String>,
+    watermark: &BTreeSet<String>,
+    hours: &[HourGroup],
+    uncovered: &BTreeSet<String>,
+) -> Result<(), StoreError> {
+    for key in reseal {
+        if !watermark.contains(key) {
+            return Err(StoreError::Check(format!(
+                "--reseal {key}: hour is not in the watermark; nothing verified to re-seal"
+            )));
+        }
+        let Some(receipt) = publish::read_receipt(request.out, key) else {
+            return Err(StoreError::Check(format!(
+                "--reseal {key}: receipt is missing or unreadable; nothing verified to re-seal"
+            )));
+        };
+        let (date, _) = hour_parts(key)?;
+        if request
+            .since
+            .as_ref()
+            .is_some_and(|since| date < since.as_str())
+            || request
+                .until
+                .as_ref()
+                .is_some_and(|until| date > until.as_str())
+        {
+            return Err(StoreError::Check(format!(
+                "--reseal {key}: hour is outside the run's --since/--until scope"
+            )));
+        }
+        if uncovered.contains(key) {
+            return Err(StoreError::Check(format!(
+                "--reseal {key}: an in-scope .lz4 on disk has no manifest row; rebuild the manifest first"
+            )));
+        }
+        let Some(group) = hours.iter().find(|hour| &hour.key == key) else {
+            return Err(StoreError::Check(format!(
+                "--reseal {key}: the manifest has no in-scope entries for that hour"
+            )));
+        };
+        let group_coins: BTreeSet<&str> = group
+            .entries
+            .iter()
+            .map(|entry| entry.coin.as_str())
+            .collect();
+        let missing_coins: Vec<&str> = receipt
+            .inputs
+            .iter()
+            .map(|file| file.coin.as_str())
+            .filter(|coin| !group_coins.contains(coin))
+            .collect();
+        if !missing_coins.is_empty() {
+            return Err(StoreError::Check(format!(
+                "--reseal {key}: the in-scope hour group is missing receipt coins {}; widen --coins or rebuild the manifest",
+                missing_coins.join(", ")
+            )));
+        }
+        for file in &receipt.inputs {
+            let path = under_input(request.input, &file.path)?;
+            if !path.is_file() {
+                return Err(StoreError::Check(format!(
+                    "--reseal {key}: receipt input {} is not on disk; a re-seal needs every receipt input's raw file",
+                    file.path
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Send more hours to the workers, up to `jobs` in flight, after the disk floor. Returns
@@ -727,8 +839,8 @@ fn identity_of(entries: &[Entry]) -> String {
     publish::input_identity(&inputs)
 }
 
-fn identity_of_inputs(files: &[LoadedFile]) -> String {
-    let inputs: Vec<InputFile> = files
+fn inputs_of(files: &[LoadedFile]) -> Vec<InputFile> {
+    files
         .iter()
         .map(|file| InputFile {
             coin: file.coin.clone(),
@@ -737,8 +849,11 @@ fn identity_of_inputs(files: &[LoadedFile]) -> String {
             bytes: u64::try_from(file.bytes.len()).unwrap_or(0),
             snapshots: 0,
         })
-        .collect();
-    publish::input_identity(&inputs)
+        .collect()
+}
+
+fn identity_of_inputs(files: &[LoadedFile]) -> String {
+    publish::input_identity(&inputs_of(files))
 }
 
 enum Space {
@@ -1078,31 +1193,58 @@ fn under_input(input: &Path, relative: &str) -> Result<PathBuf, StoreError> {
     Ok(input.join(relative))
 }
 
-fn write_drop_record(
+pub(crate) fn write_drop_record(
     out: &Path,
     hour_key: &str,
     date: &str,
     hour: u32,
     receipt: &Receipt,
 ) -> Result<(), StoreError> {
-    let files: Vec<DropFile> = receipt
-        .inputs
-        .iter()
-        .map(|file| DropFile {
-            path: file.path.clone(),
-            bytes: file.bytes,
-            sha256: file.sha256.clone(),
-            s3: s3_url(date, hour, &file.coin),
-        })
-        .collect();
+    let path = under_out_drop(out, &format!("drops/{hour_key}.json"))?;
+    // An earlier record for this hour may already name files: a crash mid-drop, or a
+    // previous, wider hour. Union by `(path, sha256)` so nothing already recorded is lost;
+    // a path that reappears with a different sha256 keeps both entries, so either copy can
+    // be fetched again. A foreign or unparsable record is an error, never an overwrite.
+    let mut merged: BTreeMap<(String, String), DropFile> = BTreeMap::new();
+    if path.is_file() {
+        let text = std::fs::read_to_string(&path)?;
+        let earlier: DropRecord = serde_json::from_str(&text)
+            .map_err(|e| StoreError::Check(format!("drops/{hour_key}.json: {e}")))?;
+        if earlier.schema != DROP_SCHEMA {
+            return Err(StoreError::Check(format!(
+                "drops/{hour_key}.json: schema is {}, this command writes {DROP_SCHEMA}",
+                earlier.schema
+            )));
+        }
+        if earlier.hour != hour_key {
+            return Err(StoreError::Check(format!(
+                "drops/{hour_key}.json: record is for hour {}, not {hour_key}",
+                earlier.hour
+            )));
+        }
+        for file in earlier.files {
+            merged.insert((file.path.clone(), file.sha256.clone()), file);
+        }
+    }
+    for file in &receipt.inputs {
+        merged.insert(
+            (file.path.clone(), file.sha256.clone()),
+            DropFile {
+                path: file.path.clone(),
+                bytes: file.bytes,
+                sha256: file.sha256.clone(),
+                s3: s3_url(date, hour, &file.coin),
+            },
+        );
+    }
+    // A `BTreeMap` keyed `(path, sha256)` writes the union sorted by path, then sha256.
     let record = DropRecord {
         schema: DROP_SCHEMA.to_owned(),
         hour: hour_key.to_owned(),
-        files,
+        files: merged.into_values().collect(),
     };
     let mut body = serde_json::to_vec(&record).map_err(|e| StoreError::Check(e.to_string()))?;
     body.push(b'\n');
-    let path = under_out_drop(out, &format!("drops/{hour_key}.json"))?;
     if let Some(parent) = path.parent() {
         create_dir_all_durable(parent)?;
     }
@@ -1110,14 +1252,14 @@ fn write_drop_record(
     Ok(())
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct DropRecord {
     schema: String,
     hour: String,
     files: Vec<DropFile>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct DropFile {
     path: String,
     bytes: u64,
@@ -1309,6 +1451,7 @@ mod tests {
             max_ratio: 1.0,
             jobs: 1,
             fault: publish::Fault::None,
+            reseal: BTreeSet::new(),
         };
         let hours = group_hours(&entries, &request);
         assert_eq!(

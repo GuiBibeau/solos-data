@@ -64,6 +64,31 @@ fn has(args: &[String], name: &str) -> bool {
     args.iter().any(|a| a == name)
 }
 
+/// Every `--name value` occurrence, for repeatable flags. A trailing `--name` without a
+/// value contributes nothing, like [`flag`].
+fn flags<'a>(args: &'a [String], name: &str) -> Vec<&'a str> {
+    args.iter()
+        .enumerate()
+        .filter(|(_, arg)| arg.as_str() == name)
+        .filter_map(|(index, _)| args.get(index + 1))
+        .map(String::as_str)
+        .collect()
+}
+
+/// `--reseal <YYYYMMDD/H>`, repeatable, comma lists: the verified hours this run may
+/// re-seal past the superset guard, for a corrected re-download.
+fn reseal_flag(args: &[String]) -> Result<std::collections::BTreeSet<String>, StoreError> {
+    let mut hours = std::collections::BTreeSet::new();
+    for value in flags(args, "--reseal") {
+        for hour in crate::augment::hll2book::parse_reseal(value)? {
+            if !hours.insert(hour.clone()) {
+                return Err(StoreError::Check(format!("--reseal lists {hour} twice")));
+            }
+        }
+    }
+    Ok(hours)
+}
+
 // ---------------------------------------------------------------------------------------------
 // spot
 
@@ -1055,7 +1080,7 @@ const AUGMENT_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "hl-l2book",
-        "Offline l2Book hours to Parquet (no download, no collector): --input <dir> --out <root> --checksums <MANIFEST> [--coins BTC,ETH] [--since YYYYMMDD] [--until YYYYMMDD] [--drop-raw-after-verify] [--max-ratio 1.0] [--min-free-tb 1.0] [--threads 4] [--memory 8GB]",
+        "Offline l2Book hours to Parquet (no download, no collector): --input <dir> --out <root> --checksums <MANIFEST> [--coins BTC,ETH] [--since YYYYMMDD] [--until YYYYMMDD] [--drop-raw-after-verify] [--reseal YYYYMMDD/H] [--max-ratio 1.0] [--min-free-tb 1.0] [--threads 4] [--memory 8GB]",
     ),
     (
         "hl-l2book-manifest",
@@ -1270,7 +1295,7 @@ fn hl_l2book_cli(args: &[String]) -> i32 {
             Obj::new()
                 .with(
                     "command",
-                    "solos-data augment hl-l2book --input <dir> --out <root> --checksums <MANIFEST> [--coins BTC,ETH] [--since YYYYMMDD] [--until YYYYMMDD] [--drop-raw-after-verify] [--min-free-tb 1.0] [--threads 4] [--memory 8GB]"
+                    "solos-data augment hl-l2book --input <dir> --out <root> --checksums <MANIFEST> [--coins BTC,ETH] [--since YYYYMMDD] [--until YYYYMMDD] [--drop-raw-after-verify] [--reseal YYYYMMDD/H] [--min-free-tb 1.0] [--threads 4] [--memory 8GB]"
                 )
                 .with(
                     "input",
@@ -1282,7 +1307,11 @@ fn hl_l2book_cli(args: &[String]) -> i32 {
                 )
                 .with(
                     "drop",
-                    "--drop-raw-after-verify deletes the hour's .lz4 only after watermark.json is durable, and writes drops/YYYYMMDD/H.json (path, bytes, sha256, s3). A rerun overwrites that file"
+                    "--drop-raw-after-verify deletes the hour's .lz4 only after watermark.json is durable, and writes drops/YYYYMMDD/H.json (path, bytes, sha256, s3). A rerun merges that file: the union of both records' files by path and sha256"
+                )
+                .with(
+                    "reseal",
+                    "--reseal YYYYMMDD/H (repeatable, comma lists) lets a named verified hour re-seal past the superset guard, for a corrected re-download. Validated before any work: the hour is in the watermark with a readable receipt, inside --since/--until, covered by in-scope manifest entries for every receipt coin, and every receipt input's raw file is on disk"
                 )
                 .with(
                     "maxRatio",
@@ -1363,6 +1392,7 @@ fn hl_l2book_run(args: &[String]) -> Result<i32, StoreError> {
         max_ratio,
         jobs,
         fault: crate::augment::hll2book::Fault::None,
+        reseal: reseal_flag(args)?,
     };
     let report = crate::augment::hll2book::run(&request, filesystem_free)?;
     println!("{}", report.to_json());

@@ -341,6 +341,7 @@ fn the_converter_publishes_from_a_built_manifest() {
         max_ratio: 1e12,
         jobs: 1,
         fault: super::publish::Fault::None,
+        reseal: std::collections::BTreeSet::new(),
     };
     let report = super::run(&request, |_| Ok(u64::MAX)).unwrap();
     assert_eq!(report.hours_verified, 1);
