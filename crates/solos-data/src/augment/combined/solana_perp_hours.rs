@@ -23,7 +23,7 @@
 
 use crate::fsutil::create_dir_all_durable;
 use crate::store::{StoreError, query_rows};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -93,10 +93,16 @@ pub struct Request<'a> {
     pub lockbox_sha256: &'a str,
     /// Operator provenance object, copied verbatim into the receipts.
     pub provenance: &'a Path,
-    /// Jupiter event directories, in lane order (history first, live last).
+    /// Jupiter event directories, in lane order (history dumps first, the live
+    /// capture last: the last lane is the live lane).
     pub jupiter_events: &'a [PathBuf],
-    /// Flash event directories, in lane order (history first, live last).
+    /// Flash event directories, in lane order (history dumps first, the live
+    /// capture last: the last lane is the live lane).
     pub flash_events: &'a [PathBuf],
+    /// The venues-history status file (`running`/`sources.<venue>.done`), the
+    /// explicit `finished` source for the history lanes. Absent means no lane
+    /// is finished: the dumps hold the watermark back as before.
+    pub history_status: Option<&'a Path>,
     /// Inclusive UTC date of the first hour built (required, bounded runs).
     pub since: &'a str,
     /// Inclusive UTC date of the last hour built (required, bounded runs).
@@ -360,12 +366,25 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let first_hour = grid::hour_of_secs(grid::day_start_secs(first_day));
     let requested_last = grid::hour_of_secs(grid::day_start_secs(last_day)) + 23;
 
-    // Closure and coverage, from Parquet statistics (no data pages): per file
-    // the (min, max) block_time; the closure watermark is per venue the min
-    // across lanes of the lane max (the most-stalled lane holds the venue
-    // back), then the min across venues; the covered spans feed the lockbox
-    // drop count.
-    let (watermark_block_time, covered) = input_facts(&conn, &jupiter_lanes, &flash_lanes)?;
+    // Closure and coverage, from Parquet statistics (no data pages): per lane
+    // the first and last record time, plus every file's covered hour span for
+    // the lockbox drop count.
+    let (jupiter_facts, flash_facts) = input_facts(&conn, &jupiter_lanes, &flash_lanes)?;
+    let jupiter_spans = jupiter_facts.spans;
+    let flash_spans = flash_facts.spans;
+    let covered = jupiter_facts.covered;
+    let history_status = io::load_history_status(request.history_status)?;
+    let jupiter_seal = io::venue_seal(
+        &jupiter_spans[..jupiter_spans.len().saturating_sub(1)],
+        jupiter_spans.last().copied(),
+        history_status.finished("jupiter"),
+    )?;
+    let flash_seal = io::venue_seal(
+        &flash_spans[..flash_spans.len().saturating_sub(1)],
+        flash_spans.last().copied(),
+        history_status.finished("flash"),
+    )?;
+    let watermark_block_time = jupiter_seal.watermark.min(flash_seal.watermark);
     let last_closed_hour = grid::floor_div(
         watermark_block_time - grid::HOUR_SECS - HOUR_GUARD_SECS,
         grid::HOUR_SECS,
@@ -385,11 +404,34 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         &lockbox_hours,
     );
 
+    // Gap hours (a finished history lane and a late-starting live lane) never
+    // seal as complete: they are cut from the plan and recorded.
+    let mut gap_hours: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    let mut gap_entries: Vec<Value> = Vec::new();
+    for (venue, venue_seal) in [("jupiter", &jupiter_seal), ("flash", &flash_seal)] {
+        if let Some(gap) = &venue_seal.gap {
+            for hour in gap.from_hour..=gap.to_hour {
+                gap_hours.insert(hour);
+            }
+            gap_entries.push(json!({
+                "venue": venue,
+                "from_hour": gap.from_hour,
+                "to_hour": gap.to_hour,
+                "reason": gap.reason,
+            }));
+        }
+    }
+
     let plan = plan_hours(first_hour, requested_last, &lockbox_hours)?;
+    let build_hours: Vec<i64> = plan
+        .build_hours
+        .into_iter()
+        .filter(|hour| !gap_hours.contains(hour))
+        .collect();
 
     // Idempotent skip, decided by the shared seal::check (see the module doc
-    // of seal): the key carries the lane file facts and the mapping assets.csv
-    // sha.
+    // of seal): the key carries the lane file facts, the mapping assets.csv
+    // sha and the history-status fact.
     let assets_fact = seal::mapping_assets_sha256(request.out)?;
     let key = seal::SkipKey::new(
         UNIT,
@@ -400,9 +442,10 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             "jupiterFilesSha256": watermark["jupiter_files_sha256"],
             "flashFilesSha256": watermark["flash_files_sha256"],
             "assetsCsvSha256": assets_fact,
+            "historyStatus": history_status.fact,
         }),
     );
-    let (mut outputs, pending) = skip_sealed_hours(request.out, TABLE, &key, &plan.build_hours)?;
+    let (mut outputs, pending) = skip_sealed_hours(request.out, TABLE, &key, &build_hours)?;
     let hours_skipped = outputs.len() as u64;
     let lockbox_dropped = drops.dropped;
 
@@ -503,6 +546,12 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let mut watermark_facts = watermark.clone();
     watermark_facts["watermark_block_time"] = json!(watermark_block_time);
     watermark_facts["last_closed_hour"] = json!(last_closed_hour);
+    watermark_facts["venue_watermark"] = json!({
+        "jupiter": jupiter_seal.watermark,
+        "flash": flash_seal.watermark,
+    });
+    watermark_facts["historyStatus"] = history_status.fact;
+    watermark_facts["gapHours"] = json!(gap_entries);
     watermark_facts["lockbox_hours_dropped"] = json!(drops.dropped);
     watermark_facts["lockbox_hours_excluded"] = json!(drops.excluded);
     finish_run(
@@ -548,22 +597,23 @@ fn scalar(conn: &duckdb::Connection, sql: &str, column: &str) -> Result<u64, Sto
         .ok_or_else(|| StoreError::Check(format!("query has no {column}: {sql}")))
 }
 
-/// Per file the (min, max) block_time of every lane file, from Parquet
-/// statistics. Returns the closure watermark (per venue the min across lanes
-/// of the lane max, then the min across venues) and every file's covered hour
-/// span (for `seal::lockbox_drops`).
+/// Per lane the first and last record time over its files, from Parquet
+/// statistics, plus every file's covered hour span (for
+/// `seal::lockbox_drops`). Lane order is the caller's: the LAST lane is the
+/// live capture, earlier lanes are the venues-history dumps.
 fn input_facts(
     conn: &duckdb::Connection,
     jupiter: &[Lane],
     flash: &[Lane],
-) -> Result<(i64, Vec<(i64, i64)>), StoreError> {
+) -> Result<(io::LaneFacts, io::LaneFacts), StoreError> {
     let mut covered: Vec<(i64, i64)> = Vec::new();
-    let mut venue_watermark = |lanes: &[Lane], what: &str| -> Result<i64, StoreError> {
-        let mut venue: Option<i64> = None;
+    let mut spans = |lanes: &[Lane]| -> Result<io::LaneFacts, StoreError> {
+        let mut venue_spans: Vec<io::LaneSpan> = Vec::new();
         for (dir, files) in lanes {
             if files.is_empty() {
                 continue;
             }
+            let mut lane_min: Option<i64> = None;
             let mut lane_max: Option<i64> = None;
             for file in files {
                 let table =
@@ -583,17 +633,25 @@ fn input_facts(
                     .int("hi")
                     .ok_or_else(|| StoreError::Check("null max(block_time)".into()))?;
                 covered.push((grid::hour_of_secs(lo), grid::hour_of_secs(hi)));
+                lane_min = Some(lane_min.map_or(lo, |current| current.min(lo)));
                 lane_max = Some(lane_max.map_or(hi, |current| current.max(hi)));
             }
-            if let Some(lane_max) = lane_max {
-                venue = Some(venue.map_or(lane_max, |current| current.min(lane_max)));
-            }
+            venue_spans.push(io::LaneSpan {
+                min: lane_min.expect("at least one file"),
+                max: lane_max.expect("at least one file"),
+            });
         }
-        venue.ok_or_else(|| StoreError::Check(format!("{what} lane files have no block_time")))
+        Ok(io::LaneFacts {
+            spans: venue_spans,
+            covered: std::mem::take(&mut covered),
+        })
     };
-    let jupiter_watermark = venue_watermark(jupiter, "jupiter")?;
-    let flash_watermark = venue_watermark(flash, "flash")?;
-    Ok((jupiter_watermark.min(flash_watermark), covered))
+    let jupiter_facts = spans(jupiter)?;
+    let mut flash_facts = spans(flash)?;
+    flash_facts
+        .covered
+        .extend(jupiter_facts.covered.iter().copied());
+    Ok((jupiter_facts, flash_facts))
 }
 
 /// Build `events_all` (all lane rows of the window with the lane index),

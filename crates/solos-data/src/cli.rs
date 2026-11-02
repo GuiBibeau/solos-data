@@ -1413,7 +1413,7 @@ fn combined_cli(args: &[String]) -> i32 {
             Obj::new()
                 .with(
                     "command",
-                    "solos-data augment combined <unit>: mapping | phoenix-hours | solana-perp-hours | pyth-hours. Common flags: --out <root> --lockbox <json> --lockbox-sha256 <hex> --provenance <json> [--threads 4] [--memory 8GB]; hour units also take --since/--until (inclusive UTC dates, bounded runs)"
+                    "solos-data augment combined <unit>: mapping | phoenix-hours | solana-perp-hours | pyth-hours. Common flags: --out <root> --lockbox <json> --lockbox-sha256 <hex> --provenance <json> [--threads 4] [--memory 8GB]; hour units also take --since/--until (inclusive UTC dates, bounded runs); the perp and pyth units take [--history-status <json>] (the venues-history status file: running=false + sources.<venue>.done=true is the only way a history lane stops holding the watermark back; absent means nothing is finished)"
                 )
                 .with(
                     "mapping",
@@ -1573,6 +1573,7 @@ fn combined_solana_perp_hours_run(args: &[String]) -> Result<i32, StoreError> {
         .map(PathBuf::from)
         .collect();
     let memory = flag(args, "--memory").unwrap_or("8GB").to_owned();
+    let history_status = flag(args, "--history-status").map(PathBuf::from);
     let request = crate::augment::combined::solana_perp_hours::Request {
         out: Path::new(required_flag(args, "--out")?),
         lockbox: Path::new(required_flag(args, "--lockbox")?),
@@ -1580,6 +1581,7 @@ fn combined_solana_perp_hours_run(args: &[String]) -> Result<i32, StoreError> {
         provenance: Path::new(required_flag(args, "--provenance")?),
         jupiter_events: &jupiter_events,
         flash_events: &flash_events,
+        history_status: history_status.as_deref(),
         since: required_flag(args, "--since")?,
         until: required_flag(args, "--until")?,
         threads: combined_threads_flag(args)?,
@@ -1599,12 +1601,14 @@ fn combined_pyth_hours_run(args: &[String]) -> Result<i32, StoreError> {
         .map(PathBuf::from)
         .collect();
     let memory = flag(args, "--memory").unwrap_or("8GB").to_owned();
+    let history_status = flag(args, "--history-status").map(PathBuf::from);
     let request = crate::augment::combined::pyth_hours::Request {
         out: Path::new(required_flag(args, "--out")?),
         lockbox: Path::new(required_flag(args, "--lockbox")?),
         lockbox_sha256: required_flag(args, "--lockbox-sha256")?,
         provenance: Path::new(required_flag(args, "--provenance")?),
         pyth_prices: &pyth_prices,
+        history_status: history_status.as_deref(),
         since: required_flag(args, "--since")?,
         until: required_flag(args, "--until")?,
         threads: combined_threads_flag(args)?,

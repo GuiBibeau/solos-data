@@ -17,7 +17,7 @@
 
 use crate::fsutil::create_dir_all_durable;
 use crate::store::{StoreError, query_rows};
-use serde_json::json;
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 use super::grid;
@@ -63,8 +63,13 @@ pub struct Request<'a> {
     pub lockbox_sha256: &'a str,
     /// Operator provenance object, copied verbatim into the receipts.
     pub provenance: &'a Path,
-    /// Pyth price directories, in lane order (history first, live last).
+    /// Pyth price directories, in lane order (history dumps first, the live
+    /// capture last: the last lane is the live lane).
     pub pyth_prices: &'a [PathBuf],
+    /// The venues-history status file (`running`/`sources.pyth.done`), the
+    /// explicit `finished` source for the history lanes. Absent means no lane
+    /// is finished: the dumps hold the watermark back as before.
+    pub history_status: Option<&'a Path>,
     /// Inclusive UTC date of the first hour built (required, bounded runs).
     pub since: &'a str,
     /// Inclusive UTC date of the last hour built (required, bounded runs).
@@ -285,11 +290,19 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let first_hour = grid::hour_of_secs(grid::day_start_secs(first_day));
     let requested_last = grid::hour_of_secs(grid::day_start_secs(last_day)) + 23;
 
-    // Closure and coverage, from Parquet statistics (no data pages): per file
-    // the (min, max) publish_time; the closure watermark is the min across
-    // lanes of the lane max (the most-stalled lane holds it back); the covered
-    // spans feed the lockbox drop count.
-    let (watermark_publish_time, covered) = input_facts(&conn, &lanes)?;
+    // Closure and coverage, from Parquet statistics (no data pages): per lane
+    // the first and last record time, plus every file's covered hour span for
+    // the lockbox drop count.
+    let facts = input_facts(&conn, &lanes)?;
+    let pyth_spans = facts.spans;
+    let covered = facts.covered;
+    let history_status = io::load_history_status(request.history_status)?;
+    let pyth_seal = io::venue_seal(
+        &pyth_spans[..pyth_spans.len().saturating_sub(1)],
+        pyth_spans.last().copied(),
+        history_status.finished("pyth"),
+    )?;
+    let watermark_publish_time = pyth_seal.watermark;
     let last_closed_hour = grid::floor_div(
         watermark_publish_time - grid::HOUR_SECS - HOUR_GUARD_SECS,
         grid::HOUR_SECS,
@@ -309,11 +322,32 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         &lockbox_hours,
     );
 
+    // Gap hours (a finished history lane and a late-starting live lane) never
+    // seal as complete: they are cut from the plan and recorded.
+    let mut gap_hours: std::collections::BTreeSet<i64> = std::collections::BTreeSet::new();
+    let mut gap_entries: Vec<Value> = Vec::new();
+    if let Some(gap) = &pyth_seal.gap {
+        for hour in gap.from_hour..=gap.to_hour {
+            gap_hours.insert(hour);
+        }
+        gap_entries.push(json!({
+            "venue": "pyth",
+            "from_hour": gap.from_hour,
+            "to_hour": gap.to_hour,
+            "reason": gap.reason,
+        }));
+    }
+
     let plan = plan_hours(first_hour, requested_last, &lockbox_hours)?;
+    let build_hours: Vec<i64> = plan
+        .build_hours
+        .into_iter()
+        .filter(|hour| !gap_hours.contains(hour))
+        .collect();
 
     // Idempotent skip, decided by the shared seal::check (see the module doc
-    // of seal): the key carries the lane file facts and the mapping assets.csv
-    // sha.
+    // of seal): the key carries the lane file facts, the mapping assets.csv
+    // sha and the history-status fact.
     let assets_fact = seal::mapping_assets_sha256(request.out)?;
     let key = seal::SkipKey::new(
         UNIT,
@@ -323,9 +357,10 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         json!({
             "filesSha256": watermark["files_sha256"],
             "assetsCsvSha256": assets_fact,
+            "historyStatus": history_status.fact,
         }),
     );
-    let (mut outputs, pending) = skip_sealed_hours(request.out, TABLE, &key, &plan.build_hours)?;
+    let (mut outputs, pending) = skip_sealed_hours(request.out, TABLE, &key, &build_hours)?;
     let hours_skipped = outputs.len() as u64;
     let lockbox_dropped = drops.dropped;
 
@@ -410,6 +445,9 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let mut watermark_facts = watermark.clone();
     watermark_facts["watermark_publish_time"] = json!(watermark_publish_time);
     watermark_facts["last_closed_hour"] = json!(last_closed_hour);
+    watermark_facts["venue_watermark"] = json!({ "pyth": pyth_seal.watermark });
+    watermark_facts["historyStatus"] = history_status.fact;
+    watermark_facts["gapHours"] = json!(gap_entries);
     watermark_facts["lockbox_hours_dropped"] = json!(drops.dropped);
     watermark_facts["lockbox_hours_excluded"] = json!(drops.excluded);
     finish_run(
@@ -452,20 +490,21 @@ fn scalar(conn: &duckdb::Connection, sql: &str, column: &str) -> Result<u64, Sto
         .ok_or_else(|| StoreError::Check(format!("query has no {column}: {sql}")))
 }
 
-/// Per file the (min, max) publish_time of every lane file, from Parquet
-/// statistics. Returns the closure watermark (the min across lanes of the lane
-/// max, so the most-stalled lane holds it back) and every file's covered hour
-/// span (for `seal::lockbox_drops`).
+/// Per lane the first and last record time over its files, from Parquet
+/// statistics, plus every file's covered hour span (for
+/// `seal::lockbox_drops`). Lane order is the caller's: the LAST lane is the
+/// live capture, earlier lanes are the venues-history dumps.
 fn input_facts(
     conn: &duckdb::Connection,
     lanes: &[(PathBuf, Vec<FileRef>)],
-) -> Result<(i64, Vec<(i64, i64)>), StoreError> {
+) -> Result<io::LaneFacts, StoreError> {
     let mut covered: Vec<(i64, i64)> = Vec::new();
-    let mut min: Option<i64> = None;
+    let mut venue_spans: Vec<io::LaneSpan> = Vec::new();
     for (dir, files) in lanes {
         if files.is_empty() {
             continue;
         }
+        let mut lane_min: Option<i64> = None;
         let mut lane_max: Option<i64> = None;
         for file in files {
             let table = parquet_list(&[dir.join(&file.relative).to_string_lossy().to_string()])?;
@@ -484,14 +523,18 @@ fn input_facts(
                 .int("hi")
                 .ok_or_else(|| StoreError::Check("null max(publish_time)".into()))?;
             covered.push((grid::hour_of_secs(lo), grid::hour_of_secs(hi)));
+            lane_min = Some(lane_min.map_or(lo, |current| current.min(lo)));
             lane_max = Some(lane_max.map_or(hi, |current| current.max(hi)));
         }
-        if let Some(lane_max) = lane_max {
-            min = Some(min.map_or(lane_max, |current| current.min(lane_max)));
-        }
+        venue_spans.push(io::LaneSpan {
+            min: lane_min.expect("at least one file"),
+            max: lane_max.expect("at least one file"),
+        });
     }
-    min.map(|watermark| (watermark, covered))
-        .ok_or_else(|| StoreError::Check("lane files have no publish_time".into()))
+    Ok(io::LaneFacts {
+        spans: venue_spans,
+        covered,
+    })
 }
 
 /// Build `pyth_all` (all lane rows of the window with the lane index) and

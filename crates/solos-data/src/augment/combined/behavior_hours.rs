@@ -1064,6 +1064,7 @@ fn solana_perp_scales_dedupes_and_maps() {
         provenance: &provenance,
         jupiter_events: &jupiter_events,
         flash_events: &flash_events,
+        history_status: None,
         since: DAY,
         until: DAY,
         threads: 1,
@@ -1244,6 +1245,7 @@ fn pyth_dedupes_and_measures_staleness() {
         lockbox_sha256: &lockbox_sha,
         provenance: &provenance,
         pyth_prices: &pyth_lanes,
+        history_status: None,
         since: DAY,
         until: DAY,
         threads: 1,
@@ -2162,6 +2164,7 @@ fn a_wrong_shape_lockbox_is_refused_before_any_read() {
         provenance: &provenance,
         jupiter_events: &jupiter_events,
         flash_events: &flash_events,
+        history_status: None,
         since: DAY,
         until: DAY,
         threads: 1,
@@ -2176,6 +2179,7 @@ fn a_wrong_shape_lockbox_is_refused_before_any_read() {
         lockbox_sha256: &lockbox_sha,
         provenance: &provenance,
         pyth_prices: &pyth_lanes,
+        history_status: None,
         since: DAY,
         until: DAY,
         threads: 1,
@@ -2478,6 +2482,7 @@ fn solana_perp_refuses_an_unclosed_day() {
         provenance: &provenance,
         jupiter_events: &jupiter_events,
         flash_events: &flash_events,
+        history_status: None,
         since: DAY,
         until: DAY,
         threads: 1,
@@ -2547,6 +2552,7 @@ fn solana_perp_watermark_is_the_most_stalled_lane() {
         provenance: &provenance,
         jupiter_events: &jupiter_events,
         flash_events: &flash_events,
+        history_status: None,
         since: DAY,
         until: DAY,
         threads: 1,
@@ -2623,6 +2629,7 @@ fn solana_perp_ret_is_identical_across_thread_counts() {
             provenance: &provenance,
             jupiter_events: &jupiter_events,
             flash_events: &flash_events,
+            history_status: None,
             since: DAY,
             until: DAY,
             threads,
@@ -2749,6 +2756,7 @@ fn solana_perp_lockbox_hours_are_read_but_never_written() {
         provenance: &provenance,
         jupiter_events: &jupiter_events,
         flash_events: &flash_events,
+        history_status: None,
         since: &inside_day,
         until: &after_day,
         threads: 1,
@@ -2826,6 +2834,7 @@ fn pyth_refuses_an_unclosed_day() {
         lockbox_sha256: &lockbox_sha,
         provenance: &provenance,
         pyth_prices: &pyth_lanes,
+        history_status: None,
         since: DAY,
         until: DAY,
         threads: 1,
@@ -2878,6 +2887,7 @@ fn pyth_watermark_is_the_most_stalled_lane() {
         lockbox_sha256: &lockbox_sha,
         provenance: &provenance,
         pyth_prices: &pyth_lanes,
+        history_status: None,
         since: DAY,
         until: DAY,
         threads: 1,
@@ -2942,6 +2952,7 @@ fn pyth_later_lane_then_later_at_ms_wins() {
         lockbox_sha256: &lockbox_sha,
         provenance: &provenance,
         pyth_prices: &pyth_lanes,
+        history_status: None,
         since: DAY,
         until: DAY,
         threads: 1,
@@ -3049,6 +3060,7 @@ fn pyth_lockbox_hours_are_read_but_never_written() {
         lockbox_sha256: &lockbox_sha,
         provenance: &provenance,
         pyth_prices: &pyth_lanes,
+        history_status: None,
         since: &inside_day,
         until: &after_day,
         threads: 1,
@@ -3159,6 +3171,7 @@ fn solana_perp_rebuilds_when_the_mapping_changes() {
         provenance: &provenance,
         jupiter_events: &jupiter_events,
         flash_events: &flash_events,
+        history_status: None,
         since: DAY,
         until: DAY,
         threads: 1,
@@ -3221,6 +3234,7 @@ fn pyth_rebuilds_when_the_mapping_changes() {
         lockbox_sha256: &lockbox_sha,
         provenance: &provenance,
         pyth_prices: &pyth_lanes,
+        history_status: None,
         since: DAY,
         until: DAY,
         threads: 1,
@@ -3346,4 +3360,608 @@ fn phoenix_rebuilds_when_the_lockbox_changes() {
         "a new lockbox file must rebuild, never skip"
     );
     assert_eq!(second.hours_skipped, 0);
+}
+
+/// A venues-history status file: `running` plus per-venue `done` flags (the
+/// explicit `finished` source), and its sha256 for `--lockbox-sha256`-style
+/// checks.
+fn status_file(dir: &Path, running: bool, done: &[(&str, bool)]) -> (PathBuf, String) {
+    let mut sources = serde_json::Map::new();
+    for (venue, is_done) in done {
+        sources.insert(
+            (*venue).to_owned(),
+            serde_json::json!({ "done": is_done, "rows": 1 }),
+        );
+    }
+    let body = serde_json::json!({
+        "running": running,
+        "at": "2026-11-02T00:00:00Z",
+        "sources": sources,
+    })
+    .to_string();
+    let path = dir.join("status-venues-history.json");
+    std::fs::write(&path, &body).unwrap();
+    let sha = crate::fsutil::sha256_hex(body.as_bytes());
+    (path, sha)
+}
+
+/// The lane-closure fixture both watermark tests share: a history lane whose
+/// last record sits at `hist_last`, and a live lane from `live_first` through a
+/// next-day 03:00 sentinel.
+fn write_two_lanes(
+    dir: &Path,
+    venue: &str,
+    hist_last: i64,
+    live_first: i64,
+    extra_live: &[(i64, &str, &str)],
+) -> (PathBuf, PathBuf) {
+    let hist = dir.join(format!("{venue}-hist"));
+    let live = dir.join(format!("{venue}-live"));
+    let hist_rows = vec![perp_event(
+        "hSentinel",
+        432_100_010,
+        hist_last,
+        0,
+        "InstantIncreasePositionEvent",
+        r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#,
+    )];
+    let mut live_rows: Vec<String> = extra_live
+        .iter()
+        .map(|(t, sig, name)| {
+            let fields = if *name == "flash" {
+                r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#.to_owned()
+            } else {
+                r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#.to_owned()
+            };
+            let name = if *name == "flash" {
+                "IncreaseSizeLogUSDv1"
+            } else {
+                "InstantIncreasePositionEvent"
+            };
+            perp_event(sig, 432_100_010, *t, 0, name, &fields)
+        })
+        .collect();
+    live_rows.insert(
+        0,
+        perp_event(
+            "lFirst",
+            432_100_010,
+            live_first,
+            0,
+            "InstantIncreasePositionEvent",
+            r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#,
+        ),
+    );
+
+    write_event_lane(&hist, &hist_rows);
+    write_event_lane(&live, &live_rows);
+    (hist, live)
+}
+
+/// T1: a finished history lane with overlapping live coverage stops holding
+/// the watermark back - the closure advances to the live lane's max (W4 keeps
+/// the min over all lanes and the day stays unclosed).
+#[test]
+fn solana_perp_finished_history_with_overlapping_live_advances_the_closure() {
+    let tmp = Tmp::new("perp-wm-finished");
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    let (jup_hist, jup_live) = write_two_lanes(
+        tmp.dir(),
+        "jupiter",
+        h0 + 1_800,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "jup")],
+    );
+    let (flash_hist, flash_live) = write_two_lanes(
+        tmp.dir(),
+        "flash",
+        h0 + 1_800,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "flash")],
+    );
+    let (status, status_sha) = status_file(tmp.dir(), false, &[("jupiter", true), ("flash", true)]);
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let jupiter_events = vec![jup_hist, jup_live];
+    let flash_events = vec![flash_hist, flash_live];
+    let request = PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: Some(&status),
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    };
+    let report = super::solana_perp_hours::run(&request).unwrap();
+    assert_eq!(report.hours_written, 1, "hour 0 has rows");
+    let receipt = unit_receipt(
+        tmp.dir(),
+        super::solana_perp_hours::TABLE,
+        super::solana_perp_hours::UNIT,
+    );
+    assert_eq!(
+        receipt["inputs"]["watermark"]["watermark_block_time"], sentinel,
+        "the closure is the live lane's max, not the history cap"
+    );
+    assert_eq!(
+        receipt["inputs"]["watermark"]["venue_watermark"]["jupiter"],
+        sentinel
+    );
+    assert_eq!(
+        receipt["inputs"]["watermark"]["venue_watermark"]["flash"],
+        sentinel
+    );
+    assert_eq!(
+        receipt["inputs"]["watermark"]["historyStatus"]["sha256"], status_sha,
+        "the status file fact is recorded"
+    );
+    assert_eq!(
+        receipt["inputs"]["watermark"]["gapHours"],
+        serde_json::json!([])
+    );
+    // The watermark_max_block_time report field is the advanced closure too.
+    assert_eq!(report.watermark_block_time, sentinel);
+}
+
+/// T2: a finished history lane whose live lane starts later leaves gap hours -
+/// from the hour containing the history max through the hour containing the
+/// live min, inclusive. They never seal (both boundary hours have rows that
+/// would seal a mis-computed gap) and the receipt records them (W2 drops the
+/// overlap check, W3 the recording, W5 the boundary).
+#[test]
+fn solana_perp_finished_history_with_a_gap_records_and_skips_the_gap_hours() {
+    let tmp = Tmp::new("perp-wm-gap");
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    let hist_last = h0 + 10 * 3_600 + 1_800;
+    let live_first = h0 + 13 * 3_600 + 1_200;
+    let (jup_hist, jup_live) = write_two_lanes(
+        tmp.dir(),
+        "jupiter",
+        h0 + 1_800,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "jup")],
+    );
+    // Flash: history stops at hour 10 (with a row there), live starts at hour
+    // 13 (with a row there) and carries hour 14 as the first post-gap hour.
+    let (flash_hist, flash_live) = write_two_lanes(
+        tmp.dir(),
+        "flash",
+        hist_last,
+        live_first,
+        &[
+            (h0 + 14 * 3_600 + 600, "lMid", "flash"),
+            (sentinel, "lSentinel", "flash"),
+        ],
+    );
+    let (status, _) = status_file(tmp.dir(), false, &[("jupiter", true), ("flash", true)]);
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let jupiter_events = vec![jup_hist, jup_live];
+    let flash_events = vec![flash_hist, flash_live];
+    let request = PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: Some(&status),
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    };
+    let report = super::solana_perp_hours::run(&request).unwrap();
+    let gap_from = grid::hour_of_secs(hist_last);
+    let gap_to = grid::hour_of_secs(live_first);
+    assert_eq!(gap_from, grid::hour_of_secs(h0) + 10);
+    assert_eq!(gap_to, grid::hour_of_secs(h0) + 13);
+    // The gap hours never sealed, even though flash rows exist at both
+    // boundary hours; the post-gap hour 14 did.
+    for hour in gap_from..=gap_to {
+        let path = tmp
+            .dir()
+            .join(io::hour_partition(hour, super::solana_perp_hours::TABLE));
+        assert!(
+            !path.exists(),
+            "gap hour {} sealed: {}",
+            hour,
+            path.display()
+        );
+    }
+    assert!(
+        report
+            .outputs
+            .iter()
+            .any(|output| output.hour == grid::hour_of_secs(h0) + 14),
+        "the post-gap hour seals"
+    );
+    let receipt = unit_receipt(
+        tmp.dir(),
+        super::solana_perp_hours::TABLE,
+        super::solana_perp_hours::UNIT,
+    );
+    let gaps = receipt["inputs"]["watermark"]["gapHours"]
+        .as_array()
+        .unwrap();
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0]["venue"], "flash");
+    assert_eq!(gaps[0]["from_hour"], gap_from);
+    assert_eq!(gaps[0]["to_hour"], gap_to);
+    let reason = gaps[0]["reason"].as_str().unwrap();
+    assert!(reason.contains("history finished at"), "{reason}");
+    assert!(reason.contains("live starts at"), "{reason}");
+}
+
+/// T3: an unfinished history lane (done=false, running=true, or no status file
+/// at all) still holds the watermark back, whatever the live lane covers (W1
+/// treats every lane as finished and lets the day close).
+#[test]
+fn solana_perp_unfinished_history_lane_still_holds_the_watermark() {
+    let build = |tmp: &Tmp,
+                 status: Option<&Path>|
+     -> Result<super::solana_perp_hours::Report, crate::store::StoreError> {
+        let h0 = day_start();
+        let (jup_hist, jup_live) =
+            write_two_lanes(tmp.dir(), "jupiter", h0 + 1_800, h0 + 1_200, &[]);
+        let (flash_hist, flash_live) =
+            write_two_lanes(tmp.dir(), "flash", h0 + 1_800, h0 + 1_200, &[]);
+        let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+        let provenance = provenance_file(tmp.dir());
+        write_mapping(tmp.dir());
+        let jupiter_events = vec![jup_hist, jup_live];
+        let flash_events = vec![flash_hist, flash_live];
+        super::solana_perp_hours::run(&PerpRequest {
+            out: tmp.dir(),
+            lockbox: &lockbox,
+            lockbox_sha256: &lockbox_sha,
+            provenance: &provenance,
+            jupiter_events: &jupiter_events,
+            flash_events: &flash_events,
+            history_status: status,
+            since: DAY,
+            until: DAY,
+            threads: 1,
+            memory_limit: "512MB".to_owned(),
+        })
+    };
+    let tmp = Tmp::new("perp-wm-unfinished");
+    let (not_done, _) = status_file(tmp.dir(), false, &[("jupiter", false), ("flash", false)]);
+    let error = build(&tmp, Some(&not_done)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("extends past the input watermark"),
+        "{error}"
+    );
+    let tmp = Tmp::new("perp-wm-running");
+    let (running, _) = status_file(tmp.dir(), true, &[("jupiter", true), ("flash", true)]);
+    let error = build(&tmp, Some(&running)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("extends past the input watermark"),
+        "{error}"
+    );
+    let tmp = Tmp::new("perp-wm-absent");
+    let error = build(&tmp, None).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("extends past the input watermark"),
+        "{error}"
+    );
+}
+
+/// T4: the status file is part of the skip key - flipping a venue's done flag
+/// (different bytes, different sha) rebuilds the hours instead of skipping
+/// them (W6 leaves the status out of the key and the rerun skips).
+#[test]
+fn solana_perp_status_change_rebuilds() {
+    let tmp = Tmp::new("perp-wm-status-key");
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    // The jupiter history lane reaches the sentinel itself, so the closure is
+    // the same under either done flag and only the key can tell them apart.
+    let (jup_hist, jup_live) = write_two_lanes(
+        tmp.dir(),
+        "jupiter",
+        sentinel,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "jup")],
+    );
+    let (flash_hist, flash_live) = write_two_lanes(
+        tmp.dir(),
+        "flash",
+        h0 + 1_800,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "flash")],
+    );
+    let (status_a, status_a_sha) =
+        status_file(tmp.dir(), false, &[("jupiter", true), ("flash", true)]);
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let jupiter_events = vec![jup_hist, jup_live];
+    let flash_events = vec![flash_hist, flash_live];
+    let first = super::solana_perp_hours::run(&PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: Some(&status_a),
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(first.hours_written, 1);
+    let status_b = tmp.dir().join("status-b.json");
+    let mut sources = serde_json::Map::new();
+    sources.insert(
+        "jupiter".to_owned(),
+        serde_json::json!({"done": false, "rows": 1}),
+    );
+    sources.insert(
+        "flash".to_owned(),
+        serde_json::json!({"done": true, "rows": 1}),
+    );
+    let body_b = serde_json::json!({
+        "running": false,
+        "at": "2026-11-02T00:00:00Z",
+        "sources": sources,
+    })
+    .to_string();
+    std::fs::write(&status_b, &body_b).unwrap();
+    let status_b_sha = crate::fsutil::sha256_hex(body_b.as_bytes());
+    assert_ne!(status_a_sha, status_b_sha);
+    let second = super::solana_perp_hours::run(&PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: Some(&status_b),
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(
+        second.hours_written, 1,
+        "the changed status file must rebuild, never skip"
+    );
+    assert_eq!(second.hours_skipped, 0);
+}
+
+/// T1 for pyth: a finished history lane with overlapping live coverage
+/// advances the closure to the live lane's max (W4 keeps the stale cap).
+#[test]
+fn pyth_finished_history_with_overlapping_live_advances_the_closure() {
+    let tmp = Tmp::new("pyth-wm-finished");
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    let hist = tmp.dir().join("pyth-hist");
+    write_pyth_lane(
+        &hist,
+        &[pyth_price(
+            "feed-sol",
+            "SOL",
+            h0 + 1_800,
+            100.0,
+            0.5,
+            (h0 + 1_800) * 1000,
+        )],
+    );
+    let live = tmp.dir().join("pyth-live");
+    write_pyth_lane(
+        &live,
+        &[
+            pyth_price(
+                "feed-sol",
+                "SOL",
+                h0 + 1_200,
+                100.0,
+                0.5,
+                (h0 + 1_200) * 1000,
+            ),
+            pyth_price("feed-sol", "SOL", sentinel, 100.0, 0.5, sentinel * 1000),
+        ],
+    );
+    let (status, _) = status_file(tmp.dir(), false, &[("pyth", true)]);
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let pyth_lanes = vec![hist, live];
+    let request = PythRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        pyth_prices: &pyth_lanes,
+        history_status: Some(&status),
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    };
+    let report = super::pyth_hours::run(&request).unwrap();
+    assert_eq!(report.hours_written, 1);
+    assert_eq!(report.watermark_publish_time, sentinel);
+    let receipt = unit_receipt(tmp.dir(), super::pyth_hours::TABLE, super::pyth_hours::UNIT);
+    assert_eq!(
+        receipt["inputs"]["watermark"]["venue_watermark"]["pyth"],
+        sentinel
+    );
+    assert_eq!(
+        receipt["inputs"]["watermark"]["gapHours"],
+        serde_json::json!([])
+    );
+}
+
+/// T2 for pyth: a finished history lane with a live-lane gap records the gap
+/// hours and never seals them; the post-gap hours seal off the live lane.
+#[test]
+fn pyth_finished_history_with_a_gap_records_and_skips_the_gap_hours() {
+    let tmp = Tmp::new("pyth-wm-gap");
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    let hist_last = h0 + 10 * 3_600 + 1_800;
+    let live_first = h0 + 13 * 3_600 + 1_200;
+    let hist = tmp.dir().join("pyth-hist");
+    write_pyth_lane(
+        &hist,
+        &[pyth_price(
+            "feed-sol",
+            "SOL",
+            hist_last,
+            100.0,
+            0.5,
+            hist_last * 1000,
+        )],
+    );
+    let live = tmp.dir().join("pyth-live");
+    write_pyth_lane(
+        &live,
+        &[
+            pyth_price("feed-sol", "SOL", live_first, 110.0, 0.5, live_first * 1000),
+            pyth_price(
+                "feed-sol",
+                "SOL",
+                h0 + 14 * 3_600 + 600,
+                111.0,
+                0.5,
+                (h0 + 14 * 3_600 + 600) * 1000,
+            ),
+            pyth_price("feed-sol", "SOL", sentinel, 100.0, 0.5, sentinel * 1000),
+        ],
+    );
+    let (status, _) = status_file(tmp.dir(), false, &[("pyth", true)]);
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let pyth_lanes = vec![hist, live];
+    let request = PythRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        pyth_prices: &pyth_lanes,
+        history_status: Some(&status),
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    };
+    let report = super::pyth_hours::run(&request).unwrap();
+    let gap_from = grid::hour_of_secs(hist_last);
+    let gap_to = grid::hour_of_secs(live_first);
+    for hour in gap_from..=gap_to {
+        let path = tmp
+            .dir()
+            .join(io::hour_partition(hour, super::pyth_hours::TABLE));
+        assert!(
+            !path.exists(),
+            "gap hour {} sealed: {}",
+            hour,
+            path.display()
+        );
+    }
+    assert!(
+        report
+            .outputs
+            .iter()
+            .any(|output| output.hour == grid::hour_of_secs(h0) + 14),
+        "the post-gap hour seals"
+    );
+    let receipt = unit_receipt(tmp.dir(), super::pyth_hours::TABLE, super::pyth_hours::UNIT);
+    let gaps = receipt["inputs"]["watermark"]["gapHours"]
+        .as_array()
+        .unwrap();
+    assert_eq!(gaps.len(), 1, "{gaps:?}");
+    assert_eq!(gaps[0]["venue"], "pyth");
+    assert_eq!(gaps[0]["from_hour"], gap_from);
+    assert_eq!(gaps[0]["to_hour"], gap_to);
+}
+
+/// T3 for pyth: an unfinished history lane still holds the watermark back.
+#[test]
+fn pyth_unfinished_history_lane_still_holds_the_watermark() {
+    let build = |tmp: &Tmp,
+                 status: Option<&Path>|
+     -> Result<super::pyth_hours::Report, crate::store::StoreError> {
+        let h0 = day_start();
+        let hist = tmp.dir().join("pyth-hist");
+        write_pyth_lane(
+            &hist,
+            &[pyth_price(
+                "feed-sol",
+                "SOL",
+                h0 + 1_800,
+                100.0,
+                0.5,
+                (h0 + 1_800) * 1000,
+            )],
+        );
+        let live = tmp.dir().join("pyth-live");
+        write_pyth_lane(
+            &live,
+            &[
+                pyth_price(
+                    "feed-sol",
+                    "SOL",
+                    h0 + 1_200,
+                    100.0,
+                    0.5,
+                    (h0 + 1_200) * 1000,
+                ),
+                pyth_price(
+                    "feed-sol",
+                    "SOL",
+                    h0 + 86_400 + 3 * 3600,
+                    100.0,
+                    0.5,
+                    (h0 + 86_400 + 3 * 3600) * 1000,
+                ),
+            ],
+        );
+        let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+        let provenance = provenance_file(tmp.dir());
+        write_mapping(tmp.dir());
+        let pyth_lanes = vec![hist, live];
+        super::pyth_hours::run(&PythRequest {
+            out: tmp.dir(),
+            lockbox: &lockbox,
+            lockbox_sha256: &lockbox_sha,
+            provenance: &provenance,
+            pyth_prices: &pyth_lanes,
+            history_status: status,
+            since: DAY,
+            until: DAY,
+            threads: 1,
+            memory_limit: "512MB".to_owned(),
+        })
+    };
+    let tmp = Tmp::new("pyth-wm-unfinished");
+    let (not_done, _) = status_file(tmp.dir(), false, &[("pyth", false)]);
+    assert!(build(&tmp, Some(&not_done)).is_err());
+    let tmp = Tmp::new("pyth-wm-running");
+    let (running, _) = status_file(tmp.dir(), true, &[("pyth", true)]);
+    assert!(build(&tmp, Some(&running)).is_err());
+    let tmp = Tmp::new("pyth-wm-absent");
+    assert!(build(&tmp, None).is_err());
 }

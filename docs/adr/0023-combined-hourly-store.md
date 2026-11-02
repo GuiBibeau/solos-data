@@ -154,6 +154,29 @@ range its input watermark does not close (hour end plus a two-hour guard;
 per event lane the watermark is that lane's max input timestamp, and a venue
 is as arrived as its most-stalled lane).
 
+Lane closure for `solana-perp-hours` and `pyth-hours` (the lane units): per
+venue the LAST lane argument is the live capture and earlier lanes are the
+venues-history dumps. A history lane stops holding the venue's watermark back
+only when it is explicitly finished and continuously covered: explicitly means
+the operator's `--history-status <json>` file (top-level `running: false`,
+`sources.<venue>.done: true`) - never the lane's age - and continuously means
+the live lane's first record is at or before the history lane's last record.
+Under those two conditions the venue's watermark is the live lane's max;
+otherwise the minimum over all lanes' maxes holds (a stale or unfinished dump
+caps the venue, and `running: true`, a missing venue entry or an absent status
+file all mean not finished). A finished history lane whose live lane starts
+later leaves gap hours - the hours whose `[h, h+1h)` neither lane fully
+covers, from the hour containing the history max through the hour containing
+the live min, inclusive. Gap hours are never sealed as complete: the unit cuts
+them from the plan and records them as `gapHours` entries `{venue, from_hour,
+to_hour, reason: "history finished at <ts>, live starts at <ts>"}` in the run
+receipt and the catalog watermark; hours after the gap seal off the live lane.
+The two-hour trailing guard always applies to the sealing watermark (the live
+lane's max when the history is finished). The status file's sha256 and the
+per-venue done flags are part of every hour's skip key and are recorded in the
+receipt's watermark facts, so flipping a venue's done flag rebuilds instead of
+skipping.
+
 `phoenix_coin_hour` (per (asset, hour), ordered by `asset_id nulls last`,
 `asset_symbol`): `hour BIGINT`, `asset_symbol VARCHAR`, `asset_id VARCHAR`,
 `mapped BOOLEAN` (false when unmapped), `n_trades BIGINT`, `vol_usd DOUBLE`,

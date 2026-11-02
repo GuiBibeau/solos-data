@@ -456,6 +456,188 @@ pub fn hour_partition(hour: i64, table: &str) -> String {
     format!("{table}/date={date}/hour={}.parquet", hour_file_key(hour))
 }
 
+/// One lane's record span: the first and last record time over its files
+/// (Parquet statistics; a lane whose files carry no records has no span).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaneSpan {
+    /// First record time (unix seconds).
+    pub min: i64,
+    /// Last record time (unix seconds).
+    pub max: i64,
+}
+
+/// What a lane walk produced: per-lane record spans and every file's covered
+/// hour span.
+#[derive(Clone, Debug)]
+pub struct LaneFacts {
+    /// Per lane (caller order; the LAST lane is the live capture, earlier
+    /// lanes the venues-history dumps): first and last record time.
+    pub spans: Vec<LaneSpan>,
+    /// Every walked file's covered hour span `[first_hour, last_hour]`, for
+    /// [`crate::augment::combined::seal::lockbox_drops`].
+    pub covered: Vec<(i64, i64)>,
+}
+
+/// The gap a finished history lane and a late-starting live lane leave: the
+/// hours whose `[h, h+1h)` is fully covered by neither lane, from the hour
+/// containing the history lane's last record through the hour containing the
+/// live lane's first record, inclusive. These hours are never sealed as
+/// complete; the receipt records them as `gapHours`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GapSpan {
+    /// First gap hour (unix hour index).
+    pub from_hour: i64,
+    /// Last gap hour (unix hour index, inclusive).
+    pub to_hour: i64,
+    /// Why these hours are a gap, with both boundary timestamps.
+    pub reason: String,
+}
+
+/// One venue's seal facts: which hours may close and the gap (if any) that
+/// must never seal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VenueSeal {
+    /// The venue's input watermark: the max record time that closes hours
+    /// (the 2h trailing guard applies on top, at the caller).
+    pub watermark: i64,
+    /// The gap hours, when a finished history lane and a late-starting live
+    /// lane leave a hole.
+    pub gap: Option<GapSpan>,
+}
+
+/// The closure of one venue over its lanes: the LAST lane is the live capture,
+/// earlier lanes are the venues-history dumps. A history lane stops holding
+/// the watermark back only when it is explicitly finished (`HistoryStatus`,
+/// never inferred from lane age) AND the live lane's first record is at or
+/// before the history lane's last record (continuous coverage); then the
+/// watermark is the live lane's max. Otherwise the minimum over all lanes'
+/// maxes holds: a stale or unfinished dump caps the venue. A finished history
+/// lane whose live lane starts later leaves a gap (see [`GapSpan`]); the hours
+/// after the gap still seal off the live lane.
+///
+/// # Errors
+///
+/// No lane of the venue carries records.
+pub fn venue_seal(
+    history: &[LaneSpan],
+    live: Option<LaneSpan>,
+    finished: bool,
+) -> Result<VenueSeal, StoreError> {
+    let no_records = || StoreError::Check("venue lanes carry no records".into());
+    let Some(live) = live else {
+        // No live-lane records: the history lanes are all there is, and no
+        // status can replace the coverage a live lane would have to prove.
+        let watermark = history
+            .iter()
+            .map(|span| span.max)
+            .min()
+            .ok_or_else(no_records)?;
+        return Ok(VenueSeal {
+            watermark,
+            gap: None,
+        });
+    };
+    let Some(hist_max) = history.iter().map(|span| span.max).max() else {
+        return Ok(VenueSeal {
+            watermark: live.max,
+            gap: None,
+        });
+    };
+    if finished {
+        let gap = (live.min > hist_max).then(|| GapSpan {
+            from_hour: crate::augment::combined::grid::hour_of_secs(hist_max),
+            to_hour: crate::augment::combined::grid::hour_of_secs(live.min),
+            reason: format!(
+                "history finished at {}, live starts at {}",
+                rfc3339(hist_max),
+                rfc3339(live.min)
+            ),
+        });
+        Ok(VenueSeal {
+            watermark: live.max,
+            gap,
+        })
+    } else {
+        Ok(VenueSeal {
+            watermark: hist_max.min(live.max),
+            gap: None,
+        })
+    }
+}
+
+/// Unix seconds as an RFC 3339 UTC stamp (the epoch second for out-of-range
+/// values, which planned runs never produce).
+#[must_use]
+pub fn rfc3339(secs: i64) -> String {
+    match chrono::DateTime::from_timestamp(secs, 0) {
+        Some(dt) => dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+        None => format!("unix {secs}"),
+    }
+}
+
+/// The venues-history status file: the operator's explicit `finished` source
+/// (`--history-status`), never inferred from lane age. `running: true`, a
+/// missing venue entry, a missing `done` flag and an absent file all mean
+/// "not finished": the dump keeps holding the watermark back.
+#[derive(Clone, Debug)]
+pub struct HistoryStatus {
+    /// The skip-key/receipt fact: `{"sha256": <hex|null>, "done": {venue:
+    /// bool}}`, or `{"sha256": null, "done": null}` when no file was given.
+    pub fact: Value,
+    /// `true` only when the file says `running: false` and the venue's source
+    /// says `done: true`.
+    done: std::collections::BTreeMap<String, bool>,
+}
+
+impl HistoryStatus {
+    /// Whether `venue`'s history dump counts as finished.
+    #[must_use]
+    pub fn finished(&self, venue: &str) -> bool {
+        self.done.get(venue).copied().unwrap_or(false)
+    }
+}
+
+/// Load the operator's `--history-status` file, or the absent-file default
+/// where nothing is finished.
+///
+/// # Errors
+///
+/// The file cannot be read, is not JSON, or lacks the `running` flag.
+pub fn load_history_status(path: Option<&Path>) -> Result<HistoryStatus, StoreError> {
+    let Some(path) = path else {
+        return Ok(HistoryStatus {
+            fact: json!({"sha256": null, "done": null}),
+            done: std::collections::BTreeMap::new(),
+        });
+    };
+    let bytes = std::fs::read(path)
+        .map_err(|error| StoreError::Check(format!("--history-status: cannot read: {error}")))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| StoreError::Check(format!("--history-status: bad JSON: {error}")))?;
+    let running = value["running"].as_bool().ok_or_else(|| {
+        StoreError::Check("--history-status: missing the top-level running flag".into())
+    })?;
+    let mut done = std::collections::BTreeMap::new();
+    if let Some(sources) = value["sources"].as_object() {
+        for (venue, source) in sources {
+            done.insert(venue.to_owned(), source["done"].as_bool().unwrap_or(false));
+        }
+    }
+    if running {
+        // `running: true` means the dump is still in progress: nothing counts
+        // as finished, whatever the per-venue flags say.
+        done.clear();
+    }
+    let mut fact = json!({
+        "sha256": crate::fsutil::sha256_hex(&bytes),
+        "done": {},
+    });
+    for (venue, is_done) in &done {
+        fact["done"][venue.as_str()] = json!(is_done);
+    }
+    Ok(HistoryStatus { fact, done })
+}
+
 /// The facts of one finished run, as `finish_run` records them.
 pub struct RunSummary<'a> {
     /// The unit that ran.
