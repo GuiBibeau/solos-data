@@ -1080,7 +1080,7 @@ const AUGMENT_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "hl-l2book",
-        "Offline l2Book hours to Parquet (no download, no collector): --input <dir> --out <root> --checksums <MANIFEST> [--coins BTC,ETH] [--since YYYYMMDD] [--until YYYYMMDD] [--drop-raw-after-verify] [--reseal YYYYMMDD/H] [--max-ratio 1.0] [--min-free-tb 1.0] [--threads 4] [--memory 8GB]",
+        "Offline l2Book hours to Parquet (no download, no collector): --input <dir> --out <root> --checksums <MANIFEST> [--coins BTC,ETH] [--since YYYYMMDD] [--until YYYYMMDD] [--drop-raw-after-verify] [--reseal YYYYMMDD/H] [--max-ratio 1.0] [--min-free-tb 1.0] [--threads 4] [--memory 8GB]; a raw line that fails to decode quarantines the hour instead of failing the run (exit 3)",
     ),
     (
         "hl-l2book-manifest",
@@ -1304,6 +1304,10 @@ fn hl_l2book_cli(args: &[String]) -> i32 {
                 .with(
                     "out",
                     "train/ and forward/ hour Parquet, receipts/, watermark.json. time_ms >= 1792713600000 is forward"
+                )
+                .with(
+                    "quarantine",
+                    "A raw line that does not decode as an l2Book snapshot quarantines its whole hour: no Parquet, no receipt, no watermark entry, and none of the hour's .lz4 files are dropped (even with --drop-raw-after-verify). Every fault is merged into quarantine.jsonl in the output root (hour, coin, path, raw sha256, line, byte column, error, git sha, detected-at; durable, idempotent on rerun). Other hours still seal, also with --jobs > 1, and the run exits 3 (hoursQuarantined in the JSON report) when any hour was quarantined. Rerunning re-detects the same hour without duplicate entries and still does not seal it; after the raw is repaired (and the manifest updated), the hour seals normally. IO errors, checksum mismatches, and manifest problems still fail the run with exit 1"
                 )
                 .with(
                     "drop",

@@ -2628,3 +2628,432 @@ fn work_one_guard_alone() {
         "the hour Parquet was touched"
     );
 }
+
+/// The 2026-11-02 incident's corruption shape (20251114/11 MEGA line 1303): a valid
+/// 20-level snapshot truncated at byte 480 with a complete later snapshot spliced on right
+/// after it, no newline between them. Every other line of the body parses. Returns the raw
+/// body, the 1-based fault line, and the exact decoder error text and byte column.
+fn incident_body(coin: &str, time_ms: i64) -> (String, u64, String, u64) {
+    const CUT: usize = 480;
+    let first = book(coin, time_ms, 20, "100");
+    assert!(first.len() > CUT, "the fixture line must survive the cut");
+    let mut spliced = first[..CUT].to_owned();
+    spliced.push_str(&book(coin, time_ms + 5_000, 20, "200"));
+    let (error, column) = match serde_json::from_str::<serde_json::Value>(&spliced) {
+        Ok(_) => panic!("the spliced line must not parse"),
+        Err(e) => (
+            format!("json: {e}"),
+            u64::try_from(e.column()).expect("serde column"),
+        ),
+    };
+    let body = lines(&[first, spliced, book(coin, time_ms + 10_000, 1, "300")]);
+    (body, 2, error, column)
+}
+
+/// A line fault like the ones `stream_hour` collects.
+fn line_fault(coin: &str, line: u64, column: Option<u64>) -> super::publish::LineFault {
+    super::publish::LineFault {
+        coin: coin.to_owned(),
+        path: format!("20261022/0/{coin}.lz4"),
+        sha256: "aa".repeat(32),
+        line,
+        column,
+        error: "json: expected , or } at line 1 column 483".to_owned(),
+    }
+}
+
+/// The quarantine rule: a raw line that does not decode quarantines its whole hour: no
+/// Parquet, no receipt, no watermark entry, and none of the hour's raw files dropped even
+/// with --drop-raw-after-verify. The hours before and after it seal normally, at any
+/// job count. The quarantine.jsonl entry is exact, the run exits 3 with the count and an
+/// example in the JSON report, and a rerun re-detects the hour without a duplicate entry.
+/// Mutation: Q1 (skip the bad line and seal), Q2 (drop the quarantined hour's raw), Q3
+/// (seal on quarantine), Q4 (no quarantine record), Q5 (exit 0), Q6 (watermark gains the
+/// hour), Q9 (a quarantine stops the run).
+#[test]
+fn a_malformed_line_quarantines_the_hour_and_the_rest_still_seals() {
+    let root = Tmp::new("quarantine");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("MANIFEST.json");
+    let time = 1_792_627_200_000_i64;
+    let (mega_body, fault_line, fault_error, fault_column) = incident_body("MEGA", time);
+    let mega = write_coin(&input, "20261022", 0, "MEGA", &mega_body);
+    let eth = write_coin(
+        &input,
+        "20261022",
+        0,
+        "ETH",
+        &lines(&[book("ETH", time + 1_000, 1, "2")]),
+    );
+    // One good hour on each side of the bad one.
+    let before = write_coin(
+        &input,
+        "20261021",
+        23,
+        "BTC",
+        &lines(&[book("BTC", time - 3_600_000, 1, "3")]),
+    );
+    let after = write_coin(
+        &input,
+        "20261022",
+        1,
+        "BTC",
+        &lines(&[book("BTC", time + 3_600_000, 1, "4")]),
+    );
+    std::fs::write(
+        &sums,
+        manifest(&[mega.clone(), eth.clone(), before.clone(), after.clone()]),
+    )
+    .unwrap();
+
+    let report = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(
+        report.stop,
+        Stop::Done,
+        "a quarantine does not stop the run"
+    );
+    assert_eq!(report.hours_verified, 2, "both good hours sealed");
+    assert_eq!(report.hours_quarantined, 1);
+    assert_eq!(report.quarantine_entries_added, 1);
+    assert_eq!(report.quarantine_examples.len(), 1);
+    assert_eq!(report.exit_code(), 3);
+    let hour_line = report
+        .hours
+        .iter()
+        .find(|line| line.hour == "20261022/0")
+        .unwrap();
+    assert_eq!(hour_line.status, "quarantined");
+    let json: Value = serde_json::from_str(&report.to_json()).unwrap();
+    assert_eq!(json["hoursQuarantined"], 1);
+    assert_eq!(json["quarantineEntriesAdded"], 1);
+    let example = &json["quarantineExamples"].as_array().unwrap()[0];
+    assert_eq!(example["hour"], "20261022/0");
+    assert_eq!(example["coin"], "MEGA");
+    assert_eq!(example["line"], fault_line);
+    assert_eq!(example["column"], fault_column);
+    assert_eq!(example["error"], fault_error);
+
+    // The hour is not sealed: no Parquet, no receipt, absent from the watermark.
+    assert!(
+        !out.join("train/date=2026-10-22/hour=20261022-0.parquet")
+            .exists(),
+        "the quarantined hour was written"
+    );
+    assert!(!out.join("receipts/20261022/0.json").exists());
+    assert!(!out.join("drops/20261022/0.json").exists());
+    assert_eq!(
+        watermark(&out),
+        vec!["20261021/23".to_owned(), "20261022/1".to_owned()],
+        "the quarantined hour is absent and nothing skips past it"
+    );
+    // The good hours' raw was dropped; none of the quarantined hour's raw was.
+    assert!(!input.join(&before.0).exists());
+    assert!(!input.join(&after.0).exists());
+    assert!(
+        input.join(&mega.0).is_file(),
+        "the bad coin's raw was deleted"
+    );
+    assert!(
+        input.join(&eth.0).is_file(),
+        "the good coin of the hour was deleted"
+    );
+
+    // The durable record names the fault exactly.
+    let recorded = std::fs::read_to_string(out.join("quarantine.jsonl")).unwrap();
+    let entry: Value = serde_json::from_str(recorded.trim()).unwrap();
+    assert_eq!(entry["schema"], super::QUARANTINE_SCHEMA);
+    assert_eq!(entry["hour"], "20261022/0");
+    assert_eq!(entry["coin"], "MEGA");
+    assert_eq!(entry["path"], mega.0.as_str());
+    assert_eq!(entry["sha256"], mega.1.as_str());
+    assert_eq!(entry["line"], fault_line);
+    assert_eq!(entry["column"], fault_column);
+    assert_eq!(entry["error"], fault_error);
+    assert_eq!(entry["git_sha"], GIT);
+    assert!(entry["detected_at"].is_string());
+
+    // A rerun with more workers re-detects the same hour, adds no duplicate entry, still
+    // does not seal it, and still keeps its raw.
+    let file_bytes = std::fs::read(out.join("quarantine.jsonl")).unwrap();
+    let again = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            jobs: 4,
+            ..drop_opts()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap();
+    assert_eq!(again.hours_quarantined, 1, "jobs=4");
+    assert_eq!(again.quarantine_entries_added, 0, "jobs=4");
+    assert_eq!(again.hours_verified, 0, "jobs=4");
+    assert_eq!(
+        again.hours_skipped, 2,
+        "jobs=4: the good hours stay verified"
+    );
+    assert_eq!(again.exit_code(), 3);
+    assert_eq!(
+        std::fs::read(out.join("quarantine.jsonl")).unwrap(),
+        file_bytes,
+        "a duplicate entry appeared on rerun"
+    );
+    assert!(!out.join("receipts/20261022/0.json").exists(), "jobs=4");
+    assert!(input.join(&mega.0).is_file(), "jobs=4");
+    assert_eq!(watermark(&out).len(), 2, "jobs=4");
+
+    // A later run: a new good hour arrives and seals while the quarantine persists. The
+    // watermark is the set of sealed hours: it gains the new hour and never the quarantined
+    // one; nothing computes a "through" hour that would skip past the gap.
+    let later = write_coin(
+        &input,
+        "20261022",
+        2,
+        "BTC",
+        &lines(&[book("BTC", time + 7_200_000, 1, "5")]),
+    );
+    let mut all = manifest_files(&sums);
+    all.push(later);
+    std::fs::write(&sums, manifest(&all)).unwrap();
+    let third = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(third.hours_verified, 1, "the new hour seals");
+    assert_eq!(third.hours_quarantined, 1, "the bad hour stays quarantined");
+    assert_eq!(third.exit_code(), 3);
+    assert_eq!(
+        watermark(&out),
+        vec![
+            "20261021/23".to_owned(),
+            "20261022/1".to_owned(),
+            "20261022/2".to_owned()
+        ],
+        "the watermark gained a quarantined hour"
+    );
+    assert!(!out.join("receipts/20261022/0.json").exists());
+}
+
+/// The manifest's current file list as `(path, sha256, size)` rows.
+fn manifest_files(sums: &Path) -> Vec<(String, String, u64)> {
+    let value: Value = serde_json::from_str(&std::fs::read_to_string(sums).unwrap()).unwrap();
+    value["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| {
+            (
+                file["path"].as_str().unwrap().to_owned(),
+                file["sha256"].as_str().unwrap().to_owned(),
+                file["size"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// A quarantined hour stays quarantined on rerun (no duplicate entry, still unsealed) until
+/// its raw is repaired: with the good file and its manifest row in place, the hour seals
+/// normally and the old quarantine entry stays on file as history.
+#[test]
+fn a_quarantined_hour_seals_once_its_raw_is_replaced() {
+    let root = Tmp::new("quarantine-fix");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("MANIFEST.json");
+    let time = 1_792_627_200_000_i64;
+    let (mega_body, _line, _error, _column) = incident_body("MEGA", time);
+    let mega = write_coin(&input, "20261022", 0, "MEGA", &mega_body);
+    let eth = write_coin(
+        &input,
+        "20261022",
+        0,
+        "ETH",
+        &lines(&[book("ETH", time + 1_000, 1, "2")]),
+    );
+    std::fs::write(&sums, manifest(&[mega.clone(), eth.clone()])).unwrap();
+
+    let first = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(first.hours_quarantined, 1);
+    let record = out.join("quarantine.jsonl");
+    let recorded = std::fs::read(&record).unwrap();
+
+    let again = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(again.hours_quarantined, 1);
+    assert_eq!(again.quarantine_entries_added, 0, "no duplicate entry");
+    assert_eq!(std::fs::read(&record).unwrap(), recorded);
+    assert!(!out.join("receipts/20261022/0.json").exists());
+    assert!(watermark(&out).is_empty());
+
+    // Repair: a good MEGA file and its manifest row. The hour seals; the quarantine entry
+    // stays as history of what was found in the old bytes.
+    let fixed = write_coin(
+        &input,
+        "20261022",
+        0,
+        "MEGA",
+        &lines(&[book("MEGA", time, 20, "100")]),
+    );
+    std::fs::write(&sums, manifest(&[fixed, eth.clone()])).unwrap();
+    let sealed = run_with(&input, &out, &sums, drop_opts(), |_| Ok(u64::MAX)).unwrap();
+    assert_eq!(sealed.stop, Stop::Done);
+    assert_eq!(sealed.hours_verified, 1);
+    assert_eq!(sealed.hours_quarantined, 0);
+    assert_eq!(sealed.exit_code(), 0);
+    assert_eq!(watermark(&out), vec!["20261022/0".to_owned()]);
+    assert!(out.join("receipts/20261022/0.json").is_file());
+    assert_eq!(
+        std::fs::read(&record).unwrap(),
+        recorded,
+        "the entry was rewritten when the hour sealed"
+    );
+    assert!(
+        !input.join("20261022/0/MEGA.lz4").exists(),
+        "the repaired raw was dropped"
+    );
+}
+
+/// Only a line that fails to decode quarantines. A file that is not an lz4 frame, and a
+/// size-matched file whose sha256 does not match the manifest, still fail the whole run,
+/// write no quarantine entry, and move no watermark. Mutants: Q7 (any error quarantines).
+#[test]
+fn only_line_parse_errors_quarantine_other_errors_still_fail() {
+    // A frame error: the bytes are on disk at the manifest size and digest, but not lz4.
+    let root = Tmp::new("quarantine-frame");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("MANIFEST.json");
+    let bytes = b"this is not an lz4 frame".to_vec();
+    std::fs::create_dir_all(input.join("20261022/0")).unwrap();
+    std::fs::write(input.join("20261022/0/MEGA.lz4"), &bytes).unwrap();
+    let listed = (
+        "20261022/0/MEGA.lz4".to_owned(),
+        crate::fsutil::sha256_hex(&bytes),
+        u64::try_from(bytes.len()).unwrap(),
+    );
+    std::fs::write(&sums, manifest(&[listed])).unwrap();
+    let error = run_ok(&input, &out, &sums).unwrap_err();
+    assert!(error.to_string().contains("not an lz4 frame"), "{error}");
+    assert!(
+        !out.join("quarantine.jsonl").exists(),
+        "frame error quarantined"
+    );
+    assert!(watermark(&out).is_empty());
+
+    // A checksum mismatch: same size on disk, wrong digest in the manifest.
+    let root = Tmp::new("quarantine-sha");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("MANIFEST.json");
+    let file = write_coin(
+        &input,
+        "20261022",
+        0,
+        "MEGA",
+        &book("MEGA", 1_792_627_200_000, 1, "1"),
+    );
+    let lied = (file.0, "bb".repeat(32), file.2);
+    std::fs::write(&sums, manifest(&[lied])).unwrap();
+    let error = run_ok(&input, &out, &sums).unwrap_err();
+    assert!(error.to_string().contains("sha256"), "{error}");
+    assert!(
+        !out.join("quarantine.jsonl").exists(),
+        "sha mismatch quarantined"
+    );
+    assert!(watermark(&out).is_empty());
+}
+
+/// The quarantine record merges like the drop record: an entry re-detected on a rerun keeps
+/// the original file line (same detected_at), entries of different hours sort by hour, and
+/// a foreign-schema or unparsable record is an error, never an overwrite.
+#[test]
+fn quarantine_file_merges_idempotently_and_refuses_foreign_records() {
+    let root = Tmp::new("quarantine-file");
+    let out = root.0.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let record = out.join("quarantine.jsonl");
+
+    let (added, examples) = super::batch::write_quarantine(
+        &out,
+        "20261022/0",
+        &[line_fault("MEGA", 1303, Some(483))],
+        GIT,
+    )
+    .unwrap();
+    assert_eq!(added, 1);
+    assert_eq!(examples.len(), 1);
+    let (added, _) =
+        super::batch::write_quarantine(&out, "20261021/23", &[line_fault("BTC", 5, None)], GIT)
+            .unwrap();
+    assert_eq!(added, 1, "another hour adds its entry");
+
+    let before = std::fs::read_to_string(&record).unwrap();
+    let hour_line = before
+        .lines()
+        .find(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["hour"]
+                .as_str()
+                .map(str::to_owned)
+                .as_deref()
+                == Some("20261022/0")
+        })
+        .unwrap()
+        .to_owned();
+    let first_entry: Value = serde_json::from_str(&hour_line).unwrap();
+    // Sorted by hour: the earlier hour's entry comes first.
+    assert_eq!(first_entry["hour"], "20261022/0");
+    assert!(before.lines().next().unwrap().contains("20261021/23"));
+    assert_eq!(before.lines().count(), 2);
+
+    // Rerun: both hours re-detect, nothing is added, the file keeps its exact bytes.
+    let (added, examples) = super::batch::write_quarantine(
+        &out,
+        "20261022/0",
+        &[line_fault("MEGA", 1303, Some(483))],
+        GIT,
+    )
+    .unwrap();
+    assert_eq!(added, 0);
+    assert_eq!(examples.len(), 1, "the hour's existing entry comes back");
+    assert_eq!(
+        examples[0].detected_at,
+        first_entry["detected_at"].as_str().unwrap()
+    );
+    assert_eq!(std::fs::read_to_string(&record).unwrap(), before);
+
+    // A second fault in an already-recorded hour does add an entry.
+    let (added, _) = super::batch::write_quarantine(
+        &out,
+        "20261022/0",
+        &[line_fault("MEGA", 2000, Some(17))],
+        GIT,
+    )
+    .unwrap();
+    assert_eq!(added, 1);
+    assert_eq!(std::fs::read_to_string(&record).unwrap().lines().count(), 3);
+
+    // A foreign schema, and an unparsable line, are errors that change nothing.
+    for (label, body) in [
+        (
+            "schema",
+            json!({"schema": "hl-l2book-quarantine-v2", "hour": "20261022/0"}).to_string(),
+        ),
+        ("garbage", "not json".to_owned()),
+    ] {
+        std::fs::write(&record, &body).unwrap();
+        let error = super::batch::write_quarantine(
+            &out,
+            "20261022/0",
+            &[line_fault("MEGA", 1303, Some(483))],
+            GIT,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("quarantine.jsonl"),
+            "{label}: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&record).unwrap(),
+            body,
+            "{label}: the record was replaced"
+        );
+    }
+}

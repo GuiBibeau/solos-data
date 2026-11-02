@@ -88,6 +88,59 @@ only while the raw is on disk (otherwise the hour goes Partial and fails at
 `batch.rs:555`), and it leaves `stale_paths` no receipt to clean old
 outputs with, so do not do that.
 
+## Quarantine: a raw line that does not decode
+
+Found in production. The live batch-01 run exited 1 at 2026-11-02 10:18 UTC with
+`20251114/11: MEGA line 1303: json: expected , or } at line 1 column 483`. Diagnosis,
+read-only: the raw file `market_data/20251114/11/l2Book/MEGA.lz4` (283,377 B) matches the
+MANIFEST sha256 `81ce31ed…9dde1` and the S3 listing md5/ETag `113b3008…d9ad677e3`, so the
+bytes are upstream data as published, not a download fault. Decompressed: 8,277,841 B,
+5,248 lines. Line 1303 (2,061 B) is a record from 11:15:17.445 truncated at byte 480, with
+a complete record from 11:21:59.289 spliced on right after it (no newline); every other
+line parses; line 1302 is 11:15:16.88 and line 1304 is 11:22:03.71. Real corruption in
+the source.
+
+A corrupt hour must not stop a run with thousands of good hours behind it (the old
+follow-up "one refused hour aborts the whole run", for this failure mode). The rule now:
+
+- A raw line that fails to decode as an `l2Book` snapshot (`count_snapshot` /
+  `snapshot_of_line`: JSON syntax, shape, or field errors of one line) quarantines the
+  WHOLE hour. The hour is not sealed: no Parquet, no receipt, no watermark entry, and
+  none of that hour's raw files is dropped, even under `--drop-raw-after-verify` (a
+  drop would make the fault unrepairable in this root).
+- Every fault is merged into `quarantine.jsonl` in the output root: hour, coin, path,
+  raw sha256, 1-based line number, JSON byte column (`null` for shape/field errors),
+  error text, git sha of the detecting binary, detected-at UTC. Durable write (`.tmp`,
+  fsync, rename, directory fsync). A rerun re-detects the same hour and merges into the
+  existing entry (same hour, coin, path, sha256, line, column, error): no duplicate
+  entries, the original detected-at survives. A foreign-schema or unparsable record is
+  an error, never an overwrite.
+- The watermark is the set of sealed hours; a quarantined hour is simply absent from it.
+  Nothing in the codebase computes a contiguous "through" hour from the watermark, so
+  nothing skips past the gap; readers must keep treating the set that way (an absent
+  hour is pending or quarantined, never sealed). Hours after it in the same run seal and
+  appear normally.
+- Other hours continue and seal normally, also with `--jobs > 1`: detection happens in
+  the worker, the quarantine record is written by the commit loop in hour order.
+- The run finishes all other hours and then exits 3 (`QUARANTINE_EXIT`; `0` done and
+  `2` disk floor keep their meanings, a quarantine wins over the floor). The JSON report
+  carries `hoursQuarantined`, `quarantineEntriesAdded`, and `quarantineExamples` (at
+  most 8).
+- Only line decode errors quarantine. IO errors, lz4 frame errors, checksum mismatches,
+  and manifest problems still fail the run with exit 1, as before. A line that decodes
+  but trips a count or sample check is still fatal: those guards verify the writer,
+  not the source.
+
+Repair: put the coin's raw back at its manifest sha256, update the manifest row, and
+rerun; the hour seals normally and the old quarantine entry stays on file as history.
+Resuming the interrupted batch-01 run needs the same root, the same `--coins`, and the
+same MANIFEST per the operating rules above; not done here.
+
+The tests build the incident's shape: a valid line truncated at byte 480 with a complete
+valid record spliced on. The mutant patches Q1..Q9 pin the rule red (skip-line, raw drop
+on a quarantined hour, seal on quarantine, missing record, exit 0, watermark gain,
+any-error quarantine, blind append, run stops).
+
 ## Coin-batch roots
 
 Convert in coin batches into separate output roots. This is the official
@@ -169,7 +222,8 @@ the listing time as possibly incomplete.
 - [ ] One refused hour aborts the whole run: in a jobs=4 probe, 3 valid
   hours were never sealed, and every rerun stops at the refused hour.
   Consider a pending-refused status that lets other hours seal and exits 1
-  at the end.
+  at the end. Done for line-decode faults by the quarantine rule above
+  (other hours seal, exit 3); the superset guard refusal still aborts.
 - [x] Tests added in #104: `drop_record_wrong_schema_is_refused`,
   `drop_record_durable_write_fault`, and `work_one_guard_alone` (the
   `work_one` guard is covered on its own).
@@ -181,3 +235,7 @@ the listing time as possibly incomplete.
   hour, which is misleading: normalize the hour or reject non-canonical forms.
 - [ ] The `--reseal` receipt-readable check and the missing-manifest-row check
   have no tests yet.
+- [x] Quarantine rule: a raw line that does not decode quarantines its hour
+  (no seal, no raw drop, a durable idempotent `quarantine.jsonl` entry,
+  other hours seal, exit 3), with the 2026-11-02 20251114/11 MEGA incident
+  numbers, the incident-shaped fixture tests, and the Q1..Q9 mutants.
