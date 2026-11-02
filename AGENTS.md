@@ -14,6 +14,13 @@ range checks. Never seal partitions without all required independent checks.
 Record engineering decisions in docs/adr and unfinished acceptance criteria in
 docs/issues. Keep modules small and test failure/restart behavior with fixtures.
 
+Every data or logic PR's evidence lists the mutants tried: name, file:line,
+and the test that went red; all must be red, and a surviving mutant is fixed
+with a new test or justified in the PR. Acceptance includes a real-data or
+real-shape sample check, not only fixtures, and states the store path and the
+numbers (rows, counts) it saw. Logic shared across units lives in one helper
+with one fixture, not copied per unit.
+
 ## Verify
 
 `scripts/cloud-setup.sh` installs the pinned toolchain, g++, the archive
