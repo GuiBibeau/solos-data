@@ -732,7 +732,11 @@ fn the_lockbox_week_is_dropped_from_the_range() {
     let conn = memory_connection("1", "512MB").unwrap();
     let root = tmp.dir().join("decoded-lockbox");
     let (lockbox, lockbox_sha, fix) = lockbox_fixture(tmp.dir());
-    let inside = fix.mid_hour();
+    // Twelve hours into the mid hour, so the covered span starts mid-day: the
+    // requested range (which clips at the day start) and the covered span
+    // (which clips at the file span) then disagree under a range-based drop
+    // count.
+    let inside = fix.mid_hour() + 12;
     let after = fix.hour_after();
     let inside_day = grid::date_of_hour(inside);
     let after_day = grid::date_of_hour(after);
@@ -2663,7 +2667,11 @@ fn solana_perp_ret_is_identical_across_thread_counts() {
 fn solana_perp_lockbox_hours_are_read_but_never_written() {
     let tmp = Tmp::new("perp-lockbox");
     let (lockbox, lockbox_sha, fix) = lockbox_fixture(tmp.dir());
-    let inside = fix.mid_hour();
+    // Twelve hours into the mid hour, so the covered span starts mid-day: the
+    // requested range (which clips at the day start) and the covered span
+    // (which clips at the file span) then disagree under a range-based drop
+    // count.
+    let inside = fix.mid_hour() + 12;
     let after = fix.hour_after();
     let inside_day = grid::date_of_hour(inside);
     let after_day = grid::date_of_hour(after);
@@ -2983,7 +2991,11 @@ fn pyth_later_lane_then_later_at_ms_wins() {
 fn pyth_lockbox_hours_are_read_but_never_written() {
     let tmp = Tmp::new("pyth-lockbox");
     let (lockbox, lockbox_sha, fix) = lockbox_fixture(tmp.dir());
-    let inside = fix.mid_hour();
+    // Twelve hours into the mid hour, so the covered span starts mid-day: the
+    // requested range (which clips at the day start) and the covered span
+    // (which clips at the file span) then disagree under a range-based drop
+    // count.
+    let inside = fix.mid_hour() + 12;
     let after = fix.hour_after();
     let inside_day = grid::date_of_hour(inside);
     let after_day = grid::date_of_hour(after);
