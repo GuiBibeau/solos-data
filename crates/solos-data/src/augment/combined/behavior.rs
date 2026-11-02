@@ -912,6 +912,82 @@ fn the_phoenix_price_window_excludes_out_of_window_fills() {
     );
 }
 
+/// The shared lockbox fixture with real data inside it: a Phoenix fill on a
+/// lockbox day (the fixture's mid hour) stays invisible to the universe span
+/// and the price map, and is counted in `lockbox_hours_dropped`. This is the
+/// U1 path of the fixture every U2 unit's tests reuse (`combined::testfix`).
+#[test]
+fn a_fill_inside_the_lockbox_is_excluded_and_counted() {
+    let tmp = Tmp::new("testfix");
+    let fix = super::testfix::v2_lockbox(tmp.dir());
+    let conn = memory_connection("1", "512MB").unwrap();
+    let phoenix = tmp.dir().join("phoenix-fills");
+    std::fs::create_dir_all(&phoenix).unwrap();
+    let path = phoenix.join("fills.parquet");
+    let check_day = super::grid::day_start_secs(super::grid::parse_date("2026-10-15").unwrap());
+    // SOL fills on the check day and on the lockbox day; LOCKED fills only on
+    // the lockbox day (same mid hour), so it is lockbox-only.
+    conn.execute_batch(&format!(
+        "COPY (
+            SELECT 'SOL' AS asset_symbol, {} AS block_time, 10_000 AS price_ticks,
+                   100 AS tick_size, 2 AS base_lot_decimals, 6 AS quote_lot_decimals, 45 AS asset_id
+            UNION ALL
+            SELECT 'SOL', {}, 11_100, 100, 2, 6, 45
+            UNION ALL
+            SELECT 'LOCKED', {}, 6_100, 100, 2, 6, 77
+        ) TO {} (FORMAT PARQUET)",
+        check_day + 120,
+        fix.secs(fix.mid_hour()) + 120,
+        fix.secs(fix.mid_hour()) + 121,
+        sql_string(&path.to_string_lossy())
+    ))
+    .unwrap();
+    let files = super::mapping::walk_parquet(&phoenix).unwrap();
+    let scan = super::mapping::scan_phoenix(
+        &conn,
+        &phoenix,
+        &files,
+        &[super::grid::parse_date("2026-10-15").unwrap()],
+        &fix.ranges,
+    )
+    .unwrap();
+    // The lockbox fill is invisible: SOL's span starts on the check day, and
+    // LOCKED, whose every fill sits inside the lockbox, is lockbox-only.
+    assert_eq!(scan.universe["SOL"].first_ts, check_day + 120);
+    assert!(!scan.universe.contains_key("LOCKED"));
+    assert_eq!(scan.lockbox_only_symbols, 1);
+    // And counted: exactly one distinct covered hour dropped.
+    assert_eq!(scan.lockbox_hours_dropped, 1);
+    // The shared no-rows-in-lockbox asserts, over a kept table and over a
+    // sealed parquet of the kept rows (the U2 units' output shape).
+    conn.execute_batch(&format!(
+        "CREATE TABLE kept AS SELECT * FROM read_parquet({}) WHERE (block_time // 3600) <> {}",
+        sql_string(&path.to_string_lossy()),
+        fix.mid_hour()
+    ))
+    .unwrap();
+    super::testfix::assert_no_rows_in_lockbox(
+        &conn,
+        "kept",
+        "block_time",
+        super::testfix::TsUnit::Secs,
+        &fix.hours,
+    );
+    let sealed = tmp.dir().join("sealed.parquet");
+    conn.execute_batch(&format!(
+        "COPY (SELECT * FROM kept) TO {} (FORMAT PARQUET)",
+        sql_string(&sealed.to_string_lossy())
+    ))
+    .unwrap();
+    super::testfix::assert_no_parquet_rows_in_lockbox(
+        &conn,
+        &sealed,
+        "block_time",
+        super::testfix::TsUnit::Secs,
+        &fix.hours,
+    );
+}
+
 #[test]
 fn a_failed_output_write_leaves_no_receipt() {
     let tmp = Tmp::new("fsync-assets");
