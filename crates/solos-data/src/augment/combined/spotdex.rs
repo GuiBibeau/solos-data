@@ -390,7 +390,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             "no closed hour in the requested range".into(),
         ));
     }
-    // U1's definition (ADR-0023): input hours the lockbox actually removes —
+    // U1's definition (ADR-0023): input hours the lockbox actually removes:
     // hours the swap inputs cover that fall inside the exclusion set, over the
     // whole input span, not the requested range.
     let lockbox_hours_dropped = lockbox_hours
