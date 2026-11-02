@@ -13,6 +13,9 @@ pub mod grid;
 pub mod lockbox;
 pub mod mapping;
 pub mod receipt;
+pub mod seal;
 
 #[cfg(test)]
 mod behavior;
+#[cfg(test)]
+mod testfix;
