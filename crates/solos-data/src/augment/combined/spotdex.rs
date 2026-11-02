@@ -343,7 +343,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         return Err(StoreError::Check("--until is before --since".into()));
     }
     let started = grid::now_rfc3339();
-    let provenance = load_provenance(request.provenance)?;
+    // The shared provenance loader (mapping.rs), same rules for every unit.
+    let provenance = mapping::load_provenance(request.provenance)?;
     let checked_lockbox_sha = request.lockbox_sha256.trim().to_ascii_lowercase();
     let lock = lockbox::load(request.lockbox, &checked_lockbox_sha)?;
     let lockbox_hours = lock.excluded_hours()?;
@@ -1969,20 +1970,6 @@ fn parse_memory_cap(text: &str) -> Result<String, StoreError> {
         return Err(StoreError::Check("--memory must be at most 32GB".into()));
     }
     Ok(limit)
-}
-
-/// The provenance object is required and must be a JSON object.
-fn load_provenance(path: &Path) -> Result<Value, StoreError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| StoreError::Check(format!("--provenance: cannot read: {error}")))?;
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|error| StoreError::Check(format!("--provenance: bad JSON: {error}")))?;
-    if !value.is_object() {
-        return Err(StoreError::Check(
-            "--provenance must be a JSON object".into(),
-        ));
-    }
-    Ok(value)
 }
 
 // ---------------------------------------------------------------------------

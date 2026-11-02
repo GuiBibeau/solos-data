@@ -1522,6 +1522,9 @@ pub(crate) fn combined_hl_hours_run(args: &[String]) -> Result<i32, StoreError> 
         git_sha: crate::augment::hlfills::git_sha(),
     };
     let report = crate::augment::combined::hlhours::run(&request)?;
+    println!("{}", report.to_json());
+    Ok(report.exit_code())
+}
 
 fn combined_spotdex_run(args: &[String]) -> Result<i32, StoreError> {
     let pyth_prices: Vec<PathBuf> = required_flag(args, "--pyth-prices")?
