@@ -4491,4 +4491,15 @@ fn a_differently_spelled_out_root_still_skips_the_sealed_hours() {
     assert_eq!(written, 0);
     assert_eq!(skipped, 3);
     assert_eq!(shas_first, shas_fourth);
+
+    // And via a symlink to the store: a rerun through the link skips every
+    // hour with unchanged bytes (B-CANON joins the sealed path onto the
+    // canonicalized root instead of the raw link root the check receives,
+    // which breaks exactly this).
+    let link = tmp.dir().join("store-link");
+    std::os::unix::fs::symlink(&store, &link).unwrap();
+    let (written, skipped, shas_fifth) = run(&link);
+    assert_eq!(written, 0);
+    assert_eq!(skipped, 3);
+    assert_eq!(shas_first, shas_fifth);
 }
