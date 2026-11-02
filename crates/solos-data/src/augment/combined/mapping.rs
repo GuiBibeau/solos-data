@@ -362,18 +362,31 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     if config.pyth.feeds.is_empty() {
         return Err(StoreError::Check("venues config has no pyth feeds".into()));
     }
-    // Input hours the lockbox actually dropped: hours each input covers that
-    // fall inside the exclusion set, through the shared seal definition.
-    // HL is exact (watermark hours); Phoenix and Pyth count distinct covered
-    // hours inside the set. The widest input defines the store-wide drop; the
-    // set's own size is recorded separately.
-    let hl_dropped = seal::lockbox_hours_dropped(
+    // Input hours the lockbox actually dropped, through the shared seal
+    // definition (ADR-0023: one computation, every unit routes through it):
+    // each venue's covered-hour set is the hours it covered that fall inside
+    // the exclusion set. HL is exact (watermark hours); Phoenix collects the
+    // distinct covered fill hours; Pyth unions the distinct covered publish
+    // hours over all given directories. The store-wide number is the union of
+    // the venues' sets (never a max, which would undercount when venues
+    // cover different lockbox hours); the set's own size is recorded
+    // separately.
+    let hl_dropped = seal::lockbox_dropped_hours(
         hl.hours.iter().filter_map(|key| watermark_unix_hour(key)),
         &lockbox_hours,
     );
-    let lockbox_hours_dropped = hl_dropped
-        .max(phoenix.lockbox_hours_dropped)
-        .max(pyth.lockbox_hours_dropped);
+    let phoenix_dropped = seal::lockbox_dropped_hours(
+        phoenix.lockbox_dropped_hours.iter().copied(),
+        &lockbox_hours,
+    );
+    let pyth_dropped =
+        seal::lockbox_dropped_hours(pyth.lockbox_dropped_hours.iter().copied(), &lockbox_hours);
+    let store_dropped: BTreeSet<i64> = hl_dropped
+        .union(&phoenix_dropped)
+        .copied()
+        .chain(pyth_dropped.iter().copied())
+        .collect();
+    let lockbox_hours_dropped = store_dropped.len() as u64;
     let lockbox_hours_excluded = lockbox_hours.len() as u64;
     // Symbols the lockbox removed entirely, per venue: they have no row in any
     // output table, so without this count they would vanish unaccounted.
@@ -413,9 +426,9 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         &pyth_files,
         request,
         DroppedHours {
-            hl: hl_dropped,
-            phoenix: phoenix.lockbox_hours_dropped,
-            pyth: pyth.lockbox_hours_dropped,
+            hl: hl_dropped.len() as u64,
+            phoenix: phoenix_dropped.len() as u64,
+            pyth: pyth_dropped.len() as u64,
         },
         &lockbox_only_symbols,
     );
@@ -1027,8 +1040,10 @@ pub(crate) struct PhoenixInput {
     /// asset symbol, Phoenix numeric market id when every fill agrees.
     market_id: BTreeMap<String, Option<String>>,
     pub(crate) prices: BTreeMap<String, BTreeMap<i64, f64>>,
-    /// Distinct fill hours inside the lockbox that this input drops.
-    pub(crate) lockbox_hours_dropped: u64,
+    /// Covered fill hours inside the lockbox, distinct: the input the lockbox
+    /// drops from this input, before `seal::lockbox_dropped_hours` intersects
+    /// them with the exclusion set.
+    pub(crate) lockbox_dropped_hours: BTreeSet<i64>,
     /// Assets whose every fill sits inside the lockbox hours.
     pub(crate) lockbox_only_symbols: u64,
 }
@@ -1080,19 +1095,21 @@ pub(crate) fn scan_phoenix(
         );
         market_id.insert(symbol, id);
     }
-    // Distinct hours with fills that the lockbox drops from this input.
+    // Covered hours with fills inside the lockbox ranges: the raw hour set
+    // `run` intersects with the exclusion set through `seal::lockbox_dropped_hours`.
+    // The hour bucket is `floor(block_time / 3600)`, the store's hour grid.
     let dropped_rows = query_rows(
         conn,
         &format!(
-            "SELECT count(DISTINCT (block_time // 3600)) AS dropped
+            "SELECT DISTINCT (block_time // 3600) AS hour
              FROM {table} WHERE NOT ({free}) AND block_time IS NOT NULL"
         ),
         &[],
     )?;
-    let lockbox_hours_dropped = dropped_rows
-        .first()
-        .and_then(|row| row.int("dropped"))
-        .unwrap_or(0) as u64;
+    let lockbox_dropped_hours = dropped_rows
+        .iter()
+        .filter_map(|row| row.int("hour"))
+        .collect::<BTreeSet<i64>>();
     let first_day = grid::day_start_secs(check_days[0]);
     let last_day = grid::day_start_secs(check_days[check_days.len() - 1]) + 86_400;
     let price_expression = "price_ticks::DOUBLE * tick_size::DOUBLE
@@ -1113,7 +1130,7 @@ pub(crate) fn scan_phoenix(
         universe,
         market_id,
         prices,
-        lockbox_hours_dropped,
+        lockbox_dropped_hours,
         lockbox_only_symbols,
     })
 }
@@ -1152,8 +1169,10 @@ fn scan_asset_contexts(
 /// Pyth price history across all given directories, merged per feed symbol.
 struct PythInput {
     universe: BTreeMap<String, Universe>,
-    /// Distinct publish hours inside the lockbox that this input drops.
-    lockbox_hours_dropped: u64,
+    /// Covered publish hours inside the lockbox, distinct over all
+    /// directories: the input `seal::lockbox_dropped_hours` intersects with
+    /// the exclusion set for this venue.
+    lockbox_dropped_hours: BTreeSet<i64>,
     /// Feeds whose every publish sits inside the lockbox hours, merged over
     /// all directories.
     lockbox_only_symbols: u64,
@@ -1224,11 +1243,12 @@ fn scan_pyth(
         .iter()
         .filter(|feed| !universe.contains_key(*feed))
         .count() as u64;
-    // Distinct publish hours inside the lockbox: the MAX across directories,
-    // not their union, so it can undercount when the directories cover
-    // different lockbox hours (each directory is counted on its own, and only
-    // the widest number survives).
-    let mut lockbox_hours_dropped = 0u64;
+    // Covered publish hours inside the lockbox, as the union over all
+    // directories (never a max across them: directories can cover different
+    // lockbox hours). `run` intersects the union with the exclusion set
+    // through `seal::lockbox_dropped_hours`. The hour bucket is
+    // `floor(publish_time / 3600)`, the store's hour grid.
+    let mut lockbox_dropped_hours = BTreeSet::new();
     for dir in dirs {
         let root_files = walk_parquet(dir)?;
         if root_files.is_empty() {
@@ -1238,23 +1258,18 @@ fn scan_pyth(
         let dropped_rows = query_rows(
             conn,
             &format!(
-                "SELECT count(DISTINCT (publish_time // 3600)) AS dropped
+                "SELECT DISTINCT (publish_time // 3600) AS hour
                  FROM {table} WHERE NOT ({free}) AND publish_time IS NOT NULL"
             ),
             &[],
         )?;
-        lockbox_hours_dropped = lockbox_hours_dropped.max(
-            dropped_rows
-                .first()
-                .and_then(|row| row.int("dropped"))
-                .unwrap_or(0) as u64,
-        );
+        lockbox_dropped_hours.extend(dropped_rows.iter().filter_map(|row| row.int("hour")));
     }
     Ok((
         all,
         PythInput {
             universe,
-            lockbox_hours_dropped,
+            lockbox_dropped_hours,
             lockbox_only_symbols,
         },
     ))

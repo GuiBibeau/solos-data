@@ -6,10 +6,18 @@
 //!
 //! 1. the hour's receipt parses and carries a `skipKey` equal to the current
 //!    run's [`SkipKey`] field for field (unit, unit version, config sha256,
-//!    lockbox sha256, inputs sha256),
+//!    lockbox sha256, inputs sha256); every field must be present, a receipt
+//!    missing one rebuilds,
 //! 2. the receipt's stored inputs still hash to its stored `inputsSha256`, so
 //!    the receipt itself was not edited after the fact,
-//! 3. the sealed file still exists and its streamed sha256 (via the shared
+//! 3. the receipt names exactly one sealed output (a singular `output`, or an
+//!    `outputs` array holding exactly one entry): a multi-output receipt
+//!    never skips, because a changed extra entry could hide behind the first,
+//! 4. the receipt output's `path` is the file `check` was pointed at: the
+//!    path stored in the receipt, taken relative to the store root, equals
+//!    `sealed_path` relative to that same root, so a receipt for one file can
+//!    never skip a different file with identical bytes,
+//! 5. the sealed file still exists and its streamed sha256 (via the shared
 //!    [`crate::fsutil::file_hash`]) equals the receipt's output sha256.
 //!
 //! Every other outcome, including a missing or garbled receipt, is a rebuild:
@@ -23,7 +31,7 @@
 use crate::store::StoreError;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Component, Path};
 
 /// Every input fact that can change one hour's output bytes, in the exact
 /// shape the caller decides: source file facts (names and shas), the mapping
@@ -113,15 +121,21 @@ pub enum Decision {
     },
 }
 
-/// The idempotent skip decision for one hour, per the module doc. Missing or
-/// garbled receipts are [`Decision::Rebuild`], never an error; the `Result`
-/// exists so a unit's `run` can `?` the call like its other checks.
+/// The idempotent skip decision for one hour, per the module doc. `root` is
+/// the combined store root the hour receipt and the sealed file live under:
+/// the receipt's output `path` (stored relative to that root, the shape
+/// `receipt::OutputFile` and every hour receipt write) is compared against
+/// `sealed_path` relative to the same root, so a receipt is bound to its own
+/// file, not just to its bytes. Missing or garbled receipts are
+/// [`Decision::Rebuild`], never an error; the `Result` exists so a unit's
+/// `run` can `?` the call like its other checks.
 ///
 /// # Errors
 ///
 /// Never in practice: every decision failure, including unreadable paths, is
 /// reported as [`Decision::Rebuild`] with the reason in its text.
 pub fn check(
+    root: &Path,
     hour_receipt_path: &Path,
     sealed_path: &Path,
     key: &SkipKey,
@@ -169,6 +183,49 @@ pub fn check(
             reason: "stored inputs do not hash to skipKey.inputsSha256".into(),
         });
     }
+    // Exactly one sealed output, and it must be the file this decision is
+    // about: a receipt naming several outputs can hide a changed extra entry
+    // behind outputs[0], and a receipt for another file with identical bytes
+    // must not skip this one.
+    let singular = receipt.get("output");
+    let plural = receipt.get("outputs").and_then(Value::as_array);
+    let output = match (singular, plural) {
+        (Some(_), Some(_)) => {
+            return Ok(Decision::Rebuild {
+                reason: "receipt names both output and outputs".into(),
+            });
+        }
+        (Some(output), None) => Some(output),
+        (None, Some(outputs)) if outputs.len() == 1 => outputs.first(),
+        (None, Some(outputs)) => {
+            return Ok(Decision::Rebuild {
+                reason: format!("receipt has {} outputs, not exactly one", outputs.len()),
+            });
+        }
+        (None, None) => None,
+    };
+    let Some(output) = output else {
+        return Ok(Decision::Rebuild {
+            reason: "receipt has no sealed output entry".into(),
+        });
+    };
+    let Some(receipt_path) = output.get("path").and_then(Value::as_str) else {
+        return Ok(Decision::Rebuild {
+            reason: "receipt's sealed output entry has no path".into(),
+        });
+    };
+    let sealed_relative = sealed_path.strip_prefix(root).ok().and_then(clean_relative);
+    let stored_relative = clean_relative(Path::new(receipt_path));
+    let Some((sealed_relative, stored_relative)) = sealed_relative.zip(stored_relative) else {
+        return Ok(Decision::Rebuild {
+            reason: "sealed file is not a clean path under the store root".into(),
+        });
+    };
+    if sealed_relative != stored_relative {
+        return Ok(Decision::Rebuild {
+            reason: format!("receipt names {stored_relative}, asked to verify {sealed_relative}"),
+        });
+    }
     if !sealed_path.is_file() {
         return Ok(Decision::Rebuild {
             reason: "sealed file is missing".into(),
@@ -181,16 +238,6 @@ pub fn check(
                 reason: format!("sealed file unreadable: {error}"),
             });
         }
-    };
-    let output = receipt
-        .get("outputs")
-        .and_then(Value::as_array)
-        .and_then(|outputs| outputs.first())
-        .or_else(|| receipt.get("output"));
-    let Some(output) = output else {
-        return Ok(Decision::Rebuild {
-            reason: "receipt has no sealed output entry".into(),
-        });
     };
     let rows = output.get("rows").and_then(Value::as_u64);
     let bytes = output.get("bytes").and_then(Value::as_u64);
@@ -233,12 +280,34 @@ fn first_changed_field(stored: &Value, key: &SkipKey) -> Option<&'static str> {
     None
 }
 
-/// `true` when `stored[field]` is the hex string `ours`, case-insensitively.
+/// `true` when `stored[field]` is present and is the hex string `ours`:
+/// trimmed on the receipt side (the key's side is trimmed in
+/// [`SkipKey::new`]) and compared case-insensitively, so an edited receipt
+/// with other casing or stray whitespace still matches, while a missing or
+/// non-string field never does.
 fn hex_field_is(stored: &Value, field: &str, ours: &str) -> bool {
     stored
         .get(field)
         .and_then(Value::as_str)
-        .is_some_and(|text| text.eq_ignore_ascii_case(ours))
+        .is_some_and(|text| text.trim().eq_ignore_ascii_case(ours))
+}
+
+/// The canonical `/`-joined text of a relative path: plain component names
+/// only (`.`, `..`, roots and prefixes refuse), so the receipt's stored path
+/// and the verified file's path compare component for component, never by a
+/// string suffix.
+fn clean_relative(path: &Path) -> Option<String> {
+    let mut joined = String::new();
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        if !joined.is_empty() {
+            joined.push('/');
+        }
+        joined.push_str(&name.to_string_lossy());
+    }
+    Some(joined)
 }
 
 /// The receipt's two lockbox counts, in the one definition ADR-0023
@@ -269,6 +338,22 @@ pub fn lockbox_drops(
     }
 }
 
+/// The covered hours inside the exclusion set, as the set itself: the hours
+/// the inputs covered that the lockbox removes (see [`LockboxDrops`] for the
+/// exact definition, and `receipt::Receipt::lockbox_hours_dropped` for where
+/// the number lands). Every venue's dropped-hour set runs through here, so a
+/// store-wide number can be built as the union of the venues' sets without a
+/// second definition of "inside the lockbox".
+pub fn lockbox_dropped_hours(
+    covered_hours: impl IntoIterator<Item = i64>,
+    excluded: &BTreeSet<i64>,
+) -> BTreeSet<i64> {
+    covered_hours
+        .into_iter()
+        .filter(|hour| excluded.contains(hour))
+        .collect()
+}
+
 /// Distinct covered hours inside the exclusion set: the hours the inputs
 /// covered that the lockbox removes (see [`LockboxDrops`] for the exact
 /// definition, and `receipt::Receipt::lockbox_hours_dropped` for where the
@@ -278,13 +363,7 @@ pub fn lockbox_hours_dropped(
     covered_hours: impl IntoIterator<Item = i64>,
     excluded: &BTreeSet<i64>,
 ) -> u64 {
-    let mut dropped = BTreeSet::new();
-    for hour in covered_hours {
-        if excluded.contains(&hour) {
-            dropped.insert(hour);
-        }
-    }
-    dropped.len() as u64
+    lockbox_dropped_hours(covered_hours, excluded).len() as u64
 }
 
 /// The mapping input fact for a unit whose bytes depend on U1's universe:
@@ -354,7 +433,8 @@ mod tests {
     }
 
     /// Seal `body` at `<dir>/<name>.parquet` with a matching receipt at
-    /// `<dir>/<name>.json` embedding `key`.
+    /// `<dir>/<name>.json` embedding `key`. The receipt's output path is the
+    /// sealed file's path relative to `dir` (the store root in these tests).
     fn seal(dir: &Path, name: &str, key: &SkipKey, body: &[u8]) -> (PathBuf, PathBuf) {
         let sealed = dir.join(format!("{name}.parquet"));
         std::fs::write(&sealed, body).unwrap();
@@ -363,7 +443,7 @@ mod tests {
             "hour": name,
             "skipKey": key.to_receipt_value(),
             "output": {
-                "path": format!("tbl/{name}.parquet"),
+                "path": format!("{name}.parquet"),
                 "rows": 3,
                 "bytes": body.len(),
                 "sha256": crate::fsutil::sha256_hex(body),
@@ -374,12 +454,22 @@ mod tests {
         (receipt_path, sealed)
     }
 
+    /// Write a raw receipt body over `<dir>/<name>.json` (for tampered or
+    /// hand-built receipts), with `body` sealed at `<dir>/<name>.parquet`.
+    fn seal_raw(dir: &Path, name: &str, receipt: Value, body: &[u8]) -> (PathBuf, PathBuf) {
+        let sealed = dir.join(format!("{name}.parquet"));
+        std::fs::write(&sealed, body).unwrap();
+        let receipt_path = dir.join(format!("{name}.json"));
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        (receipt_path, sealed)
+    }
+
     #[test]
     fn the_same_inputs_skip_with_the_receipts_numbers() {
         let tmp = Tmp::new("skip");
         let body = b"parquet-bytes";
         let (receipt_path, sealed_path) = seal(tmp.dir(), "20261015-13", &key(), body);
-        let decision = check(&receipt_path, &sealed_path, &key()).unwrap();
+        let decision = check(tmp.dir(), &receipt_path, &sealed_path, &key()).unwrap();
         assert_eq!(
             decision,
             Decision::Skip {
@@ -437,7 +527,7 @@ mod tests {
             ),
         ];
         for key in &changed {
-            let decision = check(&receipt_path, &sealed_path, key).unwrap();
+            let decision = check(tmp.dir(), &receipt_path, &sealed_path, key).unwrap();
             let Decision::Rebuild { reason } = decision else {
                 panic!("{key:?} must rebuild");
             };
@@ -445,6 +535,7 @@ mod tests {
         }
         // A different unit never skips another unit's hour.
         let decision = check(
+            tmp.dir(),
             &receipt_path,
             &sealed_path,
             &SkipKey::new("spotdex", 1, "cafe", "deadbeef", key().inputs),
@@ -453,19 +544,259 @@ mod tests {
         assert!(matches!(decision, Decision::Rebuild { .. }));
     }
 
+    /// A receipt whose skipKey is missing a field never skips, whatever the
+    /// other fields say (R10): every key field must be present to trust the
+    /// receipt.
+    #[test]
+    fn a_receipt_missing_a_skip_key_field_rebuilds() {
+        let tmp = Tmp::new("missingfield");
+        let body = b"parquet-bytes";
+        let mut receipt = serde_json::json!({
+            "schema": "hour-v1",
+            "skipKey": key().to_receipt_value(),
+            "output": {
+                "path": "h.parquet",
+                "rows": 3,
+                "bytes": body.len(),
+                "sha256": crate::fsutil::sha256_hex(body),
+            },
+        });
+        for field in [
+            "unit",
+            "unitVersion",
+            "configSha256",
+            "lockboxSha256",
+            "inputsSha256",
+        ] {
+            receipt["skipKey"].as_object_mut().unwrap().remove(field);
+            let (receipt_path, sealed_path) = seal_raw(tmp.dir(), "h", receipt.clone(), body);
+            let Decision::Rebuild { reason } =
+                check(tmp.dir(), &receipt_path, &sealed_path, &key()).unwrap()
+            else {
+                panic!("missing skipKey {field} must rebuild");
+            };
+            assert!(reason.contains(field), "{field}: {reason}");
+            receipt["skipKey"][field] = key().to_receipt_value()[field].clone();
+        }
+        // A non-string hex field is as good as a missing one.
+        receipt["skipKey"]["lockboxSha256"] = serde_json::json!(12);
+        let (receipt_path, sealed_path) = seal_raw(tmp.dir(), "h", receipt, body);
+        assert!(matches!(
+            check(tmp.dir(), &receipt_path, &sealed_path, &key()).unwrap(),
+            Decision::Rebuild { .. }
+        ));
+    }
+
+    /// Lockbox sha normalization (R18): the receipt's sha is matched trimmed
+    /// and case-insensitively on both sides, while a different sha still
+    /// rebuilds.
+    #[test]
+    fn lockbox_shas_match_trimmed_and_case_insensitively_only() {
+        let tmp = Tmp::new("shas");
+        let body = b"parquet-bytes";
+        // The receipt on disk records the sha raw: uppercased, with
+        // whitespace (a hand-written or legacy receipt). The run's key is
+        // built from an equally sloppy string. Both sides are normalized -
+        // trimmed and lowercased - before they compare, so this skips.
+        let mut receipt = serde_json::json!({
+            "schema": "hour-v1",
+            "skipKey": key().to_receipt_value(),
+            "output": {
+                "path": "h.parquet",
+                "rows": 3,
+                "bytes": body.len(),
+                "sha256": crate::fsutil::sha256_hex(body),
+            },
+        });
+        receipt["skipKey"]["lockboxSha256"] = serde_json::json!("  DEADBEEF\t");
+        let (receipt_path, sealed_path) = seal_raw(tmp.dir(), "h", receipt, body);
+        let run_key = SkipKey::new("hlhours", 1, "cafe", " DeadBeef ", key().inputs);
+        assert_eq!(
+            check(tmp.dir(), &receipt_path, &sealed_path, &run_key).unwrap(),
+            Decision::Skip {
+                rows: 3,
+                bytes: body.len() as u64,
+                sha256: crate::fsutil::sha256_hex(body),
+            }
+        );
+        // A different sha still rebuilds, whatever its casing or padding.
+        let other = SkipKey::new("hlhours", 1, "cafe", " beefcafe ", key().inputs);
+        let Decision::Rebuild { reason } =
+            check(tmp.dir(), &receipt_path, &sealed_path, &other).unwrap()
+        else {
+            panic!("a different lockbox sha must rebuild");
+        };
+        assert!(reason.contains("lockboxSha256"), "{reason}");
+    }
+
+    /// The receipt is bound to the file it names (fix 2): the receipt's
+    /// output path, relative to the store root, must be the file `check` was
+    /// asked to verify. Same bytes elsewhere rebuild; the matching path
+    /// skips.
+    #[test]
+    fn the_receipt_only_skips_the_file_it_names() {
+        let tmp = Tmp::new("pathbind");
+        let body = b"parquet-bytes";
+        let receipt = serde_json::json!({
+            "schema": "hour-v1",
+            "skipKey": key().to_receipt_value(),
+            "output": {
+                "path": "tables/spot/h.parquet",
+                "rows": 3,
+                "bytes": body.len(),
+                "sha256": crate::fsutil::sha256_hex(body),
+            },
+        });
+        let receipt_path = tmp.dir().join("h.json");
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        // Identical bytes at a different path under the same root: rebuild.
+        std::fs::create_dir_all(tmp.dir().join("tables/other")).unwrap();
+        let elsewhere = tmp.dir().join("tables/other/h.parquet");
+        std::fs::write(&elsewhere, body).unwrap();
+        let Decision::Rebuild { reason } =
+            check(tmp.dir(), &receipt_path, &elsewhere, &key()).unwrap()
+        else {
+            panic!("a receipt for tables/spot/h.parquet must not skip another file");
+        };
+        assert!(reason.contains("tables/spot/h.parquet"), "{reason}");
+        assert!(reason.contains("tables/other/h.parquet"), "{reason}");
+        // The file the receipt names: skip.
+        std::fs::create_dir_all(tmp.dir().join("tables/spot")).unwrap();
+        let named = tmp.dir().join("tables/spot/h.parquet");
+        std::fs::write(&named, body).unwrap();
+        assert_eq!(
+            check(tmp.dir(), &receipt_path, &named, &key()).unwrap(),
+            Decision::Skip {
+                rows: 3,
+                bytes: body.len() as u64,
+                sha256: crate::fsutil::sha256_hex(body),
+            }
+        );
+        // A receipt path escaping the root (or a sealed path outside it)
+        // never matches anything.
+        let outside = tmp.dir().join("../outside.parquet");
+        std::fs::write(&outside, body).unwrap();
+        assert!(matches!(
+            check(tmp.dir(), &receipt_path, &outside, &key()).unwrap(),
+            Decision::Rebuild { .. }
+        ));
+        // A receipt path with dot segments is not clean either.
+        let mut receipt = receipt.clone();
+        receipt["output"]["path"] = serde_json::json!("tables/./h.parquet");
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+        assert!(matches!(
+            check(tmp.dir(), &receipt_path, &named, &key()).unwrap(),
+            Decision::Rebuild { .. }
+        ));
+    }
+
+    /// Exactly one output or rebuild (fix 1): a two-output receipt must
+    /// rebuild whether the extra entry was tampered, deleted, or is intact,
+    /// and so must a receipt with no output at all. The reason names the
+    /// count.
+    #[test]
+    fn a_receipt_without_exactly_one_output_rebuilds() {
+        let tmp = Tmp::new("oneoutput");
+        let body = b"parquet-bytes";
+        let sha = crate::fsutil::sha256_hex(body);
+        let entry = |name: &str, sha: &str| {
+            serde_json::json!({
+                "path": format!("{name}.parquet"),
+                "rows": 3,
+                "bytes": body.len(),
+                "sha256": sha,
+            })
+        };
+        let receipt_with = |outputs: Value| {
+            serde_json::json!({
+                "schema": "hour-v1",
+                "skipKey": key().to_receipt_value(),
+                "outputs": outputs,
+            })
+        };
+        let cases: Vec<(Value, &str)> = vec![
+            (
+                receipt_with(serde_json::json!([
+                    entry("a", &sha),
+                    entry("b", "tampered")
+                ])),
+                "2 outputs",
+            ),
+            (
+                receipt_with(serde_json::json!([entry("a", &sha), entry("b", &sha)])),
+                "2 outputs",
+            ),
+            (receipt_with(serde_json::json!([entry("a", &sha)])), "skip"),
+            (receipt_with(serde_json::json!([])), "0 outputs"),
+        ];
+        let sealed = tmp.dir().join("a.parquet");
+        std::fs::write(&sealed, body).unwrap();
+        for (receipt, expected) in &cases {
+            let (receipt_path, _) = seal_raw(tmp.dir(), "a", receipt.clone(), body);
+            let decision = check(tmp.dir(), &receipt_path, &sealed, &key()).unwrap();
+            if *expected == "skip" {
+                assert_eq!(
+                    decision,
+                    Decision::Skip {
+                        rows: 3,
+                        bytes: body.len() as u64,
+                        sha256: sha.clone(),
+                    },
+                );
+            } else {
+                let Decision::Rebuild { reason } = decision else {
+                    panic!("{expected} must rebuild");
+                };
+                assert!(reason.contains(expected), "{expected}: {reason}");
+            }
+        }
+        // Deleting outputs[1] from a two-output receipt also rebuilds: the
+        // receipt that sealed the hour is no longer the receipt on disk.
+        let mut two: Value = receipt_with(serde_json::json!([entry("a", &sha), entry("b", &sha)]));
+        two["outputs"].as_array_mut().unwrap().pop();
+        let (receipt_path, _) = seal_raw(tmp.dir(), "a", two, body);
+        // A one-entry receipt now, but the sealed file b.parquet is gone;
+        // this exact case skips only when everything matches, so seal b too.
+        std::fs::write(tmp.dir().join("b.parquet"), body).unwrap();
+        assert_eq!(
+            check(tmp.dir(), &receipt_path, &sealed, &key()).unwrap(),
+            Decision::Skip {
+                rows: 3,
+                bytes: body.len() as u64,
+                sha256: sha.clone(),
+            }
+        );
+        // Both keys at once is ambiguous, never a skip.
+        let both = serde_json::json!({
+            "schema": "hour-v1",
+            "skipKey": key().to_receipt_value(),
+            "output": entry("a", &sha),
+            "outputs": [entry("a", &sha)],
+        });
+        let (receipt_path, _) = seal_raw(tmp.dir(), "a", both, body);
+        let Decision::Rebuild { reason } =
+            check(tmp.dir(), &receipt_path, &sealed, &key()).unwrap()
+        else {
+            panic!("output and outputs together must rebuild");
+        };
+        assert!(reason.contains("output and outputs"), "{reason}");
+    }
+
     #[test]
     fn a_tampered_or_missing_sealed_file_rebuilds() {
         let tmp = Tmp::new("tamper");
         let body = b"parquet-bytes";
         let (receipt_path, sealed_path) = seal(tmp.dir(), "h", &key(), body);
         std::fs::write(&sealed_path, b"parquet-bytez").unwrap();
-        let Decision::Rebuild { reason } = check(&receipt_path, &sealed_path, &key()).unwrap()
+        let Decision::Rebuild { reason } =
+            check(tmp.dir(), &receipt_path, &sealed_path, &key()).unwrap()
         else {
             panic!("a rewritten sealed file must rebuild");
         };
         assert!(reason.contains("sha256"), "{reason}");
         std::fs::remove_file(&sealed_path).unwrap();
-        let Decision::Rebuild { reason } = check(&receipt_path, &sealed_path, &key()).unwrap()
+        let Decision::Rebuild { reason } =
+            check(tmp.dir(), &receipt_path, &sealed_path, &key()).unwrap()
         else {
             panic!("a missing sealed file must rebuild");
         };
@@ -483,7 +814,8 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&receipt_path).unwrap()).unwrap();
         receipt["skipKey"]["inputs"]["assets_csv_sha256"] = serde_json::json!("zz");
         std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
-        let Decision::Rebuild { reason } = check(&receipt_path, &sealed_path, &key()).unwrap()
+        let Decision::Rebuild { reason } =
+            check(tmp.dir(), &receipt_path, &sealed_path, &key()).unwrap()
         else {
             panic!("an edited receipt must rebuild");
         };
@@ -496,20 +828,23 @@ mod tests {
         let body = b"parquet-bytes";
         let (receipt_path, sealed_path) = seal(tmp.dir(), "h", &key(), body);
         std::fs::write(&receipt_path, "{not json").unwrap();
-        let Decision::Rebuild { reason } = check(&receipt_path, &sealed_path, &key()).unwrap()
+        let Decision::Rebuild { reason } =
+            check(tmp.dir(), &receipt_path, &sealed_path, &key()).unwrap()
         else {
             panic!("a garbled receipt must rebuild");
         };
         assert!(reason.contains("garbled"), "{reason}");
         std::fs::remove_file(&receipt_path).unwrap();
-        let Decision::Rebuild { reason } = check(&receipt_path, &sealed_path, &key()).unwrap()
+        let Decision::Rebuild { reason } =
+            check(tmp.dir(), &receipt_path, &sealed_path, &key()).unwrap()
         else {
             panic!("a missing receipt must rebuild");
         };
         assert!(reason.contains("hour receipt"), "{reason}");
         // A receipt without a skipKey object is not a sealed hour either.
         std::fs::write(&receipt_path, b"{\"schema\":\"hour-v1\"}").unwrap();
-        let Decision::Rebuild { reason } = check(&receipt_path, &sealed_path, &key()).unwrap()
+        let Decision::Rebuild { reason } =
+            check(tmp.dir(), &receipt_path, &sealed_path, &key()).unwrap()
         else {
             panic!("a receipt without skipKey must rebuild");
         };
@@ -526,7 +861,7 @@ mod tests {
             "unit": "hlhours",
             "skipKey": key().to_receipt_value(),
             "outputs": [{
-                "path": "hlhours/h.parquet",
+                "path": "h.parquet",
                 "rows": 3,
                 "bytes": body.len(),
                 "sha256": crate::fsutil::sha256_hex(body),
@@ -535,7 +870,7 @@ mod tests {
         let receipt_path = tmp.dir().join("h.json");
         std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
         assert_eq!(
-            check(&receipt_path, &sealed, &key()).unwrap(),
+            check(tmp.dir(), &receipt_path, &sealed, &key()).unwrap(),
             Decision::Skip {
                 rows: 3,
                 bytes: body.len() as u64,
@@ -580,6 +915,15 @@ mod tests {
         // nothing covered them; 9, 14, 40 are covered but free; 12 twice.
         let dropped = lockbox_hours_dropped([9, 12, 12, 13, 14, 40], &excluded);
         assert_eq!(dropped, 2);
+        // The set form carries the hours, so a store-wide number can be the
+        // union of the venues' sets.
+        let hours = lockbox_dropped_hours([9, 12, 12, 13, 14, 40], &excluded);
+        assert_eq!(hours, BTreeSet::from([12, 13]));
+        let merged: BTreeSet<i64> = hours
+            .union(&lockbox_dropped_hours([10, 14], &excluded))
+            .copied()
+            .collect();
+        assert_eq!(merged, BTreeSet::from([10, 12, 13]));
         // Nothing covered inside the set: nothing dropped, whatever the set holds.
         assert_eq!(lockbox_hours_dropped([9, 14], &excluded), 0);
         // Both counts at once: excluded is the set's own size.

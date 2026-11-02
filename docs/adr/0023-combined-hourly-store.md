@@ -31,10 +31,14 @@ check: first_ts and last_ts of every venue row are the min/max over non-lockbox
 hours, and an HL coin whose fills all sit inside the lockbox has no mapping row
 at all (it has no row in any output table). The receipt records two numbers:
 `lockbox_hours_excluded`, the size of the exclusion set itself (864 for v2),
-and `lockbox_hours_dropped`, the input hours the lockbox actually removed
-(hours each input covers that fall inside the set; exact for HL from its
-watermark, distinct covered hours for Phoenix and Pyth; the widest input is
-the store-wide number). Symbols whose whole history lies inside the lockbox
+and `lockbox_hours_dropped`, the input hours the lockbox actually removed:
+each venue's covered-hour set is the hours it covers that fall inside the
+set, and the store-wide number is the union of the venues' sets, never a max
+across them (venues can cover different lockbox hours, and a max would
+hide the union). HL's set is exact, from
+its watermark hours; Phoenix's is the distinct covered fill hours; Pyth's is
+the union of the distinct covered publish hours over all given directories
+(a per-directory max would undercount). Symbols whose whole history lies inside the lockbox
 get no row in any output table; each receipt input records how many of them
 it dropped as `lockbox_only_symbols` (`inputs.hl_fills`,
 `inputs.phoenix_fills`, `inputs.pyth_prices`), the run report carries the
@@ -61,10 +65,17 @@ hour is reused only when the hour receipt's embedded skip key (unit, unit
 version, config sha256, lockbox sha256, and an inputs sha256 over the
 canonical JSON of every fact that can change the hour's bytes: source file
 shas, the mapping `assets.csv` sha256, ctx day-file shas, the requested
-window) equals the current run's key field for field, the receipt's stored
-inputs still hash to its stored inputs sha256, and the sealed file's streamed
-sha256 still equals the receipt's output sha256. Any other outcome (missing or
-garbled receipt, any key field changed, missing or rewritten file) rebuilds
+window) equals the current run's key field for field (a receipt missing any
+key field rebuilds), the receipt's stored inputs still hash to its stored
+inputs sha256, the receipt names exactly one sealed output (a singular
+`output`, or an `outputs` array holding exactly one entry; zero or several
+entries rebuild, the reason naming the count) whose stored path, taken
+relative to the store root, is the file being verified (normalized component
+for component, so a receipt for one file can never skip a different file
+with identical bytes), and the sealed file's streamed sha256 still equals
+the receipt's output sha256. Any other outcome (missing or garbled receipt,
+any key field changed or missing, a receipt naming another file, a missing
+or rewritten file) rebuilds
 the hour, so an input change such as a renamed symbol in `assets.csv` can
 never be skipped away. `--threads` (1..=8) and `--memory` (at most 32GB) are
 DuckDB caps that do not change the table.
