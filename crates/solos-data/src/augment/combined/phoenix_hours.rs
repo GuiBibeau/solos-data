@@ -33,6 +33,7 @@ use super::io::{
     self, HourOutput, TempClean, finish_run, load_provenance, lock_output, open_reader,
     parquet_list, parse_memory_cap, plan_hours, skip_sealed_hours,
 };
+use super::seal;
 
 /// The unit this module runs.
 pub const UNIT: &str = "phoenix-hours";
@@ -451,22 +452,36 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         )));
     }
 
-    // Lockbox hours inside the requested range are dropped and counted; the
-    // rest is the build plan. Closure of the range was just enforced.
-    let plan = plan_hours(first_hour, requested_last, &lockbox_hours)?;
-    let lockbox_dropped = plan.lockbox_dropped;
+    // The receipt's lockbox counts, in the one shared definition: dropped is
+    // the covered input hours (the selected fills files' block_time spans)
+    // inside the exclusion set, excluded the set's own size.
+    let covered = selected
+        .iter()
+        .flat_map(|(_, lo, hi)| grid::hour_of_secs(*lo)..=grid::hour_of_secs(*hi));
+    let drops = seal::lockbox_drops(covered, &lockbox_hours);
 
-    // Idempotent skip: an existing receipt over the same inputs with a file
-    // that still hashes the same means the hour is already sealed.
-    let (mut outputs, pending) = skip_sealed_hours(
-        request.out,
-        TABLE,
+    // Lockbox hours inside the requested range are dropped from the plan;
+    // closure of the range was just enforced.
+    let plan = plan_hours(first_hour, requested_last, &lockbox_hours)?;
+
+    // Idempotent skip, decided by the shared seal::check: the receipt's skipKey
+    // (unit, version, config sha, lockbox sha, inputs sha over the registered
+    // file facts and the mapping assets.csv sha) must match field for field and
+    // the sealed file must still hash to the receipt's output sha256.
+    let assets_fact = seal::mapping_assets_sha256(request.out)?;
+    let key = seal::SkipKey::new(
         UNIT,
         UNIT_VERSION,
-        &inputs.inputs_sha,
-        &plan.build_hours,
+        &config_hash(),
+        request.lockbox_sha256,
+        json!({
+            "catalog": inputs.watermark,
+            "assetsCsvSha256": assets_fact,
+        }),
     );
+    let (mut outputs, pending) = skip_sealed_hours(request.out, TABLE, &key, &plan.build_hours)?;
     let hours_skipped = outputs.len() as u64;
+    let lockbox_dropped = drops.dropped;
 
     let mut fills_kept = 0u64;
     let mut fills_dropped = 0u64;
@@ -537,6 +552,13 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
                     sha256: sha256.clone(),
                     inputs_sha256: inputs.inputs_sha.clone(),
                     sealed_utc: grid::now_rfc3339(),
+                    skip_key: key.to_receipt_value(),
+                    output: io::HourReceiptOutput {
+                        path: relative.clone(),
+                        rows,
+                        bytes,
+                        sha256: sha256.clone(),
+                    },
                 },
             )?;
             outputs.push(HourOutput {
@@ -574,6 +596,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let mut watermark = inputs.watermark.clone();
     watermark["max_block_time"] = json!(watermark_max_block_time);
     watermark["last_closed_hour"] = json!(last_closed_hour);
+    watermark["lockbox_hours_dropped"] = json!(drops.dropped);
+    watermark["lockbox_hours_excluded"] = json!(drops.excluded);
     finish_run(
         request.out,
         &io::RunSummary {

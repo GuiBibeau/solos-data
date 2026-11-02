@@ -25,6 +25,7 @@ use super::io::{
     self, FileRef, HourOutput, TempClean, file_list_sha256, finish_run, load_provenance,
     lock_output, open_reader, parquet_list, parse_memory_cap, plan_hours, skip_sealed_hours,
 };
+use super::seal;
 
 /// The unit this module runs.
 pub const UNIT: &str = "pyth-hours";
@@ -284,10 +285,11 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let first_hour = grid::hour_of_secs(grid::day_start_secs(first_day));
     let requested_last = grid::hour_of_secs(grid::day_start_secs(last_day)) + 23;
 
-    // Closure: the watermark is the minimum of the lanes' max publish_time
-    // (the most-stalled lane holds it back), from Parquet statistics (no data
-    // pages).
-    let watermark_publish_time = lane_watermark(&conn, &lanes)?;
+    // Closure and coverage, from Parquet statistics (no data pages): per file
+    // the (min, max) publish_time; the closure watermark is the min across
+    // lanes of the lane max (the most-stalled lane holds it back); the covered
+    // spans feed the lockbox drop count.
+    let (watermark_publish_time, covered) = input_facts(&conn, &lanes)?;
     let last_closed_hour = grid::floor_div(
         watermark_publish_time - grid::HOUR_SECS - HOUR_GUARD_SECS,
         grid::HOUR_SECS,
@@ -299,17 +301,33 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         )));
     }
 
+    // The receipt's lockbox counts, in the one shared definition: dropped is
+    // the covered input hours inside the exclusion set, excluded the set's own
+    // size.
+    let drops = seal::lockbox_drops(
+        covered.into_iter().flat_map(|(lo, hi)| lo..=hi),
+        &lockbox_hours,
+    );
+
     let plan = plan_hours(first_hour, requested_last, &lockbox_hours)?;
-    let lockbox_dropped = plan.lockbox_dropped;
-    let (mut outputs, pending) = skip_sealed_hours(
-        request.out,
-        TABLE,
+
+    // Idempotent skip, decided by the shared seal::check (see the module doc
+    // of seal): the key carries the lane file facts and the mapping assets.csv
+    // sha.
+    let assets_fact = seal::mapping_assets_sha256(request.out)?;
+    let key = seal::SkipKey::new(
         UNIT,
         UNIT_VERSION,
-        &inputs_sha,
-        &plan.build_hours,
+        &config_hash(),
+        request.lockbox_sha256,
+        json!({
+            "filesSha256": watermark["files_sha256"],
+            "assetsCsvSha256": assets_fact,
+        }),
     );
+    let (mut outputs, pending) = skip_sealed_hours(request.out, TABLE, &key, &plan.build_hours)?;
     let hours_skipped = outputs.len() as u64;
+    let lockbox_dropped = drops.dropped;
 
     let mut hours_written = 0u64;
     let mut hours_empty = 0u64;
@@ -359,6 +377,13 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
                     sha256: sha256.clone(),
                     inputs_sha256: inputs_sha.clone(),
                     sealed_utc: grid::now_rfc3339(),
+                    skip_key: key.to_receipt_value(),
+                    output: io::HourReceiptOutput {
+                        path: relative.clone(),
+                        rows,
+                        bytes,
+                        sha256: sha256.clone(),
+                    },
                 },
             )?;
             outputs.push(HourOutput {
@@ -385,6 +410,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let mut watermark_facts = watermark.clone();
     watermark_facts["watermark_publish_time"] = json!(watermark_publish_time);
     watermark_facts["last_closed_hour"] = json!(last_closed_hour);
+    watermark_facts["lockbox_hours_dropped"] = json!(drops.dropped);
+    watermark_facts["lockbox_hours_excluded"] = json!(drops.excluded);
     finish_run(
         request.out,
         &io::RunSummary {
@@ -425,13 +452,15 @@ fn scalar(conn: &duckdb::Connection, sql: &str, column: &str) -> Result<u64, Sto
         .ok_or_else(|| StoreError::Check(format!("query has no {column}: {sql}")))
 }
 
-/// Per lane the max publish_time of its files, from Parquet statistics; the
-/// caller takes the minimum across the lanes, so the most-stalled lane defines
-/// when the input counts as arrived.
-fn lane_watermark(
+/// Per file the (min, max) publish_time of every lane file, from Parquet
+/// statistics. Returns the closure watermark (the min across lanes of the lane
+/// max, so the most-stalled lane holds it back) and every file's covered hour
+/// span (for `seal::lockbox_drops`).
+fn input_facts(
     conn: &duckdb::Connection,
     lanes: &[(PathBuf, Vec<FileRef>)],
-) -> Result<i64, StoreError> {
+) -> Result<(i64, Vec<(i64, i64)>), StoreError> {
+    let mut covered: Vec<(i64, i64)> = Vec::new();
     let mut min: Option<i64> = None;
     for (dir, files) in lanes {
         if files.is_empty() {
@@ -442,18 +471,27 @@ fn lane_watermark(
             let table = parquet_list(&[dir.join(&file.relative).to_string_lossy().to_string()])?;
             let rows = query_rows(
                 conn,
-                &format!("SELECT max(publish_time) AS hi FROM {table}"),
+                &format!("SELECT min(publish_time) AS lo, max(publish_time) AS hi FROM {table}"),
                 &[],
             )?;
-            if let Some(hi) = rows.first().and_then(|row| row.int("hi")) {
-                lane_max = Some(lane_max.map_or(hi, |current| current.max(hi)));
-            }
+            let row = rows
+                .first()
+                .ok_or_else(|| StoreError::Check("lane file has no statistics row".into()))?;
+            let lo = row
+                .int("lo")
+                .ok_or_else(|| StoreError::Check("null min(publish_time)".into()))?;
+            let hi = row
+                .int("hi")
+                .ok_or_else(|| StoreError::Check("null max(publish_time)".into()))?;
+            covered.push((grid::hour_of_secs(lo), grid::hour_of_secs(hi)));
+            lane_max = Some(lane_max.map_or(hi, |current| current.max(hi)));
         }
         if let Some(lane_max) = lane_max {
             min = Some(min.map_or(lane_max, |current| current.min(lane_max)));
         }
     }
-    min.ok_or_else(|| StoreError::Check("lane files have no publish_time".into()))
+    min.map(|watermark| (watermark, covered))
+        .ok_or_else(|| StoreError::Check("lane files have no publish_time".into()))
 }
 
 /// Build `pyth_all` (all lane rows of the window with the lane index) and

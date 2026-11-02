@@ -8,6 +8,7 @@ use super::grid;
 use super::io;
 use super::pyth_hours::Request as PythRequest;
 use super::solana_perp_hours::Request as PerpRequest;
+use super::testfix;
 use crate::store::{memory_connection, sql_string};
 use std::path::{Path, PathBuf};
 
@@ -47,12 +48,13 @@ fn day_start() -> i64 {
 }
 
 /// The v2 lockbox body (four Monday weeks, guard 24h) and its sha256.
-fn lockbox_file(dir: &Path) -> (PathBuf, String) {
-    let body = super::lockbox::tests::v2_body();
-    let path = dir.join("lockbox.json");
-    std::fs::write(&path, &body).unwrap();
-    let sha = crate::fsutil::sha256_hex(body.as_bytes());
-    (path, sha)
+/// The v2 lockbox fixture (shared `testfix::v2_lockbox`), plus its path and
+/// sha as the requests want them.
+fn lockbox_fixture(dir: &Path) -> (PathBuf, String, testfix::LockboxFixture) {
+    let fix = testfix::v2_lockbox(dir);
+    let path = fix.path.clone();
+    let sha = fix.sha256.clone();
+    (path, sha, fix)
 }
 
 /// A v2-shaped lockbox body with a different week set (still valid JSON and a
@@ -547,7 +549,7 @@ fn read_phoenix_hour(
 fn phoenix_formulas_on_hand_computed_rows() {
     let tmp = Tmp::new("phoenix-formulas");
     let decoded = build_main_decoded(tmp.dir());
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
 
@@ -602,7 +604,7 @@ fn phoenix_formulas_on_hand_computed_rows() {
 fn phoenix_dedupe_drops_superseded_revisions() {
     let tmp = Tmp::new("phoenix-corrections");
     let decoded = build_corrections_decoded(tmp.dir());
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
 
@@ -650,7 +652,7 @@ fn phoenix_dedupe_drops_superseded_revisions() {
 fn phoenix_refuses_an_unclosed_day() {
     let tmp = Tmp::new("phoenix-unclosed");
     let decoded = build_unclosed_decoded(tmp.dir());
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let error = super::phoenix_hours::run(&phoenix_request(
@@ -677,7 +679,7 @@ fn phoenix_refuses_an_unclosed_day() {
 fn phoenix_rerun_skips_sealed_hours() {
     let tmp = Tmp::new("phoenix-rerun");
     let decoded = build_main_decoded(tmp.dir());
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
 
@@ -719,28 +721,45 @@ fn phoenix_rerun_skips_sealed_hours() {
     assert_eq!(hashes, again, "same inputs, same bytes");
 }
 
-/// A lockbox week inside the requested range, with data inside it: the 10-03
-/// fills are read (they are in the window) but their hours are never written;
-/// 2026-10-07 is built. The unit receipt pins the shared receipt path, the
-/// exclusion-set size (864) and the dropped count (120).
+/// Lockbox hours with data inside them, built on the shared `testfix` v2
+/// fixture: a fill at the fixture's mid hour is read with the window but its
+/// hour is never written, the first free hour after the set is built, and the
+/// dropped count is the covered input hours inside the set (the file span),
+/// not the requested range's lockbox hours.
 #[test]
 fn the_lockbox_week_is_dropped_from_the_range() {
     let tmp = Tmp::new("phoenix-lockbox");
     let conn = memory_connection("1", "512MB").unwrap();
     let root = tmp.dir().join("decoded-lockbox");
-    // Fills inside the lockbox (2026-10-03, busy-week guard), fills on
-    // 2026-10-07 hour 0, plus a sentinel on 10-08 03:00.
-    let oct3 = grid::day_start_secs(grid::parse_date("2026-10-03").unwrap());
-    let start = grid::day_start_secs(grid::parse_date("2026-10-07").unwrap());
+    let (lockbox, lockbox_sha, fix) = lockbox_fixture(tmp.dir());
+    let inside = fix.mid_hour();
+    let after = fix.hour_after();
+    let inside_day = grid::date_of_hour(inside);
+    let after_day = grid::date_of_hour(after);
+    let after_day_start = grid::day_start_secs(grid::parse_date(&after_day).unwrap());
+    let sentinel_secs = after_day_start + 86_400 + 3 * 3600;
+    let sentinel_hour = grid::hour_of_secs(sentinel_secs);
+    // The covered span is the one fills file's block_time range: from the
+    // inside fill to the sentinel. Its intersection with the exclusion set,
+    // computed here from the fixture's own ranges, is the expected dropped
+    // count.
+    let dropped_expected: i64 = fix
+        .ranges
+        .iter()
+        .map(|(lo, hi)| std::cmp::max(*lo, inside)..std::cmp::min(*hi, sentinel_hour + 1))
+        .map(|range| range.end - range.start)
+        .filter(|length| *length > 0)
+        .sum();
+    assert!(dropped_expected > 0, "the mid hour must sit inside the set");
     let fills = vec![
         Fill {
-            event_id: "e-oct3",
+            event_id: "e-inside",
             signature: "sigK",
             source_hash: "hK",
             slot: 432_100_000,
             tx_index: 1,
             ordinal: 0,
-            block_time: oct3 + 60,
+            block_time: fix.secs(inside) + 60,
             symbol: "SOL",
             ticks: 777,
             base_lots: 100,
@@ -748,13 +767,13 @@ fn the_lockbox_week_is_dropped_from_the_range() {
         }
         .values(1, 0, 0),
         Fill {
-            event_id: "e-oct7",
+            event_id: "e-after",
             signature: "sigL",
             source_hash: "hL",
             slot: 432_100_000,
             tx_index: 1,
             ordinal: 0,
-            block_time: start + 60,
+            block_time: fix.secs(after) + 60,
             symbol: "SOL",
             ticks: 100,
             base_lots: 100,
@@ -762,13 +781,13 @@ fn the_lockbox_week_is_dropped_from_the_range() {
         }
         .values(1, 0, 0),
         Fill {
-            event_id: "e-oct8",
+            event_id: "e-sentinel",
             signature: "sigL2",
             source_hash: "hL2",
             slot: 432_100_000,
             tx_index: 1,
             ordinal: 0,
-            block_time: start + 86_400 + 3 * 3600,
+            block_time: sentinel_secs,
             symbol: "SOL",
             ticks: 100,
             base_lots: 100,
@@ -793,7 +812,6 @@ fn the_lockbox_week_is_dropped_from_the_range() {
         &write_tx_parquet,
         "2026-10-30T00:00:00Z",
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
 
@@ -803,17 +821,22 @@ fn the_lockbox_week_is_dropped_from_the_range() {
         &lockbox,
         &lockbox_sha,
         &provenance,
-        "2026-10-01",
-        "2026-10-07",
+        &inside_day,
+        &after_day,
     ))
     .unwrap();
     assert_eq!(
         report.lockbox_hours_dropped,
-        5 * 24,
-        "guard covers 10-01..10-05"
+        u64::try_from(dropped_expected).unwrap(),
+        "covered input hours inside the set"
     );
-    for day in 1..=6 {
-        let date = format!("2026-10-0{day}");
+    assert_eq!(report.hours_written, 1, "the after-set day is built");
+    // No sealed file anywhere in the lockbox days, and no sealed file carries
+    // a lockbox-hour row.
+    let mut day = grid::parse_date(&inside_day).unwrap();
+    let last_lockbox_day = grid::parse_date(&grid::date_of_hour(fix.last_hour())).unwrap();
+    while day <= last_lockbox_day {
+        let date = day.format("%Y-%m-%d").to_string();
         assert!(
             !tmp.dir()
                 .join(super::phoenix_hours::TABLE)
@@ -821,36 +844,44 @@ fn the_lockbox_week_is_dropped_from_the_range() {
                 .exists(),
             "no files in lockbox day {date}"
         );
+        day += chrono::Duration::days(1);
+    }
+    for output in &report.outputs {
+        testfix::assert_no_parquet_rows_in_lockbox(
+            &conn,
+            &tmp.dir().join(&output.relative),
+            "hour",
+            testfix::TsUnit::Secs,
+            &fix.hours,
+        );
     }
     assert!(
         tmp.dir()
             .join(super::phoenix_hours::TABLE)
-            .join("date=2026-10-07")
-            .join("hour=20261007-00.parquet")
+            .join(format!("date={after_day}"))
+            .join(format!(
+                "hour={}.parquet",
+                io::hour_file_key(fix.hour_after())
+            ))
             .is_file()
     );
-    assert_eq!(report.hours_written, 1);
-    // The 10-03 fill was read with the rest of the window; its hour is just
-    // never written.
-    assert_eq!(
-        report.fills_kept, 2,
-        "the 10-03 and 10-07 fills; the sentinel is outside the window"
-    );
-    let conn = memory_connection("1", "512MB").unwrap();
-    let hour0 = grid::hour_of_secs(oct3);
-    assert!(read_phoenix_hour(&conn, tmp.dir(), hour0).is_empty());
     // The shared unit receipt: its path sits in the unit's own directory and
-    // it pins the lockbox numbers (864 is the set, 120 the dropped hours).
+    // it pins the lockbox numbers (the set's own size, never the dropped
+    // count, and the covered-hours dropped count).
     let receipt = unit_receipt(
         tmp.dir(),
         super::phoenix_hours::TABLE,
         super::phoenix_hours::UNIT,
     );
     assert_eq!(
-        receipt["lockbox_hours_excluded"], 864,
+        receipt["lockbox_hours_excluded"],
+        fix.hours.len(),
         "the exclusion set's size, never the dropped count"
     );
-    assert_eq!(receipt["lockbox_hours_dropped"], 120);
+    assert_eq!(
+        receipt["lockbox_hours_dropped"],
+        u64::try_from(dropped_expected).unwrap()
+    );
 }
 
 /// A Jupiter event lane fixture: fields JSON with 1e6-scaled USD and prices,
@@ -1016,7 +1047,7 @@ fn build_perp_lanes(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
 fn solana_perp_scales_dedupes_and_maps() {
     let tmp = Tmp::new("perp");
     let (jup_hist, jup_live, flash_hist, flash_live) = build_perp_lanes(tmp.dir());
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
 
@@ -1198,7 +1229,7 @@ fn pyth_dedupes_and_measures_staleness() {
         sql_string(&lane.join("prices.parquet").to_string_lossy())
     ))
     .unwrap();
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
 
@@ -1415,7 +1446,7 @@ fn phoenix_first_and_last_px_follow_the_slot_order() {
         &write_tx_parquet,
         "2026-10-30T00:00:00Z",
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let report = super::phoenix_hours::run(&phoenix_request(
@@ -1505,7 +1536,7 @@ fn phoenix_boundary_watermark_closes_the_last_requested_hour() {
         root
     };
     let tmp = Tmp::new("phoenix-boundary");
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     // One second short of the boundary: hour 23 is not closed yet.
@@ -1634,7 +1665,7 @@ fn phoenix_drops_and_counts_filtered_rows() {
         &write_tx_parquet,
         "2026-10-30T00:00:00Z",
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let report = super::phoenix_hours::run(&phoenix_request(
@@ -1715,7 +1746,7 @@ fn phoenix_rv_does_not_leak_across_hours() {
         &write_tx_parquet,
         "2026-10-30T00:00:00Z",
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let report = super::phoenix_hours::run(&phoenix_request(
@@ -1799,7 +1830,7 @@ fn phoenix_price_uses_asymmetric_decimals() {
         &write_tx_parquet,
         "2026-10-30T00:00:00Z",
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     super::phoenix_hours::run(&phoenix_request(
@@ -1887,7 +1918,7 @@ fn phoenix_event_dedupe_keeps_the_latest_batch_revision() {
         &write_tx_parquet,
         "2026-10-30T00:00:00Z",
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let report = super::phoenix_hours::run(&phoenix_request(
@@ -1999,7 +2030,7 @@ fn phoenix_ignores_files_created_after_the_snapshot() {
         }
     }
     std::fs::write(&catalog_path, catalog.to_string()).unwrap();
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let report = super::phoenix_hours::run(&phoenix_request(
@@ -2077,7 +2108,7 @@ fn phoenix_watermark_ignores_files_outside_the_window() {
         &write_tx_parquet,
         "2026-10-30T00:00:00Z",
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let error = super::phoenix_hours::run(&phoenix_request(
@@ -2157,7 +2188,7 @@ fn a_wrong_shape_lockbox_is_refused_before_any_read() {
 fn a_failed_hour_parquet_write_leaves_no_hour_receipt() {
     let tmp = Tmp::new("fsync-hour-parquet");
     let decoded = build_main_decoded(tmp.dir());
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     crate::fsutil::inject_fsync_eio(crate::fsutil::FsyncStep::TempFile);
@@ -2224,7 +2255,7 @@ fn a_failed_hour_parquet_write_leaves_no_hour_receipt() {
 fn the_hour_parquet_write_syncs_the_directory_after_the_rename() {
     let tmp = Tmp::new("fsync-hour-dir");
     let decoded = build_main_decoded(tmp.dir());
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     crate::fsutil::inject_fsync_eio(crate::fsutil::FsyncStep::DirAfterRename);
@@ -2279,6 +2310,13 @@ fn a_failed_hour_receipt_write_leaves_the_parquet_but_no_receipt() {
         sha256: "abc".into(),
         inputs_sha256: "def".into(),
         sealed_utc: grid::now_rfc3339(),
+        skip_key: serde_json::json!({"unit": "phoenix-hours"}),
+        output: io::HourReceiptOutput {
+            path: "t/date=2026-10-15/hour=20261015-00.parquet".into(),
+            rows: 0,
+            bytes: 0,
+            sha256: "abc".into(),
+        },
     };
     crate::fsutil::inject_fsync_eio(crate::fsutil::FsyncStep::TempFile);
     let error = io::write_hour_receipt(out, &receipt);
@@ -2302,7 +2340,7 @@ fn a_failed_hour_receipt_write_leaves_the_parquet_but_no_receipt() {
 fn a_failed_unit_receipt_write_leaves_outputs_but_no_unit_receipt() {
     let tmp = Tmp::new("fsync-unit-receipt");
     let decoded = build_main_decoded(tmp.dir());
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     super::receipt::on_before_write(|| {
@@ -2362,7 +2400,7 @@ fn a_failed_unit_receipt_write_leaves_outputs_but_no_unit_receipt() {
 fn a_failed_catalog_write_leaves_outputs_and_receipts() {
     let tmp = Tmp::new("fsync-catalog-hours");
     let decoded = build_main_decoded(tmp.dir());
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     super::catalog::on_before_save(|| {
@@ -2424,7 +2462,7 @@ fn solana_perp_refuses_an_unclosed_day() {
             r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
         )],
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let jupiter_events = vec![jup];
@@ -2493,7 +2531,7 @@ fn solana_perp_watermark_is_the_most_stalled_lane() {
             r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
         )],
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let jupiter_events = vec![jup_hist, jup_live];
@@ -2569,7 +2607,7 @@ fn solana_perp_ret_is_identical_across_thread_counts() {
                 r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
             )],
         );
-        let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+        let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
         let provenance = provenance_file(tmp.dir());
         write_mapping(tmp.dir());
         let jupiter_events = vec![jup];
@@ -2617,46 +2655,53 @@ fn solana_perp_ret_is_identical_across_thread_counts() {
     }
 }
 
-/// Perp lockbox hours with data inside them: the 10-03 events are read (they
-/// are inside the window) but never written; the receipt pins the set size
-/// and the dropped hours (M33/M34).
+/// Perp lockbox hours with data inside them, on the shared testfix fixture:
+/// jupiter events at the fixture's mid hour are read with the window but their
+/// hours are never written; the first free hour after the set is built; the
+/// dropped count is the covered input hours inside the set.
 #[test]
 fn solana_perp_lockbox_hours_are_read_but_never_written() {
     let tmp = Tmp::new("perp-lockbox");
-    let oct3 = grid::day_start_secs(grid::parse_date("2026-10-03").unwrap());
-    let oct7 = grid::day_start_secs(grid::parse_date("2026-10-07").unwrap());
+    let (lockbox, lockbox_sha, fix) = lockbox_fixture(tmp.dir());
+    let inside = fix.mid_hour();
+    let after = fix.hour_after();
+    let inside_day = grid::date_of_hour(inside);
+    let after_day = grid::date_of_hour(after);
+    let after_day_start = grid::day_start_secs(grid::parse_date(&after_day).unwrap());
+    let sentinel_secs = after_day_start + 86_400 + 3 * 3600;
+    let sentinel_hour = grid::hour_of_secs(sentinel_secs);
+    let dropped_expected: i64 = fix
+        .ranges
+        .iter()
+        .map(|(lo, hi)| std::cmp::max(*lo, inside)..std::cmp::min(*hi, sentinel_hour + 1))
+        .map(|range| range.end - range.start)
+        .filter(|length| *length > 0)
+        .sum();
+    assert!(dropped_expected > 0);
     let jup = tmp.dir().join("jup");
     write_event_lane(
         &jup,
         &[
             perp_event(
-                "jL1",
+                "jInside",
                 432_100_010,
-                oct3 + 60,
+                fix.secs(inside) + 60,
                 0,
                 "InstantIncreasePositionEvent",
                 r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#,
             ),
             perp_event(
-                "jL2",
+                "jAfter",
                 432_100_010,
-                oct3 + 120,
-                0,
-                "InstantDecreasePositionEvent",
-                r#"{"sizeUsdDelta": "500000", "positionSide": 2, "price": "100000000", "positionCustody": "Cust1"}"#,
-            ),
-            perp_event(
-                "jK",
-                432_100_010,
-                oct7 + 60,
+                fix.secs(after) + 60,
                 0,
                 "InstantIncreasePositionEvent",
                 r#"{"sizeUsdDelta": "2000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#,
             ),
             perp_event(
-                "jS",
+                "jSentinel",
                 432_100_010,
-                oct7 + 86_400 + 3 * 3600,
+                sentinel_secs,
                 0,
                 "InstantIncreasePositionEvent",
                 r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#,
@@ -2668,25 +2713,23 @@ fn solana_perp_lockbox_hours_are_read_but_never_written() {
         &flash,
         &[
             perp_event(
-                "fK",
+                "fAfter",
                 432_100_010,
-                oct7 + 70,
+                fix.secs(after) + 70,
                 0,
                 "IncreaseSizeLogUSDv1",
                 r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
             ),
-            // A sentinel outside the window closes the day.
             perp_event(
-                "fS",
+                "fSentinel",
                 432_100_010,
-                oct7 + 86_400 + 3 * 3600,
+                sentinel_secs + 10,
                 0,
                 "IncreaseSizeLogUSDv1",
                 r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
             ),
         ],
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let jupiter_events = vec![jup];
@@ -2698,43 +2741,55 @@ fn solana_perp_lockbox_hours_are_read_but_never_written() {
         provenance: &provenance,
         jupiter_events: &jupiter_events,
         flash_events: &flash_events,
-        since: "2026-10-01",
-        until: "2026-10-07",
+        since: &inside_day,
+        until: &after_day,
         threads: 1,
         memory_limit: "512MB".to_owned(),
     };
     let report = super::solana_perp_hours::run(&request).unwrap();
-    assert_eq!(report.lockbox_hours_dropped, 5 * 24);
-    assert!(
-        !tmp.dir()
-            .join(super::solana_perp_hours::TABLE)
-            .join("date=2026-10-03")
-            .exists(),
-        "no files in the lockbox day"
+    assert_eq!(
+        report.lockbox_hours_dropped,
+        u64::try_from(dropped_expected).unwrap(),
+        "covered input hours inside the set"
     );
-    assert_eq!(report.hours_written, 1, "only 2026-10-07 has written hours");
+    assert_eq!(report.hours_written, 1, "the after-set day is built");
+    let mut day = grid::parse_date(&inside_day).unwrap();
+    let last_lockbox_day = grid::parse_date(&grid::date_of_hour(fix.last_hour())).unwrap();
+    while day <= last_lockbox_day {
+        let date = day.format("%Y-%m-%d").to_string();
+        assert!(
+            !tmp.dir()
+                .join(super::solana_perp_hours::TABLE)
+                .join(format!("date={date}"))
+                .exists(),
+            "no files in lockbox day {date}"
+        );
+        day += chrono::Duration::days(1);
+    }
+    let conn = memory_connection("1", "512MB").unwrap();
+    for output in &report.outputs {
+        testfix::assert_no_parquet_rows_in_lockbox(
+            &conn,
+            &tmp.dir().join(&output.relative),
+            "hour",
+            testfix::TsUnit::Secs,
+            &fix.hours,
+        );
+    }
     let receipt = unit_receipt(
         tmp.dir(),
         super::solana_perp_hours::TABLE,
         super::solana_perp_hours::UNIT,
     );
-    assert_eq!(receipt["lockbox_hours_excluded"], 864);
-    assert_eq!(receipt["lockbox_hours_dropped"], 120);
-    let conn = memory_connection("1", "512MB").unwrap();
-    let path = tmp.dir().join(io::hour_partition(
-        grid::hour_of_secs(oct7),
-        super::solana_perp_hours::TABLE,
-    ));
-    let rows = crate::store::query_rows(
-        &conn,
-        &format!(
-            "SELECT venue, n_inc FROM read_parquet('{}')",
-            path.to_string_lossy()
-        ),
-        &[],
-    )
-    .unwrap();
-    assert_eq!(rows.len(), 2, "jupiter and flash on 10-07");
+    assert_eq!(
+        receipt["lockbox_hours_excluded"],
+        fix.hours.len(),
+        "the exclusion set's size, never the dropped count"
+    );
+    assert_eq!(
+        receipt["lockbox_hours_dropped"],
+        u64::try_from(dropped_expected).unwrap()
+    );
 }
 
 /// The pyth unit refuses a day its watermark does not close (M09).
@@ -2753,7 +2808,7 @@ fn pyth_refuses_an_unclosed_day() {
             day_start() * 1000,
         )],
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let pyth_lanes = vec![lane];
@@ -2805,7 +2860,7 @@ fn pyth_watermark_is_the_most_stalled_lane() {
             day_start() * 1000,
         )],
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let pyth_lanes = vec![ahead, stalled];
@@ -2869,7 +2924,7 @@ fn pyth_later_lane_then_later_at_ms_wins() {
             ),
         ],
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
+    let (lockbox, lockbox_sha, _lockbox_fix) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let pyth_lanes = vec![hist, live];
@@ -2920,14 +2975,29 @@ fn pyth_later_lane_then_later_at_ms_wins() {
     assert!((conf - (0.5 / 120.0 + 0.5 / 95.0) / 2.0).abs() < 1e-12);
 }
 
-/// Pyth lockbox hours with data inside them: prices on 10-03 are read but
-/// never written; the receipt pins the set size and the dropped hours
-/// (M35/M36).
+/// Pyth lockbox hours with data inside them, on the shared testfix fixture:
+/// prices at the fixture's mid hour are read with the window but their hours
+/// are never written; the first free hour after the set is built; the dropped
+/// count is the covered input hours inside the set.
 #[test]
 fn pyth_lockbox_hours_are_read_but_never_written() {
     let tmp = Tmp::new("pyth-lockbox");
-    let oct3 = grid::day_start_secs(grid::parse_date("2026-10-03").unwrap());
-    let oct7 = grid::day_start_secs(grid::parse_date("2026-10-07").unwrap());
+    let (lockbox, lockbox_sha, fix) = lockbox_fixture(tmp.dir());
+    let inside = fix.mid_hour();
+    let after = fix.hour_after();
+    let inside_day = grid::date_of_hour(inside);
+    let after_day = grid::date_of_hour(after);
+    let after_day_start = grid::day_start_secs(grid::parse_date(&after_day).unwrap());
+    let sentinel_secs = after_day_start + 86_400 + 3 * 3600;
+    let sentinel_hour = grid::hour_of_secs(sentinel_secs);
+    let dropped_expected: i64 = fix
+        .ranges
+        .iter()
+        .map(|(lo, hi)| std::cmp::max(*lo, inside)..std::cmp::min(*hi, sentinel_hour + 1))
+        .map(|range| range.end - range.start)
+        .filter(|length| *length > 0)
+        .sum();
+    assert!(dropped_expected > 0);
     let lane = tmp.dir().join("pyth");
     write_pyth_lane(
         &lane,
@@ -2935,38 +3005,29 @@ fn pyth_lockbox_hours_are_read_but_never_written() {
             pyth_price(
                 "feed-sol",
                 "SOL",
-                oct3 + 60,
+                fix.secs(inside) + 60,
                 100.0,
                 0.5,
-                oct3 * 1000 + 60_000,
+                fix.secs(inside) * 1000 + 60_000,
             ),
             pyth_price(
                 "feed-sol",
                 "SOL",
-                oct3 + 120,
-                110.0,
-                0.5,
-                oct3 * 1000 + 120_000,
-            ),
-            pyth_price(
-                "feed-sol",
-                "SOL",
-                oct7 + 60,
+                fix.secs(after) + 60,
                 120.0,
                 0.5,
-                oct7 * 1000 + 60_000,
+                fix.secs(after) * 1000 + 60_000,
             ),
             pyth_price(
                 "feed-sol",
                 "SOL",
-                oct7 + 86_400 + 3 * 3600,
+                sentinel_secs,
                 100.0,
                 0.5,
-                (oct7 + 86_400 + 3 * 3600) * 1000,
+                sentinel_secs * 1000,
             ),
         ],
     );
-    let (lockbox, lockbox_sha) = lockbox_file(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let pyth_lanes = vec![lane];
@@ -2976,22 +3037,301 @@ fn pyth_lockbox_hours_are_read_but_never_written() {
         lockbox_sha256: &lockbox_sha,
         provenance: &provenance,
         pyth_prices: &pyth_lanes,
-        since: "2026-10-01",
-        until: "2026-10-07",
+        since: &inside_day,
+        until: &after_day,
         threads: 1,
         memory_limit: "512MB".to_owned(),
     };
     let report = super::pyth_hours::run(&request).unwrap();
-    assert_eq!(report.lockbox_hours_dropped, 5 * 24);
-    assert!(
-        !tmp.dir()
-            .join(super::pyth_hours::TABLE)
-            .join("date=2026-10-03")
-            .exists(),
-        "no files in the lockbox day"
+    assert_eq!(
+        report.lockbox_hours_dropped,
+        u64::try_from(dropped_expected).unwrap(),
+        "covered input hours inside the set"
     );
-    assert_eq!(report.hours_written, 1, "only 2026-10-07 has written hours");
+    assert_eq!(report.hours_written, 1, "the after-set day is built");
+    let mut day = grid::parse_date(&inside_day).unwrap();
+    let last_lockbox_day = grid::parse_date(&grid::date_of_hour(fix.last_hour())).unwrap();
+    while day <= last_lockbox_day {
+        let date = day.format("%Y-%m-%d").to_string();
+        assert!(
+            !tmp.dir()
+                .join(super::pyth_hours::TABLE)
+                .join(format!("date={date}"))
+                .exists(),
+            "no files in lockbox day {date}"
+        );
+        day += chrono::Duration::days(1);
+    }
+    let conn = memory_connection("1", "512MB").unwrap();
+    for output in &report.outputs {
+        testfix::assert_no_parquet_rows_in_lockbox(
+            &conn,
+            &tmp.dir().join(&output.relative),
+            "hour",
+            testfix::TsUnit::Secs,
+            &fix.hours,
+        );
+    }
     let receipt = unit_receipt(tmp.dir(), super::pyth_hours::TABLE, super::pyth_hours::UNIT);
-    assert_eq!(receipt["lockbox_hours_excluded"], 864);
-    assert_eq!(receipt["lockbox_hours_dropped"], 120);
+    assert_eq!(
+        receipt["lockbox_hours_excluded"],
+        fix.hours.len(),
+        "the exclusion set's size, never the dropped count"
+    );
+    assert_eq!(
+        receipt["lockbox_hours_dropped"],
+        u64::try_from(dropped_expected).unwrap()
+    );
+}
+
+/// A changed mapping (a renamed asset in `mapping/assets.csv`) rebuilds the
+/// sealed hours instead of skipping them, and the rebuilt hours carry the new
+/// asset (the skip key's assetsCsvSha256 input; M11 leaves it out).
+#[test]
+fn phoenix_rebuilds_when_the_mapping_changes() {
+    let tmp = Tmp::new("phoenix-rename");
+    let decoded = build_main_decoded(tmp.dir());
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let first = super::phoenix_hours::run(&phoenix_request(
+        tmp.dir(),
+        &decoded,
+        &lockbox,
+        &lockbox_sha,
+        &provenance,
+        DAY,
+        DAY,
+    ))
+    .unwrap();
+    assert_eq!(first.hours_written, 1);
+    let csv = tmp.dir().join("mapping/assets.csv");
+    let text = std::fs::read_to_string(&csv).unwrap();
+    assert!(text.contains("SOL,phoenix,SOL,"));
+    std::fs::write(&csv, text.replace("SOL,phoenix,SOL,", "SOLX,phoenix,SOL,")).unwrap();
+    let second = super::phoenix_hours::run(&phoenix_request(
+        tmp.dir(),
+        &decoded,
+        &lockbox,
+        &lockbox_sha,
+        &provenance,
+        DAY,
+        DAY,
+    ))
+    .unwrap();
+    assert_eq!(
+        second.hours_written, 1,
+        "the changed mapping must rebuild, never skip"
+    );
+    assert_eq!(second.hours_skipped, 0);
+    let conn = memory_connection("1", "512MB").unwrap();
+    let rows = read_phoenix_hour(&conn, tmp.dir(), grid::hour_of_secs(day_start()));
+    let sol = rows.iter().find(|row| row.0 == "SOL").unwrap();
+    assert_eq!(sol.1.as_deref(), Some("SOLX"), "the rebuilt hour remaps");
+}
+
+/// Perp hours rebuild on a mapping change too (the perp key's assetsCsvSha256).
+#[test]
+fn solana_perp_rebuilds_when_the_mapping_changes() {
+    let tmp = Tmp::new("perp-rename");
+    let (jup_hist, jup_live, flash_hist, flash_live) = build_perp_lanes(tmp.dir());
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let jupiter_events = vec![jup_hist.clone(), jup_live.clone()];
+    let flash_events = vec![flash_hist.clone(), flash_live.clone()];
+    let request = || PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    };
+    let first = super::solana_perp_hours::run(&request()).unwrap();
+    assert_eq!(first.hours_written, 1);
+    let csv = tmp.dir().join("mapping/assets.csv");
+    let text = std::fs::read_to_string(&csv).unwrap();
+    std::fs::write(&csv, text.replace("SOL,jup,SOL,", "SOLX,jup,SOL,")).unwrap();
+    let second = super::solana_perp_hours::run(&request()).unwrap();
+    assert_eq!(second.hours_written, 1, "changed mapping rebuilds");
+    assert_eq!(second.hours_skipped, 0);
+    let conn = memory_connection("1", "512MB").unwrap();
+    let path = tmp.dir().join(io::hour_partition(
+        grid::hour_of_secs(day_start()),
+        super::solana_perp_hours::TABLE,
+    ));
+    let rows = crate::store::query_rows(
+        &conn,
+        &format!(
+            "SELECT asset_id FROM read_parquet('{}') WHERE venue = 'jupiter'",
+            path.to_string_lossy()
+        ),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].str("asset_id"), Some("SOLX"));
+}
+
+/// Pyth hours rebuild on a mapping change too (the pyth key's assetsCsvSha256).
+#[test]
+fn pyth_rebuilds_when_the_mapping_changes() {
+    let tmp = Tmp::new("pyth-rename");
+    let conn = memory_connection("1", "512MB").unwrap();
+    let lane = tmp.dir().join("pyth-hist");
+    let t0 = day_start();
+    write_pyth_lane(
+        &lane,
+        &[
+            pyth_price("feed-sol", "SOL", t0 + 60, 100.0, 0.5, t0 * 1000 + 60_000),
+            pyth_price(
+                "feed-sol",
+                "SOL",
+                t0 + 86_400 + 3 * 3600,
+                100.0,
+                0.5,
+                (t0 + 86_400 + 3 * 3600) * 1000,
+            ),
+        ],
+    );
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let pyth_lanes = vec![lane.clone()];
+    let request = || PythRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        pyth_prices: &pyth_lanes,
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    };
+    let first = super::pyth_hours::run(&request()).unwrap();
+    assert_eq!(first.hours_written, 1);
+    let csv = tmp.dir().join("mapping/assets.csv");
+    let text = std::fs::read_to_string(&csv).unwrap();
+    std::fs::write(
+        &csv,
+        text.replace("SOL,pyth,SOL/USD,", "SOLX,pyth,SOL/USD,"),
+    )
+    .unwrap();
+    let second = super::pyth_hours::run(&request()).unwrap();
+    assert_eq!(second.hours_written, 1, "changed mapping rebuilds");
+    assert_eq!(second.hours_skipped, 0);
+    let path = tmp.dir().join(io::hour_partition(
+        grid::hour_of_secs(t0),
+        super::pyth_hours::TABLE,
+    ));
+    let rows = crate::store::query_rows(
+        &conn,
+        &format!(
+            "SELECT asset_id FROM read_parquet('{}')",
+            path.to_string_lossy()
+        ),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].str("asset_id"), Some("SOLX"));
+}
+
+/// A tampered sealed file rebuilds: the rerun verifies the file's bytes
+/// against the receipt's output sha256 through seal::check (M12 bypasses the
+/// check for an is_file test and would keep the tampered file).
+#[test]
+fn phoenix_rebuilds_a_tampered_sealed_file() {
+    let tmp = Tmp::new("phoenix-tamper");
+    let decoded = build_main_decoded(tmp.dir());
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let first = super::phoenix_hours::run(&phoenix_request(
+        tmp.dir(),
+        &decoded,
+        &lockbox,
+        &lockbox_sha,
+        &provenance,
+        DAY,
+        DAY,
+    ))
+    .unwrap();
+    assert_eq!(first.hours_written, 1);
+    let sealed = tmp.dir().join(io::hour_partition(
+        grid::hour_of_secs(day_start()),
+        super::phoenix_hours::TABLE,
+    ));
+    let mut bytes = std::fs::read(&sealed).unwrap();
+    bytes[0] ^= 0xff;
+    std::fs::write(&sealed, &bytes).unwrap();
+    let second = super::phoenix_hours::run(&phoenix_request(
+        tmp.dir(),
+        &decoded,
+        &lockbox,
+        &lockbox_sha,
+        &provenance,
+        DAY,
+        DAY,
+    ))
+    .unwrap();
+    assert_eq!(
+        second.hours_written, 1,
+        "the tampered hour must rebuild, never skip"
+    );
+    assert_eq!(second.hours_skipped, 0);
+}
+
+/// A different lockbox file (same v2 shape, different bytes) rebuilds: the
+/// skip key carries the lockbox sha (M11l feeds a constant sha and would skip).
+#[test]
+fn phoenix_rebuilds_when_the_lockbox_changes() {
+    let tmp = Tmp::new("phoenix-lockbox-change");
+    let decoded = build_main_decoded(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let first_lockbox = tmp.dir().join("lockbox-1.json");
+    std::fs::write(&first_lockbox, super::lockbox::tests::v2_body()).unwrap();
+    let first_sha = crate::fsutil::file_hash(&first_lockbox).unwrap();
+    let first = super::phoenix_hours::run(&phoenix_request(
+        tmp.dir(),
+        &decoded,
+        &first_lockbox,
+        &first_sha,
+        &provenance,
+        DAY,
+        DAY,
+    ))
+    .unwrap();
+    assert_eq!(first.hours_written, 1);
+    // Same weeks, different bytes: still a valid v2 lockbox with the same 864
+    // hours, but a different sha.
+    let mut body: serde_json::Value =
+        serde_json::from_str(&super::lockbox::tests::v2_body()).unwrap();
+    body["created"] = serde_json::json!("2026-10-23");
+    let second_lockbox = tmp.dir().join("lockbox-2.json");
+    std::fs::write(&second_lockbox, body.to_string()).unwrap();
+    let second_sha = crate::fsutil::file_hash(&second_lockbox).unwrap();
+    assert_ne!(first_sha, second_sha);
+    let second = super::phoenix_hours::run(&phoenix_request(
+        tmp.dir(),
+        &decoded,
+        &second_lockbox,
+        &second_sha,
+        &provenance,
+        DAY,
+        DAY,
+    ))
+    .unwrap();
+    assert_eq!(
+        second.hours_written, 1,
+        "a new lockbox file must rebuild, never skip"
+    );
+    assert_eq!(second.hours_skipped, 0);
 }

@@ -7,6 +7,7 @@
 //! reader, provenance, memory cap) so the mapping unit stays untouched; a
 //! follow-up can move both onto this module.
 
+use crate::augment::combined::seal::{self, SkipKey};
 use crate::fsutil::{
     create_dir_all_durable, file_hash, sync_dir_after_rename, sync_tmp_file, tmp_path,
     write_durable,
@@ -288,8 +289,24 @@ pub struct HourOutput {
     pub relative: String,
 }
 
+/// The sealed-file entry of the hour receipt, in the shape `seal::check` reads
+/// (`receipt.output` with rows, bytes and sha256).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HourReceiptOutput {
+    /// Path of the file relative to the output root.
+    pub path: String,
+    /// Data rows in the file.
+    pub rows: u64,
+    /// File size in bytes.
+    pub bytes: u64,
+    /// SHA-256 of the file bytes.
+    pub sha256: String,
+}
+
 /// The per-hour receipt: what one hour wrote, over which inputs, with which
-/// unit version. Idempotent reruns compare this against the sealed file.
+/// unit version. Idempotent reruns go through `seal::check`: the receipt's
+/// `skipKey` must match the current run's key field for field, and the sealed
+/// file must still hash to the receipt's `output.sha256`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HourReceipt {
     /// The unit that ran.
@@ -311,6 +328,12 @@ pub struct HourReceipt {
     pub inputs_sha256: String,
     /// UTC time the hour was sealed.
     pub sealed_utc: String,
+    /// The seal key the hour was sealed under (`seal::SkipKey::to_receipt_value`):
+    /// what `seal::check` compares a rerun's key against.
+    #[serde(rename = "skipKey")]
+    pub skip_key: Value,
+    /// The sealed file entry `seal::check` re-verify against the file on disk.
+    pub output: HourReceiptOutput,
 }
 
 /// The per-hour receipt path: `<root>/<table>/receipts/<YYYYMMDD>-<H>.json`.
@@ -357,13 +380,12 @@ pub fn read_hour_receipt(root: &Path, table: &str, hour: i64) -> Option<HourRece
 }
 
 /// The build plan of one run: the hours to build (closed by the watermark,
-/// minus the lockbox) and the counters the receipts record.
+/// minus the lockbox). The lockbox counts come from `seal::lockbox_drops`, not
+/// from the plan.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HourPlan {
     /// Hours that may be written (locked for the first and last built hour).
     pub build_hours: Vec<i64>,
-    /// Lockbox hours inside the requested range (never written).
-    pub lockbox_dropped: u64,
     /// First unix hour of the requested range.
     pub first_hour: i64,
     /// Last unix hour of the requested range.
@@ -387,51 +409,45 @@ pub fn plan_hours(
     let build_hours: Vec<i64> = (first_hour..=requested_last)
         .filter(|hour| !lockbox_hours.contains(hour))
         .collect();
-    let lockbox_dropped = (first_hour..=requested_last)
-        .filter(|hour| lockbox_hours.contains(hour))
-        .count() as u64;
     Ok(HourPlan {
         build_hours,
-        lockbox_dropped,
         first_hour,
         requested_last,
     })
 }
 
-/// Split the plan into already-sealed hours (matching receipt + file hash) and
-/// the pending hours this run must write.
+/// Split the plan into already-sealed hours and the pending hours this run
+/// must write, deciding each hour through the shared `seal::check`: the
+/// receipt's `skipKey` must equal `key` field for field and the sealed file
+/// must still hash to the receipt's output sha256. Everything else (missing or
+/// garbled receipt, changed key component, tampered file) is a rebuild.
 pub fn skip_sealed_hours(
     out: &Path,
     table: &str,
-    unit: &str,
-    unit_version: u32,
-    inputs_sha: &str,
+    key: &SkipKey,
     build_hours: &[i64],
-) -> (Vec<HourOutput>, Vec<i64>) {
+) -> Result<(Vec<HourOutput>, Vec<i64>), StoreError> {
     let mut outputs = Vec::new();
     let mut pending = Vec::new();
     for hour in build_hours {
         let relative = hour_partition(*hour, table);
         let path = out.join(&relative);
-        let receipt = read_hour_receipt(out, table, *hour).filter(|receipt| {
-            receipt.unit == unit
-                && receipt.unit_version == unit_version
-                && receipt.inputs_sha256 == inputs_sha
-                && path.is_file()
-                && file_hash(&path).is_ok_and(|sha| sha == receipt.sha256)
-        });
-        match receipt {
-            Some(receipt) => outputs.push(HourOutput {
+        match seal::check(&hour_receipt_path(out, table, *hour), &path, key)? {
+            seal::Decision::Skip {
+                rows,
+                bytes,
+                sha256,
+            } => outputs.push(HourOutput {
                 hour: *hour,
-                rows: receipt.rows,
-                bytes: receipt.bytes,
-                sha256: receipt.sha256,
+                rows,
+                bytes,
+                sha256,
                 relative,
             }),
-            None => pending.push(*hour),
+            seal::Decision::Rebuild { .. } => pending.push(*hour),
         }
     }
-    (outputs, pending)
+    Ok((outputs, pending))
 }
 
 /// `<table>/date=YYYY-MM-DD/hour=YYYYMMDD-H.parquet`, relative to the root.
