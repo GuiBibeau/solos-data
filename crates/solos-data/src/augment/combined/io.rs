@@ -431,8 +431,12 @@ pub fn skip_sealed_hours(
     let mut pending = Vec::new();
     for hour in build_hours {
         let relative = hour_partition(*hour, table);
+        // Both paths join onto exactly the `root` value handed to
+        // `seal::check`: a differently-formed root would leave `sealed_path`
+        // un-strippable (or unclean) under it and the hour would rebuild
+        // forever.
         let path = out.join(&relative);
-        match seal::check(&hour_receipt_path(out, table, *hour), &path, key)? {
+        match seal::check(out, &hour_receipt_path(out, table, *hour), &path, key)? {
             seal::Decision::Skip {
                 rows,
                 bytes,
