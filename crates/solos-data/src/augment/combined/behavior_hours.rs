@@ -952,7 +952,7 @@ fn build_perp_lanes(dir: &Path) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
             0,
             h0 + 700,
             "IncreaseSizeLogUSDv1",
-            r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1500000000", "entry_price_exponent": -8}"#,
+            r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "15000000", "entry_price_exponent": -6}"#,
         ),
         // The flash market equals the jupiter custody: the venue-qualified
         // join must leave this row unmapped.
@@ -1123,7 +1123,7 @@ fn solana_perp_scales_dedupes_and_maps() {
         .unwrap();
     assert!(
         (flash_ret - (15.0_f64 / 17.5).ln()).abs() < 1e-12,
-        "prices 17.5 (live f1) to 15 (f2), exponent applied: {flash_ret}"
+        "prices 17.5 (live f1, exp -8) to 15 (f2, exp -6, 150000000 scaled): {flash_ret}"
     );
     assert_eq!(
         flash_row.get("buy_share"),
