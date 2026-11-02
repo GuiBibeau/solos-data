@@ -171,7 +171,10 @@ the live min, inclusive. Gap hours are never sealed as complete: the unit cuts
 them from the plan and records them as `gapHours` entries `{venue, from_hour,
 to_hour, reason: "history_lane_ended_before_live: history finished at <ts>,
 live starts at <ts>"}` in the run receipt and the catalog watermark; hours
-after the gap seal off the live lane.
+after the gap seal off the live lane. The undecoded entry's `to_hour` is the
+venue watermark hour (it can reach past the requested window) while its
+inserted hours are clamped to the plan - the entry states the full
+incompleteness, the plan only ever drops in-range hours.
 The two-hour trailing guard always applies to the sealing watermark (the live
 lane's max when the history is finished). The status file's sha256 and the
 per-venue done flags are part of every hour's skip key and are recorded in the

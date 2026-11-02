@@ -71,3 +71,16 @@ move to the shared seal PR (`pi/combined-shared-seal`) and are listed here so
 - [ ] `pyth_coin_hour` has no `mapped` column (`asset_id` NULL marks unmapped).
   Adding one is an output-shape change (unit version bump) so it waits for the
   next schema window.
+- [ ] Hours that become gap hours after having been sealed keep their stale
+  file, hour receipt and catalog entry: a key change rebuilds everything
+  except gap hours, which are cut from the plan and neither rebuilt nor
+  deleted. Same mechanism as the lockbox case above; physical cleanup of stale
+  partitions is still open for both.
+- [ ] The `lockbox_hours_dropped` covered-hour sets are window-sensitive in
+  phoenix (only fills files overlapping the requested window) but
+  window-independent in solana-perp/pyth (all walked files' spans). Both are
+  defensible readings of "covered input hours"; pick one and say it in
+  ADR-0023 before the full-span build.
+- [ ] io.rs's `lock_output`/`walk_parquet`/`open_reader` are verbatim copies
+  of the mapping.rs helpers; `load_provenance` already moved, finishing the
+  move would satisfy the one-helper rule.
