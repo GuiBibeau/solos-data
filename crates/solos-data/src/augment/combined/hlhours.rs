@@ -267,6 +267,15 @@ pub struct Report {
 }
 
 impl Report {
+    /// Process exit code: 0, or 3 when the run refused any hour. The last hours of
+    /// every steady-state run refuse until the input watermark closes them, so the
+    /// nonzero code is information, not a failure: the sealed hours are durable and
+    /// a later run picks the refused ones up.
+    #[must_use]
+    pub const fn exit_code(&self) -> i32 {
+        if self.refused_hours > 0 { 3 } else { 0 }
+    }
+
     /// JSON object for stdout.
     #[must_use]
     pub fn to_json(&self) -> String {
@@ -705,6 +714,52 @@ fn load_mapping(conn: &Connection, out: &Path) -> Result<Option<u64>, StoreError
     Ok(Some(count_rows(conn, "SELECT count(*) FROM asset_map")?))
 }
 
+/// The mapping input fact of a run: the sha256 of `mapping/assets.csv` when the
+/// mapping unit has run, else null. Part of every hour's skip key, so a newly
+/// written or changed assets.csv rebuilds the hours that predate it instead of
+/// keeping their null `asset_id`s.
+fn assets_fact(out: &Path) -> Value {
+    match std::fs::read(out.join("mapping").join("assets.csv")) {
+        Ok(bytes) => json!({"sha256": sha256_hex(&bytes)}),
+        Err(_) => json!({"sha256": null}),
+    }
+}
+
+/// The ctx input facts of one bucket: the sha256 of every daily file either ctx
+/// lane consults for `bucket` (its own day and the previous day, the hour-0
+/// baseline), null when absent. Conservative on purpose: a file counts even when
+/// no row of this bucket ends up using its lane, so changed ctx inputs always
+/// rebuild instead of silently keeping stale snapshots.
+fn ctx_input_facts(request: &Request, bucket: i64) -> Value {
+    let day = compact_day(bucket);
+    let prev = compact_day(bucket - 1);
+    let mut days = vec![day.clone()];
+    if prev != day {
+        days.push(prev);
+    }
+    let file_fact = |path: PathBuf| -> Value {
+        std::fs::read(&path).map_or(Value::Null, |bytes| json!(sha256_hex(&bytes)))
+    };
+    let mut s3 = BTreeMap::new();
+    let mut capture = BTreeMap::new();
+    for day in &days {
+        s3.insert(
+            day.clone(),
+            file_fact(request.ctx_s3.join(format!("{day}.csv.lz4"))),
+        );
+        capture.insert(
+            day.clone(),
+            file_fact(request.ctx_capture.join(format!(
+                "{}-{}-{}.parquet",
+                &day[0..4],
+                &day[4..6],
+                &day[6..8]
+            ))),
+        );
+    }
+    json!({"s3": s3, "capture": capture})
+}
+
 /// Run the unit: stage 1 per receipted source file, merge per bucket, ctx, lockbox,
 /// durable write, receipts, catalog. See the module doc for the refusal and drop
 /// rules.
@@ -782,6 +837,7 @@ pub fn run(request: &Request) -> Result<Report, StoreError> {
         seconds: 0.0,
     };
 
+    let assets = assets_fact(&request.out);
     let mut built_files: Vec<receipt::OutputFile> = Vec::new();
     execute(
         request,
@@ -790,6 +846,7 @@ pub fn run(request: &Request) -> Result<Report, StoreError> {
         &watermark,
         &lockbox_hours,
         &buckets,
+        &assets,
         &mut report,
         &mut built_files,
     )?;
@@ -811,6 +868,7 @@ pub fn run(request: &Request) -> Result<Report, StoreError> {
                     "max_hour": watermark.key(watermark.max_hour),
                 },
                 "lockbox_sha256": request.lockbox_sha256.trim().to_ascii_lowercase(),
+                "mapping_assets": assets,
             }),
             lockbox_sha256: request.lockbox_sha256.trim().to_ascii_lowercase(),
             // Dropped = buckets this run considered that sit in the exclusion set;
@@ -841,6 +899,8 @@ pub fn run(request: &Request) -> Result<Report, StoreError> {
                 "stage1_version": STAGE1_VERSION,
                 "hl_train_code_sha": HL_TRAIN_CODE_SHA,
                 "lockbox_sha256": request.lockbox_sha256.trim().to_ascii_lowercase(),
+                "lockbox_hours_dropped": report.lockbox_hours_dropped as u64,
+                "lockbox_hours_excluded": lockbox_hours.len() as u64,
             }),
         );
     }
@@ -858,6 +918,7 @@ fn execute(
     watermark: &Watermark,
     lockbox_hours: &BTreeSet<i64>,
     buckets: &[i64],
+    assets: &Value,
     report: &mut Report,
     built_files: &mut Vec<receipt::OutputFile>,
 ) -> Result<(), StoreError> {
@@ -961,6 +1022,7 @@ fn execute(
             &facts,
             watermark,
             lockbox_hours,
+            assets,
             report,
         )?;
         built_files.push(file);
@@ -984,6 +1046,7 @@ fn emit_bucket(
     facts: &[Value],
     watermark: &Watermark,
     lockbox_hours: &BTreeSet<i64>,
+    assets: &Value,
     report: &mut Report,
 ) -> Result<receipt::OutputFile, StoreError> {
     let date = grid::date_of_hour(bucket);
@@ -1000,8 +1063,14 @@ fn emit_bucket(
         .join("receipts")
         .join(format!("hour={tag}.json"));
 
-    // Idempotent skip: the receipt was sealed for the same unit version and the same
-    // source input facts, and the sealed file is still there.
+    // Idempotent skip: the receipt was sealed for the same unit version, the same
+    // source input facts, the same writer config, the same lockbox bytes, the same
+    // mapping/assets.csv content and the same ctx input files, and the sealed file
+    // still hashes to the receipt's sha256. A sealed file that no longer matches its
+    // receipt is rebuilt, not refused: the receipt is the record of what the file
+    // must contain, and a rerun from the same receipted sources is byte-identical.
+    let ctx_facts = ctx_input_facts(request, bucket);
+    let sealed_sha = file_hash(&final_path).ok();
     if let Ok(old) = std::fs::read_to_string(&receipt_path).and_then(|text| {
         serde_json::from_str::<Value>(&text).map_err(|_| std::io::Error::other("bad receipt json"))
     }) {
@@ -1010,13 +1079,30 @@ fn emit_bucket(
                 old.get("unitVersion").and_then(Value::as_u64) == Some(u64::from(UNIT_VERSION));
             let same_sources =
                 old.get("input").and_then(|i| i.get("sources")) == Some(&json!(facts));
-            if same_version && same_sources && final_path.is_file() {
+            let same_config = old.get("configSha256") == Some(&json!(config_hash()));
+            let same_lockbox = old.get("lockbox").and_then(|l| l.get("sha256"))
+                == Some(&json!(request.lockbox_sha256.trim().to_ascii_lowercase()));
+            let same_assets = old.get("input").and_then(|i| i.get("assets")) == Some(assets);
+            let same_ctx = old.get("input").and_then(|i| i.get("ctx")) == Some(&ctx_facts);
+            let sealed_intact = old
+                .get("output")
+                .and_then(|o| o.get("sha256"))
+                .and_then(Value::as_str)
+                .is_some_and(|expected| sealed_sha.as_deref() == Some(expected));
+            if same_version
+                && same_sources
+                && same_config
+                && same_lockbox
+                && same_assets
+                && same_ctx
+                && sealed_intact
+            {
                 report.skipped += 1;
                 if let Some(rows) = old.get("rows").and_then(Value::as_i64) {
                     report.coin_hour_rows += u64::try_from(rows).unwrap_or(0);
                 }
                 let bytes = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
-                let sha = file_hash(&final_path).unwrap_or_default();
+                let sha = sealed_sha.unwrap_or_default();
                 return Ok(receipt::OutputFile {
                     path: relative,
                     rows: u64::try_from(old.get("rows").and_then(Value::as_i64).unwrap_or(0))
@@ -1046,7 +1132,14 @@ fn emit_bucket(
     )
     .map_err(|e| StoreError::Check(format!("ctxrows: {e}")))?;
 
-    let ctx_rows = ctx.hour_ctx(bucket)?;
+    let mut ctx_rows = ctx.hour_ctx(bucket)?;
+    // The first hour after a lockbox gap must not baseline its d_oi on a snapshot
+    // from inside the exclusion: treat the previous-hour OI as missing there.
+    if lockbox::is_excluded(lockbox_hours, bucket - 1) {
+        for row in &mut ctx_rows {
+            row.prev_open_interest = None;
+        }
+    }
     if !ctx_rows.is_empty() {
         let mut sql = String::from("INSERT INTO ctxrows VALUES ");
         for (i, row) in ctx_rows.iter().enumerate() {
@@ -1145,6 +1238,8 @@ fn emit_bucket(
         "input": {
             "watermarkSha256": watermark.sha256,
             "sources": facts,
+            "assets": assets,
+            "ctx": ctx_facts,
         },
         "output": {
             "path": relative,

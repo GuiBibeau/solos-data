@@ -7,7 +7,7 @@
 
 use super::{
     GUARD_HOURS, HL_TRAIN_CODE_SHA, Request, SCHEMA, STAGE1_VERSION, TABLE, UNIT, UNIT_VERSION,
-    grid, lockbox, run,
+    grid, lockbox, mapping, run,
 };
 use crate::augment::combined::receipt;
 
@@ -241,13 +241,24 @@ impl Fixture {
     /// S3 day CSV rows are "time,coin,funding,open_interest"; the loader reads the full
     /// 12-column schema, so the trailing columns are constants (oracle and mark 1.0).
     fn write_s3_day(&self, day: &str, rows: &[String]) {
+        let full: Vec<String> = rows
+            .iter()
+            .map(|row| format!("{row},1,1,1,1,1,1,1,1"))
+            .collect();
+        self.write_s3_day_exact(day, &full);
+    }
+
+    /// S3 day CSV from full 12-column rows (time,coin,funding,open_interest,
+    /// prev_day_px,day_ntl_vlm,premium,oracle_px,mark_px,mid_px,impact_bid_px,
+    /// impact_ask_px), for tests that need oracle != mark.
+    fn write_s3_day_exact(&self, day: &str, rows: &[String]) {
         let mut csv = String::from(
             "time,coin,funding,open_interest,prev_day_px,day_ntl_vlm,premium,oracle_px,\
              mark_px,mid_px,impact_bid_px,impact_ask_px\n",
         );
         for row in rows {
             csv.push_str(row);
-            csv.push_str(",1,1,1,1,1,1,1,1\n");
+            csv.push('\n');
         }
         let mut encoder = lz4::EncoderBuilder::new().build(Vec::new()).unwrap();
         encoder.write_all(csv.as_bytes()).unwrap();
@@ -286,12 +297,29 @@ fn output_path(root: &Path, unix: i64) -> PathBuf {
         .join(format!("hour={}.parquet", grid::hour_key(unix)))
 }
 
-fn receipt_json(root: &Path, unix: i64) -> Value {
-    let path = root
-        .join(super::TABLE)
+fn hour_receipt_path(root: &Path, unix: i64) -> PathBuf {
+    root.join(super::TABLE)
         .join("receipts")
-        .join(format!("hour={}.json", grid::hour_key(unix)));
-    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+        .join(format!("hour={}.json", grid::hour_key(unix)))
+}
+
+fn receipt_json(root: &Path, unix: i64) -> Value {
+    serde_json::from_str(&std::fs::read_to_string(hour_receipt_path(root, unix)).unwrap()).unwrap()
+}
+
+/// Write `mapping/assets.csv` (the mapping unit's output shape: PLAN column order).
+fn write_assets_csv(root: &Path, rows: &[&str]) {
+    let dir = root.join("mapping");
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut csv = String::from(
+        "asset_id,venue,venue_symbol,builder,coin_class,venue_market_id,first_ts,last_ts,\
+         source_of_truth,mapped,reason,median_abs_log_ratio,n_hours\n",
+    );
+    for row in rows {
+        csv.push_str(row);
+        csv.push('\n');
+    }
+    std::fs::write(dir.join("assets.csv"), csv).unwrap();
 }
 
 fn rows_of(path: &Path) -> Vec<Obj> {
@@ -484,6 +512,9 @@ fn hour_boundary_strays_merge_and_unclosed_buckets_refuse() {
     assert_eq!(i(sol, "last_ms"), h * HOUR * 1000 + 660_000);
     // d_oi sums across files: 50*1/2 + 51*1/2 + 49*1/2 = 75.0
     assert!((f(sol, "d_oi_usd") - 75.0).abs() < 1e-9);
+    // first/last px survive the cross-file merge in first_ms/last_ms order
+    assert!((f(sol, "first_px") - 50.0).abs() < 1e-9);
+    assert!((f(sol, "last_px") - 49.0).abs() < 1e-9);
     assert!(
         !output_path(fx.root.path(), h + 1).exists(),
         "a refused bucket writes nothing"
@@ -726,6 +757,14 @@ fn rerun_is_idempotent() {
     let path = output_path(fx.root.path(), h);
     let bytes1 = std::fs::read(&path).unwrap();
     let receipt1 = serde_json::to_string(&receipt_json(fx.root.path(), h)).unwrap();
+    // The catalog watermark carries the two lockbox counts with U1's meaning:
+    // dropped = input hours this run actually lost, excluded = the v2 set size.
+    let cat: Value = serde_json::from_str(
+        &std::fs::read_to_string(fx.root.path().join("catalog.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cat["watermarks"][UNIT]["lockbox_hours_dropped"], 0);
+    assert_eq!(cat["watermarks"][UNIT]["lockbox_hours_excluded"], 864);
 
     let second = run(&fx.request(h, h)).unwrap();
     assert_eq!(second.built, 0, "nothing rebuilt");
@@ -779,4 +818,496 @@ fn hour_keys_and_pins() {
     assert_eq!(GUARD_HOURS, 2);
     assert_eq!(HL_TRAIN_CODE_SHA.len(), 40);
     assert_eq!(UNIT_VERSION, super::UNIT_VERSION);
+}
+
+/// A mapping written after a first run rebuilds the sealed hour with its asset_id:
+/// the skip key pins the assets.csv content. A third run with nothing changed skips.
+#[test]
+fn adding_assets_csv_rebuilds_and_populates_asset_id() {
+    let fx = Fixture::new("assets-rebuild");
+    let h = h0();
+    let c = conn(fx.root.path());
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 1, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+
+    let first = run(&fx.request(h, h)).unwrap();
+    assert_eq!(first.built, 1, "report: {}", first.to_json());
+    let btc = &rows_of(&output_path(fx.root.path(), h))[0];
+    assert!(
+        matches!(btc.get("asset_id"), None | Some(Value::Null)),
+        "no mapping yet: {btc:?}"
+    );
+
+    write_assets_csv(
+        fx.root.path(),
+        &["A-BTC,hl,BTC,BTC,perp,,,2025-07-20T04:59:59Z,paired,mapped,,0.001,24"],
+    );
+    let second = run(&fx.request(h, h)).unwrap();
+    assert_eq!(
+        second.built,
+        1,
+        "the new assets.csv must rebuild: {}",
+        second.to_json()
+    );
+    assert_eq!(second.skipped, 0);
+    let btc = &rows_of(&output_path(fx.root.path(), h))[0];
+    assert_eq!(s(btc, "asset_id"), "A-BTC");
+
+    let third = run(&fx.request(h, h)).unwrap();
+    assert_eq!(third.built, 0, "nothing changed since the rebuild");
+    assert_eq!(third.skipped, 1);
+}
+
+/// The asset_id join scopes to venue='hl' rows: another venue's row for the same
+/// venue_symbol must not win the min() in the final select.
+#[test]
+fn the_asset_id_join_scopes_to_hl_rows() {
+    let fx = Fixture::new("venue-filter");
+    let h = h0();
+    let c = conn(fx.root.path());
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 1, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+    write_assets_csv(
+        fx.root.path(),
+        &[
+            "Z-HL,hl,BTC,BTC,perp,,,2025-07-20T04:59:59Z,paired,mapped,,0.001,24",
+            "A-OTH,hlx,BTC,BTC,perp,,,2025-07-20T04:59:59Z,paired,mapped,,0.001,24",
+        ],
+    );
+
+    let report = run(&fx.request(h, h)).unwrap();
+    assert_eq!(report.built, 1, "report: {}", report.to_json());
+    let btc = &rows_of(&output_path(fx.root.path(), h))[0];
+    assert_eq!(s(btc, "asset_id"), "Z-HL", "only the hl row joins");
+}
+
+/// A receipt sealed under an older writer config (different configSha256) rebuilds.
+#[test]
+fn a_stale_config_sha_in_the_hour_receipt_forces_a_rebuild() {
+    let fx = Fixture::new("stale-config");
+    let h = h0();
+    let c = conn(fx.root.path());
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 1, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+    run(&fx.request(h, h)).unwrap();
+
+    let path = hour_receipt_path(fx.root.path(), h);
+    let mut old: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    old["configSha256"] = json!("0".repeat(64));
+    std::fs::write(&path, old.to_string()).unwrap();
+
+    let second = run(&fx.request(h, h)).unwrap();
+    assert_eq!(second.built, 1, "a stale config sha must rebuild");
+    assert_eq!(second.skipped, 0);
+    let sealed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(sealed["configSha256"], json!(super::config_hash()));
+}
+
+/// A different lockbox file (same weeks, different bytes and sha) rebuilds.
+#[test]
+fn a_changed_lockbox_file_forces_a_rebuild() {
+    let fx = Fixture::new("lockbox-change");
+    let h = h0();
+    let c = conn(fx.root.path());
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 1, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+    run(&fx.request(h, h)).unwrap();
+
+    let mut body: Value = serde_json::from_str(&lockbox::tests::v2_body()).unwrap();
+    body["created"] = json!("2026-10-23");
+    let path2 = fx.root.path().join("lockbox2.json");
+    std::fs::write(&path2, body.to_string()).unwrap();
+    let sha2 = crate::fsutil::sha256_hex(&std::fs::read(&path2).unwrap());
+    let mut request = fx.request(h, h);
+    request.lockbox = path2;
+    request.lockbox_sha256 = sha2;
+
+    let second = run(&request).unwrap();
+    assert_eq!(second.built, 1, "a changed lockbox file must rebuild");
+    assert_eq!(second.skipped, 0);
+}
+
+/// Changed ctx input files rebuild the sealed hour and the new values land.
+#[test]
+fn changed_ctx_inputs_force_a_rebuild() {
+    let fx = Fixture::new("ctx-change");
+    let h = h0();
+    let day = compact_day(h);
+    let day_iso = format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]);
+    let c = conn(fx.root.path());
+    fx.write_s3_day(&day, &[format!("{day_iso}T04:59:00Z,BTC,0.0001,500")]);
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 1, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+
+    let first = run(&fx.request(h, h)).unwrap();
+    assert_eq!(first.built, 1, "report: {}", first.to_json());
+    let btc = &rows_of(&output_path(fx.root.path(), h))[0];
+    assert!((opt_f(btc, "ctx_funding").unwrap() - 0.0001).abs() < 1e-12);
+
+    fx.write_s3_day(&day, &[format!("{day_iso}T04:59:00Z,BTC,0.0002,510")]);
+    let second = run(&fx.request(h, h)).unwrap();
+    assert_eq!(second.built, 1, "changed ctx inputs must rebuild");
+    assert_eq!(second.skipped, 0);
+    let btc = &rows_of(&output_path(fx.root.path(), h))[0];
+    assert!((opt_f(btc, "ctx_funding").unwrap() - 0.0002).abs() < 1e-12);
+    assert!((opt_f(btc, "ctx_open_interest").unwrap() - 510.0).abs() < 1e-9);
+}
+
+/// A sealed file tampered after its receipt is rebuilt, and the fresh file matches
+/// the receipt's sha256 again.
+#[test]
+fn a_tampered_sealed_file_is_rebuilt() {
+    let fx = Fixture::new("tamper");
+    let h = h0();
+    let c = conn(fx.root.path());
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 1, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+    run(&fx.request(h, h)).unwrap();
+
+    let out = output_path(fx.root.path(), h);
+    let mut bytes = std::fs::read(&out).unwrap();
+    bytes.extend_from_slice(b"tampered");
+    std::fs::write(&out, bytes).unwrap();
+
+    let second = run(&fx.request(h, h)).unwrap();
+    assert_eq!(second.built, 1, "a tampered sealed file must rebuild");
+    assert_eq!(second.skipped, 0);
+    let receipt: Value = serde_json::from_str(
+        &std::fs::read_to_string(hour_receipt_path(fx.root.path(), h)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::fsutil::file_hash(&out).unwrap(),
+        receipt["output"]["sha256"],
+        "the rebuilt file matches the receipt again"
+    );
+}
+
+/// The oracle basis divides by the oracle price, not the mark.
+#[test]
+fn oracle_basis_uses_the_oracle_as_denominator() {
+    let fx = Fixture::new("oracle-basis");
+    let h = h0();
+    let day = compact_day(h);
+    let day_iso = format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]);
+    let c = conn(fx.root.path());
+    fx.write_s3_day_exact(
+        &day,
+        &[format!(
+            "{day_iso}T04:59:00Z,BTC,0.0001,500.0,1.0,1.0,0.0002,100.0,110.0,105.0,99.0,101.0"
+        )],
+    );
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 1, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+
+    let report = run(&fx.request(h, h)).unwrap();
+    assert_eq!(report.built, 1, "report: {}", report.to_json());
+    let btc = &rows_of(&output_path(fx.root.path(), h))[0];
+    assert!((f(btc, "ctx_oracle_px") - 100.0).abs() < 1e-9);
+    assert!((f(btc, "ctx_mark_px") - 110.0).abs() < 1e-9);
+    assert!((f(btc, "ctx_oracle_basis") - 0.1).abs() < 1e-12);
+}
+
+/// A coin covered by both ctx lanes reads s3: the capture row must not win.
+#[test]
+fn s3_wins_over_capture_for_a_shared_coin() {
+    let fx = Fixture::new("s3-priority");
+    let h = h0();
+    let day = compact_day(h);
+    let day_iso = format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]);
+    let c = conn(fx.root.path());
+    fx.write_s3_day(&day, &[format!("{day_iso}T04:59:00Z,BTC,0.0001,500")]);
+    fx.write_capture_day(
+        &c,
+        &day,
+        &format!("('BTC', {}, 9.75, 1000.0)", h * HOUR * 1000 + 3_540_000),
+    );
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 1, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+
+    let report = run(&fx.request(h, h)).unwrap();
+    assert_eq!(report.built, 1, "report: {}", report.to_json());
+    let btc = &rows_of(&output_path(fx.root.path(), h))[0];
+    assert_eq!(s(btc, "ctx_source"), "s3");
+    assert!((opt_f(btc, "ctx_funding").unwrap() - 0.0001).abs() < 1e-12);
+    assert!((opt_f(btc, "ctx_open_interest").unwrap() - 500.0).abs() < 1e-9);
+}
+
+/// A run refuses while another process holds the combined root lock.
+#[test]
+fn a_second_run_refuses_while_the_root_is_locked() {
+    let fx = Fixture::new("locked");
+    let h = h0();
+    let c = conn(fx.root.path());
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 1, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+
+    let _held = mapping::lock_output(fx.root.path()).unwrap();
+    assert!(
+        run(&fx.request(h, h)).is_err(),
+        "the held lock must refuse the run"
+    );
+}
+
+/// A failed fsync of the sealed file's temp leaves no output and no receipt; the
+/// fault must hit the sealed file's temp fsync, not a later one.
+#[test]
+fn a_failed_sealed_file_fsync_leaves_no_output() {
+    let fx = Fixture::new("fsync-sealed");
+    let h = h0();
+    let c = conn(fx.root.path());
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 1, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+
+    crate::fsutil::inject_fsync_failure(crate::fsutil::FsyncStep::TempFile);
+    let error = run(&fx.request(h, h));
+    crate::fsutil::clear_fsync_failure();
+    assert!(
+        error.is_err(),
+        "the injected fsync failure must fail the run"
+    );
+    assert_eq!(
+        crate::fsutil::last_fsync_step(),
+        Some(crate::fsutil::FsyncStep::TempFile),
+        "the fault hit a temp-file fsync"
+    );
+    let synced = crate::fsutil::last_fsync_path().unwrap_or_default();
+    assert!(
+        synced.to_string_lossy().ends_with(".parquet.tmp"),
+        "the fault hit the sealed file's temp fsync, got {synced:?}"
+    );
+    assert!(!output_path(fx.root.path(), h).exists(), "no sealed output");
+    assert!(
+        !hour_receipt_path(fx.root.path(), h).exists(),
+        "no receipt after a failed output"
+    );
+    let second = run(&fx.request(h, h)).unwrap();
+    assert_eq!(second.built, 1, "a rerun without the fault builds the hour");
+}
+
+/// A failed durable write of the hour receipt leaves the sealed file but no receipt.
+#[test]
+fn a_failed_hour_receipt_write_leaves_the_sealed_file_but_no_receipt() {
+    let fx = Fixture::new("fsync-receipt");
+    let h = h0();
+    let c = conn(fx.root.path());
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 1, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+
+    crate::fsutil::inject_write_enospc();
+    let error = run(&fx.request(h, h));
+    crate::fsutil::clear_write_failure();
+    assert!(
+        error.is_err(),
+        "the faulted receipt write must fail the run"
+    );
+    assert!(
+        output_path(fx.root.path(), h).exists(),
+        "the sealed file is durable"
+    );
+    assert!(
+        !hour_receipt_path(fx.root.path(), h).exists(),
+        "no receipt after the failed write"
+    );
+    let second = run(&fx.request(h, h)).unwrap();
+    assert_eq!(second.built, 1, "a rerun seals the unreceipted hour");
+}
+
+/// The first hour after the lockbox does not baseline its d_oi on a snapshot from
+/// inside the exclusion: its previous-hour OI counts as missing there.
+#[test]
+fn ctx_d_oi_is_missing_after_a_lockbox_gap() {
+    let fx = Fixture::new("lockgap");
+    let lockbox = lockbox::load(&fx.lockbox, &fx.lockbox_sha).unwrap();
+    let excluded = lockbox.excluded_hours().unwrap();
+    let h = excluded.iter().next_back().unwrap() + 1;
+    assert!(
+        lockbox::is_excluded(&excluded, h - 1),
+        "the baseline hour sits inside the exclusion"
+    );
+    let day = compact_day(h);
+    let prev_day = compact_day(h - 1);
+    let day_iso = format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]);
+    let prev_iso = format!(
+        "{}-{}-{}",
+        &prev_day[0..4],
+        &prev_day[4..6],
+        &prev_day[6..8]
+    );
+    fx.write_s3_day(&prev_day, &[format!("{prev_iso}T23:59:00Z,BTC,0.0001,440")]);
+    fx.write_s3_day(&day, &[format!("{day_iso}T00:59:00Z,BTC,0.0002,460")]);
+    let c = conn(fx.root.path());
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 1, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+
+    let report = run(&fx.request(h, h)).unwrap();
+    assert_eq!(report.built, 1, "report: {}", report.to_json());
+    assert_eq!(report.lockbox_hours_dropped, 0);
+    let btc = &rows_of(&output_path(fx.root.path(), h))[0];
+    assert_eq!(s(btc, "ctx_source"), "s3");
+    assert!((opt_f(btc, "ctx_open_interest").unwrap() - 460.0).abs() < 1e-9);
+    assert!(
+        opt_f(btc, "ctx_d_oi").is_none(),
+        "the baseline snapshot is inside the lockbox"
+    );
+}
+
+/// The CLI exits 0 when every requested hour closed, and nonzero when hours were
+/// refused, so a scheduler can see the refused tail.
+#[test]
+fn the_cli_exits_nonzero_when_hours_are_refused() {
+    let fx = Fixture::new("cli-exit");
+    let h = h0();
+    let c = conn(fx.root.path());
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 5, h + 3, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 5..=h + 3).collect::<Vec<_>>());
+    let day = "2025-07-20";
+    let args = |fx: &Fixture| -> Vec<String> {
+        vec![
+            "hl-hours".into(),
+            "--out".into(),
+            fx.root.path().to_string_lossy().into_owned(),
+            "--fills".into(),
+            fx.fills.to_string_lossy().into_owned(),
+            "--ctx-s3".into(),
+            fx.ctx_s3.to_string_lossy().into_owned(),
+            "--ctx-capture".into(),
+            fx.ctx_capture.to_string_lossy().into_owned(),
+            "--lockbox".into(),
+            fx.lockbox.to_string_lossy().into_owned(),
+            "--lockbox-sha256".into(),
+            fx.lockbox_sha.clone(),
+            "--provenance".into(),
+            fx.provenance.to_string_lossy().into_owned(),
+            "--since".into(),
+            day.into(),
+            "--until".into(),
+            day.into(),
+        ]
+    };
+    let code = crate::cli::combined_hl_hours_run(&args(&fx)).unwrap();
+    assert_eq!(code, 0, "every requested hour is closed and receipted");
+
+    // A watermark with a hole: the buckets before h keep refusing, and the exit
+    // code says so.
+    write_watermark(&fx.fills, &[h - 1, h, h + 1, h + 2, h + 3]);
+    let code = crate::cli::combined_hl_hours_run(&args(&fx)).unwrap();
+    assert_ne!(code, 0, "refused hours must be visible in the exit code");
 }

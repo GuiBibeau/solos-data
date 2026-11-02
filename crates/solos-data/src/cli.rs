@@ -1485,7 +1485,7 @@ fn combined_mapping_run(args: &[String]) -> Result<i32, StoreError> {
     Ok(report.exit_code())
 }
 
-fn combined_hl_hours_run(args: &[String]) -> Result<i32, StoreError> {
+pub(crate) fn combined_hl_hours_run(args: &[String]) -> Result<i32, StoreError> {
     let memory = flag(args, "--memory").unwrap_or("8GB").to_owned();
     let parse_day_hour = |name: &str, end_of_day: i64| -> Result<Option<i64>, StoreError> {
         match flag(args, name) {
@@ -1518,7 +1518,7 @@ fn combined_hl_hours_run(args: &[String]) -> Result<i32, StoreError> {
     };
     let report = crate::augment::combined::hlhours::run(&request)?;
     println!("{}", report.to_json());
-    Ok(0)
+    Ok(report.exit_code())
 }
 
 /// Combined units cap threads at 8 (PLAN.md).
