@@ -345,7 +345,11 @@ hour is dispatched (`statvfs`). Below `--min-free-tb` (default 1.0, meaning
 10^12 bytes) the process exits 2 and does not dispatch more hours; hours
 already dispatched finish and commit. Exit 0 means every complete hour is
 verified; pending hours are counted in `hoursPending` and are not a failure.
-Exit 1 is a bad hour or a bad argument.
+Exit 1 is a bad hour or a bad argument. Exit 3 means one or more hours were
+quarantined for a malformed raw line: the hour is not sealed, its raw is
+kept, and the fault is recorded in `quarantine.jsonl`; quarantine wins over
+the disk-floor code 2. See docs/issues/007, "Quarantine: a raw line that
+does not decode".
 
 `--threads` and `--memory` are the per-worker DuckDB caps; with `--jobs J` the
 process can use about `J` times each. The sort spills under
