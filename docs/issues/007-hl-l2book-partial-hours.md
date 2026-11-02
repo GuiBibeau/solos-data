@@ -95,7 +95,8 @@ Found in production. The live batch-01 run exited 1 at 2026-11-02 10:18 UTC with
 read-only: the raw file `market_data/20251114/11/l2Book/MEGA.lz4` (283,377 B) matches the
 MANIFEST sha256 `81ce31ed…9dde1` and the S3 listing md5/ETag `113b3008…d9ad677e3`, so the
 bytes are upstream data as published, not a download fault. Decompressed: 8,277,841 B,
-5,248 lines. Line 1303 (2,061 B) is a record from 11:15:17.445 truncated at byte 480, with
+5,247 newline-terminated lines (5,248 is the split-on-newline element count including
+the empty tail). Line 1303 (2,061 B) is a record from 11:15:17.445 truncated at byte 480, with
 a complete record from 11:21:59.289 spliced on right after it (no newline); every other
 line parses; line 1302 is 11:15:16.88 and line 1304 is 11:22:03.71. Real corruption in
 the source.
