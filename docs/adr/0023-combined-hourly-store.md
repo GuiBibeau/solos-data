@@ -175,7 +175,15 @@ The two-hour trailing guard always applies to the sealing watermark (the live
 lane's max when the history is finished). The status file's sha256 and the
 per-venue done flags are part of every hour's skip key and are recorded in the
 receipt's watermark facts, so flipping a venue's done flag rebuilds instead of
-skipping.
+skipping. Completeness is per event, not per lane: an hour in which any
+deduplicated in-window event of a venue has an undecoded name (`name` NULL) is
+not complete either - the raw lane held events the decoder could not read, so
+whatever the hour's decoded rows say, sealing it would look complete while it
+is not. Such hours are gap hours with reason `undecoded_events` (the entry
+carries the venue, the hour range and the undecoded event count) and are never
+sealed; fully decoded hours still seal. The strictness is deliberate: a live
+lane starting even one second after a finished history lane's last record
+leaves the boundary hour a gap.
 
 `phoenix_coin_hour` (per (asset, hour), ordered by `asset_id nulls last`,
 `asset_symbol`): `hour BIGINT`, `asset_symbol VARCHAR`, `asset_id VARCHAR`,

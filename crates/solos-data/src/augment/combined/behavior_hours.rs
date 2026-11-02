@@ -3978,3 +3978,200 @@ fn pyth_unfinished_history_lane_still_holds_the_watermark() {
     let tmp = Tmp::new("pyth-wm-absent");
     assert!(build(&tmp, None).is_err());
 }
+
+/// An hour with one decoded and one NULL-name (undecoded) event is a gap hour
+/// with reason `undecoded_events` and is never sealed, even though it also
+/// holds a decoded event that would give it rows; a fully decoded hour seals
+/// (U1 ignores the NULL names and seals the hour, U2 skips the seal but
+/// records nothing).
+#[test]
+fn solana_perp_undecoded_events_make_the_hour_a_gap() {
+    let tmp = Tmp::new("perp-undecoded");
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    // One flash lane (history + live in one directory is not allowed: the last
+    // lane is the live lane), so a single flash lane is the live lane.
+    let flash = tmp.dir().join("flash");
+    write_event_lane(
+        &flash,
+        &[
+            perp_event(
+                "fDec1",
+                432_100_010,
+                h0 + 600,
+                0,
+                "IncreaseSizeLogUSDv1",
+                r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
+            ),
+            // The undecoded event: no name, no fields.
+            format!("('uNull', 432_100_010, {}, 0, NULL, NULL)", h0 + 1_200),
+            perp_event(
+                "fDec2",
+                432_100_010,
+                h0 + 2 * 3_600 + 600,
+                0,
+                "IncreaseSizeLogUSDv1",
+                r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
+            ),
+            perp_event(
+                "fSent",
+                432_100_010,
+                sentinel,
+                0,
+                "IncreaseSizeLogUSDv1",
+                r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
+            ),
+        ],
+    );
+    // Jupiter closes cleanly (its history reaches the sentinel, so no status
+    // is needed and the venue never holds the day back).
+    let (jup_hist, jup_live) = write_two_lanes(
+        tmp.dir(),
+        "jupiter",
+        sentinel,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "jup")],
+    );
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let jupiter_events = vec![jup_hist, jup_live];
+    let flash_events = vec![flash];
+    let request = PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: None,
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    };
+    let report = super::solana_perp_hours::run(&request).unwrap();
+    let hour0 = grid::hour_of_secs(h0);
+    let hour2 = grid::hour_of_secs(h0) + 2;
+    // Hour 0 holds the undecoded event: never sealed. Hour 2 is fully
+    // decoded: sealed.
+    let path0 = tmp
+        .dir()
+        .join(io::hour_partition(hour0, super::solana_perp_hours::TABLE));
+    assert!(
+        !path0.exists(),
+        "the undecoded hour sealed: {}",
+        path0.display()
+    );
+    assert!(
+        tmp.dir()
+            .join(io::hour_partition(hour2, super::solana_perp_hours::TABLE))
+            .is_file(),
+        "the fully decoded hour seals"
+    );
+    assert_eq!(report.hours_written, 1);
+    let receipt = unit_receipt(
+        tmp.dir(),
+        super::solana_perp_hours::TABLE,
+        super::solana_perp_hours::UNIT,
+    );
+    let gaps = receipt["inputs"]["watermark"]["gapHours"]
+        .as_array()
+        .unwrap();
+    let undecoded = gaps
+        .iter()
+        .find(|entry| entry["reason"] == "undecoded_events")
+        .expect("the undecoded hour must be recorded");
+    assert_eq!(undecoded["venue"], "flash");
+    assert_eq!(undecoded["from_hour"], hour0);
+    assert_eq!(undecoded["to_hour"], hour0);
+    assert_eq!(undecoded["count"], 1, "one NULL-name event");
+}
+
+/// Strictness pin: a live start even one second after the history lane's last
+/// record leaves the boundary hour a gap (history finished at 15:55:02, live
+/// starts 15:55:33, same hour - the hour still never seals, and the decoded
+/// history row that would fill it is not enough).
+#[test]
+fn solana_perp_a_one_second_live_gap_makes_the_hour_a_gap() {
+    let tmp = Tmp::new("perp-one-second");
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    let hist_last = h0 + 15 * 3_600 + 55 * 60 + 2;
+    let live_first = hist_last + 31;
+    let (flash_hist, flash_live) = write_two_lanes(
+        tmp.dir(),
+        "flash",
+        hist_last,
+        live_first,
+        &[
+            (h0 + 16 * 3_600 + 600, "lPost", "flash"),
+            (sentinel, "lSentinel", "flash"),
+        ],
+    );
+    let (jup_hist, jup_live) = write_two_lanes(
+        tmp.dir(),
+        "jupiter",
+        sentinel,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "jup")],
+    );
+    let (status, _) = status_file(tmp.dir(), false, &[("jupiter", true), ("flash", true)]);
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let jupiter_events = vec![jup_hist, jup_live];
+    let flash_events = vec![flash_hist, flash_live];
+    let request = PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: Some(&status),
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    };
+    let report = super::solana_perp_hours::run(&request).unwrap();
+    let hour15 = grid::hour_of_secs(hist_last);
+    let hour16 = grid::hour_of_secs(h0) + 16;
+    assert_eq!(hour15, hour16 - 1);
+    let path15 = tmp
+        .dir()
+        .join(io::hour_partition(hour15, super::solana_perp_hours::TABLE));
+    assert!(
+        !path15.exists(),
+        "the one-second-gap hour sealed: {}",
+        path15.display()
+    );
+    assert!(
+        tmp.dir()
+            .join(io::hour_partition(hour16, super::solana_perp_hours::TABLE))
+            .is_file(),
+        "the post-gap hour seals"
+    );
+    let receipt = unit_receipt(
+        tmp.dir(),
+        super::solana_perp_hours::TABLE,
+        super::solana_perp_hours::UNIT,
+    );
+    let gaps = receipt["inputs"]["watermark"]["gapHours"]
+        .as_array()
+        .unwrap();
+    let gap = gaps
+        .iter()
+        .find(|entry| entry["venue"] == "flash")
+        .expect("the flash gap must be recorded");
+    assert_eq!(gap["from_hour"], hour15);
+    assert_eq!(gap["to_hour"], hour15, "one second is still a gap");
+    assert!(
+        gap["reason"]
+            .as_str()
+            .unwrap()
+            .contains("history finished at")
+    );
+    let _ = report;
+}

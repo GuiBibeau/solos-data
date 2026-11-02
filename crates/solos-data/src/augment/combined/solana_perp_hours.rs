@@ -40,8 +40,9 @@ pub const UNIT: &str = "solana-perp-hours";
 /// The table this unit writes under the output root.
 pub const TABLE: &str = "solana_perp_coin_hour";
 
-/// Bumped on an output-shape change.
-pub const UNIT_VERSION: u32 = 1;
+/// Bumped on an output-shape change; 2 adds the undecoded-events rule (an
+/// hour with any in-window NULL-name event is a gap hour, never sealed).
+pub const UNIT_VERSION: u32 = 2;
 
 /// An output hour is sealed only when the input watermark covers the hour end
 /// plus this guard (DESIGN.md 3).
@@ -210,6 +211,7 @@ fn config_hash() -> String {
         "ret": "ln(last/first event price in hour), price>0 rows only",
         "retOrder": "event order is the (slot, signature, ordinal) tuple: the tx is its signature, ordinal the position inside it; no packed bucket can tie or spill",
         "watermark": "per venue the min of its lanes' max block_time (a stalled lane holds the watermark back), then the min across venues",
+        "undecoded": "an hour with any in-window deduplicated event whose name is NULL is a gap hour (reason undecoded_events, with the event count) and never seals",
         "flashPrice": "coalesce(exit, entry, oracle_account_price) * 10^exponent",
         "dedupe": "(signature, ordinal), later lane wins",
         "hourGuardSecs": HOUR_GUARD_SECS,
@@ -422,6 +424,16 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         }
     }
 
+    // The deduplicated event views are built on every run: the
+    // undecoded-events rule needs the in-window names before any hour is
+    // sealed (ADR-0023).
+    let window_lo = grid::hour_start(first_hour);
+    let window_hi = grid::hour_start(requested_last) + grid::HOUR_SECS;
+    build_event_views(&conn, &jupiter_lanes, &flash_lanes, window_lo, window_hi)?;
+    let (undecoded_hours, undecoded_entries) = undecoded_gap_hours(&conn)?;
+    gap_hours.extend(undecoded_hours.iter().copied());
+    gap_entries.extend(undecoded_entries);
+
     let plan = plan_hours(first_hour, requested_last, &lockbox_hours)?;
     let build_hours: Vec<i64> = plan
         .build_hours
@@ -454,13 +466,6 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let mut jupiter_events = 0u64;
     let mut flash_events = 0u64;
     if !pending.is_empty() {
-        build_event_views(
-            &conn,
-            &jupiter_lanes,
-            &flash_lanes,
-            grid::hour_start(first_hour),
-            grid::hour_start(requested_last) + grid::HOUR_SECS,
-        )?;
         jupiter_events = scalar(&conn, "SELECT count(*) AS n FROM jup_pos", "n")?;
         flash_events = scalar(&conn, "SELECT count(*) AS n FROM flash_pos", "n")?;
         build_aggregates(&conn)?;
@@ -761,6 +766,59 @@ fn build_event_views(
     )
     .map_err(|error| StoreError::Check(format!("flash projection: {error}")))?;
     Ok(())
+}
+
+/// Hours whose deduplicated in-window events include an undecoded row (`name
+/// IS NULL`): the hour is not complete (ADR-0023), whatever else it holds.
+/// Returns the hour indices and the `gapHours` entries - one per contiguous
+/// run of hours per venue, with the run's total undecoded event count.
+fn undecoded_gap_hours(
+    conn: &duckdb::Connection,
+) -> Result<(std::collections::BTreeSet<i64>, Vec<Value>), StoreError> {
+    let mut set = std::collections::BTreeSet::new();
+    let mut entries: Vec<Value> = Vec::new();
+    for (table, venue) in [("jup_dedup", "jupiter"), ("flash_dedup", "flash")] {
+        let rows = query_rows(
+            conn,
+            &format!(
+                "SELECT (block_time // 3600) AS hour, count(*) AS n FROM {table}
+                 WHERE name IS NULL GROUP BY hour ORDER BY hour"
+            ),
+            &[],
+        )?;
+        let mut hours: Vec<(i64, u64)> = Vec::new();
+        for row in rows {
+            let hour = row
+                .int("hour")
+                .ok_or_else(|| StoreError::Check("null undecoded hour".into()))?;
+            let n = row
+                .int("n")
+                .ok_or_else(|| StoreError::Check("null undecoded count".into()))?;
+            hours.push((hour, n.max(0) as u64));
+        }
+        // Merge consecutive hours into runs with the run's total event count.
+        let mut runs: Vec<(i64, i64, u64)> = Vec::new(); // (first, last, count)
+        for (hour, count) in hours {
+            match runs.last_mut() {
+                Some(run) if run.1 + 1 == hour => {
+                    run.1 = hour;
+                    run.2 += count;
+                }
+                _ => runs.push((hour, hour, count)),
+            }
+            set.insert(hour);
+        }
+        for (first, last, count) in runs {
+            entries.push(json!({
+                "venue": venue,
+                "from_hour": first,
+                "to_hour": last,
+                "reason": "undecoded_events",
+                "count": count,
+            }));
+        }
+    }
+    Ok((set, entries))
 }
 
 /// The per-(key, hour) aggregates of both venues over the projected events.
