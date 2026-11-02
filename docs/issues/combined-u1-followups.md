@@ -38,3 +38,32 @@ Non-blocking items the reviewer asked to record rather than fix now.
   non-positive Phoenix price), N13 (the finite-price filter in `hourly_prices`;
   needs a non-finite fixture price), N8 (Phoenix is left out of the dropped
   hours max, so it needs fixture counts where HL and Phoenix differ).
+
+## Post-merge real-data rerun (main 83da358)
+
+After #99 merged, the U1 mapping was rerun on real data at main
+83da3584aed1b24f93ca1792ec2f0c236559cbab (code identical to PR head 5d9d0a6)
+from a release binary built at that SHA
+(sha256 7f259c899530734e461b187bedccf9eed524a41a3546e5e5f3c1455b159ffd8d),
+same inputs and check days (2026-10-15..17) as review round 1, written to a
+new dated store `free/combined/qa-u1-20261101-83da358` (under the solos-data
+data root). Results: rows 29,370 (hl 29,220, phoenix 105, pyth 39, jup 6),
+unchanged from round 1; 144 pairs checked, 96 mapped, 0 price divergence,
+48 thin; lockbox_hours_dropped 864, lockbox_hours_excluded 864;
+lockbox_only_symbols hl 7,354, phoenix 0, pyth 0 (the 7,354 matches the
+drop PR #99 reported against the pre-review QA run (36,724 to 29,370 rows):
+the lockbox-only coins). Rows and symbols only match because
+lockbox_only_symbols counts (coin, class) groups and there is no two-class case
+in this data. assets.csv sha256
+54a076d5686a098850703c791e51c6b45033681d0728af12217b1bbac6b2c715; versus the
+round-1 output it differs only in last_ts on 104 phoenix and 13 pyth rows
+(live lanes moved on), no other column changed.
+
+Non-blocking follow-ups:
+
+- HL groups by (coin, coin_class). If a coin trades in two classes and one
+  class exists only inside the lockbox, that class is counted as lockbox-only
+  and skipped before the two-classes guard runs, so the guard never fires for
+  that coin and lockbox_only_symbols is off by one (it counts a class, not a
+  coin). Fix later by checking classes per coin before the lockbox skip, or
+  counting distinct coins.
