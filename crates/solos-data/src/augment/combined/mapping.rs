@@ -31,6 +31,7 @@ use super::catalog;
 use super::grid;
 use super::lockbox;
 use super::receipt;
+use super::seal;
 
 /// The unit this module runs.
 pub const UNIT: &str = "mapping";
@@ -362,15 +363,14 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         return Err(StoreError::Check("venues config has no pyth feeds".into()));
     }
     // Input hours the lockbox actually dropped: hours each input covers that
-    // fall inside the exclusion set. HL is exact (watermark hours); Phoenix and
-    // Pyth count distinct covered hours inside the set. The widest input
-    // defines the store-wide drop; the set's own size is recorded separately.
-    let hl_dropped = hl
-        .hours
-        .iter()
-        .filter_map(|key| watermark_unix_hour(key))
-        .filter(|hour| in_ranges(&lockbox_ranges, *hour))
-        .count() as u64;
+    // fall inside the exclusion set, through the shared seal definition.
+    // HL is exact (watermark hours); Phoenix and Pyth count distinct covered
+    // hours inside the set. The widest input defines the store-wide drop; the
+    // set's own size is recorded separately.
+    let hl_dropped = seal::lockbox_hours_dropped(
+        hl.hours.iter().filter_map(|key| watermark_unix_hour(key)),
+        &lockbox_hours,
+    );
     let lockbox_hours_dropped = hl_dropped
         .max(phoenix.lockbox_hours_dropped)
         .max(pyth.lockbox_hours_dropped);
@@ -480,15 +480,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     })
 }
 
-/// A unix-hour number inside any lockbox range.
-fn in_ranges(ranges: &[(i64, i64)], hour: i64) -> bool {
-    ranges
-        .iter()
-        .any(|(first, last_exclusive)| hour >= *first && hour < *last_exclusive)
-}
-
-/// The SQL complement of [`in_ranges`]: `NOT (hour in any range)` for a row
-/// filter. Empty ranges free everything.
+/// The SQL complement of the lockbox ranges: `NOT (hour in any range)` for a
+/// row filter. Empty ranges free everything.
 fn lockbox_free_sql(ranges: &[(i64, i64)], hour_expression: &str) -> String {
     if ranges.is_empty() {
         return "TRUE".to_owned();
@@ -1035,7 +1028,7 @@ pub(crate) struct PhoenixInput {
     market_id: BTreeMap<String, Option<String>>,
     pub(crate) prices: BTreeMap<String, BTreeMap<i64, f64>>,
     /// Distinct fill hours inside the lockbox that this input drops.
-    lockbox_hours_dropped: u64,
+    pub(crate) lockbox_hours_dropped: u64,
     /// Assets whose every fill sits inside the lockbox hours.
     pub(crate) lockbox_only_symbols: u64,
 }
@@ -1685,10 +1678,6 @@ mod tests {
     #[test]
     fn lockbox_range_helpers_and_watermark_hours() {
         let ranges = vec![(100, 200), (300, 400)];
-        assert!(in_ranges(&ranges, 100));
-        assert!(in_ranges(&ranges, 399));
-        assert!(!in_ranges(&ranges, 200));
-        assert!(!in_ranges(&ranges, 50));
         assert_eq!(
             lockbox_free_sql(&ranges, "h"),
             "NOT ((h >= 100 AND h < 200) OR (h >= 300 AND h < 400))"

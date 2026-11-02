@@ -39,7 +39,10 @@ get no row in any output table; each receipt input records how many of them
 it dropped as `lockbox_only_symbols` (`inputs.hl_fills`,
 `inputs.phoenix_fills`, `inputs.pyth_prices`), the run report carries the
 same per-venue counts as `lockboxOnlySymbols`, and the catalog watermark
-repeats them, always as counts, never as symbol names.
+repeats them, always as counts, never as symbol names. The two counts are
+computed once, in the combined `seal` module, and every unit routes its
+computation through it: dropped counts covered input hours inside the set,
+excluded is the set's own size.
 
 ## Outputs, receipts, catalog
 
@@ -52,8 +55,19 @@ the other inputs as relative paths and sizes), the lockbox fields, a config
 sha256 over the unit's semantic rules, the operator's `--provenance` object
 verbatim, and started/finished UTC. Only the data output is byte-identical
 across reruns of the same inputs; the receipt and catalog carry run timestamps.
-`--threads` (1..=8) and `--memory` (at most 32GB) are DuckDB caps that do not
-change the table.
+An hourly unit that seals one file per hour must route every rerun skip through
+the `seal` module's shared check instead of a hand-rolled comparison: a sealed
+hour is reused only when the hour receipt's embedded skip key (unit, unit
+version, config sha256, lockbox sha256, and an inputs sha256 over the
+canonical JSON of every fact that can change the hour's bytes: source file
+shas, the mapping `assets.csv` sha256, ctx day-file shas, the requested
+window) equals the current run's key field for field, the receipt's stored
+inputs still hash to its stored inputs sha256, and the sealed file's streamed
+sha256 still equals the receipt's output sha256. Any other outcome (missing or
+garbled receipt, any key field changed, missing or rewritten file) rebuilds
+the hour, so an input change such as a renamed symbol in `assets.csv` can
+never be skipped away. `--threads` (1..=8) and `--memory` (at most 32GB) are
+DuckDB caps that do not change the table.
 
 ## Mapping
 
