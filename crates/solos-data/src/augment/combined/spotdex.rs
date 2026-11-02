@@ -434,7 +434,10 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
-    if state.config_sha256.as_str() != config || state.pyth_sha256 != pyth_facts_sha256 {
+    if state.config_sha256.as_str() != config
+        || state.pyth_sha256 != pyth_facts_sha256
+        || state.lockbox_sha256 != checked_lockbox_sha
+    {
         state = State::default();
     }
     let range_start_secs = range_lo * grid::HOUR_SECS;
@@ -471,17 +474,21 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         state.files.insert(file.stem.clone(), file.sha256.clone());
         state.config_sha256 = config.clone();
         state.pyth_sha256 = pyth_facts_sha256.clone();
+        state.lockbox_sha256 = checked_lockbox_sha.clone();
         let mut body = serde_json::to_vec(&state).map_err(|e| StoreError::Check(e.to_string()))?;
         body.push(b'\n');
         write_atomic(&state_path, &body)?;
     }
 
-    // Per-pool first hour: exact only when the run reads the whole span.
+    // Per-pool first hour: exact only when the run reads the whole span. The
+    // b partials of batches no longer in the input set are dropped, so a
+    // deleted batch's pools cannot be counted.
     let covers_floor = swaps
         .first()
         .is_some_and(|first| state.files.contains_key(&first.stem));
+    let swap_stems: BTreeSet<String> = swaps.iter().map(|file| file.stem.clone()).collect();
     let new_pools = if covers_floor {
-        Some(load_new_pools(&conn, &parts)?)
+        Some(load_new_pools(&conn, &parts, &swap_stems)?)
     } else {
         None
     };
@@ -561,7 +568,12 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             // from the same partials the hour was merged from, cross-checked
             // against the receipt's recorded USD and the sealed hour file's
             // swap count, and let the month seal below re-seal the month.
-            let published = read_hour_receipt(request.out, &key_str).expect("checked above");
+            // The receipt passed seal::check, so it describes the sealed file;
+            // it must also parse into the typed receipt the venue rebuild
+            // reads, and an externally edited receipt may not.
+            let published = read_hour_receipt(request.out, &key_str).ok_or_else(|| {
+                StoreError::Check(format!("hour {hour}: sealed receipt does not parse"))
+            })?;
             let venue = merge_venue_hour(
                 &conn,
                 &parts,
@@ -595,6 +607,9 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
                 .push((hour, venue));
             continue;
         }
+        let covering_stems: BTreeSet<String> =
+            covering.iter().map(|file| file.stem.clone()).collect();
+        refuse_stale_partials(hour, &parts, &covering_stems)?;
         let Some(mint) = merge_mint_hour(&conn, &parts, hour)? else {
             report.hours_empty += 1;
             continue;
@@ -656,6 +671,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             &config,
             &checked_lockbox_sha,
             json!({
+                // Belt-and-braces: any swap change that matters also moves the
+                // `hours` rows below; this digest catches it first.
                 "swapsFilesSha256": swap_list_sha256(&swaps),
                 "pythFilesSha256": pyth_facts_sha256,
                 "hours": month_rows_facts(&rows),
@@ -828,6 +845,12 @@ struct State {
     /// reset the state and reprice every batch.
     #[serde(default)]
     pyth_sha256: String,
+    /// SHA-256 of the lockbox bytes of the run that wrote the partials: the
+    /// partials bake the exclusion set in (lockbox hours get no partials, the
+    /// `b` partial filters lockbox swaps), so a new lockbox must reset the
+    /// state and re-derive every batch or newly-free hours come out empty.
+    #[serde(default)]
+    lockbox_sha256: String,
     /// Processed file stems with the catalog sha they were processed under.
     files: BTreeMap<String, String>,
 }
@@ -1409,13 +1432,22 @@ fn partials_look_written(parts: &Path, file: &SwapFile) -> bool {
             .unwrap_or(false)
 }
 
-/// Per-pool first hour across every `b` partial: (hour, pool count).
+/// Per-pool first hour across every `b` partial: (hour, pool count). B
+/// partials of batches no longer in the input set are dropped, so a deleted
+/// batch's pools are never counted as new.
 fn load_new_pools(
     conn: &duckdb::Connection,
     parts: &Path,
+    allowed: &BTreeSet<String>,
 ) -> Result<BTreeMap<i64, i64>, StoreError> {
     let mut files: Vec<String> = Vec::new();
     collect_parquet(&parts.join("b"), &mut files)?;
+    files.retain(|path| {
+        Path::new(path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| allowed.contains(stem))
+    });
     if files.is_empty() {
         return Err(StoreError::Check("no b partials for new pools".into()));
     }
@@ -1481,6 +1513,34 @@ fn partial_files(dir: &Path) -> Result<Vec<String>, StoreError> {
     collect_parquet(dir, &mut out)?;
     out.sort();
     Ok(out)
+}
+
+/// Refuse partials whose batch is no longer part of the hour's covering set
+/// (a re-spanned or deleted batch): merging them would seal hours built from
+/// inputs the store no longer has. The a1 partition's presence decides
+/// "empty hour", so it is checked first, then a2 and c.
+fn refuse_stale_partials(
+    hour: i64,
+    parts: &Path,
+    allowed: &BTreeSet<String>,
+) -> Result<(), StoreError> {
+    let key = grid::hour_key(hour);
+    for kind in ["a1", "a2", "c"] {
+        for path in partial_files(&parts.join(kind).join(format!("hk={key}")))? {
+            let stem = Path::new(&path)
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .ok_or_else(|| {
+                    StoreError::Check(format!("hour {hour}: unreadable partial name {path}"))
+                })?;
+            if !allowed.contains(stem) {
+                return Err(StoreError::Check(format!(
+                    "hour {hour}: stale partial {kind}/{stem} is not a covering batch"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Merge the partials of one hour. `None` when the hour has no partials at all.
@@ -1871,7 +1931,9 @@ fn sql_f64(value: f64) -> String {
     }
 }
 
-/// A JSON number (or null) as a SQL literal.
+/// A JSON number (or null) as a SQL literal. The `Value::String` arm reaches
+/// here only as BIGINT-as-string digits (how `store::json_of` renders BIGINT),
+/// never free-form text.
 fn double_sql(value: Option<&Value>) -> String {
     match value {
         Some(Value::Number(n)) => sql_f64(n.as_f64().unwrap_or_default()),
@@ -3471,6 +3533,188 @@ mod tests {
             receipt_stamp,
             "month receipt untouched"
         );
+
+        // The same store through a symlink to it: the link is the run's out,
+        // so every sealed path joins onto the link and strip_prefix against
+        // the same link must succeed. Nothing rebuilds, nothing is touched.
+        let link = fx
+            .root
+            .parent()
+            .expect("temp dir")
+            .join(format!("spotdex-link-{}", std::process::id()));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&fx.root, &link).expect("symlink store root");
+        let request = Request {
+            out: &link,
+            swaps_dir: &fx.swaps_dir,
+            catalog: &fx.catalog,
+            pyth_prices: std::slice::from_ref(&fx.pyth_dir),
+            lockbox: &fx.lockbox,
+            lockbox_sha256: &fx.lockbox_sha,
+            provenance: &fx.provenance,
+            since: None,
+            until: None,
+            threads: 2,
+            memory_limit: "1GB".to_owned(),
+        };
+        let third = run(&request).expect("third run");
+        assert_eq!(third.hours_skipped, 1, "the sealed hour skips via the link");
+        assert_eq!(third.hours_written, 0, "nothing rebuilds via the link");
+        assert_eq!(third.venue_hours, 0, "the month skips via the link");
+        assert_eq!(third.outputs, 0, "nothing re-sealed via the link");
+        assert_eq!(file_hash(&hour_path).expect("hour sha"), hour_sha);
+        assert_eq!(file_hash(&month_path).expect("month sha"), month_sha);
+        assert_eq!(file_stamp(&hour_path), hour_stamp, "hour file untouched");
+        assert_eq!(file_stamp(&month_path), month_stamp, "month file untouched");
+        assert_eq!(
+            file_stamp(&month_receipt_path(&fx.root, "2026-10")),
+            receipt_stamp,
+            "month receipt untouched"
+        );
+        let _ = std::fs::remove_file(&link);
+    }
+
+    #[test]
+    fn a_new_lockbox_resets_the_partials() {
+        let mut fx = Fixture::new("lockboxreset");
+        // Hour inside the busy week + its guard; the watermark swap closes the
+        // requested day from inside the exclusion. One SOL print in a free
+        // hour keeps the price table non-empty (the lockbox-hour print is
+        // filtered at load time).
+        let lb_sec = 1_790_769_600; // 2026-09-30T12:00
+        write_pyth(&fx.pyth_dir, &[(1_790_463_610, "SOL", 100.0)]);
+        let swaps = vec![
+            swap(lb_sec + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(lb_sec + 172_800, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        let first = run(&fx.request(Some("2026-09-30"), Some("2026-09-30"))).expect("first run");
+        assert_eq!(first.hours_written, 0, "every hour is a lockbox hour");
+        // Move the busy week away, same v2 shape (864 hours over 36 dates):
+        // the run's hours become free, and the partials were written under the
+        // old exclusion set, so the state must reset and re-derive them.
+        let moved = json!({
+            "version": "v2",
+            "created": "2026-10-22",
+            "guard_hours": 24,
+            "weeks": [
+                {"name": "early_stress", "start": "2026-06-01T00:00:00Z", "end": "2026-06-08T00:00:00Z"},
+                {"name": "stress", "start": "2026-08-17T00:00:00Z", "end": "2026-08-24T00:00:00Z"},
+                {"name": "quiet", "start": "2026-09-07T00:00:00Z", "end": "2026-09-14T00:00:00Z"},
+                {"name": "busy", "start": "2026-10-12T00:00:00Z", "end": "2026-10-19T00:00:00Z"}
+            ]
+        });
+        let bytes = serde_json::to_vec(&moved).expect("lockbox json");
+        fx.lockbox_sha = crate::fsutil::sha256_hex(&bytes);
+        std::fs::write(&fx.lockbox, &bytes).expect("rewrite lockbox");
+        let second = run(&fx.request(Some("2026-09-30"), Some("2026-09-30"))).expect("second run");
+        assert_eq!(
+            second.hours_written, 1,
+            "the now-free hour must be written, not reported empty"
+        );
+        assert_eq!(second.hours_empty, 11, "the rest of the day is empty");
+        assert_eq!(
+            second.lockbox_hours_dropped, 0,
+            "the moved busy week no longer covers the day"
+        );
+        assert!(hour_file(&fx.root, lb_sec / 3_600).exists());
+    }
+
+    #[test]
+    fn a_publish_time_tie_takes_the_higher_price() {
+        let fx = Fixture::new("pricetie");
+        // Two SOL prints at the SAME publish_time: the documented tie-break
+        // takes the higher price (110); the lower (100) would give usd 300.
+        write_pyth(
+            &fx.pyth_dir,
+            &[(H_SEC + 10, "SOL", 110.0), (H_SEC + 10, "SOL", 100.0)],
+        );
+        let swaps = vec![
+            Swap {
+                block_time: H_SEC + 100,
+                program: "pumpswap",
+                pool: "PX",
+                mint_a: "TokenA11111111111111111111111111111111111111",
+                mint_b: WSOL_MINT,
+                decimals_a: 6,
+                decimals_b: 9,
+                a_to_b: true,
+                amount_in: 1_000_000,
+                amount_out: 3_000_000_000,
+            },
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        let report = run(&fx.request(None, None)).expect("run");
+        assert_eq!(report.hours_written, 1);
+        let rows = read_rows(&hour_file(&fx.root, H));
+        let wsol = rows
+            .iter()
+            .find(|row| row.str("mint") == Some(WSOL_MINT))
+            .expect("wsol row");
+        let usd = wsol.get("usd_volume").and_then(Value::as_f64).expect("usd");
+        assert!(
+            (usd - 330.0).abs() < 1e-9,
+            "an exact publish_time tie takes the higher price (110), got usd {usd}"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_hour_receipt_fails_the_run() {
+        let fx = Fixture::new("badreceipt");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        run(&fx.request(None, None)).expect("first run");
+        // Drop a field seal::check never reads but HourReceipt requires: the
+        // hour must fail the run with a StoreError, not panic on an expect.
+        let receipt_path = hour_receipt_path(&fx.root, &grid::hour_key(H));
+        let mut receipt: Value =
+            serde_json::from_str(&std::fs::read_to_string(&receipt_path).expect("receipt"))
+                .expect("json");
+        receipt
+            .as_object_mut()
+            .expect("object")
+            .remove("written_utc");
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt).expect("json"))
+            .expect("rewrite");
+        let error = run(&fx.request(None, None))
+            .expect_err("an unparsable sealed receipt must fail the run");
+        assert!(error.to_string().contains("does not parse"), "{error}");
+    }
+
+    #[test]
+    fn a_deleted_batchs_stale_partials_are_refused() {
+        let fx = Fixture::new("stalepartials");
+        sol_at_100(&fx.pyth_dir, H);
+        let first = vec![swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000)];
+        let second = vec![
+            swap(H_SEC + 200, "PY", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let mut batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &first)];
+        batches.push(write_batch(&fx.swaps_dir, "0370090000-0370179999", &second));
+        write_catalog(&fx.catalog, &batches);
+        let first_run = run(&fx.request(None, None)).expect("first run");
+        assert_eq!(first_run.hours_written, 1);
+        // Drop the first batch from the directory and the catalog: its hour-H
+        // partials are stale, and the rerun must refuse to merge them into
+        // the rebuild instead of sealing hours from abandoned inputs.
+        std::fs::remove_file(fx.swaps_dir.join("0370000000-0370089999.parquet"))
+            .expect("remove batch");
+        write_catalog(
+            &fx.catalog,
+            &[("0370090000-0370179999".to_owned(), second.len() as u64)],
+        );
+        let error = run(&fx.request(None, None))
+            .expect_err("stale partials of a deleted batch must be refused");
+        assert!(error.to_string().contains("stale partial"), "{error}");
     }
 
     #[test]
