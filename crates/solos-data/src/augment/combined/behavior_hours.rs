@@ -3397,40 +3397,35 @@ fn write_two_lanes(
 ) -> (PathBuf, PathBuf) {
     let hist = dir.join(format!("{venue}-hist"));
     let live = dir.join(format!("{venue}-live"));
+    // The lane's own venue names its events, so a flash lane's boundary rows
+    // are flash-position rows: the aggregate-level gap assertions bite on
+    // them, not only on the raw lane.
+    let flash_venue = venue == "flash";
+    let event_name = if flash_venue {
+        "IncreaseSizeLogUSDv1"
+    } else {
+        "InstantIncreasePositionEvent"
+    };
+    let fields = if flash_venue {
+        r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#
+    } else {
+        r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#
+    };
     let hist_rows = vec![perp_event(
         "hSentinel",
         432_100_010,
         hist_last,
         0,
-        "InstantIncreasePositionEvent",
-        r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#,
+        event_name,
+        fields,
     )];
     let mut live_rows: Vec<String> = extra_live
         .iter()
-        .map(|(t, sig, name)| {
-            let fields = if *name == "flash" {
-                r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#.to_owned()
-            } else {
-                r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#.to_owned()
-            };
-            let name = if *name == "flash" {
-                "IncreaseSizeLogUSDv1"
-            } else {
-                "InstantIncreasePositionEvent"
-            };
-            perp_event(sig, 432_100_010, *t, 0, name, &fields)
-        })
+        .map(|(t, sig, _tag)| perp_event(sig, 432_100_010, *t, 0, event_name, fields))
         .collect();
     live_rows.insert(
         0,
-        perp_event(
-            "lFirst",
-            432_100_010,
-            live_first,
-            0,
-            "InstantIncreasePositionEvent",
-            r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#,
-        ),
+        perp_event("lFirst", 432_100_010, live_first, 0, event_name, fields),
     );
 
     write_event_lane(&hist, &hist_rows);
@@ -4839,4 +4834,198 @@ fn pyth_dense_day_rerun_skips_every_hour() {
     assert_eq!(second.hours_skipped, 24);
     assert_eq!(second.hours_written, 0);
     assert_eq!(second.rows, first.rows);
+}
+
+/// The perp two-hour trailing guard boundary: a watermark exactly at
+/// `hour end + HOUR_GUARD_SECS` closes the requested day, one second short
+/// refuses (R-GUARD zeroes the guard and accepts the short input).
+#[test]
+fn solana_perp_boundary_watermark_closes_the_last_requested_hour() {
+    let run = |watermark_secs: i64| -> Result<super::solana_perp_hours::Report, crate::store::StoreError> {
+        let tmp = Tmp::new("perp-guard");
+        let h0 = day_start();
+        let jup = tmp.dir().join("jup");
+        write_event_lane(
+            &jup,
+            &[
+                perp_event(
+                    "jH0",
+                    432_100_010,
+                    h0 + 60,
+                    0,
+                    "InstantIncreasePositionEvent",
+                    r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#,
+                ),
+                perp_event(
+                    "jBound",
+                    432_100_010,
+                    watermark_secs,
+                    0,
+                    "InstantIncreasePositionEvent",
+                    r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#,
+                ),
+            ],
+        );
+        let flash = tmp.dir().join("flash");
+        write_event_lane(
+            &flash,
+            &[perp_event(
+                "fBound",
+                432_100_010,
+                watermark_secs,
+                0,
+                "IncreaseSizeLogUSDv1",
+                r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
+            )],
+        );
+        let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+        let provenance = provenance_file(tmp.dir());
+        write_mapping(tmp.dir());
+        let jupiter_events = vec![jup];
+        let flash_events = vec![flash];
+        super::solana_perp_hours::run(&PerpRequest {
+            out: tmp.dir(),
+            lockbox: &lockbox,
+            lockbox_sha256: &lockbox_sha,
+            provenance: &provenance,
+            jupiter_events: &jupiter_events,
+            flash_events: &flash_events,
+            history_status: None,
+            since: DAY,
+            until: DAY,
+            threads: 1,
+            memory_limit: "512MB".to_owned(),
+        })
+    };
+    // One second short of hour end + 2h: hour 23 is not closed yet.
+    let error = run(day_start() + 86_400 + 2 * 3600 - 1).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("extends past the input watermark"),
+        "{error}"
+    );
+    // Exactly at the boundary: closed.
+    let report = run(day_start() + 86_400 + 2 * 3600).unwrap();
+    assert_eq!(report.hours_written, 1, "hour 0 has rows");
+}
+
+/// The pyth two-hour trailing guard boundary, mirror of the perp test
+/// (R-GUARD-PYTH zeroes the guard and accepts the short input).
+#[test]
+fn pyth_boundary_watermark_closes_the_last_requested_hour() {
+    let run = |watermark_secs: i64| -> Result<super::pyth_hours::Report, crate::store::StoreError> {
+        let tmp = Tmp::new("pyth-guard");
+        let h0 = day_start();
+        let lane = tmp.dir().join("pyth");
+        write_pyth_lane(
+            &lane,
+            &[
+                pyth_price("feed-sol", "SOL", h0 + 60, 100.0, 0.5, (h0 + 60) * 1000),
+                pyth_price(
+                    "feed-sol",
+                    "SOL",
+                    watermark_secs,
+                    100.0,
+                    0.5,
+                    watermark_secs * 1000,
+                ),
+            ],
+        );
+        let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+        let provenance = provenance_file(tmp.dir());
+        write_mapping(tmp.dir());
+        let pyth_lanes = vec![lane];
+        super::pyth_hours::run(&PythRequest {
+            out: tmp.dir(),
+            lockbox: &lockbox,
+            lockbox_sha256: &lockbox_sha,
+            provenance: &provenance,
+            pyth_prices: &pyth_lanes,
+            history_status: None,
+            since: DAY,
+            until: DAY,
+            threads: 1,
+            memory_limit: "512MB".to_owned(),
+        })
+    };
+    let error = run(day_start() + 86_400 + 2 * 3600 - 1).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("extends past the input watermark"),
+        "{error}"
+    );
+    let report = run(day_start() + 86_400 + 2 * 3600).unwrap();
+    assert_eq!(report.hours_written, 1);
+}
+
+/// The status file's BYTES are part of the skip key, not just its flags: a
+/// new file with identical flags but different bytes (a fresh stamp) rebuilds
+/// instead of skipping (R-STATUS-KEY-SHA drops the sha from the key).
+#[test]
+fn solana_perp_status_bytes_change_rebuilds() {
+    let tmp = Tmp::new("perp-status-bytes");
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    let (jup_hist, jup_live) = write_two_lanes(
+        tmp.dir(),
+        "jupiter",
+        sentinel,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "jup")],
+    );
+    let (flash_hist, flash_live) = write_two_lanes(
+        tmp.dir(),
+        "flash",
+        sentinel,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "flash")],
+    );
+    let (status_a, _) = status_file(tmp.dir(), false, &[("jupiter", true), ("flash", true)]);
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let jupiter_events = vec![jup_hist, jup_live];
+    let flash_events = vec![flash_hist, flash_live];
+    let first = super::solana_perp_hours::run(&PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: Some(&status_a),
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(first.hours_written, 1);
+    // Identical flags, different bytes: the file's sha is the key component.
+    let status_b = tmp.dir().join("status-b.json");
+    let mut body: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&status_a).unwrap()).unwrap();
+    body["note"] = serde_json::json!("re-stamped");
+    std::fs::write(&status_b, body.to_string()).unwrap();
+    let second = super::solana_perp_hours::run(&PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: Some(&status_b),
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(
+        second.hours_written, 1,
+        "a re-stamped status file must rebuild, never skip"
+    );
+    assert_eq!(second.hours_skipped, 0);
 }
