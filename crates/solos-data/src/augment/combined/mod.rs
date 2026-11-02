@@ -7,7 +7,8 @@
 //! database file, never sends a transaction, and never touches the network.
 //!
 //! Units: `mapping` (U1) assigns canonical `asset_id`s across venues; `hl-hours`
-//! (U2a) builds the HL per-coin hourly table `hl_coin_hour` (DESIGN 4.1).
+//! (U2a) builds the HL per-coin hourly table `hl_coin_hour` (DESIGN 4.1);
+//! `spotdex-hours` (U2d) aggregates the spot DEX swaps per mint and hour.
 
 pub mod catalog;
 pub mod grid;
@@ -16,6 +17,7 @@ pub mod lockbox;
 pub mod mapping;
 pub mod receipt;
 pub mod seal;
+pub mod spotdex;
 
 #[cfg(test)]
 mod behavior;

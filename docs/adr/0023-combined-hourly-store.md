@@ -14,17 +14,22 @@ and never send a transaction.
 One command, one receipt, one unit. Each unit's receipt lives in that unit's
 output directory: `<root>/<unit_dir>/receipt-<unit>.json` (the mapping unit
 writes `mapping/receipt-mapping.json`, the hl-hours unit writes
-`hl_coin_hour/receipt-hl-hours.json`; a spotdex unit would write
-`spotdex/receipt-spotdex.json`). `mapping` (this note) assigns canonical
-`asset_id`s. Hourly aggregators and assembly follow in their own units: an
-hourly unit also seals one receipt per built hour beside its files
-(`hl_coin_hour/receipts/hour=<tag>.json`), and an already-sealed hour is
-skipped only when the unit version, the source facts, the config sha256, the
-lockbox bytes, the `mapping/assets.csv` content, the ctx input files and the
-sealed file's own sha256 all still match that receipt. The
-hour grid works in unix hour indices internally and in unix seconds in the CSV;
-the hour is `t = floor(ts/3600)*3600`, the same construction as hl-train's full
-grid.
+`hl_coin_hour/receipt-hl-hours.json`, and the spotdex-hours unit writes
+`spotdex_mint_hour/receipt-spotdex-hours.json`). Hourly aggregators also
+seal one receipt per built hour beside their files
+(`hl_coin_hour/receipts/hour=<tag>.json`,
+`spotdex_mint_hour/receipts/<YYYYMMDD-H>.json`), and the spotdex-hours unit
+one receipt per venue-month file
+(`spotdex_venue_hour/receipts/month=<YYYY-MM>.json`). `mapping` (this note)
+assigns canonical `asset_id`s. Hourly aggregators and assembly follow in
+their own units. An already-sealed hour is skipped only when the unit
+version, the input facts (for hl-hours the source files, the
+`mapping/assets.csv` content and the ctx input files; for spotdex-hours the
+covering swap files and the Pyth price files), the config sha256, the
+lockbox bytes and the sealed file's own sha256 all still match that
+receipt. The hour grid works in unix hour indices internally and in unix
+seconds in the CSV; the hour is `t = floor(ts/3600)*3600`, the same
+construction as hl-train's full grid.
 
 ## Lockbox
 
@@ -35,16 +40,20 @@ asserts the v2 shape (864 hours over 36 dates) and refuses a check day inside
 that set. The exclusion is applied to every input span, not only to the price
 check: first_ts and last_ts of every venue row are the min/max over non-lockbox
 hours, and an HL coin whose fills all sit inside the lockbox has no mapping row
-at all (it has no row in any output table). The receipt records two numbers:
+at all (it has no row in any output table). Intermediate state counts as an
+input span too: a unit's partials, if it keeps any, never cover a lockbox hour,
+and a carry-forward price input cannot reach across a lockbox print. The
+receipt records two numbers, with the same meaning in every unit:
 `lockbox_hours_excluded`, the size of the exclusion set itself (864 for v2),
 and `lockbox_hours_dropped`, the input hours the lockbox actually removed:
 each venue's covered-hour set is the hours it covers that fall inside the
 set, and the store-wide number is the union of the venues' sets, never a max
 across them (venues can cover different lockbox hours, and a max would
-hide the union). HL's set is exact, from
-its watermark hours; Phoenix's is the distinct covered fill hours; Pyth's is
-the union of the distinct covered publish hours over all given directories
-(a per-directory max would undercount). Symbols whose whole history lies inside the lockbox
+hide the union). HL's set is exact, from its watermark hours; Phoenix's is
+the distinct covered fill hours; Pyth's is the union of the distinct
+covered publish hours over all given directories (a per-directory max
+would undercount); an hourly aggregator's is the union of the hour spans
+its input files cover. Symbols whose whole history lies inside the lockbox
 get no row in any output table; each receipt input records how many of them
 it dropped as `lockbox_only_symbols` (`inputs.hl_fills`,
 `inputs.phoenix_fills`, `inputs.pyth_prices`), the run report carries the

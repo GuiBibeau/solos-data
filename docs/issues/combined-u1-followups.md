@@ -86,3 +86,21 @@ fixed now.
   upsert is per sealed file); it keeps the last run that built something.
   Refresh the watermark entry even on a zero-output run if that stale window
   ever matters.
+
+## U2d spotdex-hours (#100) review round 1 follow-ups
+
+From the #100 review (Carmack, REQUEST CHANGES). Recorded here so nothing is
+lost; the shared-helper items have since landed and the dedupe happened in
+the post-#101 rebase.
+
+- Spotdex has no crash failpoint seam of its own (no `on_before_write`-style
+  hook around the hour receipt -> venue seal gap). The lost-venue-month probe
+  is covered by `a_rerun_rebuilds_a_lost_venue_month` (delete the venue dir,
+  rerun, byte-identical rebuild); a real kill-point seam is future work.
+- The month skip key holds no output-derived value (the pre-seal month file
+  sha came out again in round 2): `seal::check` verifies the sealed file
+  against the receipt's output sha, so the first rerun must skip. Pinned by
+  `an_unchanged_month_skips` and mutant M16.
+- The month key's price-file facts are whole-list: any Pyth file change
+  rebuilds every month (and hour) even when the changed print cannot affect
+  the bytes. Track per-file span pruning if the extra rebuilds ever matter.
