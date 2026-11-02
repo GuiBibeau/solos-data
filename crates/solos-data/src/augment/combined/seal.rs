@@ -720,7 +720,11 @@ mod tests {
     /// receipt's stored path (a trailing slash, repeated `/`) carry no extra
     /// components and compare equal, while a path that is only a string
     /// suffix of the sealed path - a different component list - rebuilds.
-    /// The compare is component-wise, never a string-suffix compare.
+    /// The compare is component-wise, never a string-suffix compare, and by
+    /// the same token never a string-prefix compare: a receipt naming a
+    /// strict directory prefix of the sealed file (its directory, or the
+    /// root of the tree) rebuilds even though the sealed bytes, rows and sha
+    /// match the receipt exactly.
     #[test]
     fn the_path_compare_is_component_wise_over_cleaned_components() {
         let tmp = Tmp::new("pathnorm");
@@ -761,6 +765,19 @@ mod tests {
             panic!("the path compare must not be a string-suffix compare");
         };
         assert!(reason.contains("receipt names spot/h.parquet"), "{reason}");
+        // The prefix direction is pinned the same way: "tables/spot" (the
+        // file's directory) and "tables" (the tree root) are clean component
+        // paths and string prefixes of the sealed path, but neither is the
+        // file the receipt sealed - both rebuild, whatever the bytes say.
+        for prefix in ["tables/spot", "tables"] {
+            let Decision::Rebuild { reason } = check_with(prefix) else {
+                panic!("a receipt naming the prefix {prefix} must not skip the file below it");
+            };
+            assert!(
+                reason.contains(&format!("receipt names {prefix}")),
+                "{prefix}: {reason}"
+            );
+        }
     }
 
     /// `clean_relative` refuses anything that is not a plain relative name: a

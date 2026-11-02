@@ -1056,38 +1056,56 @@ fn the_store_wide_drop_is_the_union_of_the_venue_hours() {
     assert!(report.lockbox_hours_dropped > hl.max(phoenix).max(pyth));
 }
 
-/// The lockbox filter is load-bearing on the max side too (a #111 review
-/// survivor): every venue input holds a symbol whose free fills end at
-/// `last_free`, followed in time by a fill inside the lockbox at `locked`.
-/// The span's first_ts/last_ts must come from the free fills; a scan with
-/// the `CASE WHEN free` filter removed would take last_ts from the lockbox
-/// row, and a dropped-hours query without its `NOT (free)` guard would take
-/// the hour set from the free rows - both go red. The free-side Parquet
-/// files are asserted lockbox-clean through the shared testfix helper, so
-/// the fixture itself proves the span has no lockbox row to take.
+/// The lockbox filter is load-bearing on both ends of the span (a #111
+/// review survivor): every venue input holds a symbol with two free fills on
+/// a day between two v2 exclusion windows, a fill inside the set strictly
+/// BEFORE the free fills (the first window's opening hour) and one strictly
+/// AFTER them (the second window's opening hour). The span's first_ts and
+/// last_ts must come from the free fills: a scan with the `CASE WHEN free`
+/// filter dropped on the min side would take first_ts from the early lockbox
+/// row, one dropped on the max side would take last_ts from the late row,
+/// and a dropped-hours query without its `NOT (free)` guard would take the
+/// hour set from the free rows - all go red. The free-side Parquet files are
+/// asserted lockbox-clean through the shared testfix helper, so the fixture
+/// itself proves the span has no lockbox row to take.
 #[test]
-fn a_lockbox_fill_after_the_free_fills_never_becomes_the_last_ts() {
-    let tmp = Tmp::new("maxlock");
+fn a_lockbox_fill_outside_the_free_fills_never_becomes_the_span() {
+    let tmp = Tmp::new("spanlock");
     let fix = super::testfix::v2_lockbox(tmp.dir());
     let conn = memory_connection("1", "512MB").unwrap();
-    // Free fills on 2026-05-20 (outside every v2 week), the lockbox fill on
-    // the set's first hour: strictly after the free fills.
-    let free_day = super::grid::day_start_secs(super::grid::parse_date("2026-05-20").unwrap());
+    // Free fills on 2026-06-15 (between the early_stress and stress guard
+    // windows, outside every v2 range); lockbox fills inside the first
+    // window's opening hour and the second window's opening hour.
+    let free_day = super::grid::day_start_secs(super::grid::parse_date("2026-06-15").unwrap());
     let first_free = free_day + 10 * 3600 + 60;
     let last_free = free_day + 11 * 3600 + 60;
-    let locked = fix.secs(fix.first_hour()) + 120;
-    assert!(locked > last_free);
+    let early = fix.ranges[0].0 * 3600 + 120;
+    let late = fix.ranges[1].0 * 3600 + 120;
     assert!(
-        fix.hours.contains(&(locked / 3600)),
-        "the late fill must sit inside the set"
+        early < first_free,
+        "the early lockbox fill must precede the free fills"
     );
-    let check_day = super::grid::parse_date("2026-05-20").unwrap();
+    assert!(
+        late > last_free,
+        "the late lockbox fill must follow the free fills"
+    );
+    assert!(
+        fix.hours.contains(&(early / 3600)) && fix.hours.contains(&(late / 3600)),
+        "both lockbox fills must sit inside the set"
+    );
+    assert!(!fix.hours.contains(&(first_free / 3600)));
+    let check_day = super::grid::parse_date("2026-06-15").unwrap();
 
-    // HL: one hour file per fill, all three receipted in the watermark.
-    let hl = tmp.dir().join("hl-fills-max");
+    // HL: one hour file per fill, all four receipted in the watermark.
+    let hl = tmp.dir().join("hl-fills-span");
     let mut watermark_hours = Vec::new();
     let mut hl_free_files = Vec::new();
-    for (secs, price) in [(first_free, 100.0), (last_free, 101.0), (locked, 111.0)] {
+    for (secs, price) in [
+        (early, 99.0),
+        (first_free, 100.0),
+        (last_free, 101.0),
+        (late, 111.0),
+    ] {
         let hour = super::grid::hour_of_secs(secs);
         let dt = chrono::DateTime::from_timestamp(hour * 3600, 0).unwrap();
         let ymd = dt.format("%Y%m%d");
@@ -1102,7 +1120,7 @@ fn a_lockbox_fill_after_the_free_fills_never_becomes_the_last_ts() {
             sql_string(&path.to_string_lossy())
         ))
         .unwrap();
-        if secs != locked {
+        if secs == first_free || secs == last_free {
             hl_free_files.push(path);
         }
     }
@@ -1119,9 +1137,9 @@ fn a_lockbox_fill_after_the_free_fills_never_becomes_the_last_ts() {
     let (_, span) = &hl_scan.universe["MAXSOL"];
     assert_eq!((span.first_ts, span.last_ts), (first_free, last_free));
 
-    // Phoenix: free fills in one file, the late lockbox fill in another -
+    // Phoenix: free fills in one file, the two lockbox fills in another -
     // both scanned together, like one lane split across files.
-    let phoenix = tmp.dir().join("phoenix-fills-max");
+    let phoenix = tmp.dir().join("phoenix-fills-span");
     std::fs::create_dir_all(&phoenix).unwrap();
     let phoenix_free = phoenix.join("free.parquet");
     let phoenix_locked = phoenix.join("locked.parquet");
@@ -1134,11 +1152,12 @@ fn a_lockbox_fill_after_the_free_fills_never_becomes_the_last_ts() {
     };
     conn.execute_batch(&format!(
         "COPY ({} UNION ALL {}) TO {} (FORMAT PARQUET);
-         COPY ({}) TO {} (FORMAT PARQUET);",
+         COPY ({} UNION ALL {}) TO {} (FORMAT PARQUET);",
         phoenix_row(first_free),
         phoenix_row(last_free),
         sql_string(&phoenix_free.to_string_lossy()),
-        phoenix_row(locked),
+        phoenix_row(early),
+        phoenix_row(late),
         sql_string(&phoenix_locked.to_string_lossy()),
     ))
     .unwrap();
@@ -1154,23 +1173,24 @@ fn a_lockbox_fill_after_the_free_fills_never_becomes_the_last_ts() {
     assert_eq!(phoenix_scan.universe["PHXMAX"].last_ts, last_free);
     assert_eq!(
         phoenix_scan.lockbox_dropped_hours,
-        std::collections::BTreeSet::from([locked / 3600])
+        std::collections::BTreeSet::from([early / 3600, late / 3600])
     );
     assert_eq!(phoenix_scan.lockbox_only_symbols, 0);
 
     // Pyth: the same shape over publish_time.
-    let pyth = tmp.dir().join("pyth-prices-max");
+    let pyth = tmp.dir().join("pyth-prices-span");
     std::fs::create_dir_all(&pyth).unwrap();
     let pyth_free = pyth.join("free.parquet");
     let pyth_locked = pyth.join("locked.parquet");
     let pyth_row = |secs: i64| format!("SELECT 'PYXMAX' AS symbol, {secs} AS publish_time");
     conn.execute_batch(&format!(
         "COPY ({} UNION ALL {}) TO {} (FORMAT PARQUET);
-         COPY ({}) TO {} (FORMAT PARQUET);",
+         COPY ({} UNION ALL {}) TO {} (FORMAT PARQUET);",
         pyth_row(first_free),
         pyth_row(last_free),
         sql_string(&pyth_free.to_string_lossy()),
-        pyth_row(locked),
+        pyth_row(early),
+        pyth_row(late),
         sql_string(&pyth_locked.to_string_lossy()),
     ))
     .unwrap();
@@ -1179,7 +1199,7 @@ fn a_lockbox_fill_after_the_free_fills_never_becomes_the_last_ts() {
     assert_eq!(pyth_scan.universe["PYXMAX"].last_ts, last_free);
     assert_eq!(
         pyth_scan.lockbox_dropped_hours,
-        std::collections::BTreeSet::from([locked / 3600])
+        std::collections::BTreeSet::from([early / 3600, late / 3600])
     );
     assert_eq!(pyth_scan.lockbox_only_symbols, 0);
 
