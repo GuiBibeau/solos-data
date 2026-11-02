@@ -533,6 +533,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             }),
         );
         let existing = match seal::check(
+            request.out,
             &hour_receipt_path(request.out, &key_str),
             &sealed_path,
             &skip_key,
@@ -661,6 +662,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             }),
         );
         let output = match seal::check(
+            request.out,
             &month_receipt_path(request.out, &month),
             &month_path,
             &month_key,
@@ -3422,6 +3424,65 @@ mod tests {
             file_hash(&month_path).expect("month sha"),
             sha,
             "the rebuild is byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_differently_formed_root_still_skips_every_seal() {
+        // Carmack's contract for seal::check callers: root and sealed_path
+        // must be the same form, so both sealed paths are built by joining
+        // onto exactly the root the run was given. A second run over the
+        // same inputs with the root passed as `<root>/spotdex_venue_hour/..`
+        // (same directory, a different path form that survives component
+        // normalization) must skip the sealed hour and the month and leave
+        // every sealed byte untouched; a differently-formed root would
+        // strip_prefix to nothing and rebuild forever.
+        let fx = Fixture::new("pathform");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        let first = run(&fx.request(None, None)).expect("first run");
+        assert_eq!(first.hours_written, 1);
+        let hour_path = hour_file(&fx.root, H);
+        let month_path = fx.root.join(VENUE_TABLE).join("month=2026-10.parquet");
+        let hour_sha = file_hash(&hour_path).expect("hour sha");
+        let month_sha = file_hash(&month_path).expect("month sha");
+        let hour_stamp = file_stamp(&hour_path);
+        let month_stamp = file_stamp(&month_path);
+        let receipt_stamp = file_stamp(&month_receipt_path(&fx.root, "2026-10"));
+
+        // The same store, with the root passed in a different form.
+        let odd_root = fx.root.join(VENUE_TABLE).join("..");
+        let request = Request {
+            out: &odd_root,
+            swaps_dir: &fx.swaps_dir,
+            catalog: &fx.catalog,
+            pyth_prices: std::slice::from_ref(&fx.pyth_dir),
+            lockbox: &fx.lockbox,
+            lockbox_sha256: &fx.lockbox_sha,
+            provenance: &fx.provenance,
+            since: None,
+            until: None,
+            threads: 2,
+            memory_limit: "1GB".to_owned(),
+        };
+        let second = run(&request).expect("second run");
+        assert_eq!(second.hours_skipped, 1, "the sealed hour skips");
+        assert_eq!(second.hours_written, 0, "nothing rebuilds");
+        assert_eq!(second.venue_hours, 0, "the month skips");
+        assert_eq!(second.outputs, 0, "nothing re-sealed");
+        assert_eq!(file_hash(&hour_path).expect("hour sha"), hour_sha);
+        assert_eq!(file_hash(&month_path).expect("month sha"), month_sha);
+        assert_eq!(file_stamp(&hour_path), hour_stamp, "hour file untouched");
+        assert_eq!(file_stamp(&month_path), month_stamp, "month file untouched");
+        assert_eq!(
+            file_stamp(&month_receipt_path(&fx.root, "2026-10")),
+            receipt_stamp,
+            "month receipt untouched"
         );
     }
 
