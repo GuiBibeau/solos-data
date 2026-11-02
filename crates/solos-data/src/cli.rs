@@ -1382,6 +1382,10 @@ fn combined_cli(args: &[String]) -> i32 {
                     "solos-data augment combined mapping --out <root> --lockbox <json> --lockbox-sha256 <hex> --provenance <json> --hl-fills <hl-fills-v1 root> --phoenix-fills <fills dir> --pyth-prices <dir[,dir...]> --venues-config <config/venues.json> --asset-contexts <dir> --check-days YYYY-MM-DD,YYYY-MM-DD,YYYY-MM-DD [--threads 4] [--memory 8GB]"
                 )
                 .with(
+                    "spotdex-hours",
+                    "solos-data augment combined spotdex-hours --out <root> --swaps <swaps-ALL dir> --catalog <catalog-spot-history.json> --pyth-prices <dir[,dir...]> --lockbox <json> --lockbox-sha256 <hex> --provenance <json> [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--threads 4] [--memory 8GB]"
+                )
+                .with(
                     "out",
                     "combined store root: mapping/assets.csv, mapping/receipt-mapping.json, catalog.json"
                 )
@@ -1399,8 +1403,9 @@ fn combined_cli(args: &[String]) -> i32 {
     }
     let result = match unit {
         "mapping" => combined_mapping_run(&args[1..]),
+        "spotdex-hours" => combined_spotdex_run(&args[1..]),
         _ => Err(StoreError::Check(format!(
-            "unknown combined unit '{unit}' (units: mapping)"
+            "unknown combined unit '{unit}' (units: mapping, spotdex-hours)"
         ))),
     };
     match result {
@@ -1438,6 +1443,32 @@ fn combined_mapping_run(args: &[String]) -> Result<i32, StoreError> {
         memory_limit: memory,
     };
     let report = crate::augment::combined::mapping::run(&request)?;
+    println!("{}", report.to_json());
+    Ok(report.exit_code())
+}
+
+fn combined_spotdex_run(args: &[String]) -> Result<i32, StoreError> {
+    let pyth_prices: Vec<PathBuf> = required_flag(args, "--pyth-prices")?
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let memory = flag(args, "--memory").unwrap_or("8GB").to_owned();
+    let request = crate::augment::combined::spotdex::Request {
+        out: Path::new(required_flag(args, "--out")?),
+        swaps_dir: Path::new(required_flag(args, "--swaps")?),
+        catalog: Path::new(required_flag(args, "--catalog")?),
+        pyth_prices: &pyth_prices,
+        lockbox: Path::new(required_flag(args, "--lockbox")?),
+        lockbox_sha256: required_flag(args, "--lockbox-sha256")?,
+        provenance: Path::new(required_flag(args, "--provenance")?),
+        since: flag(args, "--since"),
+        until: flag(args, "--until"),
+        threads: combined_threads_flag(args)?,
+        memory_limit: memory,
+    };
+    let report = crate::augment::combined::spotdex::run(&request)?;
     println!("{}", report.to_json());
     Ok(report.exit_code())
 }

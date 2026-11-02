@@ -78,12 +78,22 @@ pub fn load(root: &Path) -> Result<Catalog, StoreError> {
 }
 
 impl Catalog {
-    /// Replace (by path) or insert `entry`, and record `watermarks` for its unit.
-    pub fn upsert(&mut self, entry: FileEntry, unit: &str, watermarks: Value) {
+    /// Replace (by path) or insert `entry`.
+    pub fn upsert_file(&mut self, entry: FileEntry) {
         self.files.retain(|file| file.path != entry.path);
         self.files.push(entry);
         self.files.sort_by(|a, b| a.path.cmp(&b.path));
+    }
+
+    /// Record `watermarks` for a unit.
+    pub fn set_watermarks(&mut self, unit: &str, watermarks: Value) {
         self.watermarks.insert(unit.to_owned(), watermarks);
+    }
+
+    /// Replace (by path) or insert `entry`, and record `watermarks` for its unit.
+    pub fn upsert(&mut self, entry: FileEntry, unit: &str, watermarks: Value) {
+        self.upsert_file(entry);
+        self.set_watermarks(unit, watermarks);
     }
 
     /// Rewrite the catalog durably with a fresh `updated_utc`.
