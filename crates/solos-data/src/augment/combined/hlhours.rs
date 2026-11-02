@@ -1075,7 +1075,11 @@ fn emit_bucket(
             "ctx": ctx_input_facts(request, bucket),
         }),
     );
-    match seal::check(&receipt_path, &final_path, &key)? {
+    // Root and sealed path must share one form: the root value handed to
+    // `seal::check` is the exact value `final_path` (and the hour receipt
+    // path) were joined onto, so the receipt's stored relative path can only
+    // ever match the file it sealed.
+    match seal::check(&request.out, &receipt_path, &final_path, &key)? {
         seal::Decision::Skip {
             rows,
             bytes,

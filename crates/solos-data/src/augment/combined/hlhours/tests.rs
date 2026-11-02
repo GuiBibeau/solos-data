@@ -289,6 +289,13 @@ fn output_path(root: &Path, unix: i64) -> PathBuf {
         .join(format!("hour={}.parquet", grid::hour_key(unix)))
 }
 
+/// Every sealed output file under the store root (the two-level layout).
+fn outputs_glob(root: &Path) -> PathBuf {
+    root.join(super::TABLE)
+        .join("date=*")
+        .join("hour=*.parquet")
+}
+
 fn hour_receipt_path(root: &Path, unix: i64) -> PathBuf {
     root.join(super::TABLE)
         .join("receipts")
@@ -733,6 +740,15 @@ fn lockbox_hours_are_dropped() {
     .unwrap();
     assert_eq!(cat["watermarks"][UNIT]["lockbox_hours_dropped"], 5);
     assert_eq!(cat["watermarks"][UNIT]["lockbox_hours_excluded"], 864);
+    // The one sealed output (the free hour) stays outside the lockbox hours.
+    let lb = testfix::v2_lockbox(fx.root.path());
+    testfix::assert_no_parquet_rows_in_lockbox(
+        &c,
+        &outputs_glob(fx.root.path()),
+        "hour",
+        testfix::TsUnit::Secs,
+        &lb.hours,
+    );
 }
 
 /// A lockbox sha mismatch refuses the whole run.
@@ -782,6 +798,15 @@ fn rerun_is_idempotent() {
     .unwrap();
     assert_eq!(cat["watermarks"][UNIT]["lockbox_hours_dropped"], 0);
     assert_eq!(cat["watermarks"][UNIT]["lockbox_hours_excluded"], 864);
+    // The sealed outputs stay outside the lockbox fixture's hours.
+    let lb = testfix::v2_lockbox(fx.root.path());
+    testfix::assert_no_parquet_rows_in_lockbox(
+        &c,
+        &outputs_glob(fx.root.path()),
+        "hour",
+        testfix::TsUnit::Secs,
+        &lb.hours,
+    );
 
     let second = run(&fx.request(h, h)).unwrap();
     assert_eq!(second.built, 0, "nothing rebuilt");
@@ -1410,12 +1435,7 @@ fn fills_inside_the_lockbox_are_dropped_and_absent_from_outputs() {
          in the gap between weeks 2 and 3"
     );
     // No row of any sealed output carries a lockbox hour.
-    let glob = fx
-        .root
-        .path()
-        .join(super::TABLE)
-        .join("date=*")
-        .join("hour=*.parquet");
+    let glob = outputs_glob(fx.root.path());
     testfix::assert_no_parquet_rows_in_lockbox(&c, &glob, "hour", testfix::TsUnit::Secs, &lb.hours);
     let run_receipt: Value = serde_json::from_str(
         &std::fs::read_to_string(receipt::receipt_path(fx.root.path(), TABLE, UNIT)).unwrap(),
@@ -1423,4 +1443,52 @@ fn fills_inside_the_lockbox_are_dropped_and_absent_from_outputs() {
     .unwrap();
     assert_eq!(run_receipt["lockbox_hours_dropped"], 3);
     assert_eq!(run_receipt["lockbox_hours_excluded"], 864);
+}
+
+/// A second run over the same inputs skips every sealed hour, and the skip
+/// survives a differently-formed store root (an embedded "./" segment): root
+/// and sealed file share one form at the `seal::check` call.
+#[test]
+fn a_rerun_skips_every_sealed_hour_in_any_root_form() {
+    let fx = Fixture::new("root-form");
+    let h = h0();
+    let c = conn(fx.root.path());
+    let p = fx.fills.join("p.parquet");
+    write_fills(
+        &c,
+        &p,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h * HOUR * 1000
+        ),
+    );
+    seal_range(fx.root.path(), &c, h - 2, h + 4, Some(h), Some(&p));
+    write_watermark(&fx.fills, &(h - 2..=h + 4).collect::<Vec<_>>());
+
+    let first = run(&fx.request(h - 1, h)).unwrap();
+    assert_eq!(first.built, 2, "report: {}", first.to_json());
+    let paths: Vec<PathBuf> = [h - 1, h]
+        .iter()
+        .map(|u| output_path(fx.root.path(), *u))
+        .collect();
+    let before: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+
+    let second = run(&fx.request(h - 1, h)).unwrap();
+    assert_eq!(second.skipped, 2, "report: {}", second.to_json());
+    assert_eq!(second.built, 0);
+    let after: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    assert_eq!(before, after, "sealed bytes unchanged by the skip");
+
+    // The same store root, spelled through an embedded "./" segment: root and
+    // sealed file still share one form at the check, so every hour skips and
+    // the sealed bytes stay identical.
+    let parent = fx.root.path().parent().unwrap().to_path_buf();
+    let name = fx.root.path().file_name().unwrap().to_os_string();
+    let mut dotted = fx.request(h - 1, h);
+    dotted.out = parent.join(Path::new(".")).join(name);
+    let third = run(&dotted).unwrap();
+    assert_eq!(third.skipped, 2, "report: {}", third.to_json());
+    assert_eq!(third.built, 0, "report: {}", third.to_json());
+    let after_dotted: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    assert_eq!(before, after_dotted, "sealed bytes unchanged by the skip");
 }
