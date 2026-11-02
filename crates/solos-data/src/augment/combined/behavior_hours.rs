@@ -4481,4 +4481,14 @@ fn a_differently_spelled_out_root_still_skips_the_sealed_hours() {
     assert_eq!(written, 0);
     assert_eq!(skipped, 3);
     assert_eq!(shas_first, shas_third);
+
+    // And with a `..` segment (a non-canonical out): the paths the unit hands
+    // seal::check still share its root form, so every hour skips. The
+    // intermediate directory must exist for the kernel to resolve the `..`.
+    std::fs::create_dir_all(tmp.dir().join("pathformsub")).unwrap();
+    let dotdot = PathBuf::from(format!("{}/pathformsub/../store", tmp.dir().display()));
+    let (written, skipped, shas_fourth) = run(&dotdot);
+    assert_eq!(written, 0);
+    assert_eq!(skipped, 3);
+    assert_eq!(shas_first, shas_fourth);
 }
