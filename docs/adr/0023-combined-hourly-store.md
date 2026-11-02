@@ -86,7 +86,15 @@ the hour, so an input change such as a renamed symbol in `assets.csv` can
 never be skipped away. `--threads` (1..=8) and `--memory` (at most 32GB) are
 DuckDB caps that do not change the table.
 
+An hourly unit that joins an asset_ctxs block onto its rows takes, for bucket h, the
+last snapshot in `[h, h+1h)` (s3 daily CSV first, the augment capture lane per coin as
+fallback). A snapshot carrying a non-finite field (NaN or infinite) counts as not
+present at all: the coin falls through the lanes exactly as if it had no snapshot, so
+no non-finite float can reach a sealed table, while a NULL field stays a legitimate
+missing value (a NULL field does not disqualify the snapshot).
+
 ## Mapping
+
 
 `mapping/assets.csv` has one row per (venue, venue symbol) with columns
 `asset_id, venue, venue_symbol, builder, coin_class, venue_market_id,
