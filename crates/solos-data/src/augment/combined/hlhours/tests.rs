@@ -1491,4 +1491,41 @@ fn a_rerun_skips_every_sealed_hour_in_any_root_form() {
     assert_eq!(third.built, 0, "report: {}", third.to_json());
     let after_dotted: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
     assert_eq!(before, after_dotted, "sealed bytes unchanged by the skip");
+
+    // The hard case: a symlinked store root. canonicalize resolves the link,
+    // so a canonical-vs-raw mismatch (or any other form change) must not turn
+    // the skip into a rebuild; both linked runs reuse the sealed bytes. The
+    // link lives beside the store with a unique name and is removed on the
+    // way out, even when an assertion fails mid-test.
+    let link = parent.join(format!(
+        "store-link-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::os::unix::fs::symlink(fx.root.path(), &link).unwrap();
+    struct RemoveLink(PathBuf);
+    impl Drop for RemoveLink {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+    let _guard = RemoveLink(link.clone());
+    let mut linked = fx.request(h - 1, h);
+    linked.out = link.clone();
+    let via_link = run(&linked).unwrap();
+    assert_eq!(via_link.skipped, 2, "report: {}", via_link.to_json());
+    assert_eq!(via_link.built, 0, "report: {}", via_link.to_json());
+    let via_link_again = run(&linked).unwrap();
+    assert_eq!(
+        via_link_again.skipped,
+        2,
+        "report: {}",
+        via_link_again.to_json()
+    );
+    assert_eq!(via_link_again.built, 0);
+    let after_link: Vec<Vec<u8>> = paths.iter().map(|p| std::fs::read(p).unwrap()).collect();
+    assert_eq!(before, after_link, "sealed bytes unchanged by the skip");
 }
