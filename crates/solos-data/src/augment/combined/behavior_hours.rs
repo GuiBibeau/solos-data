@@ -4374,3 +4374,111 @@ fn solana_perp_a_one_second_live_gap_makes_the_hour_a_gap() {
     );
     let _ = report;
 }
+
+/// #111's path-form contract: `seal::check` binds the sealed path to the
+/// store root it was given (strip_prefix + clean_relative), so the units must
+/// build every hour path from exactly the `--out` value of the run. A rerun
+/// over the same store whose out spelling differs - a `./` segment in the
+/// middle, or a trailing `/.` - therefore still skips every sealed hour and
+/// rebuilds nothing, and the sealed bytes are unchanged (P1 builds the sealed
+/// path from a differently-formed root and breaks exactly this).
+#[test]
+fn a_differently_spelled_out_root_still_skips_the_sealed_hours() {
+    let tmp = Tmp::new("path-form");
+    let store = tmp.dir().join("store");
+    let decoded = build_main_decoded(tmp.dir());
+    let (jup_hist, jup_live, flash_hist, flash_live) = build_perp_lanes(tmp.dir());
+    let pyth_lane = tmp.dir().join("pyth-lane");
+    let t0 = day_start();
+    write_pyth_lane(
+        &pyth_lane,
+        &[
+            pyth_price("feed-sol", "SOL", t0 + 60, 100.0, 0.5, (t0 + 60) * 1000),
+            pyth_price(
+                "feed-sol",
+                "SOL",
+                t0 + 86_400 + 3 * 3600,
+                100.0,
+                0.5,
+                (t0 + 86_400 + 3 * 3600) * 1000,
+            ),
+        ],
+    );
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    // The mapping lives under the store root (the units read it from `out`).
+    write_mapping(&store);
+    let jupiter_events = vec![jup_hist.clone(), jup_live.clone()];
+    let flash_events = vec![flash_hist.clone(), flash_live.clone()];
+    let pyth_lanes = vec![pyth_lane.clone()];
+
+    let run = |out: &Path| -> (u64, u64, Vec<String>) {
+        let phoenix = super::phoenix_hours::run(&phoenix_request(
+            out,
+            &decoded,
+            &lockbox,
+            &lockbox_sha,
+            &provenance,
+            DAY,
+            DAY,
+        ))
+        .unwrap();
+        let perp = super::solana_perp_hours::run(&PerpRequest {
+            out,
+            lockbox: &lockbox,
+            lockbox_sha256: &lockbox_sha,
+            provenance: &provenance,
+            jupiter_events: &jupiter_events,
+            flash_events: &flash_events,
+            history_status: None,
+            since: DAY,
+            until: DAY,
+            threads: 1,
+            memory_limit: "512MB".to_owned(),
+        })
+        .unwrap();
+        let pyth = super::pyth_hours::run(&PythRequest {
+            out,
+            lockbox: &lockbox,
+            lockbox_sha256: &lockbox_sha,
+            provenance: &provenance,
+            pyth_prices: &pyth_lanes,
+            history_status: None,
+            since: DAY,
+            until: DAY,
+            threads: 1,
+            memory_limit: "512MB".to_owned(),
+        })
+        .unwrap();
+        let mut shas = Vec::new();
+        for report in [&phoenix.outputs, &perp.outputs, &pyth.outputs] {
+            for output in report {
+                shas.push(output.sha256.clone());
+            }
+        }
+        (
+            phoenix.hours_written + perp.hours_written + pyth.hours_written,
+            phoenix.hours_skipped + perp.hours_skipped + pyth.hours_skipped,
+            shas,
+        )
+    };
+
+    let (written, skipped, shas_first) = run(&store);
+    assert_eq!(written, 3, "one sealing hour per unit");
+    assert_eq!(skipped, 0);
+
+    // The same store, the out root spelled with a `./` segment: every sealed
+    // hour skips and no bytes change.
+    let dotted = PathBuf::from(format!("{}/./store", tmp.dir().display()));
+    let (written, skipped, shas_second) = run(&dotted);
+    assert_eq!(written, 0, "nothing rebuilt under a dotted out root");
+    assert_eq!(skipped, 3, "every sealed hour skips");
+    assert_eq!(shas_first, shas_second);
+
+    // And with a trailing `/.`: still the same store, still all skips.
+    let trailing = PathBuf::from(format!("{}/store/.", tmp.dir().display()));
+    let (written, skipped, shas_third) = run(&trailing);
+    assert_eq!(written, 0);
+    assert_eq!(skipped, 3);
+    assert_eq!(shas_first, shas_third);
+}
