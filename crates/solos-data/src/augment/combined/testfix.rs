@@ -120,8 +120,10 @@ pub(crate) fn assert_no_rows_in_lockbox(
 
 /// [`assert_no_rows_in_lockbox`] over a sealed Parquet file.
 ///
-/// The hourly units' tests seal one parquet per hour and use it for every
-/// unit, so the shared helper stays the one definition.
+/// U1's behavior tests run it on their free-side fixture Parquet inputs (a
+/// file whose span pins a lockbox filter must prove it carries no lockbox
+/// rows), and the hourly units' tests seal one parquet per hour and use it
+/// for every unit, so the shared helper stays the one definition.
 pub(crate) fn assert_no_parquet_rows_in_lockbox(
     conn: &duckdb::Connection,
     path: &Path,

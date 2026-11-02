@@ -11,8 +11,10 @@
 //! 2. the receipt's stored inputs still hash to its stored `inputsSha256`, so
 //!    the receipt itself was not edited after the fact,
 //! 3. the receipt names exactly one sealed output (a singular `output`, or an
-//!    `outputs` array holding exactly one entry): a multi-output receipt
-//!    never skips, because a changed extra entry could hide behind the first,
+//!    `outputs` array holding exactly one entry; both keys present rebuilds
+//!    whatever their types, and so do any other count and a non-array
+//!    `outputs`): a multi-output receipt never skips, because a changed extra
+//!    entry could hide behind the first,
 //! 4. the receipt output's `path` is the file `check` was pointed at: the
 //!    path stored in the receipt, taken relative to the store root, equals
 //!    `sealed_path` relative to that same root, so a receipt for one file can
@@ -56,8 +58,10 @@ pub struct SkipKey {
 }
 
 impl SkipKey {
-    /// Build a key from the run's facts. `lockbox_sha256` is normalized to
-    /// lowercase, the same form the receipt records.
+    /// Build a key from the run's facts. `config_sha256` and `lockbox_sha256`
+    /// are trimmed and normalized to lowercase, the same form the receipt
+    /// records, so a caller whose sha picked up padding or casing still
+    /// matches its own receipt instead of rebuilding the hour forever.
     #[must_use]
     pub fn new(
         unit: &str,
@@ -69,7 +73,7 @@ impl SkipKey {
         Self {
             unit: unit.to_owned(),
             unit_version,
-            config_sha256: config_sha256.to_ascii_lowercase(),
+            config_sha256: config_sha256.trim().to_ascii_lowercase(),
             lockbox_sha256: lockbox_sha256.trim().to_ascii_lowercase(),
             inputs,
         }
@@ -126,9 +130,13 @@ pub enum Decision {
 /// the receipt's output `path` (stored relative to that root, the shape
 /// `receipt::OutputFile` and every hour receipt write) is compared against
 /// `sealed_path` relative to the same root, so a receipt is bound to its own
-/// file, not just to its bytes. Missing or garbled receipts are
-/// [`Decision::Rebuild`], never an error; the `Result` exists so a unit's
-/// `run` can `?` the call like its other checks.
+/// file, not just to its bytes. `root` and `sealed_path` must be the same
+/// form - both absolute, or both relative under the same prefix - and the
+/// compare is lexical (`strip_prefix` plus cleaned components, no symlink
+/// resolution): a form mismatch or an escaping path fails the compare and
+/// the hour rebuilds forever, which is the safe direction. Missing or
+/// garbled receipts are [`Decision::Rebuild`], never an error; the `Result`
+/// exists so a unit's `run` can `?` the call like its other checks.
 ///
 /// # Errors
 ///
@@ -185,10 +193,11 @@ pub fn check(
     }
     // Exactly one sealed output, and it must be the file this decision is
     // about: a receipt naming several outputs can hide a changed extra entry
-    // behind outputs[0], and a receipt for another file with identical bytes
-    // must not skip this one.
+    // behind outputs[0], a receipt carrying both keys is ambiguous whatever
+    // their types (a non-array `outputs` is not "no array"), and a receipt
+    // for another file with identical bytes must not skip this one.
     let singular = receipt.get("output");
-    let plural = receipt.get("outputs").and_then(Value::as_array);
+    let plural = receipt.get("outputs");
     let output = match (singular, plural) {
         (Some(_), Some(_)) => {
             return Ok(Decision::Rebuild {
@@ -196,11 +205,19 @@ pub fn check(
             });
         }
         (Some(output), None) => Some(output),
-        (None, Some(outputs)) if outputs.len() == 1 => outputs.first(),
         (None, Some(outputs)) => {
-            return Ok(Decision::Rebuild {
-                reason: format!("receipt has {} outputs, not exactly one", outputs.len()),
-            });
+            let Some(entries) = outputs.as_array() else {
+                return Ok(Decision::Rebuild {
+                    reason: "receipt's outputs is not an array".into(),
+                });
+            };
+            if entries.len() == 1 {
+                entries.first()
+            } else {
+                return Ok(Decision::Rebuild {
+                    reason: format!("receipt has {} outputs, not exactly one", entries.len()),
+                });
+            }
         }
         (None, None) => None,
     };
@@ -293,9 +310,11 @@ fn hex_field_is(stored: &Value, field: &str, ours: &str) -> bool {
 }
 
 /// The canonical `/`-joined text of a relative path: plain component names
-/// only (`.`, `..`, roots and prefixes refuse), so the receipt's stored path
-/// and the verified file's path compare component for component, never by a
-/// string suffix.
+/// only (a leading `./`, any `..`, and root or prefix components refuse), so
+/// the receipt's stored path and the verified file's path compare component
+/// for component, never by a string suffix. Separator redundancy carries no
+/// components - a trailing slash, repeated `/`, and a `.` between names
+/// normalize to the same text - so those forms compare equal.
 fn clean_relative(path: &Path) -> Option<String> {
     let mut joined = String::new();
     for component in path.components() {
@@ -636,6 +655,11 @@ mod tests {
     #[test]
     fn the_receipt_only_skips_the_file_it_names() {
         let tmp = Tmp::new("pathbind");
+        // The store root is a directory of its own, so a file one level above
+        // it (a path escaping the root) is still inside this test's own temp
+        // dir - nothing is written to the temp root or any shared path.
+        let root = tmp.dir().join("store");
+        std::fs::create_dir_all(&root).unwrap();
         let body = b"parquet-bytes";
         let receipt = serde_json::json!({
             "schema": "hour-v1",
@@ -647,25 +671,24 @@ mod tests {
                 "sha256": crate::fsutil::sha256_hex(body),
             },
         });
-        let receipt_path = tmp.dir().join("h.json");
+        let receipt_path = root.join("h.json");
         std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
         // Identical bytes at a different path under the same root: rebuild.
-        std::fs::create_dir_all(tmp.dir().join("tables/other")).unwrap();
-        let elsewhere = tmp.dir().join("tables/other/h.parquet");
+        std::fs::create_dir_all(root.join("tables/other")).unwrap();
+        let elsewhere = root.join("tables/other/h.parquet");
         std::fs::write(&elsewhere, body).unwrap();
-        let Decision::Rebuild { reason } =
-            check(tmp.dir(), &receipt_path, &elsewhere, &key()).unwrap()
+        let Decision::Rebuild { reason } = check(&root, &receipt_path, &elsewhere, &key()).unwrap()
         else {
             panic!("a receipt for tables/spot/h.parquet must not skip another file");
         };
         assert!(reason.contains("tables/spot/h.parquet"), "{reason}");
         assert!(reason.contains("tables/other/h.parquet"), "{reason}");
         // The file the receipt names: skip.
-        std::fs::create_dir_all(tmp.dir().join("tables/spot")).unwrap();
-        let named = tmp.dir().join("tables/spot/h.parquet");
+        std::fs::create_dir_all(root.join("tables/spot")).unwrap();
+        let named = root.join("tables/spot/h.parquet");
         std::fs::write(&named, body).unwrap();
         assert_eq!(
-            check(tmp.dir(), &receipt_path, &named, &key()).unwrap(),
+            check(&root, &receipt_path, &named, &key()).unwrap(),
             Decision::Skip {
                 rows: 3,
                 bytes: body.len() as u64,
@@ -673,21 +696,176 @@ mod tests {
             }
         );
         // A receipt path escaping the root (or a sealed path outside it)
-        // never matches anything.
-        let outside = tmp.dir().join("../outside.parquet");
+        // never matches anything. The file exists at exactly the given path
+        // with the receipted bytes, so only the path binding can refuse it.
+        let outside = root.join("../outside.parquet");
         std::fs::write(&outside, body).unwrap();
         assert!(matches!(
-            check(tmp.dir(), &receipt_path, &outside, &key()).unwrap(),
+            check(&root, &receipt_path, &outside, &key()).unwrap(),
             Decision::Rebuild { .. }
         ));
-        // A receipt path with dot segments is not clean either.
+        // A `.` between names is not refused either - `components()` just
+        // normalizes it away, so the receipt now names a different path
+        // (tables/h.parquet) than the sealed file, and that mismatch rebuilds.
         let mut receipt = receipt.clone();
         receipt["output"]["path"] = serde_json::json!("tables/./h.parquet");
         std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
         assert!(matches!(
-            check(tmp.dir(), &receipt_path, &named, &key()).unwrap(),
+            check(&root, &receipt_path, &named, &key()).unwrap(),
             Decision::Rebuild { .. }
         ));
+    }
+
+    /// The documented path normalization: redundant separators in the
+    /// receipt's stored path (a trailing slash, repeated `/`) carry no extra
+    /// components and compare equal, while a path that is only a string
+    /// suffix of the sealed path - a different component list - rebuilds.
+    /// The compare is component-wise, never a string-suffix compare, and by
+    /// the same token never a string-prefix compare: a receipt naming a
+    /// strict directory prefix of the sealed file (its directory, or the
+    /// root of the tree) rebuilds even though the sealed bytes, rows and sha
+    /// match the receipt exactly.
+    #[test]
+    fn the_path_compare_is_component_wise_over_cleaned_components() {
+        let tmp = Tmp::new("pathnorm");
+        let body = b"parquet-bytes";
+        let sealed = tmp.dir().join("tables/spot/h.parquet");
+        std::fs::create_dir_all(sealed.parent().unwrap()).unwrap();
+        std::fs::write(&sealed, body).unwrap();
+        let check_with = |path: &str| {
+            let receipt = serde_json::json!({
+                "schema": "hour-v1",
+                "skipKey": key().to_receipt_value(),
+                "output": {
+                    "path": path,
+                    "rows": 3,
+                    "bytes": body.len(),
+                    "sha256": crate::fsutil::sha256_hex(body),
+                },
+            });
+            let receipt_path = tmp.dir().join("h.json");
+            std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            check(tmp.dir(), &receipt_path, &sealed, &key()).unwrap()
+        };
+        // Redundant forms normalize exactly as documented: skip.
+        for sloppy in ["tables/spot/h.parquet/", "tables//spot/h.parquet"] {
+            assert_eq!(
+                check_with(sloppy),
+                Decision::Skip {
+                    rows: 3,
+                    bytes: body.len() as u64,
+                    sha256: crate::fsutil::sha256_hex(body),
+                },
+                "{sloppy} must normalize to the same path"
+            );
+        }
+        // "spot/h.parquet" is a string suffix of the sealed path but a
+        // different component path: rebuild, never skip.
+        let Decision::Rebuild { reason } = check_with("spot/h.parquet") else {
+            panic!("the path compare must not be a string-suffix compare");
+        };
+        assert!(reason.contains("receipt names spot/h.parquet"), "{reason}");
+        // The prefix direction is pinned the same way: "tables/spot" (the
+        // file's directory) and "tables" (the tree root) are clean component
+        // paths and string prefixes of the sealed path, but neither is the
+        // file the receipt sealed - both rebuild, whatever the bytes say.
+        for prefix in ["tables/spot", "tables"] {
+            let Decision::Rebuild { reason } = check_with(prefix) else {
+                panic!("a receipt naming the prefix {prefix} must not skip the file below it");
+            };
+            assert!(
+                reason.contains(&format!("receipt names {prefix}")),
+                "{prefix}: {reason}"
+            );
+        }
+    }
+
+    /// `clean_relative` refuses anything that is not a plain relative name: a
+    /// leading `./`, any `..`, root and prefix components. A receipt for a
+    /// file outside the root never skips even when the receipted bytes sit
+    /// exactly at the given path (the files exist here, so only the path
+    /// check can refuse each case).
+    #[test]
+    fn a_receipt_path_outside_or_unclean_rebuilds() {
+        let tmp = Tmp::new("pathclean");
+        let root = tmp.dir().join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        let body = b"parquet-bytes";
+        std::fs::write(tmp.dir().join("outside.parquet"), body).unwrap();
+        std::fs::write(root.join("x.parquet"), body).unwrap();
+        std::fs::write(tmp.dir().join("x.parquet"), body).unwrap();
+        let check_with = |stored: &str, sealed: &Path, name: &str| {
+            let receipt = serde_json::json!({
+                "schema": "hour-v1",
+                "skipKey": key().to_receipt_value(),
+                "output": {
+                    "path": stored,
+                    "rows": 3,
+                    "bytes": body.len(),
+                    "sha256": crate::fsutil::sha256_hex(body),
+                },
+            });
+            let receipt_path = tmp.dir().join(format!("{name}.json"));
+            std::fs::write(&receipt_path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            check(&root, &receipt_path, sealed, &key()).unwrap()
+        };
+        // The receipt names "outside.parquet"; the sealed path steps out of
+        // the root, whose bytes match the receipt at exactly that path.
+        let Decision::Rebuild { reason } =
+            check_with("outside.parquet", &root.join("../outside.parquet"), "esc")
+        else {
+            panic!("a sealed path outside the root must never skip");
+        };
+        assert!(reason.contains("not a clean path"), "{reason}");
+        // A receipt naming "../x.parquet" with the file (and its receipted
+        // bytes) at exactly <root>/../x.parquet: the .. must refuse.
+        let Decision::Rebuild { reason } =
+            check_with("../x.parquet", &root.join("../x.parquet"), "dotdot")
+        else {
+            panic!("a receipt path through .. must never skip");
+        };
+        assert!(reason.contains("not a clean path"), "{reason}");
+        // A leading ./ and an absolute path refuse the same way (both files
+        // exist at the sealed path, so only cleanliness can rebuild).
+        for (stored, name) in [("./x.parquet", "dot"), ("/abs/x.parquet", "abs")] {
+            let Decision::Rebuild { reason } = check_with(stored, &root.join("x.parquet"), name)
+            else {
+                panic!("{stored} must refuse");
+            };
+            assert!(reason.contains("not a clean path"), "{stored}: {reason}");
+        }
+    }
+
+    /// The config sha is normalized like the lockbox sha (trimmed and
+    /// lowercased in [`SkipKey::new`]): a rerun whose config sha picked up
+    /// whitespace or casing still matches its own receipt, while a genuinely
+    /// different sha still rebuilds. Without the trim, a padded key would
+    /// never equal its own receipt and the hour would rebuild forever.
+    #[test]
+    fn config_shas_match_trimmed_and_case_insensitively_only() {
+        let tmp = Tmp::new("configsha");
+        let body = b"parquet-bytes";
+        // Sealed by a run whose key carried the canonical sha ("cafe").
+        let (receipt_path, sealed_path) = seal(tmp.dir(), "h", &key(), body);
+        // The rerun's config sha came back padded and uppercase: same sha.
+        let padded = SkipKey::new("hlhours", 1, "  CAFE\t", "deadbeef", key().inputs);
+        assert_eq!(padded.config_sha256, "cafe");
+        assert_eq!(
+            check(tmp.dir(), &receipt_path, &sealed_path, &padded).unwrap(),
+            Decision::Skip {
+                rows: 3,
+                bytes: body.len() as u64,
+                sha256: crate::fsutil::sha256_hex(body),
+            }
+        );
+        // A different sha still rebuilds, whatever its casing or padding.
+        let other = SkipKey::new("hlhours", 1, " f00d ", "deadbeef", key().inputs);
+        let Decision::Rebuild { reason } =
+            check(tmp.dir(), &receipt_path, &sealed_path, &other).unwrap()
+        else {
+            panic!("a different config sha must rebuild");
+        };
+        assert!(reason.contains("configSha256"), "{reason}");
     }
 
     /// Exactly one output or rebuild (fix 1): a two-output receipt must
@@ -766,7 +944,9 @@ mod tests {
                 sha256: sha.clone(),
             }
         );
-        // Both keys at once is ambiguous, never a skip.
+        // Both keys at once is ambiguous, never a skip - whatever the types:
+        // the guard fires on key presence, so a non-array `outputs` beside a
+        // singular `output` cannot sneak through as "no array".
         let both = serde_json::json!({
             "schema": "hour-v1",
             "skipKey": key().to_receipt_value(),
@@ -780,6 +960,32 @@ mod tests {
             panic!("output and outputs together must rebuild");
         };
         assert!(reason.contains("output and outputs"), "{reason}");
+        let both_junk = serde_json::json!({
+            "schema": "hour-v1",
+            "skipKey": key().to_receipt_value(),
+            "output": entry("a", &sha),
+            "outputs": "junk",
+        });
+        let (receipt_path, _) = seal_raw(tmp.dir(), "a", both_junk, body);
+        let Decision::Rebuild { reason } =
+            check(tmp.dir(), &receipt_path, &sealed, &key()).unwrap()
+        else {
+            panic!("output and a non-array outputs must rebuild");
+        };
+        assert!(reason.contains("output and outputs"), "{reason}");
+        // A non-array outputs alone is not an exactly-one array either.
+        let (receipt_path, _) = seal_raw(
+            tmp.dir(),
+            "a",
+            receipt_with(serde_json::json!("junk")),
+            body,
+        );
+        let Decision::Rebuild { reason } =
+            check(tmp.dir(), &receipt_path, &sealed, &key()).unwrap()
+        else {
+            panic!("a non-array outputs must rebuild");
+        };
+        assert!(reason.contains("not an array"), "{reason}");
     }
 
     #[test]
