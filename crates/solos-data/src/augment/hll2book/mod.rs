@@ -28,6 +28,9 @@ pub const SCHEMA: &str = "hl-l2book-v1";
 /// Schema name of one hour's raw-deletion record.
 pub const DROP_SCHEMA: &str = "hl-l2book-drop-v1";
 
+/// Schema name of one `quarantine.jsonl` line (a raw line that does not decode).
+pub const QUARANTINE_SCHEMA: &str = "hl-l2book-quarantine-v1";
+
 /// Levels kept on each side. The archive sample is 20; a shorter side is stored as nulls.
 pub const BOOK_LEVELS: usize = 20;
 

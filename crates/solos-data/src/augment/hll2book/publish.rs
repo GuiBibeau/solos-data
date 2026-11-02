@@ -4,6 +4,11 @@
 //! counted back, sampled, and checked. A failure deletes the temporary files and leaves the
 //! watermark alone. The caller writes the watermark after this returns, and only then may
 //! delete raw inputs.
+//!
+//! One failure mode is not a run failure: a raw line that does not decode as an `l2Book`
+//! snapshot (upstream corruption, as in the 20251114/11 MEGA file) quarantines the hour.
+//! [`prepare_hour`] returns every fault it found and stages nothing; the caller records the
+//! quarantine and leaves the hour unsealed, its receipt unwritten, and its raw files alone.
 
 use super::decode::{self, DuplicateRule, Snapshot};
 use super::{
@@ -31,6 +36,42 @@ pub struct FileBytes<'a> {
     pub sha256: &'a str,
     /// The `.lz4` body.
     pub bytes: &'a [u8],
+}
+
+/// One raw line that failed to decode as an `l2Book` snapshot while staging an hour.
+///
+/// `line` is the 1-based line number in the decompressed file, `column` is the JSON byte
+/// column when the fault is a JSON syntax error, and `error` is the decoder's error text
+/// (`json: expected , or } at line 1 column 483` in the 20251114/11 incident).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineFault {
+    /// Coin whose file the line came from.
+    pub coin: String,
+    /// The raw file's path relative to the input root.
+    pub path: String,
+    /// SHA-256 of the raw `.lz4` bytes (the manifest digest).
+    pub sha256: String,
+    /// 1-based line number in the decompressed file.
+    pub line: u64,
+    /// Byte column of a JSON syntax error; `None` for shape and field errors.
+    pub column: Option<u64>,
+    /// The decoder's error text.
+    pub error: String,
+}
+
+/// How many line faults one hour collects before its scan stops. Every collected fault
+/// becomes a `quarantine.jsonl` entry; past the cap the hour quarantines on what it saw.
+pub const LINE_FAULT_CAP: usize = 8;
+
+/// Why [`prepare_hour`] failed.
+#[derive(Debug)]
+pub enum PrepareError {
+    /// The hour fails the run, as before: IO, a short or corrupt lz4 frame, a count or
+    /// sample check, the COPY, or a receipt trouble. The watermark does not move.
+    Fatal(StoreError),
+    /// One or more raw lines did not decode ([`LINE_FAULT_CAP`] at most). The hour is
+    /// quarantined: nothing is staged or sealed, and the run continues with other hours.
+    Quarantine(Vec<LineFault>),
 }
 
 /// An injected count fault for the guard tests (ADR-0021 verification). It rides the job, so
@@ -163,23 +204,25 @@ pub struct Receipt {
 ///
 /// # Errors
 ///
-/// A frame is short or corrupt, a line does not parse, a count or sample check fails, or a
-/// staged file fails a range check.
+/// [`PrepareError::Quarantine`] when a raw line does not decode: the hour is quarantined,
+/// nothing final or temporary survives, and the caller records the faults. Everything else
+/// is [`PrepareError::Fatal`]: a frame is short or corrupt, a count or sample check fails,
+/// or a staged file fails a range check.
 pub fn prepare_hour(
     conn: &Connection,
     out: &Path,
     job: &HourJob<'_>,
     settings: &WriterSettings,
-) -> Result<Prepared, StoreError> {
+) -> Result<Prepared, PrepareError> {
     let staging = out.join(".staging").join(job.hour_key.replace('/', "-"));
     let _ = std::fs::remove_dir_all(&staging);
-    create_dir_all_durable(&staging)?;
+    create_dir_all_durable(&staging).map_err(|e| PrepareError::Fatal(StoreError::Io(e)))?;
     let cleaner = DirClean(staging.clone());
     let mut spill = Spill::new(staging.clone());
     let mut samples = Vec::new();
     let mut tallies = BTreeMap::new();
     let streamed = stream_hour(job.files, &mut spill, &mut samples, &mut tallies, job.fault)?;
-    let mut parts = spill.finish()?;
+    let mut parts = spill.finish().map_err(PrepareError::Fatal)?;
     if job.fault == Fault::Staged
         && let Some(part) = parts.first_mut()
     {
@@ -187,29 +230,29 @@ pub fn prepare_hour(
     }
     let mut pending = Vec::with_capacity(parts.len());
     for part in &parts {
-        pending.push(write_tmp(conn, out, job.hour_key, part)?);
+        pending.push(write_tmp(conn, out, job.hour_key, part).map_err(PrepareError::Fatal)?);
     }
     let mut output_rows = 0u64;
     for file in &pending {
-        output_rows += check_tmp(conn, file)?;
+        output_rows += check_tmp(conn, file).map_err(PrepareError::Fatal)?;
     }
     if output_rows != streamed.written {
         drop_tmps(&pending);
-        return Err(StoreError::Check(format!(
+        return Err(PrepareError::Fatal(StoreError::Check(format!(
             "hour kept {} rows != parquet rows {output_rows}",
             streamed.written
-        )));
+        ))));
     }
     // Every line the independent count saw is either kept or was an identical re-send.
     if streamed.counted != streamed.written + streamed.dup_identical {
         drop_tmps(&pending);
-        return Err(StoreError::Check(format!(
+        return Err(PrepareError::Fatal(StoreError::Check(format!(
             "snapshot count {} != kept {} + identical re-sends {}",
             streamed.counted, streamed.written, streamed.dup_identical
-        )));
+        ))));
     }
-    check_coins(conn, &pending, &tallies)?;
-    check_samples(conn, &pending, &samples)?;
+    check_coins(conn, &pending, &tallies).map_err(PrepareError::Fatal)?;
+    check_samples(conn, &pending, &samples).map_err(PrepareError::Fatal)?;
     let inputs = input_files(job, &tallies);
     drop(cleaner);
     Ok(Prepared {
@@ -423,6 +466,23 @@ impl Drop for DirClean {
     }
 }
 
+/// Byte column a serde JSON syntax error reported (`... at line 1 column 483`), when the
+/// error text carries one. Shape and field errors have no column.
+#[must_use]
+fn fault_column(error: &str) -> Option<u64> {
+    let marker = "column ";
+    let start = error.rfind(marker)? + marker.len();
+    let tail = &error[start..];
+    let end = tail
+        .bytes()
+        .position(|byte| !byte.is_ascii_digit())
+        .unwrap_or(tail.len());
+    if end == 0 {
+        return None;
+    }
+    tail[..end].parse().ok()
+}
+
 /// What streaming one hour produced.
 struct Streamed {
     /// Lines the independent count saw, duplicates included.
@@ -441,11 +501,16 @@ fn stream_hour(
     samples: &mut Vec<Snapshot>,
     tallies: &mut BTreeMap<String, u64>,
     fault: Fault,
-) -> Result<Streamed, StoreError> {
+) -> Result<Streamed, PrepareError> {
     let mut counted = 0u64;
     let mut written = 0u64;
     let mut dup_identical = 0u64;
     let mut dup_distinct = 0u64;
+    // A line that does not decode is upstream corruption in a file whose bytes match the
+    // manifest (20251114/11 MEGA line 1303). It quarantines the hour instead of failing the
+    // run: the faults are collected, the scan runs to the cap or the end of the hour, and no
+    // output of the hour is staged or sealed. Frame, IO, and count errors stay fatal.
+    let mut faults: Vec<LineFault> = Vec::new();
     // One file per coin per hour, so the duplicate state is per file keyed by `time_ms`
     // alone: no per-row String key, and clearing between files cannot merge two coins. A
     // later line that repeats a kept digest is an identical re-send and is dropped; a new
@@ -456,38 +521,60 @@ fn stream_hour(
     for file in files {
         seen.clear();
         if !file.bytes.starts_with(&crate::augment::hls3::LZ4_MAGIC) {
-            return Err(StoreError::Check(format!(
+            return Err(PrepareError::Fatal(StoreError::Check(format!(
                 "{}: lz4: not an lz4 frame",
                 file.coin
-            )));
+            ))));
         }
-        let decoder = lz4::Decoder::new(std::io::Cursor::new(file.bytes))
-            .map_err(|e| StoreError::Check(format!("{}: lz4: {e}", file.coin)))?;
+        let decoder = lz4::Decoder::new(std::io::Cursor::new(file.bytes)).map_err(|e| {
+            PrepareError::Fatal(StoreError::Check(format!("{}: lz4: {e}", file.coin)))
+        })?;
         let reader = BufReader::new(decoder);
         for (index, line) in reader.lines().enumerate() {
-            let line = line
-                .map_err(|e| StoreError::Check(format!("{} line {}: {e}", file.coin, index + 1)))?;
+            let line = line.map_err(|e| {
+                PrepareError::Fatal(StoreError::Check(format!(
+                    "{} line {}: {e}",
+                    file.coin,
+                    index + 1
+                )))
+            })?;
             let line = line.trim_end_matches('\r');
             if line.is_empty() {
                 continue;
             }
-            let events = decode::count_snapshot(line)
-                .map_err(|e| StoreError::Check(format!("{} line {}: {e}", file.coin, index + 1)))?;
-            let snapshot = decode::snapshot_of_line(line, file.coin)
-                .map_err(|e| StoreError::Check(format!("{} line {}: {e}", file.coin, index + 1)))?;
+            let decoded = decode::count_snapshot(line).and_then(|events| {
+                decode::snapshot_of_line(line, file.coin).map(|row| (events, row))
+            });
+            let (events, snapshot) = match decoded {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    faults.push(LineFault {
+                        coin: file.coin.to_owned(),
+                        path: file.relative.to_owned(),
+                        sha256: file.sha256.to_owned(),
+                        line: u64::try_from(index + 1).unwrap_or(u64::MAX),
+                        column: fault_column(&error),
+                        error,
+                    });
+                    if faults.len() >= LINE_FAULT_CAP {
+                        return Err(PrepareError::Quarantine(faults));
+                    }
+                    continue;
+                }
+            };
             let mut rows = vec![snapshot];
             if fault == Fault::Line && !fault_fired {
                 fault_fired = true;
                 rows.pop();
             }
-            let got =
-                u64::try_from(rows.len()).map_err(|_| StoreError::Check("too many rows".into()))?;
+            let got = u64::try_from(rows.len())
+                .map_err(|_| PrepareError::Fatal(StoreError::Check("too many rows".into())))?;
             if got != events {
-                return Err(StoreError::Check(format!(
+                return Err(PrepareError::Fatal(StoreError::Check(format!(
                     "{} line {}: snapshot count {events} diverged from {got} rows",
                     file.coin,
                     index + 1
-                )));
+                ))));
             }
             for row in rows {
                 counted += 1;
@@ -511,17 +598,20 @@ fn stream_hour(
                 }
                 consider_sample(samples, &row, written);
                 let row = stage_mutation(row, fault, &mut fault_fired);
-                spill.write(&row, written)?;
+                spill.write(&row, written).map_err(PrepareError::Fatal)?;
                 written += 1;
             }
         }
         tallies.insert(file.coin.to_owned(), tally);
         tally = 0;
     }
+    if !faults.is_empty() {
+        return Err(PrepareError::Quarantine(faults));
+    }
     if counted != written + dup_identical {
-        return Err(StoreError::Check(format!(
+        return Err(PrepareError::Fatal(StoreError::Check(format!(
             "snapshot count {counted} diverged from {written} rows + {dup_identical} identical re-sends"
-        )));
+        ))));
     }
     Ok(Streamed {
         counted,

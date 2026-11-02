@@ -5,10 +5,19 @@
 //! [`super::publish`] passed. Raw `.lz4` files are deleted only after that write, and only
 //! when the request asked for it. A file whose size does not match the manifest is left
 //! untouched: the downloader has not finished it.
+//!
+//! One failure is quarantined instead of fatal: a raw line that does not decode as an
+//! `l2Book` snapshot (upstream corruption in files whose bytes match the manifest).
+//! A quarantined hour is never sealed: no Parquet, no receipt, no watermark entry, and its
+//! raw files are never dropped, even under `--drop-raw-after-verify`. Every fault is merged
+//! into `quarantine.jsonl` in the output root (durable write, idempotent on rerun), the run
+//! continues with the other hours, and the report's exit code is [`QUARANTINE_EXIT`] when
+//! any hour was quarantined. IO errors, checksum mismatches, and manifest problems still
+//! fail the run as before.
 
 use super::checksum::{self, Entry};
-use super::publish::{self, FileBytes, HourJob, InputFile, Receipt};
-use super::{DROP_SCHEMA, SCHEMA, config_hash, s3_url};
+use super::publish::{self, FileBytes, HourJob, InputFile, LineFault, Receipt};
+use super::{DROP_SCHEMA, QUARANTINE_SCHEMA, SCHEMA, config_hash, s3_url};
 use crate::fsutil::{create_dir_all_durable, file_hash, write_durable};
 use crate::store::StoreError;
 use serde::{Deserialize, Serialize};
@@ -58,6 +67,43 @@ pub struct Request<'a> {
     pub reseal: BTreeSet<String>,
 }
 
+/// Process exit code when at least one hour was quarantined. The run still completed every
+/// other hour; the quarantined hours need upstream data before they can seal. `0` finished
+/// with no quarantine, `2` stopped on the disk floor (a quarantine still wins: `3`).
+pub const QUARANTINE_EXIT: i32 = 3;
+
+/// How many quarantine examples the report carries. The file has every entry; the report
+/// is a summary.
+pub const QUARANTINE_EXAMPLE_CAP: usize = 8;
+
+/// One `quarantine.jsonl` line: a raw line that does not decode, the hour it quarantined,
+/// and where and when it was detected. Reruns re-detect the same hour and merge into the
+/// existing entry (same hour, coin, path, sha256, line, column, and error text keep the
+/// original `detected_at`), so the file never duplicates an entry.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuarantineEntry {
+    /// [`super::QUARANTINE_SCHEMA`].
+    pub schema: String,
+    /// `YYYYMMDD/H` of the hour the fault quarantined.
+    pub hour: String,
+    /// Coin whose raw file holds the line.
+    pub coin: String,
+    /// The raw file's path relative to the input root.
+    pub path: String,
+    /// SHA-256 of the raw `.lz4` bytes (the manifest digest).
+    pub sha256: String,
+    /// 1-based line number in the decompressed file.
+    pub line: u64,
+    /// Byte column of a JSON syntax error; `null` for shape and field errors.
+    pub column: Option<u64>,
+    /// The decoder's error text.
+    pub error: String,
+    /// Git commit of the binary that detected the fault.
+    pub git_sha: String,
+    /// UTC instant of the first detection, RFC 3339 with milliseconds.
+    pub detected_at: String,
+}
+
 /// Why `run` returned.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stop {
@@ -80,6 +126,16 @@ pub struct Report {
     /// an in-scope `.lz4` on disk has no manifest row yet (those are also in
     /// [`Report::hours_uncovered`]).
     pub hours_pending: u64,
+    /// Hours whose staging found a raw line that does not decode. A quarantined hour is not
+    /// sealed (no Parquet, no receipt, no watermark entry) and its raw files are kept even
+    /// under `--drop-raw-after-verify`; the run continues with every other hour.
+    pub hours_quarantined: u64,
+    /// `quarantine.jsonl` entries this run added (an entry re-detected on a rerun is a
+    /// merge, not an add).
+    pub quarantine_entries_added: u64,
+    /// The quarantined hours' entries, at most [`QUARANTINE_EXAMPLE_CAP`]. On a rerun that
+    /// re-detects a known hour this is the file's existing entry for it.
+    pub quarantine_examples: Vec<QuarantineEntry>,
     /// Hours skipped because an in-scope `.lz4` on disk has no manifest row (a subset of
     /// [`Report::hours_pending`]). The manifest builder covers those hours; the run does not
     /// abort on them.
@@ -136,12 +192,17 @@ pub struct HourLine {
 }
 
 impl Report {
-    /// Process exit code: `0` finished, `2` stopped on the disk floor.
+    /// Process exit code: `0` finished, `2` stopped on the disk floor, [`QUARANTINE_EXIT`]
+    /// (`3`) when any hour was quarantined, whatever the stop.
     #[must_use]
     pub const fn exit_code(&self) -> i32 {
-        match self.stop {
-            Stop::Done => 0,
-            Stop::DiskFloor => 2,
+        if self.hours_quarantined > 0 {
+            QUARANTINE_EXIT
+        } else {
+            match self.stop {
+                Stop::Done => 0,
+                Stop::DiskFloor => 2,
+            }
         }
     }
 
@@ -161,6 +222,26 @@ impl Report {
             .with("hoursSkipped", self.hours_skipped)
             .with("hoursPending", self.hours_pending)
             .with("hoursUncovered", self.hours_uncovered)
+            .with("hoursQuarantined", self.hours_quarantined)
+            .with("quarantineEntriesAdded", self.quarantine_entries_added)
+            .with_rows(
+                "quarantineExamples",
+                self.quarantine_examples
+                    .iter()
+                    .map(|entry| {
+                        crate::jsonout::Obj::new()
+                            .with("hour", entry.hour.clone())
+                            .with("coin", entry.coin.clone())
+                            .with("path", entry.path.clone())
+                            .with("sha256", entry.sha256.clone())
+                            .with("line", entry.line)
+                            .with("column", entry.column)
+                            .with("error", entry.error.clone())
+                            .with("gitSha", entry.git_sha.clone())
+                            .with("detectedAt", entry.detected_at.clone())
+                    })
+                    .collect(),
+            )
             .with("rows", self.rows)
             .with("dupIdentical", self.dup_identical)
             .with("dupDistinct", self.dup_distinct)
@@ -218,10 +299,12 @@ fn hour_ratio(parquet_bytes: u64, lz4_bytes: u64) -> f64 {
 ///
 /// # Errors
 ///
-/// A size-matched file's sha256 does not match the manifest, a frame is short or corrupt, a
-/// count or sample check fails, or the output lock is already held. The watermark does not
-/// gain that hour. An incomplete hour is not an error: a short or missing file, or a finished
-/// `.lz4` with no manifest row, is counted as pending and the run continues.
+/// A size-matched file's sha256 does not match the manifest, a frame is short or corrupt,
+/// a count or sample check fails, or the output lock is already held. The watermark does
+/// not gain that hour. A raw line that does not decode is not an error: the hour is
+/// quarantined, counted in [`Report::hours_quarantined`], and the run continues. An
+/// incomplete hour is not an error either: a short or missing file, or a finished `.lz4`
+/// with no manifest row, is counted as pending and the run continues.
 pub fn run(
     request: &Request<'_>,
     mut free_bytes: impl FnMut(&Path) -> Result<u64, String>,
@@ -262,6 +345,9 @@ pub fn run(
         hours_skipped: 0,
         hours_pending: 0,
         hours_uncovered: 0,
+        hours_quarantined: 0,
+        quarantine_entries_added: 0,
+        quarantine_examples: Vec::new(),
         rows: 0,
         dup_identical: 0,
         dup_distinct: 0,
@@ -430,6 +516,23 @@ pub fn run(
                         report.hours_pending += 1;
                         report.hours.push(pending_line(&tasks[next].key, "pending"));
                     }
+                    WorkerOutcome::Quarantined { hour_key, faults } => {
+                        // The hour is not sealed and its raw files are not touched, however
+                        // many good coins it also holds: the Parquet would silently miss the
+                        // corrupt coin's rows, and a drop would make the fault unrepairable
+                        // in this root. The record is durable before the run moves on.
+                        let (added, examples) =
+                            write_quarantine(request.out, &hour_key, &faults, &git)?;
+                        report.hours_quarantined += 1;
+                        report.quarantine_entries_added += added;
+                        for entry in examples {
+                            if report.quarantine_examples.len() >= QUARANTINE_EXAMPLE_CAP {
+                                break;
+                            }
+                            report.quarantine_examples.push(entry);
+                        }
+                        report.hours.push(pending_line(&hour_key, "quarantined"));
+                    }
                     WorkerOutcome::Skip(receipt) => {
                         skip_verified(request, &receipt, &mut report)?;
                     }
@@ -531,6 +634,14 @@ enum WorkerOutcome {
     Pending,
     /// The hour was already verified and still matches; the receipt carries the numbers.
     Skip(Receipt),
+    /// A raw line of the hour does not decode: the hour is quarantined with the faults
+    /// found, never sealed, its raw kept, and the run continues.
+    Quarantined {
+        /// `YYYYMMDD/H`.
+        hour_key: String,
+        /// Every fault found, at most [`publish::LINE_FAULT_CAP`].
+        faults: Vec<LineFault>,
+    },
     /// The hour is staged, checked, and waiting for its ordered seal.
     Prepared(publish::Prepared),
     /// The hour fails; the run stops.
@@ -629,8 +740,18 @@ fn work_one(
         threads: publish::current_setting(conn, "threads")?,
         memory_limit: publish::current_setting(conn, "memory_limit")?,
     };
-    let prepared = publish::prepare_hour(conn, request.out, &job, &settings)
-        .map_err(|error| StoreError::Check(format!("{key}: {error}")))?;
+    let prepared = match publish::prepare_hour(conn, request.out, &job, &settings) {
+        Ok(prepared) => prepared,
+        Err(publish::PrepareError::Quarantine(faults)) => {
+            return Ok(WorkerOutcome::Quarantined {
+                hour_key: key.clone(),
+                faults,
+            });
+        }
+        Err(publish::PrepareError::Fatal(error)) => {
+            return Err(StoreError::Check(format!("{key}: {error}")));
+        }
+    };
     Ok(WorkerOutcome::Prepared(prepared))
 }
 
@@ -1259,6 +1380,101 @@ struct DropRecord {
     files: Vec<DropFile>,
 }
 
+/// `quarantine.jsonl` in the output root.
+fn quarantine_path(out: &Path) -> PathBuf {
+    out.join("quarantine.jsonl")
+}
+
+/// The identity of a quarantine entry: everything but the bookkeeping fields (`schema`,
+/// `git_sha`, `detected_at`). A rerun that re-detects the same fault keeps the original
+/// entry instead of adding a duplicate.
+type QuarantineKey = (String, String, String, String, u64, Option<u64>, String);
+
+fn quarantine_key(entry: &QuarantineEntry) -> QuarantineKey {
+    (
+        entry.hour.clone(),
+        entry.coin.clone(),
+        entry.path.clone(),
+        entry.sha256.clone(),
+        entry.line,
+        entry.column,
+        entry.error.clone(),
+    )
+}
+
+/// Merge `hour_key`'s line faults into `quarantine.jsonl` and return how many entries were
+/// newly added plus the hour's entries as they now stand (the file's, when the fault was
+/// already recorded). The whole file is rewritten through [`write_durable`] (`.tmp`, fsync,
+/// rename, directory fsync), so the merge is atomic and an entry is never duplicated.
+/// A foreign-schema or unparsable line in the file is an error, never an overwrite.
+///
+/// # Errors
+///
+/// The file cannot be read, holds a foreign schema or unparsable line, or the write fails.
+pub(crate) fn write_quarantine(
+    out: &Path,
+    hour_key: &str,
+    faults: &[LineFault],
+    git_sha: &str,
+) -> Result<(u64, Vec<QuarantineEntry>), StoreError> {
+    let path = quarantine_path(out);
+    let mut merged: BTreeMap<QuarantineKey, QuarantineEntry> = BTreeMap::new();
+    if path.is_file() {
+        let text = std::fs::read_to_string(&path)?;
+        for (number, line) in text.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let entry: QuarantineEntry = serde_json::from_str(line).map_err(|e| {
+                StoreError::Check(format!("quarantine.jsonl line {}: {e}", number + 1))
+            })?;
+            if entry.schema != QUARANTINE_SCHEMA {
+                return Err(StoreError::Check(format!(
+                    "quarantine.jsonl line {}: schema is {}, this command writes {QUARANTINE_SCHEMA}",
+                    number + 1,
+                    entry.schema
+                )));
+            }
+            merged.insert(quarantine_key(&entry), entry);
+        }
+    }
+    let detected_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let mut added = 0u64;
+    for fault in faults {
+        let entry = QuarantineEntry {
+            schema: QUARANTINE_SCHEMA.to_owned(),
+            hour: hour_key.to_owned(),
+            coin: fault.coin.clone(),
+            path: fault.path.clone(),
+            sha256: fault.sha256.clone(),
+            line: fault.line,
+            column: fault.column,
+            error: fault.error.clone(),
+            git_sha: git_sha.to_owned(),
+            detected_at: detected_at.clone(),
+        };
+        let key = quarantine_key(&entry);
+        if merged.contains_key(&key) {
+            continue;
+        }
+        merged.insert(key, entry);
+        added += 1;
+    }
+    let mut body = Vec::new();
+    let mut mine = Vec::new();
+    for entry in merged.into_values() {
+        serde_json::to_writer(&mut body, &entry).map_err(|e| StoreError::Check(e.to_string()))?;
+        body.push(b'\n');
+        if entry.hour == hour_key {
+            mine.push(entry);
+        }
+    }
+    create_dir_all_durable(out)?;
+    write_durable(&path, &body)?;
+    Ok((added, mine))
+}
+
 #[derive(Serialize, Deserialize)]
 struct DropFile {
     path: String,
@@ -1286,6 +1502,12 @@ struct Watermark {
     schema: String,
     hours: BTreeSet<String>,
 }
+
+// The watermark is the set of sealed hours, keyed `YYYYMMDD/H`. There is no "through" hour:
+// nothing computes a max-contiguous prefix from it, and readers must treat it as a set. A
+// quarantined hour is simply absent until its raw is repaired and the hour seals; hours
+// after it in the same run seal and appear normally, so a gap in the set is a quarantine (or
+// a pending hour), never a skip.
 
 fn watermark_path(out: &Path) -> PathBuf {
     out.join("watermark.json")
