@@ -62,6 +62,7 @@ use super::grid;
 use super::lockbox;
 use super::mapping;
 use super::receipt;
+use super::seal;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -265,9 +266,11 @@ pub struct HourReceipt {
     pub usd_micro: Option<i64>,
     /// Sealed mint file.
     pub output: receipt::OutputFile,
-    /// SHA-256 of the sorted `stem sha256` lines of the input batches that
-    /// cover the hour.
-    pub input_files_sha256: String,
+    /// The shared skip key this hour was sealed under ([`seal::SkipKey`]):
+    /// unit, unit version, config, lockbox, and the input facts with their
+    /// sha256, so [`seal::check`] can decide the next rerun.
+    #[serde(rename = "skipKey")]
+    pub skip_key: Value,
     /// Lockbox sha256 the run checked.
     pub lockbox_sha256: String,
     /// [`config_hash`].
@@ -390,12 +393,16 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             "no closed hour in the requested range".into(),
         ));
     }
-    // U1's definition (ADR-0023): input hours the lockbox actually removes:
-    // hours the swap inputs cover that fall inside the exclusion set, over the
-    // whole input span, not the requested range.
-    let lockbox_hours_dropped = lockbox_hours
-        .range(first_data_hour..=last_data_hour)
-        .count() as u64;
+    // The hours the swap inputs cover, for the shared lockbox-drop count
+    // (seal::lockbox_drops, ADR-0023): covered hours inside the exclusion set
+    // are the dropped ones; the set's own size is the excluded count.
+    let mut covered_hours = BTreeSet::new();
+    for file in &swaps {
+        for hour in grid::hour_of_secs(file.bt_min)..=grid::hour_of_secs(file.bt_max) {
+            covered_hours.insert(hour);
+        }
+    }
+    let drops = seal::lockbox_drops(covered_hours.iter().copied(), &lockbox_hours);
     let hours_unclosed = last_data_hour.saturating_sub(last_closed_hour) as u64;
 
     // Pyth SOL hourly last prices (lockbox-hour prints filtered out).
@@ -404,6 +411,10 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             "no Pyth SOL prices in --pyth-prices (wSOL pricing impossible)".into(),
         ));
     }
+    // The price files' facts, hashed into every hour's skip key: a changed
+    // print changes a sealed hour's bytes, so it must never be skipped away.
+    let pyth_facts = pyth_input_facts(request.pyth_prices)?;
+    let pyth_facts_sha256 = crate::fsutil::sha256_hex(pyth_facts.to_string().as_bytes());
 
     // Partials for every batch that overlaps the range; resumable via state.
     let parts = request.out.join(".spotdex-partials");
@@ -413,7 +424,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default();
-    if state.config_sha256.as_str() != config {
+    if state.config_sha256.as_str() != config || state.pyth_sha256 != pyth_facts_sha256 {
         state = State::default();
     }
     let range_start_secs = range_lo * grid::HOUR_SECS;
@@ -449,6 +460,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         write_partials(&conn, &parts, file, &lockbox_hours)?;
         state.files.insert(file.stem.clone(), file.sha256.clone());
         state.config_sha256 = config.clone();
+        state.pyth_sha256 = pyth_facts_sha256.clone();
         let mut body = serde_json::to_vec(&state).map_err(|e| StoreError::Check(e.to_string()))?;
         body.push(b'\n');
         write_atomic(&state_path, &body)?;
@@ -469,7 +481,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         hours_written: 0,
         hours_skipped: 0,
         hours_empty: 0,
-        lockbox_hours_dropped,
+        lockbox_hours_dropped: drops.dropped,
         hours_unclosed,
         mint_rows: 0,
         venue_hours: 0,
@@ -492,17 +504,43 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
                     && file.bt_max >= hour * grid::HOUR_SECS
             })
             .collect();
-        let inputs_sha = file_list_sha256(&covering);
-        let key = grid::hour_key(hour);
-        if let Some(existing) = already_published(
-            &conn,
-            request.out,
-            hour,
-            &key,
-            &inputs_sha,
+        let key_str = grid::hour_key(hour);
+        let date = grid::date_of_hour(hour);
+        let sealed_rel = format!("{MINT_TABLE}/date={date}/hour={key_str}.parquet");
+        let sealed_path = under_out(request.out, &sealed_rel)?;
+        // The shared skip decision (seal::check): the hour's bytes are a
+        // function of the covering swap files and the Pyth price files, so
+        // those are the key's input facts. The requested window only chooses
+        // which hours run; it never changes an hour's bytes, so it is not a
+        // key component.
+        let skip_key = seal::SkipKey::new(
+            UNIT,
+            UNIT_VERSION,
             &config,
             &checked_lockbox_sha,
+            json!({
+                "sources": covering_sources(&covering),
+                "pyth": pyth_facts,
+            }),
+        );
+        let existing = match seal::check(
+            &hour_receipt_path(request.out, &key_str),
+            &sealed_path,
+            &skip_key,
         )? {
+            seal::Decision::Skip {
+                rows,
+                bytes,
+                sha256,
+            } => Some(receipt::OutputFile {
+                path: sealed_rel.clone(),
+                rows,
+                bytes,
+                sha256,
+            }),
+            seal::Decision::Rebuild { .. } => None,
+        };
+        if let Some(existing) = existing {
             let rebuilt_swaps = existing.rows;
             let hour_path = under_out(request.out, &existing.path)?;
             sealed.push(existing);
@@ -512,7 +550,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             // from the same partials the hour was merged from, cross-checked
             // against the receipt's recorded USD and the sealed hour file's
             // swap count, and let the month seal below re-seal the month.
-            let published = read_hour_receipt(request.out, &key).expect("checked above");
+            let published = read_hour_receipt(request.out, &key_str).expect("checked above");
             let venue = merge_venue_hour(
                 &conn,
                 &parts,
@@ -567,11 +605,11 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
                 unit: UNIT.to_owned(),
                 unit_version: UNIT_VERSION,
                 hour,
-                hour_key: key.clone(),
+                hour_key: key_str.clone(),
                 rows: output.rows,
                 usd_micro: venue.usd_micro,
                 output: output.clone(),
-                input_files_sha256: inputs_sha,
+                skip_key: skip_key.to_receipt_value(),
                 lockbox_sha256: checked_lockbox_sha.clone(),
                 config_sha256: config.clone(),
                 git_sha: git.clone(),
@@ -633,7 +671,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
                     "catalog_sha256": catalog_sha256,
                 },
                 "pyth_prices": {
-                    "files_sha256": pyth_list_sha256(request.pyth_prices)?,
+                    "files_sha256": pyth_facts_sha256,
                 },
                 "since": since.map(|day| day.to_string()),
                 "until": until.map(|day| day.to_string()),
@@ -641,11 +679,12 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
                 "hours_skipped": report.hours_skipped,
                 "hours_empty": report.hours_empty,
                 "hours_unclosed": report.hours_unclosed,
-                "lockbox_hours_dropped": report.lockbox_hours_dropped,
+                "lockbox_hours_dropped": drops.dropped,
+                "lockbox_hours_excluded": drops.excluded,
             }),
             lockbox_sha256: checked_lockbox_sha.clone(),
-            lockbox_hours_dropped: report.lockbox_hours_dropped,
-            lockbox_hours_excluded: lockbox_hours.len() as u64,
+            lockbox_hours_dropped: drops.dropped,
+            lockbox_hours_excluded: drops.excluded,
             config_sha256: config.clone(),
             provenance,
             started_utc: started,
@@ -676,8 +715,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             "since": since.map(|day| day.to_string()),
             "until": until.map(|day| day.to_string()),
             "lockbox_sha256": checked_lockbox_sha,
-            "lockbox_hours_dropped": report.lockbox_hours_dropped,
-            "lockbox_hours_excluded": lockbox_hours.len() as u64,
+            "lockbox_hours_dropped": drops.dropped,
+            "lockbox_hours_excluded": drops.excluded,
         }),
     );
     cat.save(request.out)?;
@@ -730,6 +769,11 @@ struct SpotCatalog {
 struct State {
     /// [`config_hash`] of the run that wrote the partials.
     config_sha256: String,
+    /// SHA-256 of the Pyth input facts of the run that wrote the partials:
+    /// the partials bake the SOL prices in, so a changed price file must
+    /// reset the state and reprice every batch.
+    #[serde(default)]
+    pyth_sha256: String,
     /// Processed file stems with the catalog sha they were processed under.
     files: BTreeMap<String, String>,
 }
@@ -757,22 +801,16 @@ fn under_out(out: &Path, relative: &str) -> Result<PathBuf, StoreError> {
     Ok(out.join(relative))
 }
 
-/// SHA-256 of the sorted `stem sha256` lines of a covering-file list.
-fn file_list_sha256(files: &[&SwapFile]) -> String {
-    let mut stems: Vec<&str> = files.iter().map(|file| file.stem.as_str()).collect();
-    stems.sort_unstable();
-    let mut text = String::new();
-    for stem in stems {
-        let file = files
+/// The skip-key facts of the batches covering one hour: stem and catalog sha
+/// per file. The sealed hour's bytes are a function of these facts and the
+/// Pyth price files, so both go into the hour's [`seal::SkipKey`].
+fn covering_sources(files: &[&SwapFile]) -> Value {
+    Value::Array(
+        files
             .iter()
-            .find(|file| file.stem == stem)
-            .expect("same list");
-        text.push_str(stem);
-        text.push(' ');
-        text.push_str(&file.sha256);
-        text.push('\n');
-    }
-    crate::fsutil::sha256_hex(text.as_bytes())
+            .map(|file| json!({"stem": file.stem, "sha256": file.sha256}))
+            .collect(),
+    )
 }
 
 /// SHA-256 of the sorted `stem sha256` lines of the whole input set.
@@ -787,15 +825,23 @@ fn swap_list_sha256(swaps: &[SwapFile]) -> String {
     crate::fsutil::sha256_hex(text.as_bytes())
 }
 
-/// SHA-256 of the sorted absolute Pyth file paths the run can read.
-fn pyth_list_sha256(dirs: &[PathBuf]) -> Result<String, StoreError> {
+/// The Pyth price files' input facts: path and sha256 of every file, embedded
+/// in each hour's skip key (canonical JSON, so order cannot change the hash).
+fn pyth_input_facts(dirs: &[PathBuf]) -> Result<Value, StoreError> {
     let mut files: Vec<String> = Vec::new();
     for dir in dirs {
         collect_parquet(dir, &mut files)?;
     }
     files.sort();
-    let text = files.join("\n");
-    Ok(crate::fsutil::sha256_hex(text.as_bytes()))
+    files.dedup();
+    let mut facts = Vec::new();
+    for file in &files {
+        facts.push(json!({
+            "path": file,
+            "sha256": crate::fsutil::file_hash(Path::new(file))?,
+        }));
+    }
+    Ok(Value::Array(facts))
 }
 
 /// SHA-256 over the unit's semantic config: the pin that must move on purpose.
@@ -1837,43 +1883,6 @@ fn write_month_receipt(out: &Path, receipt: &MonthReceipt) -> Result<(), StoreEr
     Ok(())
 }
 
-/// Whether an hour is already published exactly as this run would publish it:
-/// the receipt matches the inputs, config and lockbox, and the sealed file
-/// still hashes and counts to the receipt's values. Returns the recorded
-/// output so the run receipt and the catalog can list it again.
-fn already_published(
-    conn: &duckdb::Connection,
-    out: &Path,
-    hour: i64,
-    key: &str,
-    inputs_sha: &str,
-    config: &str,
-    lockbox_request_sha: &str,
-) -> Result<Option<receipt::OutputFile>, StoreError> {
-    let Some(r) = read_hour_receipt(out, key) else {
-        return Ok(None);
-    };
-    if r.schema != SCHEMA
-        || r.unit != UNIT
-        || r.unit_version != UNIT_VERSION
-        || r.hour != hour
-        || r.hour_key != key
-        || r.input_files_sha256 != inputs_sha
-        || r.config_sha256 != config
-        || r.lockbox_sha256 != lockbox_request_sha
-    {
-        return Ok(None);
-    }
-    let path = under_out(out, &r.output.path)?;
-    if !path.is_file() || file_hash(&path)? != r.output.sha256 {
-        return Ok(None);
-    }
-    if row_count(conn, &path)? != r.rows {
-        return Ok(None);
-    }
-    Ok(Some(r.output))
-}
-
 /// DuckDB memory cap: the shared parser, plus the plan's 32GB ceiling.
 fn parse_memory_cap(text: &str) -> Result<String, StoreError> {
     let limit = crate::augment::hlfills::parse_memory_limit(text)?;
@@ -1910,6 +1919,7 @@ fn load_provenance(path: &Path) -> Result<Value, StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::augment::combined::testfix;
     use crate::jsonout::Obj;
 
     /// `2026-10-23T00:00:00Z`, outside every lockbox week.
@@ -2043,26 +2053,9 @@ mod tests {
         path.to_path_buf()
     }
 
-    /// The v2 lockbox: the four real exclusion weeks with a 24-hour guard.
-    fn write_lockbox(dir: &Path) -> (PathBuf, String) {
-        let body = json!({
-            "version": "v2",
-            "created": "2026-10-22",
-            "guard_hours": 24,
-            "weeks": [
-                {"name": "early_stress", "start": "2026-06-01T00:00:00Z", "end": "2026-06-08T00:00:00Z"},
-                {"name": "stress", "start": "2026-08-17T00:00:00Z", "end": "2026-08-24T00:00:00Z"},
-                {"name": "quiet", "start": "2026-09-07T00:00:00Z", "end": "2026-09-14T00:00:00Z"},
-                {"name": "busy", "start": "2026-09-28T00:00:00Z", "end": "2026-10-05T00:00:00Z"}
-            ]
-        });
-        let path = dir.join("lockbox.json");
-        let bytes = serde_json::to_vec(&body).expect("lockbox json");
-        let sha = crate::fsutil::sha256_hex(&bytes);
-        std::fs::write(&path, &bytes).expect("lockbox");
-        (path, sha)
-    }
-
+    /// The v2 lockbox comes from the shared fixture (testfix::v2_lockbox):
+    /// the four real exclusion weeks with a 24-hour guard, and the named
+    /// hours every unit's in-lockbox tests use.
     fn write_provenance(dir: &Path) -> PathBuf {
         let path = dir.join("provenance.json");
         std::fs::write(&path, br#"{"solos_data_git_sha":"test"}"#).expect("provenance");
@@ -2076,6 +2069,8 @@ mod tests {
         catalog: PathBuf,
         lockbox: PathBuf,
         lockbox_sha: String,
+        /// The shared fixture's exclusion hours (864 for v2).
+        lockbox_hours: BTreeSet<i64>,
         provenance: PathBuf,
     }
 
@@ -2084,13 +2079,14 @@ mod tests {
             let root = temp_root(tag);
             std::fs::create_dir_all(root.join("swaps")).expect("swaps dir");
             std::fs::create_dir_all(root.join("pyth")).expect("pyth dir");
-            let (lockbox, lockbox_sha) = write_lockbox(&root);
+            let fix = crate::augment::combined::testfix::v2_lockbox(&root);
             Self {
                 swaps_dir: root.join("swaps"),
                 pyth_dir: root.join("pyth"),
                 catalog: root.join("swaps").join("catalog-spot-history.json"),
-                lockbox,
-                lockbox_sha,
+                lockbox: fix.path,
+                lockbox_sha: fix.sha256,
+                lockbox_hours: fix.hours,
                 provenance: write_provenance(&root),
                 root,
             }
@@ -2603,8 +2599,7 @@ mod tests {
 
     /// The fixture's lockbox exclusion hours.
     fn lockbox_set(fx: &Fixture) -> BTreeSet<i64> {
-        let lock = lockbox::load(&fx.lockbox, &fx.lockbox_sha).expect("lockbox");
-        lock.excluded_hours().expect("excluded hours")
+        fx.lockbox_hours.clone()
     }
 
     /// An in-memory DuckDB connection with the Parquet extension.
@@ -2716,6 +2711,15 @@ mod tests {
             Some(2),
             "PB and PW are new at H; the lockbox week decides nothing"
         );
+        // The shared helper confirms nothing lockbox-hour-shaped leaked into
+        // the sealed month.
+        testfix::assert_no_parquet_rows_in_lockbox(
+            &conn,
+            &fx.root.join(VENUE_TABLE).join("month=2026-10.parquet"),
+            "hour",
+            testfix::TsUnit::Secs,
+            &fx.lockbox_hours,
+        );
     }
 
     #[test]
@@ -2768,6 +2772,16 @@ mod tests {
             wsol.get("usd_priced").and_then(Value::as_f64),
             Some(0.0),
             "nothing priced"
+        );
+        // The sealed hour is a free one, and the shared helper confirms no
+        // lockbox hour leaked into it.
+        let conn = test_conn();
+        testfix::assert_no_parquet_rows_in_lockbox(
+            &conn,
+            &hour_file(&fx.root, free_sec / 3_600),
+            "hour",
+            testfix::TsUnit::Secs,
+            &fx.lockbox_hours,
         );
     }
 
@@ -3083,6 +3097,131 @@ mod tests {
             .find(|row| row.str("mint") == Some(USDC_MINT))
             .expect("usdc row");
         assert_eq!(usdc.int("n_swaps"), Some(2), "sealed from the new bytes");
+    }
+
+    #[test]
+    fn a_changed_pyth_file_rebuilds_the_hour() {
+        let fx = Fixture::new("pythchange");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            Swap {
+                block_time: H_SEC + 100,
+                program: "pumpswap",
+                pool: "PX",
+                mint_a: "TokenA11111111111111111111111111111111111111",
+                mint_b: WSOL_MINT,
+                decimals_a: 6,
+                decimals_b: 9,
+                a_to_b: true,
+                amount_in: 1_000_000,
+                amount_out: 3_000_000_000,
+            },
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        let first = run(&fx.request(None, None)).expect("first run");
+        assert_eq!(first.hours_written, 1);
+        let usd = |rows: &[Obj]| {
+            rows.iter()
+                .find(|row| row.str("mint") == Some(WSOL_MINT))
+                .expect("wsol row")
+                .get("usd_volume")
+                .and_then(Value::as_f64)
+                .expect("usd")
+        };
+        assert!((usd(&read_rows(&hour_file(&fx.root, H))) - 300.0).abs() < 1e-9);
+        // A new print in the same pyth file changes the hour's price and its
+        // bytes: the rerun must rebuild, not skip (the price files are skip-
+        // key inputs).
+        write_pyth(&fx.pyth_dir, &[(H_SEC + 10, "SOL", 90.0)]);
+        let second = run(&fx.request(None, None)).expect("second run");
+        assert_eq!(
+            second.hours_written, 1,
+            "a changed price file must rebuild the hour"
+        );
+        assert!((usd(&read_rows(&hour_file(&fx.root, H))) - 270.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_tampered_sealed_hour_rebuilds_byte_identically() {
+        let fx = Fixture::new("tamper");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        run(&fx.request(None, None)).expect("first run");
+        let sha = file_hash(&hour_file(&fx.root, H)).expect("hour sha");
+        let path = hour_file(&fx.root, H);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("append");
+        std::io::Write::write_all(&mut file, b"garbage").expect("append bytes");
+        drop(file);
+        let second = run(&fx.request(None, None)).expect("second run");
+        assert_eq!(
+            second.hours_written, 1,
+            "a sealed file that no longer hashes to the receipt must rebuild"
+        );
+        assert_eq!(
+            file_hash(&hour_file(&fx.root, H)).expect("hour sha"),
+            sha,
+            "the rebuild is byte-identical"
+        );
+    }
+
+    #[test]
+    fn an_edited_hour_receipt_rebuilds() {
+        let fx = Fixture::new("editedreceipt");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        run(&fx.request(None, None)).expect("first run");
+        // Swap a stored input fact but keep the stored inputsSha256: the
+        // receipt no longer describes what the inputs hash says, so the hour
+        // must rebuild (seal::check's stored-inputs re-hash).
+        let receipt_path = fx
+            .root
+            .join(MINT_TABLE)
+            .join("receipts")
+            .join(format!("{}.json", grid::hour_key(H)));
+        let mut receipt: Value =
+            serde_json::from_str(&std::fs::read_to_string(&receipt_path).expect("receipt"))
+                .expect("json");
+        receipt["skipKey"]["inputs"]["sources"][0]["sha256"] = Value::String("0".repeat(64));
+        std::fs::write(&receipt_path, serde_json::to_vec(&receipt).expect("json"))
+            .expect("rewrite");
+        let second = run(&fx.request(None, None)).expect("second run");
+        assert_eq!(
+            second.hours_written, 1,
+            "an edited receipt must rebuild, never skip"
+        );
+    }
+
+    #[test]
+    fn a_different_window_skips_the_same_hours() {
+        let fx = Fixture::new("window");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        run(&fx.request(None, None)).expect("first run");
+        // The requested window only chooses which hours run; it never
+        // changes an hour's bytes, so a rerun over the same hours still skips.
+        let second = run(&fx.request(Some("2026-10-23"), None)).expect("second run");
+        assert_eq!(second.hours_skipped, 1);
+        assert_eq!(second.hours_written, 0);
     }
 
     #[test]
