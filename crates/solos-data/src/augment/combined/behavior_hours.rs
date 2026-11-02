@@ -3611,10 +3611,23 @@ fn solana_perp_unfinished_history_lane_still_holds_the_watermark() {
                  status: Option<&Path>|
      -> Result<super::solana_perp_hours::Report, crate::store::StoreError> {
         let h0 = day_start();
-        let (jup_hist, jup_live) =
-            write_two_lanes(tmp.dir(), "jupiter", h0 + 1_800, h0 + 1_200, &[]);
-        let (flash_hist, flash_live) =
-            write_two_lanes(tmp.dir(), "flash", h0 + 1_800, h0 + 1_200, &[]);
+        let sentinel = h0 + 86_400 + 3 * 3600;
+        // The live lanes reach the sentinel, so a finished history would close
+        // the day: only the unfinished status keeps the refusal.
+        let (jup_hist, jup_live) = write_two_lanes(
+            tmp.dir(),
+            "jupiter",
+            h0 + 1_800,
+            h0 + 1_200,
+            &[(sentinel, "lSentinel", "jup")],
+        );
+        let (flash_hist, flash_live) = write_two_lanes(
+            tmp.dir(),
+            "flash",
+            h0 + 1_800,
+            h0 + 1_200,
+            &[(sentinel, "lSentinel", "flash")],
+        );
         let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
         let provenance = provenance_file(tmp.dir());
         write_mapping(tmp.dir());
