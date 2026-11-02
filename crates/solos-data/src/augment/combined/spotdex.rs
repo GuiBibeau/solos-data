@@ -299,8 +299,14 @@ pub struct MonthReceipt {
     pub month: String,
     /// Rows in the month file.
     pub rows: u64,
-    /// Sealed month file.
-    pub output: receipt::OutputFile,
+    /// The sealed month file. Exactly one output per month receipt, as the
+    /// one-element array [`seal::check`] reads (`outputs[0]`).
+    #[serde(rename = "outputs")]
+    pub outputs: Vec<receipt::OutputFile>,
+    /// The shared skip key this month was sealed under ([`seal::SkipKey`]),
+    /// so [`seal::check`] can decide the next rerun.
+    #[serde(rename = "skipKey")]
+    pub skip_key: Value,
     /// Hours of this month this run (re)wrote.
     pub hours: Vec<i64>,
     /// Lockbox sha256 the run checked.
@@ -629,28 +635,70 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     report.usd_volume = usd_micro_total as f64 / 1e6;
 
     // Venue months: union with the existing file, drop lockbox hours, seal.
+    // The month's own skip decision goes through seal::check like the hours:
+    // its receipt carries a skipKey over the whole-input swap and price
+    // digests, the per-hour venue rows this run feeds the month, whether the
+    // run covered the input floor (sd_new_pools is exact only then), and the
+    // pre-seal month file's sha (null on first seal: any rerun's key carries
+    // the sealed file's sha, so the first rerun refreshes the receipt and the
+    // ones after it skip). Exactly one output: the month file itself.
     for (month, mut rows) in venue_months {
         rows.sort_by_key(|(hour, _)| *hour);
         let written_hours: BTreeSet<i64> = rows.iter().map(|(hour, _)| *hour).collect();
-        let output = seal_venue_month(&conn, request.out, &month, &rows, &lockbox_hours)?;
-        write_month_receipt(
-            request.out,
-            &MonthReceipt {
-                schema: SCHEMA.to_owned(),
-                unit: UNIT.to_owned(),
-                unit_version: UNIT_VERSION,
-                month: month.clone(),
-                rows: output.rows,
-                hours: written_hours.iter().copied().collect(),
-                output: output.clone(),
-                lockbox_sha256: checked_lockbox_sha.clone(),
-                config_sha256: config.clone(),
-                provenance: provenance.clone(),
-                written_utc: grid::now_rfc3339(),
+        let month_rel = format!("{VENUE_TABLE}/month={month}.parquet");
+        let month_path = under_out(request.out, &month_rel)?;
+        let month_key = seal::SkipKey::new(
+            UNIT,
+            UNIT_VERSION,
+            &config,
+            &checked_lockbox_sha,
+            json!({
+                "swapsFilesSha256": swap_list_sha256(&swaps),
+                "pythFilesSha256": pyth_facts_sha256,
+                "hours": month_rows_facts(&rows),
+                "wholeSpan": covers_floor,
+                "existingSha256": month_file_sha(&month_path)?,
+            }),
+        );
+        let output = match seal::check(
+            &month_receipt_path(request.out, &month),
+            &month_path,
+            &month_key,
+        )? {
+            seal::Decision::Skip {
+                rows: month_rows,
+                bytes,
+                sha256,
+            } => receipt::OutputFile {
+                path: month_rel,
+                rows: month_rows,
+                bytes,
+                sha256,
             },
-        )?;
-        report.venue_hours += written_hours.len() as u64;
-        report.outputs += 1;
+            seal::Decision::Rebuild { .. } => {
+                let output = seal_venue_month(&conn, request.out, &month, &rows, &lockbox_hours)?;
+                write_month_receipt(
+                    request.out,
+                    &MonthReceipt {
+                        schema: SCHEMA.to_owned(),
+                        unit: UNIT.to_owned(),
+                        unit_version: UNIT_VERSION,
+                        month: month.clone(),
+                        rows: output.rows,
+                        hours: written_hours.iter().copied().collect(),
+                        outputs: vec![output.clone()],
+                        skip_key: month_key.to_receipt_value(),
+                        lockbox_sha256: checked_lockbox_sha.clone(),
+                        config_sha256: config.clone(),
+                        provenance: provenance.clone(),
+                        written_utc: grid::now_rfc3339(),
+                    },
+                )?;
+                report.venue_hours += written_hours.len() as u64;
+                report.outputs += 1;
+                output
+            }
+        };
         sealed.push(output);
     }
 
@@ -1872,6 +1920,36 @@ fn month_receipt_path(out: &Path, month: &str) -> PathBuf {
     out.join(VENUE_TABLE)
         .join("receipts")
         .join(format!("month={month}.json"))
+}
+
+/// SHA-256 of the month file as it stands before this run's seal, or JSON
+/// null when it does not exist yet: the seal unions its rows, so what the
+/// file holds is an input fact of the month's bytes.
+fn month_file_sha(path: &Path) -> Result<Value, StoreError> {
+    if !path.is_file() {
+        return Ok(Value::Null);
+    }
+    Ok(json!(file_hash(path)?))
+}
+
+/// The month's per-hour venue rows as skip-key facts: the exact derived rows
+/// this run contributes to the union, in sealed (hour) order.
+fn month_rows_facts(rows: &[(i64, VenueRow)]) -> Value {
+    Value::Array(
+        rows.iter()
+            .map(|(hour, row)| {
+                json!({
+                    "hour": hour,
+                    "usdMicro": row.usd_micro,
+                    "sdLogVolume": row.sd_log_volume,
+                    "sdSwaps": row.sd_swaps,
+                    "sdMintsActive": row.sd_mints_active,
+                    "sdProgramHhi": row.sd_program_hhi,
+                    "sdNewPools": row.sd_new_pools,
+                })
+            })
+            .collect(),
+    )
 }
 
 /// Write one month receipt durably.
@@ -3225,6 +3303,123 @@ mod tests {
         let second = run(&fx.request(Some("2026-10-23"), None)).expect("second run");
         assert_eq!(second.hours_skipped, 1);
         assert_eq!(second.hours_written, 0);
+    }
+
+    #[test]
+    fn an_unchanged_month_skips() {
+        let fx = Fixture::new("monthskip");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        run(&fx.request(None, None)).expect("first run");
+        // The first rerun refreshes the month receipt (its key gains the
+        // pre-seal file's sha); the rerun after it skips without a rewrite.
+        let second = run(&fx.request(None, None)).expect("second run");
+        assert_eq!(second.venue_hours, 1, "the receipt refresh reseals once");
+        let receipt_path = month_receipt_path(&fx.root, "2026-10");
+        let receipt: Value =
+            serde_json::from_str(&std::fs::read_to_string(&receipt_path).expect("month receipt"))
+                .expect("json");
+        assert_eq!(receipt["skipKey"]["unit"], UNIT);
+        assert_eq!(
+            receipt["outputs"].as_array().map(Vec::len),
+            Some(1),
+            "exactly one output per month receipt"
+        );
+        assert_eq!(
+            receipt["outputs"][0]["path"],
+            format!("{VENUE_TABLE}/month=2026-10.parquet")
+        );
+        let third = run(&fx.request(None, None)).expect("third run");
+        assert_eq!(third.venue_hours, 0, "an unchanged month must skip");
+        let after: Value =
+            serde_json::from_str(&std::fs::read_to_string(&receipt_path).expect("month receipt"))
+                .expect("json");
+        assert_eq!(
+            after["written_utc"], receipt["written_utc"],
+            "a skipped month is not rewritten"
+        );
+    }
+
+    #[test]
+    fn a_changed_month_input_rebuilds_the_month() {
+        let fx = Fixture::new("monthinput");
+        write_pyth(&fx.pyth_dir, &[(H_SEC + 10, "SOL", 100.0)]);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        run(&fx.request(None, None)).expect("first run");
+        run(&fx.request(None, None)).expect("second run");
+        let month_path = fx.root.join(VENUE_TABLE).join("month=2026-10.parquet");
+        let sha = file_hash(&month_path).expect("month sha");
+        // A new print in an hour with no swaps: no venue row changes, but the
+        // price-file facts feed the month's skip key, so the month must
+        // rebuild and stay byte-identical.
+        write_pyth(
+            &fx.pyth_dir,
+            &[
+                (H_SEC + 10, "SOL", 100.0),
+                (H_SEC + 5 * 3_600 + 10, "SOL", 100.0),
+            ],
+        );
+        let third = run(&fx.request(None, None)).expect("third run");
+        assert_eq!(
+            third.venue_hours, 1,
+            "a changed price file must rebuild the month"
+        );
+        assert_eq!(
+            file_hash(&month_path).expect("month sha"),
+            sha,
+            "the rebuild is byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_tampered_month_file_rebuilds() {
+        let fx = Fixture::new("monthtamper");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        run(&fx.request(None, None)).expect("first run");
+        run(&fx.request(None, None)).expect("second run");
+        let month_path = fx.root.join(VENUE_TABLE).join("month=2026-10.parquet");
+        let sha = file_hash(&month_path).expect("month sha");
+        // Rewrite the month file in place: still valid Parquet, different
+        // bytes, so its sha no longer matches the receipt's output. (The
+        // rebuilt seal replaces the tampered hour row, so the bytes come back
+        // exactly.)
+        let conn = test_conn();
+        conn.execute_batch(&format!(
+            "COPY (
+               SELECT * FROM (VALUES ({h}, 2.0, 9, 9, 0.9, 9))
+                 t(hour, sd_log_volume, sd_swaps, sd_mints_active, sd_program_hhi, sd_new_pools)
+             ) TO {} ({})",
+            sql_string(&month_path.to_string_lossy()),
+            parquet::COPY_OPTIONS,
+            h = H,
+        ))
+        .expect("tamper month file");
+        let third = run(&fx.request(None, None)).expect("third run");
+        assert_eq!(
+            third.venue_hours, 1,
+            "a month file that no longer hashes to its receipt must rebuild"
+        );
+        assert_eq!(
+            file_hash(&month_path).expect("month sha"),
+            sha,
+            "the rebuild is byte-identical"
+        );
     }
 
     #[test]
