@@ -30,8 +30,8 @@ use std::path::{Path, PathBuf};
 
 use super::grid;
 use super::io::{
-    self, HourOutput, TempClean, finish_run, load_provenance, lock_output, open_reader,
-    parquet_list, parse_memory_cap, plan_hours, skip_sealed_hours,
+    self, HourOutput, TempClean, finish_run, lock_output, open_reader, parquet_list,
+    parse_memory_cap, plan_hours, skip_sealed_hours,
 };
 use super::seal;
 
@@ -396,7 +396,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         return Err(StoreError::Check("--threads must be 1..=8".into()));
     }
     let memory_limit = parse_memory_cap(&request.memory_limit)?;
-    let provenance = load_provenance(request.provenance)?;
+    let provenance = super::mapping::load_provenance(request.provenance)?;
     let lockbox = super::lockbox::load(request.lockbox, request.lockbox_sha256)?;
     let lockbox_hours = lockbox.excluded_hours()?;
     lockbox.assert_v2_shape(&lockbox_hours)?;

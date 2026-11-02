@@ -11,6 +11,8 @@
 
 pub mod catalog;
 pub mod grid;
+pub mod hlhours;
+pub mod io;
 pub mod lockbox;
 pub mod mapping;
 pub mod phoenix_hours;

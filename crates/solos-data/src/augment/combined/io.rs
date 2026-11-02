@@ -107,24 +107,6 @@ pub fn parquet_one(root: &Path, file: &FileRef) -> Result<String, StoreError> {
     parquet_list(&[root.join(&file.relative).to_string_lossy().to_string()])
 }
 
-/// The provenance object is required and must be a JSON object.
-///
-/// # Errors
-///
-/// The file cannot be read or is not a JSON object.
-pub fn load_provenance(path: &Path) -> Result<Value, StoreError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| StoreError::Check(format!("--provenance: cannot read: {error}")))?;
-    let value: Value = serde_json::from_str(&text)
-        .map_err(|error| StoreError::Check(format!("--provenance: bad JSON: {error}")))?;
-    if !value.is_object() {
-        return Err(StoreError::Check(
-            "--provenance must be a JSON object".into(),
-        ));
-    }
-    Ok(value)
-}
-
 /// DuckDB memory cap: the shared parser, plus the plan's 32GB ceiling.
 ///
 /// # Errors

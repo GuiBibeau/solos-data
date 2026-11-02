@@ -1458,13 +1458,11 @@ fn combined_cli(args: &[String]) -> i32 {
     let result = match unit {
         "mapping" => combined_mapping_run(&args[1..]),
         "hl-hours" => combined_hl_hours_run(&args[1..]),
-        _ => Err(StoreError::Check(format!(
-            "unknown combined unit '{unit}' (units: mapping, hl-hours)"
         "phoenix-hours" => combined_phoenix_hours_run(&args[1..]),
         "solana-perp-hours" => combined_solana_perp_hours_run(&args[1..]),
         "pyth-hours" => combined_pyth_hours_run(&args[1..]),
         _ => Err(StoreError::Check(format!(
-            "unknown combined unit '{unit}' (units: mapping, phoenix-hours, solana-perp-hours, pyth-hours)"
+            "unknown combined unit '{unit}' (units: mapping, hl-hours, phoenix-hours, solana-perp-hours, pyth-hours)"
         ))),
     };
     match result {
@@ -1538,6 +1536,10 @@ pub(crate) fn combined_hl_hours_run(args: &[String]) -> Result<i32, StoreError> 
         git_sha: crate::augment::hlfills::git_sha(),
     };
     let report = crate::augment::combined::hlhours::run(&request)?;
+    println!("{}", report.to_json());
+    Ok(report.exit_code())
+}
+
 /// `augment combined phoenix-hours`: U2b, Phoenix fills to phoenix_coin_hour.
 fn combined_phoenix_hours_run(args: &[String]) -> Result<i32, StoreError> {
     let memory = flag(args, "--memory").unwrap_or("8GB").to_owned();
