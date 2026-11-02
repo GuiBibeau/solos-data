@@ -2086,6 +2086,174 @@ fn reseal_unknown_hour_refused() {
     assert!(parquet_files(&out).is_empty(), "the run wrote parquet");
 }
 
+/// `--reseal` cannot shrink an hour through `--coins`: the receipt-coin coverage check
+/// refuses before any work, and the sealed hour, its raw, and the watermark are untouched.
+#[test]
+fn reseal_refuses_a_narrower_coins() {
+    let root = Tmp::new("reseal-narrow");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("MANIFEST.json");
+    let time = 1_792_627_200_000_i64;
+    let btc = write_coin(&input, "20261022", 0, "BTC", &book("BTC", time, 1, "1"));
+    let eth = write_coin(
+        &input,
+        "20261022",
+        0,
+        "ETH",
+        &book("ETH", time + 5_000, 1, "2"),
+    );
+    let sol = write_coin(
+        &input,
+        "20261022",
+        0,
+        "SOL",
+        &book("SOL", time + 10_000, 1, "3"),
+    );
+    std::fs::write(&sums, manifest(&[btc.clone(), eth.clone(), sol.clone()])).unwrap();
+    let first = run_ok(&input, &out, &sums).unwrap();
+    assert_eq!(first.hours_verified, 1);
+    let train = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+    let train_sha = crate::fsutil::file_hash(&train).unwrap();
+    let rows = read_rows(&train).len();
+    let receipt = std::fs::read(out.join("receipts/20261022/0.json")).unwrap();
+    let watermark_before = watermark(&out);
+
+    // A strict subset of the receipt's coins, plus the escape hatch: still refused.
+    let mut coins = BTreeSet::new();
+    coins.insert("BTC".to_owned());
+    let error = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            coins: Some(coins),
+            reseal: reseal_hours(&["20261022/0"]),
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("missing receipt coins"), "{message}");
+    assert!(message.contains("ETH"), "{message}");
+    assert!(message.contains("SOL"), "{message}");
+    assert_eq!(
+        read_rows(&train).len(),
+        rows,
+        "the hour Parquet row count changed"
+    );
+    assert_eq!(
+        crate::fsutil::file_hash(&train).unwrap(),
+        train_sha,
+        "the hour Parquet was rewritten"
+    );
+    assert_eq!(
+        std::fs::read(out.join("receipts/20261022/0.json")).unwrap(),
+        receipt,
+        "the receipt was rewritten"
+    );
+    for file in [&btc, &eth, &sol] {
+        assert!(input.join(&file.0).is_file(), "{} was touched", file.0);
+    }
+    assert_eq!(watermark(&out), watermark_before, "the watermark moved");
+    assert!(
+        !out.join("drops/20261022/0.json").exists(),
+        "a drop record appeared"
+    );
+}
+
+/// The `--reseal` precheck runs before any hour is processed: a refused re-seal of hour A
+/// leaves hour B, which dispatches first (same date, lower hour, jobs=1), completely
+/// untouched. The on-disk state is asserted before the error's wording so a mutation of
+/// the precheck fails on behavior, not on message text.
+#[test]
+fn reseal_precheck_runs_before_any_work() {
+    let root = Tmp::new("reseal-precheck");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("MANIFEST.json");
+    let time = 1_792_627_200_000_i64;
+    // Hour B (20261022/0) sorts before hour A (20261022/1).
+    let b_sol = write_coin(&input, "20261022", 0, "SOL", &book("SOL", time, 1, "1"));
+    let a_btc = write_coin(
+        &input,
+        "20261022",
+        1,
+        "BTC",
+        &book("BTC", time + 3_600_000, 1, "2"),
+    );
+    let a_eth = write_coin(
+        &input,
+        "20261022",
+        1,
+        "ETH",
+        &book("ETH", time + 3_605_000, 1, "3"),
+    );
+    std::fs::write(&sums, manifest(&[b_sol, a_btc, a_eth])).unwrap();
+    // Seal only hour A, with drop-raw: --coins names A's coins, so B has no in-scope
+    // entries and stays pending.
+    let mut a_coins = BTreeSet::new();
+    a_coins.insert("BTC".to_owned());
+    a_coins.insert("ETH".to_owned());
+    let sealed = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            coins: Some(a_coins),
+            ..drop_opts()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap();
+    assert_eq!(sealed.hours_verified, 1);
+    assert_eq!(watermark(&out), vec!["20261022/1".to_owned()]);
+    assert!(
+        !input.join("20261022/1/BTC.lz4").exists(),
+        "A's raw survived the seal"
+    );
+
+    // Rerun with drop-raw on and --reseal A: the precheck refuses A before B is touched.
+    let error = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            reseal: reseal_hours(&["20261022/1"]),
+            ..drop_opts()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap_err();
+    assert_eq!(
+        watermark(&out),
+        vec!["20261022/1".to_owned()],
+        "the watermark moved for B"
+    );
+    assert!(
+        !out.join("receipts/20261022/0.json").exists(),
+        "B got a receipt"
+    );
+    assert!(
+        !out.join("train/date=2026-10-22/hour=20261022-0.parquet")
+            .exists(),
+        "B was written"
+    );
+    assert!(
+        input.join("20261022/0/SOL.lz4").is_file(),
+        "B's raw was touched"
+    );
+    assert!(
+        !out.join("drops/20261022/0.json").exists(),
+        "a drop record appeared for B"
+    );
+    let message = error.to_string();
+    assert!(message.contains("20261022/1"), "{message}");
+    assert!(message.contains("20261022/1/BTC.lz4"), "{message}");
+    assert!(message.contains("not on disk"), "{message}");
+}
+
 /// A foreign-schema or wrong-hour drop record refuses the whole drop: the record is
 /// unchanged and no raw file is deleted after it.
 #[test]
