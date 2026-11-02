@@ -4602,3 +4602,241 @@ fn solana_perp_flash_coverage_counts_toward_the_lockbox_drops() {
     );
     assert_eq!(receipt["lockbox_hours_excluded"], fix.hours.len());
 }
+
+/// A fully dense day seals every hour in run 1 and must rerun as a pure skip:
+/// every hour's receipt matches, nothing is pending, the aggregate views are
+/// never built, and the run still completes with every count it can take from
+/// the sealed outputs (a crash here was the full-skip bug: the counts queried
+/// aggregate tables that a pure-skip run never builds).
+#[test]
+fn solana_perp_dense_day_rerun_skips_every_hour() {
+    let tmp = Tmp::new("perp-dense");
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    let jup = tmp.dir().join("jup");
+    let rows: Vec<String> = (0..24)
+        .map(|hour| {
+            perp_event(
+                Box::leak(format!("j{hour}").into_boxed_str()),
+                432_100_010,
+                h0 + hour * 3_600 + 60,
+                0,
+                "InstantIncreasePositionEvent",
+                r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#,
+            )
+        })
+        .chain([perp_event(
+            "jS",
+            432_100_010,
+            sentinel,
+            0,
+            "InstantIncreasePositionEvent",
+            r#"{"sizeUsdDelta": "1000000", "positionSide": 1, "price": "100000000", "positionCustody": "Cust1"}"#,
+        )])
+        .collect();
+    write_event_lane(&jup, &rows);
+    let flash = tmp.dir().join("flash");
+    write_event_lane(
+        &flash,
+        &[perp_event(
+            "fS",
+            432_100_010,
+            sentinel,
+            0,
+            "IncreaseSizeLogUSDv1",
+            r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
+        )],
+    );
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let jupiter_events = vec![jup];
+    let flash_events = vec![flash];
+    let first = super::solana_perp_hours::run(&PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: None,
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(first.hours_written, 24, "a dense day seals all 24 hours");
+    let second = super::solana_perp_hours::run(&PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: None,
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(second.hours_skipped, 24, "every sealed hour skips");
+    assert_eq!(
+        second.hours_written, 0,
+        "nothing rebuilt (R-DENSE re-breaks this)"
+    );
+    assert_eq!(second.rows, first.rows);
+}
+
+/// The phoenix dense-day rerun: every hour sealed, the rerun a pure skip.
+#[test]
+fn phoenix_dense_day_rerun_skips_every_hour() {
+    let tmp = Tmp::new("phoenix-dense");
+    let conn = memory_connection("1", "512MB").unwrap();
+    let root = tmp.dir().join("decoded");
+    let h0 = day_start();
+    let fill = |hour: i64| {
+        Fill {
+            event_id: Box::leak(format!("e{hour}").into_boxed_str()),
+            signature: Box::leak(format!("s{hour}").into_boxed_str()),
+            source_hash: Box::leak(format!("h{hour}").into_boxed_str()),
+            slot: 432_100_000,
+            tx_index: 1,
+            ordinal: 0,
+            block_time: h0 + hour * 3_600 + 60,
+            symbol: "SOL",
+            ticks: 100,
+            base_lots: 100,
+            maker_side: "ask",
+        }
+        .values(1, 0, 0)
+    };
+    let fills: Vec<String> = (0..24)
+        .map(fill)
+        .chain([Fill {
+            event_id: "e-sentinel",
+            signature: "sigS",
+            source_hash: "hS",
+            slot: 432_100_000,
+            tx_index: 1,
+            ordinal: 0,
+            block_time: h0 + 86_400 + 3 * 3600,
+            symbol: "SOL",
+            ticks: 100,
+            base_lots: 100,
+            maker_side: "ask",
+        }
+        .values(1, 0, 0)])
+        .collect();
+    let txs: Vec<String> = (0..24)
+        .map(|hour| {
+            tx_row(
+                Box::leak(format!("s{hour}").into_boxed_str()),
+                Box::leak(format!("h{hour}").into_boxed_str()),
+                432_100_000,
+            )
+        })
+        .chain([tx_row("sigS", "hS", 432_100_001)])
+        .collect();
+    write_decoded_root(
+        &conn,
+        &root,
+        &[("tables/fills/epoch=1000/fills.parquet", 1, fills)],
+        &[("tables/decoded_transactions/epoch=1000/tx.parquet", 1, txs)],
+        &write_fills_parquet,
+        &write_tx_parquet,
+        "2026-10-30T00:00:00Z",
+    );
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let first = super::phoenix_hours::run(&phoenix_request(
+        tmp.dir(),
+        &root,
+        &lockbox,
+        &lockbox_sha,
+        &provenance,
+        DAY,
+        DAY,
+    ))
+    .unwrap();
+    assert_eq!(first.hours_written, 24);
+    let second = super::phoenix_hours::run(&phoenix_request(
+        tmp.dir(),
+        &root,
+        &lockbox,
+        &lockbox_sha,
+        &provenance,
+        DAY,
+        DAY,
+    ))
+    .unwrap();
+    assert_eq!(second.hours_skipped, 24);
+    assert_eq!(second.hours_written, 0);
+    assert_eq!(second.rows, first.rows);
+}
+
+/// The pyth dense-day rerun: every hour sealed, the rerun a pure skip.
+#[test]
+fn pyth_dense_day_rerun_skips_every_hour() {
+    let tmp = Tmp::new("pyth-dense");
+    let lane = tmp.dir().join("pyth");
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    let rows: Vec<String> = (0..24)
+        .map(|hour| {
+            pyth_price(
+                "feed-sol",
+                "SOL",
+                h0 + hour * 3_600 + 60,
+                100.0,
+                0.5,
+                (h0 + hour * 3_600 + 60) * 1000,
+            )
+        })
+        .chain([pyth_price(
+            "feed-sol",
+            "SOL",
+            sentinel,
+            100.0,
+            0.5,
+            sentinel * 1000,
+        )])
+        .collect();
+    write_pyth_lane(&lane, &rows);
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let pyth_lanes = vec![lane];
+    let first = super::pyth_hours::run(&PythRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        pyth_prices: &pyth_lanes,
+        history_status: None,
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(first.hours_written, 24);
+    let second = super::pyth_hours::run(&PythRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        pyth_prices: &pyth_lanes,
+        history_status: None,
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    })
+    .unwrap();
+    assert_eq!(second.hours_skipped, 24);
+    assert_eq!(second.hours_written, 0);
+    assert_eq!(second.rows, first.rows);
+}

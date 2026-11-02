@@ -476,6 +476,10 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let mut hours_empty = 0u64;
     let mut jupiter_events = 0u64;
     let mut flash_events = 0u64;
+    // A fully-sealed rerun leaves the aggregate views unbuilt: gate every
+    // count derived from them on this (a pure-skip run reports 0 for them;
+    // rows still come from the sealed outputs).
+    let agg_built = !pending.is_empty();
     if !pending.is_empty() {
         jupiter_events = scalar(&conn, "SELECT count(*) AS n FROM jup_pos", "n")?;
         flash_events = scalar(&conn, "SELECT count(*) AS n FROM flash_pos", "n")?;
@@ -539,25 +543,25 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     }
 
     let rows: u64 = outputs.iter().map(|file| file.rows).sum();
-    let pairs = if outputs.is_empty() {
-        0
-    } else {
+    let pairs = if agg_built {
         scalar(
             &conn,
             "SELECT count(*) AS n FROM (SELECT venue, venue_key FROM solana_perp_hour_agg
              GROUP BY venue, venue_key) pairs",
             "n",
         )?
-    };
-    let unmapped = if outputs.is_empty() {
-        0
     } else {
+        0
+    };
+    let unmapped = if agg_built {
         scalar(
             &conn,
             "SELECT count(*) AS n FROM (SELECT venue, venue_key FROM solana_perp_hour_agg
              WHERE asset_id IS NULL GROUP BY venue, venue_key) unmapped",
             "n",
         )?
+    } else {
+        0
     };
     let mut watermark_facts = watermark.clone();
     watermark_facts["watermark_block_time"] = json!(watermark_block_time);

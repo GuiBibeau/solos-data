@@ -488,6 +488,9 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let mut fills_filtered = 0u64;
     let mut hours_written = 0u64;
     let mut hours_empty = 0u64;
+    // A fully-sealed rerun leaves the aggregate views unbuilt: gate every
+    // count derived from them on this (a pure-skip run reports 0 for them).
+    let agg_built = !pending.is_empty();
     if !pending.is_empty() {
         // The deduplicated fills view over the selected files (projected
         // columns only; `event_json` is big and not needed here).
@@ -574,24 +577,24 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
 
     // Per-run receipt and catalog registration, after every output is durable.
     let rows: u64 = outputs.iter().map(|file| file.rows).sum();
-    let assets = if outputs.is_empty() {
-        0
-    } else {
+    let assets = if agg_built {
         scalar(
             &conn,
             "SELECT count(DISTINCT asset_symbol) AS n FROM phoenix_coin_hour_agg",
             "n",
         )?
-    };
-    let unmapped = if outputs.is_empty() {
-        0
     } else {
+        0
+    };
+    let unmapped = if agg_built {
         scalar(
             &conn,
             "SELECT count(DISTINCT asset_symbol) AS n FROM phoenix_coin_hour_agg
              WHERE asset_id IS NULL",
             "n",
         )?
+    } else {
+        0
     };
     let mut watermark = inputs.watermark.clone();
     watermark["max_block_time"] = json!(watermark_max_block_time);

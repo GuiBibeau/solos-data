@@ -366,6 +366,9 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
 
     let mut hours_written = 0u64;
     let mut hours_empty = 0u64;
+    // A fully-sealed rerun leaves the aggregate views unbuilt: gate every
+    // count derived from them on this (a pure-skip run reports 0 for them).
+    let agg_built = !pending.is_empty();
     if !pending.is_empty() {
         build_price_view(
             &conn,
@@ -433,14 +436,14 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     }
 
     let rows: u64 = outputs.iter().map(|file| file.rows).sum();
-    let feeds = if outputs.is_empty() {
-        0
-    } else {
+    let feeds = if agg_built {
         scalar(
             &conn,
             "SELECT count(DISTINCT feed_id) AS n FROM pyth_coin_hour_agg",
             "n",
         )?
+    } else {
+        0
     };
     let mut watermark_facts = watermark.clone();
     watermark_facts["watermark_publish_time"] = json!(watermark_publish_time);
