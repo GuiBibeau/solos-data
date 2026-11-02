@@ -67,3 +67,22 @@ Non-blocking follow-ups:
   that coin and lockbox_only_symbols is off by one (it counts a class, not a
   coin). Fix later by checking classes per coin before the lockbox skip, or
   counting distinct coins.
+
+## U2a hl-hours (#101) review follow-ups
+
+Non-blocking items from the U2a review round 1 that are recorded rather than
+fixed now.
+
+- The per-hour skip key's ctx facts are conservative: they hash both lanes'
+  day and previous-day files even when a lane was not consulted for the
+  bucket's coins, so an unrelated ctx file change rebuilds hours that its
+  bytes cannot affect. Track exact per-lane, per-bucket usage if the extra
+  rebuilds ever matter.
+- The run receipt's `inputs` carries the fills watermark, the lockbox sha and
+  the assets.csv hash, but not the ctx input facts; only the per-hour receipts
+  do. Add a run-level ctx summary if run receipts are ever audited alone.
+- A run whose buckets all sit inside the lockbox writes no output files, so
+  the catalog's `watermarks["hl-hours"]` entry is not refreshed that run (the
+  upsert is per sealed file); it keeps the last run that built something.
+  Refresh the watermark entry even on a zero-output run if that stale window
+  ever matters.

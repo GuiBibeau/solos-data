@@ -6,10 +6,12 @@
 //! the root's `catalog.json` only after the checks pass. It never opens a DuckDB
 //! database file, never sends a transaction, and never touches the network.
 //!
-//! Units: `mapping` (U1) assigns canonical `asset_id`s across venues.
+//! Units: `mapping` (U1) assigns canonical `asset_id`s across venues; `hl-hours`
+//! (U2a) builds the HL per-coin hourly table `hl_coin_hour` (DESIGN 4.1).
 
 pub mod catalog;
 pub mod grid;
+pub mod hlhours;
 pub mod lockbox;
 pub mod mapping;
 pub mod receipt;

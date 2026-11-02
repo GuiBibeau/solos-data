@@ -13,9 +13,15 @@ and never send a transaction.
 
 One command, one receipt, one unit. Each unit's receipt lives in that unit's
 output directory: `<root>/<unit_dir>/receipt-<unit>.json` (the mapping unit
-writes `mapping/receipt-mapping.json`; a spotdex unit would write
+writes `mapping/receipt-mapping.json`, the hl-hours unit writes
+`hl_coin_hour/receipt-hl-hours.json`; a spotdex unit would write
 `spotdex/receipt-spotdex.json`). `mapping` (this note) assigns canonical
-`asset_id`s. Hourly aggregators and assembly follow in their own units. The
+`asset_id`s. Hourly aggregators and assembly follow in their own units: an
+hourly unit also seals one receipt per built hour beside its files
+(`hl_coin_hour/receipts/hour=<tag>.json`), and an already-sealed hour is
+skipped only when the unit version, the source facts, the config sha256, the
+lockbox bytes, the `mapping/assets.csv` content, the ctx input files and the
+sealed file's own sha256 all still match that receipt. The
 hour grid works in unix hour indices internally and in unix seconds in the CSV;
 the hour is `t = floor(ts/3600)*3600`, the same construction as hl-train's full
 grid.
