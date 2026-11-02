@@ -831,7 +831,7 @@ pub(crate) struct HlInput {
     hours_sha256: String,
     files: Vec<FileRef>,
     /// coin, (coin_class, first/last fill second).
-    universe: BTreeMap<String, (String, Universe)>,
+    pub(crate) universe: BTreeMap<String, (String, Universe)>,
     /// coin, hour start, last price of the hour (check days only).
     pub(crate) prices: BTreeMap<String, BTreeMap<i64, f64>>,
     /// Coins whose every fill sits inside the lockbox hours.
@@ -1167,18 +1167,18 @@ fn scan_asset_contexts(
 }
 
 /// Pyth price history across all given directories, merged per feed symbol.
-struct PythInput {
-    universe: BTreeMap<String, Universe>,
+pub(crate) struct PythInput {
+    pub(crate) universe: BTreeMap<String, Universe>,
     /// Covered publish hours inside the lockbox, distinct over all
     /// directories: the input `seal::lockbox_dropped_hours` intersects with
     /// the exclusion set for this venue.
-    lockbox_dropped_hours: BTreeSet<i64>,
+    pub(crate) lockbox_dropped_hours: BTreeSet<i64>,
     /// Feeds whose every publish sits inside the lockbox hours, merged over
     /// all directories.
-    lockbox_only_symbols: u64,
+    pub(crate) lockbox_only_symbols: u64,
 }
 
-fn scan_pyth(
+pub(crate) fn scan_pyth(
     conn: &duckdb::Connection,
     dirs: &[PathBuf],
     lockbox_ranges: &[(i64, i64)],

@@ -71,17 +71,32 @@ hour is reused only when the hour receipt's embedded skip key (unit, unit
 version, config sha256, lockbox sha256, and an inputs sha256 over the
 canonical JSON of every fact that can change the hour's bytes: source file
 shas, the mapping `assets.csv` sha256, ctx day-file shas, the requested
-window) equals the current run's key field for field (a receipt missing any
-key field rebuilds), the receipt's stored inputs still hash to its stored
-inputs sha256, the receipt names exactly one sealed output (a singular
-`output`, or an `outputs` array holding exactly one entry; zero or several
-entries rebuild, the reason naming the count) whose stored path, taken
-relative to the store root, is the file being verified (normalized component
-for component, so a receipt for one file can never skip a different file
-with identical bytes), and the sealed file's streamed sha256 still equals
-the receipt's output sha256. Any other outcome (missing or garbled receipt,
-any key field changed or missing, a receipt naming another file, a missing
-or rewritten file) rebuilds
+window) equals the current run's key field for field (a receipt missing any key
+field rebuilds; the run trims and lowercases its own config and lockbox
+shas when it builds the key, so a sha that picked up whitespace or casing
+still matches its own receipt instead of rebuilding the hour forever), the
+receipt's stored inputs still hash to its stored inputs sha256, the receipt
+names exactly one sealed output (a singular `output`, or an `outputs` array
+holding exactly one entry; zero or several entries rebuild with the reason
+naming the count, a non-array `outputs` rebuilds, and a receipt carrying
+both keys rebuilds whatever their types: the both-keys guard fires on key
+presence, because a non-array `outputs` is not proof that no array exists)
+whose stored path, taken relative to the store root, is the file being
+verified (normalized component for component, never by a string-suffix
+compare, so a receipt for one file can never skip a different file with
+identical bytes; redundant separators and a `.` between names normalize
+away, while a leading `./`, any `..`, and root or prefix components
+refuse), and the sealed file's streamed sha256 still equals the receipt's
+output sha256. The path binding is a caller contract with a safe failure
+mode: `root` and `sealed_path` must be the same form, both absolute or both
+relative under the same prefix, and the compare is lexical (`strip_prefix`
+plus cleaned components; no symlink resolution happens), so a form
+mismatch, an escaping path, or a renamed file rebuilds the hour forever and
+never skips it; a symlink inside the store is not detected by design, which
+stays out of the threat model because the unit itself writes the store and
+the bytes stay receipt-hash-bound. Any other outcome (missing or garbled
+receipt, any key field changed or missing, a receipt naming another file, a
+missing or rewritten file) rebuilds
 the hour, so an input change such as a renamed symbol in `assets.csv` can
 never be skipped away. `--threads` (1..=8) and `--memory` (at most 32GB) are
 DuckDB caps that do not change the table.
