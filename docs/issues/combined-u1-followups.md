@@ -51,7 +51,10 @@ data root). Results: rows 29,370 (hl 29,220, phoenix 105, pyth 39, jup 6),
 unchanged from round 1; 144 pairs checked, 96 mapped, 0 price divergence,
 48 thin; lockbox_hours_dropped 864, lockbox_hours_excluded 864;
 lockbox_only_symbols hl 7,354, phoenix 0, pyth 0 (the 7,354 matches the
-outcome markets the ADR and PR #99 described as dropped). assets.csv sha256
+drop PR #99 reported against the pre-review QA run (36,724 to 29,370 rows):
+the lockbox-only coins). Rows and symbols only match because
+lockbox_only_symbols counts (coin, class) groups and there is no two-class case
+in this data. assets.csv sha256
 54a076d5686a098850703c791e51c6b45033681d0728af12217b1bbac6b2c715; versus the
 round-1 output it differs only in last_ts on 104 phoenix and 13 pyth rows
 (live lanes moved on), no other column changed.
