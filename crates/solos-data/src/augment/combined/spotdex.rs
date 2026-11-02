@@ -264,8 +264,11 @@ pub struct HourReceipt {
     pub rows: u64,
     /// Winsorized USD micro-dollars of the hour (NULL when nothing priced).
     pub usd_micro: Option<i64>,
-    /// Sealed mint file.
-    pub output: receipt::OutputFile,
+    /// The sealed mint file. Exactly one output per hour receipt, as the
+    /// one-element array [`seal::check`] reads (`outputs[0]`; a receipt whose
+    /// `outputs` does not hold exactly one entry can never be trusted).
+    #[serde(rename = "outputs")]
+    pub outputs: Vec<receipt::OutputFile>,
     /// The shared skip key this hour was sealed under ([`seal::SkipKey`]):
     /// unit, unit version, config, lockbox, and the input facts with their
     /// sha256, so [`seal::check`] can decide the next rerun.
@@ -608,7 +611,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
                 hour_key: key_str.clone(),
                 rows: output.rows,
                 usd_micro: venue.usd_micro,
-                output: output.clone(),
+                outputs: vec![output.clone()],
                 skip_key: skip_key.to_receipt_value(),
                 lockbox_sha256: checked_lockbox_sha.clone(),
                 config_sha256: config.clone(),
