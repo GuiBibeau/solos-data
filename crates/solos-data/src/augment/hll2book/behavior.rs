@@ -2163,10 +2163,14 @@ fn reseal_refuses_a_narrower_coins() {
     );
 }
 
-/// The `--reseal` bypass is scoped to the named hour. With `--reseal X`, a second
-/// watermarked hour Y whose inputs shrank (a rebuilt manifest with fewer rows, its
-/// dropped coin's raw gone) is still refused by the superset guard: its sealed output,
-/// receipt, and watermark entry are untouched, while X alone re-seals past the guard.
+/// The `--reseal` bypass is scoped to the named hour. With `--reseal X`, two other
+/// watermarked hours whose inputs shrank (a rebuilt manifest with fewer rows, the
+/// dropped coin's raw gone) are still refused by the superset guard: sealed output,
+/// receipt, and watermark entry untouched, while X alone re-seals past the guard.
+/// Y = 20261022/1 shares X's date; Z = 20261023/0 shares X's hour, so a bypass that
+/// matched on the date alone dies on Y and one that matched on the hour alone dies
+/// on Z. Each shrink is refused in its own run: the run stops at the first refused
+/// hour (sorted order), so Y is restored before Z's refusal is observed.
 #[test]
 fn reseal_bypass_is_scoped_to_the_named_hour() {
     let root = Tmp::new("reseal-scope");
@@ -2174,7 +2178,12 @@ fn reseal_bypass_is_scoped_to_the_named_hour() {
     let out = root.0.join("out");
     let sums = root.0.join("MANIFEST.json");
     let time = 1_792_627_200_000_i64;
-    // Hour X = 20261022/0, hour Y = 20261022/1, each with BTC and ETH.
+    // Z's rows stay before the forward split at `FORWARD_START_MS` so the hour seals
+    // into `train/` like X and Y; the partition date follows the row time, the hour
+    // in the file name follows the source hour key.
+    let z_time = time + 3_600_000;
+    // Hour X = 20261022/0, hour Y = 20261022/1, hour Z = 20261023/0, each with BTC
+    // and ETH.
     let x_btc = write_coin(&input, "20261022", 0, "BTC", &book("BTC", time, 1, "1"));
     let x_eth = write_coin(
         &input,
@@ -2197,25 +2206,51 @@ fn reseal_bypass_is_scoped_to_the_named_hour() {
         "ETH",
         &book("ETH", time + 3_605_000, 1, "4"),
     );
+    let z_btc = write_coin(&input, "20261023", 0, "BTC", &book("BTC", z_time, 1, "5"));
+    let z_eth = write_coin(
+        &input,
+        "20261023",
+        0,
+        "ETH",
+        &book("ETH", z_time + 5_000, 1, "6"),
+    );
     std::fs::write(
         &sums,
-        manifest(&[x_btc.clone(), x_eth.clone(), y_btc.clone(), y_eth.clone()]),
+        manifest(&[
+            x_btc.clone(),
+            x_eth.clone(),
+            y_btc.clone(),
+            y_eth.clone(),
+            z_btc.clone(),
+            z_eth.clone(),
+        ]),
     )
     .unwrap();
     let first = run_ok(&input, &out, &sums).unwrap();
-    assert_eq!(first.hours_verified, 2);
+    assert_eq!(first.hours_verified, 3);
     assert_eq!(
         watermark(&out),
-        vec!["20261022/0".to_owned(), "20261022/1".to_owned()]
+        vec![
+            "20261022/0".to_owned(),
+            "20261022/1".to_owned(),
+            "20261023/0".to_owned()
+        ]
     );
 
-    // Positive control: with Y's inputs intact, `--reseal X` re-seals a corrected
-    // re-download of X alone and leaves the skipped Y untouched.
+    // Positive control: with Y's and Z's inputs intact, `--reseal X` re-seals a
+    // corrected re-download of X alone and leaves the skipped Y and Z untouched.
     let fixed_x = write_coin(&input, "20261022", 0, "BTC", &book("BTC", time, 1, "11"));
     assert_ne!(fixed_x.1, x_btc.1, "the corrected bytes have a new sha256");
     std::fs::write(
         &sums,
-        manifest(&[fixed_x.clone(), x_eth.clone(), y_btc.clone(), y_eth.clone()]),
+        manifest(&[
+            fixed_x.clone(),
+            x_eth.clone(),
+            y_btc.clone(),
+            y_eth.clone(),
+            z_btc.clone(),
+            z_eth.clone(),
+        ]),
     )
     .unwrap();
     let fixed = run_with(
@@ -2230,19 +2265,38 @@ fn reseal_bypass_is_scoped_to_the_named_hour() {
     )
     .unwrap();
     assert_eq!(fixed.hours_verified, 1, "the named hour X re-seals");
-    assert_eq!(fixed.hours_skipped, 1, "Y was not skipped");
+    assert_eq!(fixed.hours_skipped, 2, "Y or Z was not skipped");
     assert_eq!(
         watermark(&out),
-        vec!["20261022/0".to_owned(), "20261022/1".to_owned()]
+        vec![
+            "20261022/0".to_owned(),
+            "20261022/1".to_owned(),
+            "20261023/0".to_owned()
+        ]
     );
     let y_train = out.join("train/date=2026-10-22/hour=20261022-1.parquet");
     let y_train_sha = crate::fsutil::file_hash(&y_train).unwrap();
+    let z_train = out.join("train/date=2026-10-22/hour=20261023-0.parquet");
+    let z_train_sha = crate::fsutil::file_hash(&z_train).unwrap();
 
-    // Now shrink Y: its ETH row leaves the manifest and the raw goes with it, so Y is
-    // Ready over the BTC subset. The run still names X in `--reseal`, but the bypass
-    // must not reach Y: the guard refuses the run and Y is untouched.
-    std::fs::write(&sums, manifest(&[fixed_x, x_eth, y_btc])).unwrap();
-    std::fs::remove_file(input.join("20261022/1/ETH.lz4")).unwrap();
+    // Shrink Y first: its ETH row leaves the manifest and the raw goes with it, so Y
+    // is Ready over the BTC subset. The run still names X in `--reseal`, but the
+    // bypass must not reach Y: the guard refuses the run and Y is untouched. Y shares
+    // X's date, so a date-matched bypass dies here.
+    let y_eth_raw = input.join("20261022/1/ETH.lz4");
+    let y_eth_bytes = std::fs::read(&y_eth_raw).unwrap();
+    std::fs::write(
+        &sums,
+        manifest(&[
+            fixed_x.clone(),
+            x_eth.clone(),
+            y_btc.clone(),
+            z_btc.clone(),
+            z_eth.clone(),
+        ]),
+    )
+    .unwrap();
+    std::fs::remove_file(&y_eth_raw).unwrap();
     let y_receipt = std::fs::read(out.join("receipts/20261022/1.json")).unwrap();
     let error = run_with(
         &input,
@@ -2276,12 +2330,78 @@ fn reseal_bypass_is_scoped_to_the_named_hour() {
     );
     assert_eq!(
         watermark(&out),
-        vec!["20261022/0".to_owned(), "20261022/1".to_owned()],
+        vec![
+            "20261022/0".to_owned(),
+            "20261022/1".to_owned(),
+            "20261023/0".to_owned()
+        ],
         "the watermark moved"
     );
     assert!(
         !out.join("drops/20261022/1.json").exists(),
         "a drop record appeared for Y"
+    );
+
+    // Now shrink Z, whose only tie to X is the hour number: restore Y first (the run
+    // stops at the first refused hour, so a still-shrunk Y would mask Z's refusal),
+    // then drop Z's ETH the same way. The guard must refuse Z too, with Z's hour
+    // named, and leave Z untouched.
+    std::fs::write(&y_eth_raw, y_eth_bytes).unwrap();
+    let z_eth_raw = input.join("20261023/0/ETH.lz4");
+    std::fs::write(&sums, manifest(&[fixed_x, x_eth, y_btc, y_eth, z_btc])).unwrap();
+    std::fs::remove_file(&z_eth_raw).unwrap();
+    let z_receipt = std::fs::read(out.join("receipts/20261023/0.json")).unwrap();
+    let error = run_with(
+        &input,
+        &out,
+        &sums,
+        Opts {
+            reseal: reseal_hours(&["20261022/0"]),
+            ..Opts::default()
+        },
+        |_| Ok(u64::MAX),
+    )
+    .unwrap_err();
+    let message = error.to_string();
+    assert!(message.contains("20261023/0"), "{message}");
+    assert!(
+        !message.contains("20261022/1"),
+        "the refusal named Y, not Z: {message}"
+    );
+    assert!(message.contains("refusing to re-seal"), "{message}");
+    assert!(message.contains("not a superset"), "{message}");
+    assert!(message.contains("ETH"), "{message}");
+    assert_eq!(
+        crate::fsutil::file_hash(&z_train).unwrap(),
+        z_train_sha,
+        "Z's hour Parquet was rewritten"
+    );
+    assert_eq!(
+        std::fs::read(out.join("receipts/20261023/0.json")).unwrap(),
+        z_receipt,
+        "Z's receipt was rewritten"
+    );
+    assert!(
+        input.join("20261023/0/BTC.lz4").is_file(),
+        "Z's remaining raw was deleted"
+    );
+    assert_eq!(
+        crate::fsutil::file_hash(&y_train).unwrap(),
+        y_train_sha,
+        "the restored Y was touched while Z was refused"
+    );
+    assert_eq!(
+        watermark(&out),
+        vec![
+            "20261022/0".to_owned(),
+            "20261022/1".to_owned(),
+            "20261023/0".to_owned()
+        ],
+        "the watermark moved"
+    );
+    assert!(
+        !out.join("drops/20261023/0.json").exists(),
+        "a drop record appeared for Z"
     );
 }
 
