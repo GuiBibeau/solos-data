@@ -637,11 +637,12 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     // Venue months: union with the existing file, drop lockbox hours, seal.
     // The month's own skip decision goes through seal::check like the hours:
     // its receipt carries a skipKey over the whole-input swap and price
-    // digests, the per-hour venue rows this run feeds the month, whether the
-    // run covered the input floor (sd_new_pools is exact only then), and the
-    // pre-seal month file's sha (null on first seal: any rerun's key carries
-    // the sealed file's sha, so the first rerun refreshes the receipt and the
-    // ones after it skip). Exactly one output: the month file itself.
+    // digests, the per-hour venue rows this run feeds the month, and whether
+    // the run covered the input floor (sd_new_pools is exact only then). The
+    // key holds no output-derived value: the sealed month file is already
+    // verified against the receipt's output sha by seal::check, so the first
+    // rerun skips instead of rebuilding around its own pre-seal sha. Exactly
+    // one output: the month file itself.
     for (month, mut rows) in venue_months {
         rows.sort_by_key(|(hour, _)| *hour);
         let written_hours: BTreeSet<i64> = rows.iter().map(|(hour, _)| *hour).collect();
@@ -657,7 +658,6 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
                 "pythFilesSha256": pyth_facts_sha256,
                 "hours": month_rows_facts(&rows),
                 "wholeSpan": covers_floor,
-                "existingSha256": month_file_sha(&month_path)?,
             }),
         );
         let output = match seal::check(
@@ -1920,16 +1920,6 @@ fn month_receipt_path(out: &Path, month: &str) -> PathBuf {
     out.join(VENUE_TABLE)
         .join("receipts")
         .join(format!("month={month}.json"))
-}
-
-/// SHA-256 of the month file as it stands before this run's seal, or JSON
-/// null when it does not exist yet: the seal unions its rows, so what the
-/// file holds is an input fact of the month's bytes.
-fn month_file_sha(path: &Path) -> Result<Value, StoreError> {
-    if !path.is_file() {
-        return Ok(Value::Null);
-    }
-    Ok(json!(file_hash(path)?))
 }
 
 /// The month's per-hour venue rows as skip-key facts: the exact derived rows
@@ -3305,6 +3295,12 @@ mod tests {
         assert_eq!(second.hours_written, 0);
     }
 
+    /// (mtime, size) of one file, so a test can prove a rerun did not touch it.
+    fn file_stamp(path: &Path) -> (std::time::SystemTime, u64) {
+        let meta = std::fs::metadata(path).expect("file metadata");
+        (meta.modified().expect("mtime"), meta.len())
+    }
+
     #[test]
     fn an_unchanged_month_skips() {
         let fx = Fixture::new("monthskip");
@@ -3316,14 +3312,15 @@ mod tests {
         let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
         write_catalog(&fx.catalog, &batches);
         run(&fx.request(None, None)).expect("first run");
-        // The first rerun refreshes the month receipt (its key gains the
-        // pre-seal file's sha); the rerun after it skips without a rewrite.
-        let second = run(&fx.request(None, None)).expect("second run");
-        assert_eq!(second.venue_hours, 1, "the receipt refresh reseals once");
+        // The FIRST rerun must already skip: the month key holds no
+        // output-derived value, and seal::check verifies the sealed file
+        // against the receipt's output sha, so nothing justifies a rebuild.
+        let month_path = fx.root.join(VENUE_TABLE).join("month=2026-10.parquet");
         let receipt_path = month_receipt_path(&fx.root, "2026-10");
-        let receipt: Value =
-            serde_json::from_str(&std::fs::read_to_string(&receipt_path).expect("month receipt"))
-                .expect("json");
+        let parquet_before = file_stamp(&month_path);
+        let receipt_before = file_stamp(&receipt_path);
+        let receipt_text = std::fs::read_to_string(&receipt_path).expect("month receipt");
+        let receipt: Value = serde_json::from_str(&receipt_text).expect("json");
         assert_eq!(receipt["skipKey"]["unit"], UNIT);
         assert_eq!(
             receipt["outputs"].as_array().map(Vec::len),
@@ -3334,14 +3331,20 @@ mod tests {
             receipt["outputs"][0]["path"],
             format!("{VENUE_TABLE}/month=2026-10.parquet")
         );
-        let third = run(&fx.request(None, None)).expect("third run");
-        assert_eq!(third.venue_hours, 0, "an unchanged month must skip");
-        let after: Value =
-            serde_json::from_str(&std::fs::read_to_string(&receipt_path).expect("month receipt"))
-                .expect("json");
+        let second = run(&fx.request(None, None)).expect("second run");
+        assert_eq!(second.hours_skipped, 1);
+        assert_eq!(second.venue_hours, 0, "the first rerun skips the month");
+        assert_eq!(second.outputs, 0, "nothing re-sealed");
+        assert_eq!(file_stamp(&month_path), parquet_before, "parquet untouched");
         assert_eq!(
-            after["written_utc"], receipt["written_utc"],
-            "a skipped month is not rewritten"
+            file_stamp(&receipt_path),
+            receipt_before,
+            "receipt untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&receipt_path).expect("month receipt"),
+            receipt_text,
+            "no receipt rewrite"
         );
     }
 
