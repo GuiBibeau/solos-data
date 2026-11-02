@@ -28,7 +28,10 @@
 //! parquet (which also carries HIP-3 builder names); otherwise the block is null with
 //! `ctx_present = false` and `ctx_source = 'none'`. The snapshot for bucket h is the
 //! last one in [h, h+1h); `ctx_d_oi` subtracts the same-source snapshot of h-1h (the
-//! previous day's file is loaded on demand for hour 0).
+//! previous day's file is loaded on demand for hour 0). A snapshot carrying a NaN or
+//! infinite field is not present at all: the coin falls through the lanes exactly as
+//! if it had no snapshot, so no non-finite float reaches the sealed table. A NULL
+//! field stays a legitimate missing value.
 
 use super::{catalog, grid, lockbox, mapping, receipt, seal};
 use crate::fsutil::{
@@ -189,7 +192,8 @@ pub fn config_hash() -> String {
         "columns": TABLE_COLUMNS,
         "sort": ["coin", "hour"],
         "guardHours": GUARD_HOURS,
-        "ctxSnapshot": "last in [h, h+1h), s3 then capture per coin",
+        "ctxSnapshot": "last in [h, h+1h), s3 then capture per coin, \
+                       non-finite snapshot fields make the snapshot not present",
         "ctxDoi": "same-source previous hour snapshot",
         "aggregateThreads": 1,
     });
@@ -238,7 +242,9 @@ pub struct Report {
     pub built: usize,
     /// Buckets whose matching receipt sealed them before.
     pub skipped: usize,
-    /// Considered buckets inside the lockbox exclusion.
+    /// Input hours (the fills watermark) the lockbox exclusion removed, counted once
+    /// per run over the whole watermark per ADR-0023, independent of which buckets
+    /// the run considered.
     pub lockbox_hours_dropped: usize,
     /// Buckets the input watermark cannot close yet.
     pub refused_hours: usize,
@@ -267,8 +273,10 @@ pub struct Report {
 }
 
 impl Report {
-    /// Process exit code: 0, or 3 when the run refused any hour. The last hours of
-    /// every steady-state run refuse until the input watermark closes them, so the
+    /// Process exit code: 0, or 3 when the run refused any hour. The run range is
+    /// clamped to the closed watermark (the guard), so a steady-state run over the
+    /// unclosed tail exits 0; refusals in practice come from a hole in the input
+    /// watermark or from a bucket whose h-1 source sits below the data floor. The
     /// nonzero code is information, not a failure: the sealed hours are durable and
     /// a later run picks the refused ones up.
     #[must_use]
@@ -446,6 +454,24 @@ fn count_rows(conn: &Connection, sql: &str) -> Result<u64, StoreError> {
     u64::try_from(n).map_err(|_| StoreError::Check("negative count".into()))
 }
 
+/// A snapshot is present only when every field it carries is finite: a NaN or
+/// infinite value means the snapshot is not present at all (ADR-0023), so the
+/// coin falls to the next ctx lane (or to `ctx_present = false`) and no
+/// non-finite float can reach the sealed table. A NULL field is a legitimate
+/// missing value and keeps the snapshot usable.
+fn snapshot_present(row: &CtxRow) -> bool {
+    [
+        row.funding,
+        row.open_interest,
+        row.premium,
+        row.oracle_px,
+        row.mark_px,
+        row.mid_px,
+    ]
+    .into_iter()
+    .all(|value| value.is_none_or(f64::is_finite))
+}
+
 /// The asset_ctxs block for one bucket: one row per coin that has a snapshot.
 #[derive(Clone)]
 struct CtxRow {
@@ -542,7 +568,11 @@ impl CtxSource {
         Ok(set)
     }
 
-    /// Last snapshot per coin with `at_ms` in `[w0, w1)`.
+    /// Last usable snapshot per coin with `at_ms` in `[w0, w1)`: the window is
+    /// half-open, so a snapshot stamped exactly at `w1` belongs to the next
+    /// bucket, and a snapshot carrying a non-finite field is dropped here (the
+    /// caller sees it as missing, for current windows and previous-hour
+    /// baselines alike; ADR-0023).
     fn window(&self, table: &str, w0: i64, w1: i64) -> Result<Vec<CtxRow>, StoreError> {
         let sql = format!(
             "SELECT coin, funding, open_interest, premium, oracle_px, mark_px, mid_px FROM (\
@@ -564,7 +594,7 @@ impl CtxSource {
             let coin: String = row
                 .get(0)
                 .map_err(|e| StoreError::Check(format!("ctx window: {e}")))?;
-            out.push(CtxRow {
+            let snapshot = CtxRow {
                 coin,
                 src: "",
                 funding: row.get(1).ok(),
@@ -574,7 +604,13 @@ impl CtxSource {
                 mark_px: row.get(5).ok(),
                 mid_px: row.get(6).ok(),
                 prev_open_interest: None,
-            });
+            };
+            // A snapshot with a non-finite field is not present at all, both for
+            // a bucket's own window and for a previous-hour d_oi baseline.
+            if !snapshot_present(&snapshot) {
+                continue;
+            }
+            out.push(snapshot);
         }
         Ok(out)
     }
@@ -1251,6 +1287,9 @@ fn emit_bucket(
     })
 }
 
+/// SQL literal for an optional float. Non-finite values never reach here in
+/// practice: `snapshot_present` drops such snapshots upstream (ADR-0023); this
+/// stays a guard so a NaN or infinity can never be pasted into the INSERT.
 fn opt_f64(value: Option<f64>) -> String {
     match value {
         Some(v) if v.is_finite() => format!("{v}"),
