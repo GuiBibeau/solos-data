@@ -15,9 +15,10 @@ is a gap hour and is never sealed:
 - 2026-10-17T23:00Z through 2026-10-19T00:00Z are gap hours with the
   history-end reason (the finished history lane ends 2026-10-17T23:50:48Z,
   the live lane starts 2026-10-19T00:36:29Z).
-- Every later hour that contains one of the 151 undecoded live events is a
-  gap hour with reason `undecoded_events` (the event count is in the
-  receipt's `gapHours` entry).
+- Because the undecoded rule is lane-level, the first undecoded live event
+  stops Flash completeness for good: every Flash hour from the hour of the
+  earliest undecoded event through the venue watermark is a gap hour with
+  reason `undecoded_events` (the entry carries the event count).
 
 So `solana_perp_coin_hour` is effectively Flash-history-only through
 2026-10-17T22Z until this is fixed; Jupiter and Pyth are unaffected (their

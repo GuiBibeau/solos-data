@@ -548,7 +548,7 @@ pub fn venue_seal(
             from_hour: crate::augment::combined::grid::hour_of_secs(hist_max),
             to_hour: crate::augment::combined::grid::hour_of_secs(live.min),
             reason: format!(
-                "history finished at {}, live starts at {}",
+                "history_lane_ended_before_live: history finished at {}, live starts at {}",
                 rfc3339(hist_max),
                 rfc3339(live.min)
             ),

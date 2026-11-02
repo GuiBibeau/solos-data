@@ -169,21 +169,25 @@ later leaves gap hours - the hours whose `[h, h+1h)` neither lane fully
 covers, from the hour containing the history max through the hour containing
 the live min, inclusive. Gap hours are never sealed as complete: the unit cuts
 them from the plan and records them as `gapHours` entries `{venue, from_hour,
-to_hour, reason: "history finished at <ts>, live starts at <ts>"}` in the run
-receipt and the catalog watermark; hours after the gap seal off the live lane.
+to_hour, reason: "history_lane_ended_before_live: history finished at <ts>,
+live starts at <ts>"}` in the run receipt and the catalog watermark; hours
+after the gap seal off the live lane.
 The two-hour trailing guard always applies to the sealing watermark (the live
 lane's max when the history is finished). The status file's sha256 and the
 per-venue done flags are part of every hour's skip key and are recorded in the
 receipt's watermark facts, so flipping a venue's done flag rebuilds instead of
-skipping. Completeness is per event, not per lane: an hour in which any
-deduplicated in-window event of a venue has an undecoded name (`name` NULL) is
-not complete either - the raw lane held events the decoder could not read, so
-whatever the hour's decoded rows say, sealing it would look complete while it
-is not. Such hours are gap hours with reason `undecoded_events` (the entry
-carries the venue, the hour range and the undecoded event count) and are never
-sealed; fully decoded hours still seal. The strictness is deliberate: a live
-lane starting even one second after a finished history lane's last record
-leaves the boundary hour a gap.
+skipping. Completeness is per lane, not per event: when a venue's live lane holds any
+undecoded event (`name` NULL - the raw lane held events the decoder could not
+read), the venue's complete coverage ends at the hour of its earliest
+undecoded event, and that hour plus every hour after it, through the venue's
+watermark, is a gap hour with reason `undecoded_events` (the entry carries the
+venue, the hour range and the undecoded event count) and never seals, whatever
+decoded rows it holds; hours before the stop keep the existing rules, and a
+history lane's undecoded events never trigger the rule. The strictness is
+deliberate on both ends: a live lane starting even one second after a finished
+history lane's last record leaves the boundary hour a gap, and sparse
+undecoded events gap everything after them - a per-event check would still
+seal the empty hours between two undecoded events as complete.
 
 `phoenix_coin_hour` (per (asset, hour), ordered by `asset_id nulls last`,
 `asset_symbol`): `hour BIGINT`, `asset_symbol VARCHAR`, `asset_id VARCHAR`,

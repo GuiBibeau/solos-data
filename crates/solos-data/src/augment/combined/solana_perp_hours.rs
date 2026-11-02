@@ -430,7 +430,14 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let window_lo = grid::hour_start(first_hour);
     let window_hi = grid::hour_start(requested_last) + grid::HOUR_SECS;
     build_event_views(&conn, &jupiter_lanes, &flash_lanes, window_lo, window_hi)?;
-    let (undecoded_hours, undecoded_entries) = undecoded_gap_hours(&conn)?;
+    let (undecoded_hours, undecoded_entries) = undecoded_stops(
+        &conn,
+        request.jupiter_events.len(),
+        request.flash_events.len(),
+        jupiter_seal.watermark,
+        flash_seal.watermark,
+        requested_last,
+    )?;
     gap_hours.extend(undecoded_hours.iter().copied());
     gap_entries.extend(undecoded_entries);
 
@@ -768,54 +775,67 @@ fn build_event_views(
     Ok(())
 }
 
-/// Hours whose deduplicated in-window events include an undecoded row (`name
-/// IS NULL`): the hour is not complete (ADR-0023), whatever else it holds.
-/// Returns the hour indices and the `gapHours` entries - one per contiguous
-/// run of hours per venue, with the run's total undecoded event count.
-fn undecoded_gap_hours(
+/// The undecoded-events stop, per venue: when a venue's LIVE lane (the last
+/// lane argument) holds any undecoded event (`name` IS NULL), the venue's
+/// complete coverage ends at the hour of its earliest undecoded event - that
+/// hour and every hour after it, through the venue's watermark, is a gap hour
+/// with reason `undecoded_events` and never seals, whatever decoded rows it
+/// holds (ADR-0023). A history lane's undecoded events never trigger the
+/// rule: only the live capture's decoding defines completeness. Returns the
+/// excluded hour indices (clamped to the requested range) and the `gapHours`
+/// entries (one per venue, with the undecoded event count).
+fn undecoded_stops(
     conn: &duckdb::Connection,
+    jupiter_lanes: usize,
+    flash_lanes: usize,
+    jupiter_watermark: i64,
+    flash_watermark: i64,
+    requested_last: i64,
 ) -> Result<(std::collections::BTreeSet<i64>, Vec<Value>), StoreError> {
     let mut set = std::collections::BTreeSet::new();
     let mut entries: Vec<Value> = Vec::new();
-    for (table, venue) in [("jup_dedup", "jupiter"), ("flash_dedup", "flash")] {
+    for (table, venue, live_lane, watermark) in [
+        (
+            "jup_all",
+            "jupiter",
+            jupiter_lanes.saturating_sub(1),
+            jupiter_watermark,
+        ),
+        (
+            "flash_all",
+            "flash",
+            flash_lanes.saturating_sub(1),
+            flash_watermark,
+        ),
+    ] {
         let rows = query_rows(
             conn,
             &format!(
-                "SELECT (block_time // 3600) AS hour, count(*) AS n FROM {table}
-                 WHERE name IS NULL GROUP BY hour ORDER BY hour"
+                "SELECT min(block_time // 3600) AS first_hour, count(*) AS n
+                 FROM {table} WHERE lane = {live_lane} AND name IS NULL"
             ),
             &[],
         )?;
-        let mut hours: Vec<(i64, u64)> = Vec::new();
-        for row in rows {
-            let hour = row
-                .int("hour")
-                .ok_or_else(|| StoreError::Check("null undecoded hour".into()))?;
-            let n = row
-                .int("n")
-                .ok_or_else(|| StoreError::Check("null undecoded count".into()))?;
-            hours.push((hour, n.max(0) as u64));
+        let Some(row) = rows.first() else {
+            continue;
+        };
+        let Some(first_hour) = row.int("first_hour") else {
+            continue; // no undecoded events in the live lane
+        };
+        let count = row.int("n").unwrap_or(0).max(0) as u64;
+        if count == 0 {
+            continue;
         }
-        // Merge consecutive hours into runs with the run's total event count.
-        let mut runs: Vec<(i64, i64, u64)> = Vec::new(); // (first, last, count)
-        for (hour, count) in hours {
-            match runs.last_mut() {
-                Some(run) if run.1 + 1 == hour => {
-                    run.1 = hour;
-                    run.2 += count;
-                }
-                _ => runs.push((hour, hour, count)),
-            }
+        let to_hour = grid::hour_of_secs(watermark);
+        entries.push(json!({
+            "venue": venue,
+            "from_hour": first_hour,
+            "to_hour": to_hour,
+            "reason": "undecoded_events",
+            "count": count,
+        }));
+        for hour in first_hour..=to_hour.min(requested_last) {
             set.insert(hour);
-        }
-        for (first, last, count) in runs {
-            entries.push(json!({
-                "venue": venue,
-                "from_hour": first,
-                "to_hour": last,
-                "reason": "undecoded_events",
-                "count": count,
-            }));
         }
     }
     Ok((set, entries))

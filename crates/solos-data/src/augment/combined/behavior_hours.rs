@@ -3979,36 +3979,60 @@ fn pyth_unfinished_history_lane_still_holds_the_watermark() {
     assert!(build(&tmp, None).is_err());
 }
 
-/// An hour with one decoded and one NULL-name (undecoded) event is a gap hour
-/// with reason `undecoded_events` and is never sealed, even though it also
-/// holds a decoded event that would give it rows; a fully decoded hour seals
-/// (U1 ignores the NULL names and seals the hour, U2 skips the seal but
-/// records nothing).
+/// (a) The undecoded rule is lane-level: one NULL-name event in the venue's
+/// live lane stops completeness at its hour, and every hour from there
+/// through the watermark is a gap hour - including a decoded-only hour after
+/// the stop that would seal under a per-event check. Hours before the stop
+/// seal, a history lane's NULL event never triggers the rule, and the count
+/// covers the live lane's undecoded events only (U1 restores per-hour gaps,
+/// U2 ignores the NULL names, U3 records nothing).
 #[test]
-fn solana_perp_undecoded_events_make_the_hour_a_gap() {
-    let tmp = Tmp::new("perp-undecoded");
+fn solana_perp_undecoded_lane_stops_sealing_through_the_watermark() {
+    let tmp = Tmp::new("perp-undecoded-stop");
     let h0 = day_start();
     let sentinel = h0 + 86_400 + 3 * 3600;
-    // One flash lane (history + live in one directory is not allowed: the last
-    // lane is the live lane), so a single flash lane is the live lane.
-    let flash = tmp.dir().join("flash");
+    let flash_hist = tmp.dir().join("flash-hist");
     write_event_lane(
-        &flash,
+        &flash_hist,
         &[
+            // A NULL-name event in the HISTORY lane: never triggers the rule.
+            format!(
+                "('uNullHist', 432_100_010, {}, 0, NULL, NULL)",
+                h0 + 3_600 + 600
+            ),
             perp_event(
-                "fDec1",
+                "fHistDec",
                 432_100_010,
-                h0 + 600,
+                h0 + 2 * 3_600 + 1_200,
                 0,
                 "IncreaseSizeLogUSDv1",
                 r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
             ),
-            // The undecoded event: no name, no fields.
-            format!("('uNull', 432_100_010, {}, 0, NULL, NULL)", h0 + 1_200),
+        ],
+    );
+    let flash_live = tmp.dir().join("flash-live");
+    write_event_lane(
+        &flash_live,
+        &[
             perp_event(
-                "fDec2",
+                "fLiveDec",
                 432_100_010,
                 h0 + 2 * 3_600 + 600,
+                0,
+                "IncreaseSizeLogUSDv1",
+                r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
+            ),
+            // The live lane's NULL-name event: completeness stops at its hour.
+            format!(
+                "('uNullLive', 432_100_010, {}, 0, NULL, NULL)",
+                h0 + 5 * 3_600 + 600
+            ),
+            // A decoded-only hour AFTER the stop: would seal under a per-event
+            // check, must stay a gap hour.
+            perp_event(
+                "fPost",
+                432_100_010,
+                h0 + 7 * 3_600 + 600,
                 0,
                 "IncreaseSizeLogUSDv1",
                 r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
@@ -4023,8 +4047,6 @@ fn solana_perp_undecoded_events_make_the_hour_a_gap() {
             ),
         ],
     );
-    // Jupiter closes cleanly (its history reaches the sentinel, so no status
-    // is needed and the venue never holds the day back).
     let (jup_hist, jup_live) = write_two_lanes(
         tmp.dir(),
         "jupiter",
@@ -4032,11 +4054,12 @@ fn solana_perp_undecoded_events_make_the_hour_a_gap() {
         h0 + 1_200,
         &[(sentinel, "lSentinel", "jup")],
     );
+    let (status, _) = status_file(tmp.dir(), false, &[("jupiter", true), ("flash", true)]);
     let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
     let provenance = provenance_file(tmp.dir());
     write_mapping(tmp.dir());
     let jupiter_events = vec![jup_hist, jup_live];
-    let flash_events = vec![flash];
+    let flash_events = vec![flash_hist, flash_live];
     let request = PerpRequest {
         out: tmp.dir(),
         lockbox: &lockbox,
@@ -4044,31 +4067,110 @@ fn solana_perp_undecoded_events_make_the_hour_a_gap() {
         provenance: &provenance,
         jupiter_events: &jupiter_events,
         flash_events: &flash_events,
-        history_status: None,
+        history_status: Some(&status),
         since: DAY,
         until: DAY,
         threads: 1,
         memory_limit: "512MB".to_owned(),
     };
     let report = super::solana_perp_hours::run(&request).unwrap();
-    let hour0 = grid::hour_of_secs(h0);
     let hour2 = grid::hour_of_secs(h0) + 2;
-    // Hour 0 holds the undecoded event: never sealed. Hour 2 is fully
-    // decoded: sealed.
-    let path0 = tmp
-        .dir()
-        .join(io::hour_partition(hour0, super::solana_perp_hours::TABLE));
-    assert!(
-        !path0.exists(),
-        "the undecoded hour sealed: {}",
-        path0.display()
-    );
+    let hour5 = grid::hour_of_secs(h0) + 5;
+    let hour7 = grid::hour_of_secs(h0) + 7;
+    // Hours before the stop seal (hour 2 holds decoded flash rows); hour 5
+    // (the stop) and every later hour - including the decoded-only hour 7 -
+    // never seal.
     assert!(
         tmp.dir()
             .join(io::hour_partition(hour2, super::solana_perp_hours::TABLE))
             .is_file(),
-        "the fully decoded hour seals"
+        "the decoded hour before the stop seals"
     );
+    for hour in [hour5, hour5 + 1, hour7] {
+        let path = tmp
+            .dir()
+            .join(io::hour_partition(hour, super::solana_perp_hours::TABLE));
+        assert!(
+            !path.exists(),
+            "hour {} sealed past the stop: {}",
+            hour,
+            path.display()
+        );
+    }
+    assert_eq!(
+        report.hours_written, 2,
+        "hour 0 (jupiter's live rows) and hour 2 (decoded flash); \
+         hours 5..watermark are gap hours"
+    );
+    let receipt = unit_receipt(
+        tmp.dir(),
+        super::solana_perp_hours::TABLE,
+        super::solana_perp_hours::UNIT,
+    );
+    let gaps = receipt["inputs"]["watermark"]["gapHours"]
+        .as_array()
+        .unwrap();
+    let stop = gaps
+        .iter()
+        .find(|entry| entry["reason"] == "undecoded_events")
+        .expect("the undecoded stop must be recorded");
+    assert_eq!(stop["venue"], "flash");
+    assert_eq!(
+        stop["from_hour"], hour5,
+        "the stop is the live lane's earliest undecoded hour"
+    );
+    assert_eq!(
+        stop["to_hour"],
+        grid::hour_of_secs(sentinel),
+        "through the venue watermark"
+    );
+    assert_eq!(
+        stop["count"], 1,
+        "the history lane's NULL event is not counted"
+    );
+}
+
+/// (b) A venue whose lanes hold no undecoded events is unaffected: no
+/// `undecoded_events` entries, and its decoded hours seal.
+#[test]
+fn solana_perp_lane_without_undecoded_events_is_unaffected() {
+    let tmp = Tmp::new("perp-no-null");
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    let (jup_hist, jup_live) = write_two_lanes(
+        tmp.dir(),
+        "jupiter",
+        sentinel,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "jup")],
+    );
+    let (flash_hist, flash_live) = write_two_lanes(
+        tmp.dir(),
+        "flash",
+        sentinel,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "flash")],
+    );
+    let (status, _) = status_file(tmp.dir(), false, &[("jupiter", true), ("flash", true)]);
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let jupiter_events = vec![jup_hist, jup_live];
+    let flash_events = vec![flash_hist, flash_live];
+    let request = PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: Some(&status),
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    };
+    let report = super::solana_perp_hours::run(&request).unwrap();
     assert_eq!(report.hours_written, 1);
     let receipt = unit_receipt(
         tmp.dir(),
@@ -4078,14 +4180,111 @@ fn solana_perp_undecoded_events_make_the_hour_a_gap() {
     let gaps = receipt["inputs"]["watermark"]["gapHours"]
         .as_array()
         .unwrap();
-    let undecoded = gaps
-        .iter()
-        .find(|entry| entry["reason"] == "undecoded_events")
-        .expect("the undecoded hour must be recorded");
-    assert_eq!(undecoded["venue"], "flash");
-    assert_eq!(undecoded["from_hour"], hour0);
-    assert_eq!(undecoded["to_hour"], hour0);
-    assert_eq!(undecoded["count"], 1, "one NULL-name event");
+    assert!(
+        gaps.iter()
+            .all(|entry| entry["reason"] != "undecoded_events"),
+        "{gaps:?}"
+    );
+}
+
+/// (c) Flash's undecoded events never gap jupiter: the gapHours entry is
+/// attributed to flash only, and jupiter's decoded hours before the flash
+/// stop seal with jupiter rows (U4 labels the flash run jupiter).
+#[test]
+fn solana_perp_flash_undecoded_events_do_not_gap_jupiter() {
+    let tmp = Tmp::new("perp-no-cross-leak");
+    let h0 = day_start();
+    let sentinel = h0 + 86_400 + 3 * 3600;
+    let flash_hist = tmp.dir().join("flash-hist");
+    write_event_lane(
+        &flash_hist,
+        &[perp_event(
+            "fHistDec",
+            432_100_010,
+            h0 + 2 * 3_600 + 1_200,
+            0,
+            "IncreaseSizeLogUSDv1",
+            r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
+        )],
+    );
+    let flash_live = tmp.dir().join("flash-live");
+    write_event_lane(
+        &flash_live,
+        &[
+            format!(
+                "('uNullLive', 432_100_010, {}, 0, NULL, NULL)",
+                h0 + 5 * 3_600 + 600
+            ),
+            format!(
+                "('uNullLive2', 432_100_010, {}, 0, NULL, NULL)",
+                h0 + 8 * 3_600 + 600
+            ),
+            perp_event(
+                "fSent",
+                432_100_010,
+                sentinel,
+                0,
+                "IncreaseSizeLogUSDv1",
+                r#"{"market": "mkt1", "delta_size_usd": "100000000", "entry_price": "1000000000", "entry_price_exponent": -8}"#,
+            ),
+        ],
+    );
+    let (jup_hist, jup_live) = write_two_lanes(
+        tmp.dir(),
+        "jupiter",
+        sentinel,
+        h0 + 1_200,
+        &[(sentinel, "lSentinel", "jup")],
+    );
+    let (status, _) = status_file(tmp.dir(), false, &[("jupiter", true), ("flash", true)]);
+    let (lockbox, lockbox_sha, _) = lockbox_fixture(tmp.dir());
+    let provenance = provenance_file(tmp.dir());
+    write_mapping(tmp.dir());
+    let jupiter_events = vec![jup_hist, jup_live];
+    let flash_events = vec![flash_hist, flash_live];
+    let request = PerpRequest {
+        out: tmp.dir(),
+        lockbox: &lockbox,
+        lockbox_sha256: &lockbox_sha,
+        provenance: &provenance,
+        jupiter_events: &jupiter_events,
+        flash_events: &flash_events,
+        history_status: Some(&status),
+        since: DAY,
+        until: DAY,
+        threads: 1,
+        memory_limit: "512MB".to_owned(),
+    };
+    super::solana_perp_hours::run(&request).unwrap();
+    let receipt = unit_receipt(
+        tmp.dir(),
+        super::solana_perp_hours::TABLE,
+        super::solana_perp_hours::UNIT,
+    );
+    let gaps = receipt["inputs"]["watermark"]["gapHours"]
+        .as_array()
+        .unwrap();
+    assert!(
+        gaps.iter()
+            .all(|entry| entry["venue"] != "jupiter" || entry["reason"] != "undecoded_events"),
+        "flash's undecoded events must not gap jupiter: {gaps:?}"
+    );
+    // Jupiter's decoded hour before the flash stop seals (with jupiter rows).
+    let conn = memory_connection("1", "512MB").unwrap();
+    let path = tmp.dir().join(io::hour_partition(
+        grid::hour_of_secs(h0),
+        super::solana_perp_hours::TABLE,
+    ));
+    let rows = crate::store::query_rows(
+        &conn,
+        &format!(
+            "SELECT venue FROM read_parquet('{}')",
+            path.to_string_lossy()
+        ),
+        &[],
+    )
+    .unwrap();
+    assert!(rows.iter().any(|row| row.str("venue") == Some("jupiter")));
 }
 
 /// Strictness pin: a live start even one second after the history lane's last
