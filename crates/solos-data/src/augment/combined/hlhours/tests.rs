@@ -9,7 +9,7 @@ use super::{
     GUARD_HOURS, HL_TRAIN_CODE_SHA, Request, SCHEMA, STAGE1_VERSION, TABLE, UNIT, UNIT_VERSION,
     grid, lockbox, mapping, run,
 };
-use crate::augment::combined::receipt;
+use crate::augment::combined::{receipt, testfix};
 
 /// Seconds in one hour (mirror of `grid::HOUR_SECS`).
 const HOUR: i64 = 3_600;
@@ -164,15 +164,6 @@ fn write_watermark(root: &Path, hours: &[i64]) {
     .unwrap();
 }
 
-/// A v2 lockbox fixture with the real shape (the common lockbox test body): four
-/// 2026 Monday weeks with a 24 h guard, 864 excluded hours over 36 UTC days.
-fn write_lockbox(root: &Path) -> (PathBuf, String) {
-    let path = root.join("lockbox.json");
-    std::fs::write(&path, lockbox::tests::v2_body()).unwrap();
-    let sha = crate::fsutil::sha256_hex(&std::fs::read(&path).unwrap());
-    (path, sha)
-}
-
 /// The canonical fixture hour: 2025-07-20 04:00 UTC, far from the fixture lockbox.
 fn h0() -> i64 {
     chrono::NaiveDate::from_ymd_opt(2025, 7, 20)
@@ -199,7 +190,8 @@ impl Fixture {
         let root = Tmp::new(label);
         let fills = root.path().join("fills");
         std::fs::create_dir_all(&fills).unwrap();
-        let (lockbox, lockbox_sha) = write_lockbox(root.path());
+        // The shared v2 lockbox fixture (same bytes everywhere, named hours).
+        let lockbox = testfix::v2_lockbox(root.path());
         let ctx_s3 = root.path().join("ctx-s3");
         let ctx_capture = root.path().join("ctx-capture");
         std::fs::create_dir_all(&ctx_s3).unwrap();
@@ -213,8 +205,8 @@ impl Fixture {
         Self {
             root,
             fills,
-            lockbox,
-            lockbox_sha,
+            lockbox: lockbox.path,
+            lockbox_sha: lockbox.sha256,
             ctx_s3,
             ctx_capture,
             provenance,
@@ -679,7 +671,10 @@ fn ctx_two_lane_fallback_and_doi() {
     assert!((opt_f(mbtc, "ctx_d_oi").unwrap() - 20.0).abs() < 1e-9);
 }
 
-/// Every hour inside a lockbox week (including the guard band) is dropped unwritten.
+/// Hours inside a lockbox week (including the guard band) are dropped unwritten,
+/// and the dropped count is the covered input hours inside the set (not the
+/// requested range): the watermark covers five lockbox hours, the requested
+/// range only one.
 #[test]
 fn lockbox_hours_are_dropped() {
     let fx = Fixture::new("lockbox");
@@ -688,6 +683,14 @@ fn lockbox_hours_are_dropped() {
     let h = chrono::NaiveDate::from_ymd_opt(2026, 6, 3)
         .unwrap()
         .and_hms_opt(5, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp()
+        / HOUR;
+    // A free hour days after the week, so the second run's catalog entry exists.
+    let h_out = chrono::NaiveDate::from_ymd_opt(2026, 6, 10)
+        .unwrap()
+        .and_hms_opt(12, 0, 0)
         .unwrap()
         .and_utc()
         .timestamp()
@@ -701,21 +704,35 @@ fn lockbox_hours_are_dropped() {
             h * HOUR * 1000
         ),
     );
-    seal_range(fx.root.path(), &c, h - 3, h + 3, Some(h), Some(&p));
-    write_watermark(&fx.fills, &(h - 3..=h + 3).collect::<Vec<_>>());
+    seal_range(fx.root.path(), &c, h - 3, h + 1, Some(h), Some(&p));
+    seal_range(fx.root.path(), &c, h_out - 1, h_out + 1, None, None);
+    let watermark: Vec<i64> = (h - 3..=h + 1).chain(h_out - 1..=h_out + 3).collect();
+    write_watermark(&fx.fills, &watermark);
 
     let report = run(&fx.request(h, h)).unwrap();
     assert_eq!(report.built, 0);
-    assert_eq!(report.lockbox_hours_dropped, 1);
+    assert_eq!(report.lockbox_hours_dropped, 5, "the whole covered span");
     assert!(!output_path(fx.root.path(), h).exists());
-    // The receipt keeps the two apart: dropped is the one input hour this run
-    // actually lost to the lockbox, excluded is the v2 set's own size.
+    // The receipt keeps the two apart: dropped is the covered input hours the
+    // lockbox removed, excluded is the v2 set's own size.
     let receipt: Value = serde_json::from_str(
         &std::fs::read_to_string(receipt::receipt_path(fx.root.path(), TABLE, UNIT)).unwrap(),
     )
     .unwrap();
-    assert_eq!(receipt["lockbox_hours_dropped"], 1);
+    assert_eq!(receipt["lockbox_hours_dropped"], 5);
     assert_eq!(receipt["lockbox_hours_excluded"], 864);
+
+    // A later run over the free hour keeps counting the covered lockbox hours
+    // (the watermark, not the requested range) and records them in the catalog.
+    let second = run(&fx.request(h_out, h_out)).unwrap();
+    assert_eq!(second.built, 1, "report: {}", second.to_json());
+    assert_eq!(second.lockbox_hours_dropped, 5);
+    let cat: Value = serde_json::from_str(
+        &std::fs::read_to_string(fx.root.path().join("catalog.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cat["watermarks"][UNIT]["lockbox_hours_dropped"], 5);
+    assert_eq!(cat["watermarks"][UNIT]["lockbox_hours_excluded"], 864);
 }
 
 /// A lockbox sha mismatch refuses the whole run.
@@ -920,14 +937,17 @@ fn a_stale_config_sha_in_the_hour_receipt_forces_a_rebuild() {
 
     let path = hour_receipt_path(fx.root.path(), h);
     let mut old: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    old["configSha256"] = json!("0".repeat(64));
+    old["skipKey"]["configSha256"] = json!("0".repeat(64));
     std::fs::write(&path, old.to_string()).unwrap();
 
     let second = run(&fx.request(h, h)).unwrap();
     assert_eq!(second.built, 1, "a stale config sha must rebuild");
     assert_eq!(second.skipped, 0);
     let sealed: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-    assert_eq!(sealed["configSha256"], json!(super::config_hash()));
+    assert_eq!(
+        sealed["skipKey"]["configSha256"],
+        json!(super::config_hash())
+    );
 }
 
 /// A different lockbox file (same weeks, different bytes and sha) rebuilds.
@@ -1217,11 +1237,10 @@ fn a_failed_hour_receipt_write_leaves_the_sealed_file_but_no_receipt() {
 #[test]
 fn ctx_d_oi_is_missing_after_a_lockbox_gap() {
     let fx = Fixture::new("lockgap");
-    let lockbox = lockbox::load(&fx.lockbox, &fx.lockbox_sha).unwrap();
-    let excluded = lockbox.excluded_hours().unwrap();
-    let h = excluded.iter().next_back().unwrap() + 1;
+    let lb = testfix::v2_lockbox(fx.root.path());
+    let h = lb.hour_after();
     assert!(
-        lockbox::is_excluded(&excluded, h - 1),
+        lb.hours.contains(&(h - 1)),
         "the baseline hour sits inside the exclusion"
     );
     let day = compact_day(h);
@@ -1250,7 +1269,9 @@ fn ctx_d_oi_is_missing_after_a_lockbox_gap() {
 
     let report = run(&fx.request(h, h)).unwrap();
     assert_eq!(report.built, 1, "report: {}", report.to_json());
-    assert_eq!(report.lockbox_hours_dropped, 0);
+    // The watermark covers h-1 (inside the set) and three free hours: dropped
+    // counts the covered inside hour even though the requested range does not.
+    assert_eq!(report.lockbox_hours_dropped, 1);
     let btc = &rows_of(&output_path(fx.root.path(), h))[0];
     assert_eq!(s(btc, "ctx_source"), "s3");
     assert!((opt_f(btc, "ctx_open_interest").unwrap() - 460.0).abs() < 1e-9);
@@ -1310,4 +1331,96 @@ fn the_cli_exits_nonzero_when_hours_are_refused() {
     write_watermark(&fx.fills, &[h - 1, h, h + 1, h + 2, h + 3]);
     let code = crate::cli::combined_hl_hours_run(&args(&fx)).unwrap();
     assert_ne!(code, 0, "refused hours must be visible in the exit code");
+}
+
+/// Real fills inside the lockbox are dropped unwritten: no output row carries a
+/// lockbox hour, and dropped counts the covered hours the set removed.
+#[test]
+fn fills_inside_the_lockbox_are_dropped_and_absent_from_outputs() {
+    let fx = Fixture::new("lockbox-data");
+    let lb = testfix::v2_lockbox(fx.root.path());
+    let h_in = lb.mid_hour();
+    let h_out = lb.hour_after();
+    let c = conn(fx.root.path());
+    // A real fill inside the lockbox and one in the first free hour after it.
+    let p_in = fx.fills.join("in.parquet");
+    write_fills(
+        &c,
+        &p_in,
+        &format!(
+            "('BTC', 'perp', {}, 1, 100.0, 1.0, 'B', true, null, null)",
+            h_in * HOUR * 1000
+        ),
+    );
+    let p_out = fx.fills.join("out.parquet");
+    write_fills(
+        &c,
+        &p_out,
+        &format!(
+            "('BTC', 'perp', {}, 2, 90.0, 1.0, 'B', true, null, null)",
+            h_out * HOUR * 1000
+        ),
+    );
+    // Sources: the inside hour's bucket needs h_in-1, h_in, h_in+1 receipted
+    // and the free hour needs h_out-1 (the last lockbox hour), h_out, h_out+1;
+    // the lockbox never gates input receipts. The watermark reaches h_out+3,
+    // so both requested buckets are closed, not refused.
+    let e1 = fx.fills.join("e1.parquet");
+    write_fills(&c, &e1, "");
+    seal_hour_file(&fx, &c, h_in - 1, &e1);
+    seal_hour_file(&fx, &c, h_in, &p_in);
+    seal_hour_file(&fx, &c, h_in + 1, &e1);
+    seal_hour_file(&fx, &c, h_out - 1, &e1);
+    seal_hour_file(&fx, &c, h_out, &p_out);
+    seal_hour_file(&fx, &c, h_out + 1, &e1);
+    write_watermark(
+        &fx.fills,
+        &[
+            h_in - 1,
+            h_in,
+            h_in + 1,
+            h_out - 1,
+            h_out,
+            h_out + 1,
+            h_out + 2,
+            h_out + 3,
+        ],
+    );
+
+    // The inside hour itself is requested: complete and closed, so only the
+    // lockbox can stop it. It is dropped, never refused, and stays unwritten.
+    // (Dropped counts the whole covered watermark, so run 1 already reports 3.)
+    let first = run(&fx.request(h_in, h_in)).unwrap();
+    assert_eq!(first.built, 0, "report: {}", first.to_json());
+    assert_eq!(
+        first.refused_hours, 0,
+        "the inside hour is closed, not refused"
+    );
+    assert_eq!(first.lockbox_hours_dropped, 3, "the covered inside hours");
+    assert!(
+        !output_path(fx.root.path(), h_in).exists(),
+        "no file for the inside hour"
+    );
+
+    let report = run(&fx.request(h_out, h_out)).unwrap();
+    assert_eq!(report.built, 1, "report: {}", report.to_json());
+    assert_eq!(
+        report.lockbox_hours_dropped, 3,
+        "covered inside hours: h_in, h_in+1 (in week 3) and h_out-1; h_in-1 sits \
+         in the gap between weeks 2 and 3"
+    );
+    // No row of any sealed output carries a lockbox hour.
+    let glob = fx
+        .root
+        .path()
+        .join(super::TABLE)
+        .join("date=*")
+        .join("hour=*.parquet");
+    testfix::assert_no_parquet_rows_in_lockbox(&c, &glob, "hour", testfix::TsUnit::Secs, &lb.hours);
+    let run_receipt: Value = serde_json::from_str(
+        &std::fs::read_to_string(receipt::receipt_path(fx.root.path(), TABLE, UNIT)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(run_receipt["lockbox_hours_dropped"], 3);
+    assert_eq!(run_receipt["lockbox_hours_excluded"], 864);
 }

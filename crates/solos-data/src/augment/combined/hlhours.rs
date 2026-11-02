@@ -30,7 +30,7 @@
 //! last one in [h, h+1h); `ctx_d_oi` subtracts the same-source snapshot of h-1h (the
 //! previous day's file is loaded on demand for hour 0).
 
-use super::{catalog, grid, lockbox, mapping, receipt};
+use super::{catalog, grid, lockbox, mapping, receipt, seal};
 use crate::fsutil::{
     create_dir_all_durable, file_hash, sha256_hex, sync_dir_after_rename, sync_tmp_file, tmp_path,
     write_durable,
@@ -714,17 +714,6 @@ fn load_mapping(conn: &Connection, out: &Path) -> Result<Option<u64>, StoreError
     Ok(Some(count_rows(conn, "SELECT count(*) FROM asset_map")?))
 }
 
-/// The mapping input fact of a run: the sha256 of `mapping/assets.csv` when the
-/// mapping unit has run, else null. Part of every hour's skip key, so a newly
-/// written or changed assets.csv rebuilds the hours that predate it instead of
-/// keeping their null `asset_id`s.
-fn assets_fact(out: &Path) -> Value {
-    match std::fs::read(out.join("mapping").join("assets.csv")) {
-        Ok(bytes) => json!({"sha256": sha256_hex(&bytes)}),
-        Err(_) => json!({"sha256": null}),
-    }
-}
-
 /// The ctx input facts of one bucket: the sha256 of every daily file either ctx
 /// lane consults for `bucket` (its own day and the previous day, the hour-0
 /// baseline), null when absent. Conservative on purpose: a file counts even when
@@ -803,6 +792,10 @@ pub fn run(request: &Request) -> Result<Report, StoreError> {
         Some(b + 1).filter(|b| *b <= last_bucket)
     })
     .collect();
+    // The receipt's lockbox counts, in the one shared definition: dropped is
+    // the covered input hours (the fills watermark) inside the exclusion set,
+    // excluded the set's own size.
+    let drops = seal::lockbox_drops(watermark.hours.iter().copied(), &lockbox_hours);
 
     create_dir_all_durable(&request.out)?;
     let _guard = mapping::lock_output(&request.out)?;
@@ -815,7 +808,7 @@ pub fn run(request: &Request) -> Result<Report, StoreError> {
         emit_buckets: buckets.len(),
         built: 0,
         skipped: 0,
-        lockbox_hours_dropped: 0,
+        lockbox_hours_dropped: drops.dropped as usize,
         refused_hours: 0,
         refused_examples: Vec::new(),
         coin_hour_rows: 0,
@@ -837,7 +830,7 @@ pub fn run(request: &Request) -> Result<Report, StoreError> {
         seconds: 0.0,
     };
 
-    let assets = assets_fact(&request.out);
+    let assets = seal::mapping_assets_sha256(&request.out)?;
     let mut built_files: Vec<receipt::OutputFile> = Vec::new();
     execute(
         request,
@@ -871,10 +864,10 @@ pub fn run(request: &Request) -> Result<Report, StoreError> {
                 "mapping_assets": assets,
             }),
             lockbox_sha256: request.lockbox_sha256.trim().to_ascii_lowercase(),
-            // Dropped = buckets this run considered that sit in the exclusion set;
-            // excluded = the set's own v2 size.
-            lockbox_hours_dropped: report.lockbox_hours_dropped as u64,
-            lockbox_hours_excluded: lockbox_hours.len() as u64,
+            // Dropped = covered input hours inside the exclusion set; excluded =
+            // the set's own v2 size (seal::lockbox_drops).
+            lockbox_hours_dropped: drops.dropped,
+            lockbox_hours_excluded: drops.excluded,
             config_sha256: config_hash(),
             provenance,
             started_utc: started,
@@ -899,8 +892,8 @@ pub fn run(request: &Request) -> Result<Report, StoreError> {
                 "stage1_version": STAGE1_VERSION,
                 "hl_train_code_sha": HL_TRAIN_CODE_SHA,
                 "lockbox_sha256": request.lockbox_sha256.trim().to_ascii_lowercase(),
-                "lockbox_hours_dropped": report.lockbox_hours_dropped as u64,
-                "lockbox_hours_excluded": lockbox_hours.len() as u64,
+                "lockbox_hours_dropped": drops.dropped,
+                "lockbox_hours_excluded": drops.excluded,
             }),
         );
     }
@@ -999,7 +992,8 @@ fn execute(
             continue;
         }
         if lockbox::is_excluded(lockbox_hours, *b) {
-            report.lockbox_hours_dropped += 1;
+            // Dropped hours are counted once per run from the input coverage
+            // (seal::lockbox_drops in `run`), not per considered bucket.
             continue;
         }
         let facts: Vec<Value> = [b - 1, *b, b + 1]
@@ -1063,55 +1057,40 @@ fn emit_bucket(
         .join("receipts")
         .join(format!("hour={tag}.json"));
 
-    // Idempotent skip: the receipt was sealed for the same unit version, the same
-    // source input facts, the same writer config, the same lockbox bytes, the same
-    // mapping/assets.csv content and the same ctx input files, and the sealed file
-    // still hashes to the receipt's sha256. A sealed file that no longer matches its
-    // receipt is rebuilt, not refused: the receipt is the record of what the file
-    // must contain, and a rerun from the same receipted sources is byte-identical.
-    let ctx_facts = ctx_input_facts(request, bucket);
-    let sealed_sha = file_hash(&final_path).ok();
-    if let Ok(old) = std::fs::read_to_string(&receipt_path).and_then(|text| {
-        serde_json::from_str::<Value>(&text).map_err(|_| std::io::Error::other("bad receipt json"))
-    }) {
-        {
-            let same_version =
-                old.get("unitVersion").and_then(Value::as_u64) == Some(u64::from(UNIT_VERSION));
-            let same_sources =
-                old.get("input").and_then(|i| i.get("sources")) == Some(&json!(facts));
-            let same_config = old.get("configSha256") == Some(&json!(config_hash()));
-            let same_lockbox = old.get("lockbox").and_then(|l| l.get("sha256"))
-                == Some(&json!(request.lockbox_sha256.trim().to_ascii_lowercase()));
-            let same_assets = old.get("input").and_then(|i| i.get("assets")) == Some(assets);
-            let same_ctx = old.get("input").and_then(|i| i.get("ctx")) == Some(&ctx_facts);
-            let sealed_intact = old
-                .get("output")
-                .and_then(|o| o.get("sha256"))
-                .and_then(Value::as_str)
-                .is_some_and(|expected| sealed_sha.as_deref() == Some(expected));
-            if same_version
-                && same_sources
-                && same_config
-                && same_lockbox
-                && same_assets
-                && same_ctx
-                && sealed_intact
-            {
-                report.skipped += 1;
-                if let Some(rows) = old.get("rows").and_then(Value::as_i64) {
-                    report.coin_hour_rows += u64::try_from(rows).unwrap_or(0);
-                }
-                let bytes = std::fs::metadata(&final_path).map(|m| m.len()).unwrap_or(0);
-                let sha = sealed_sha.unwrap_or_default();
-                return Ok(receipt::OutputFile {
-                    path: relative,
-                    rows: u64::try_from(old.get("rows").and_then(Value::as_i64).unwrap_or(0))
-                        .unwrap_or(0),
-                    bytes,
-                    sha256: sha,
-                });
-            }
+    // Idempotent skip, decided by the shared seal::check: the receipt's skipKey
+    // (unit, unit version, config sha256, lockbox sha256, inputs sha over the
+    // source facts, the assets.csv sha and the ctx day-file facts) must match
+    // field for field, and the sealed file must still hash to the receipt's
+    // output sha256. Everything else rebuilds: the receipt is the record of what
+    // the file must contain, and a rerun from the same receipted sources is
+    // byte-identical.
+    let key = seal::SkipKey::new(
+        UNIT,
+        UNIT_VERSION,
+        &config_hash(),
+        &request.lockbox_sha256,
+        json!({
+            "sources": facts,
+            "assetsCsvSha256": assets,
+            "ctx": ctx_input_facts(request, bucket),
+        }),
+    );
+    match seal::check(&receipt_path, &final_path, &key)? {
+        seal::Decision::Skip {
+            rows,
+            bytes,
+            sha256,
+        } => {
+            report.skipped += 1;
+            report.coin_hour_rows += rows;
+            return Ok(receipt::OutputFile {
+                path: relative,
+                rows,
+                bytes,
+                sha256,
+            });
         }
+        seal::Decision::Rebuild { .. } => {}
     }
 
     // parts.hour is unix seconds (the frozen stage-1 convention); `bucket` is an
@@ -1235,11 +1214,9 @@ fn emit_bucket(
         "hour": tag,
         "bucketHour": bucket,
         "rows": rows,
+        "skipKey": key.to_receipt_value(),
         "input": {
             "watermarkSha256": watermark.sha256,
-            "sources": facts,
-            "assets": assets,
-            "ctx": ctx_facts,
         },
         "output": {
             "path": relative,
@@ -1253,7 +1230,6 @@ fn emit_bucket(
             "dropped": false,
             "excludedHours": lockbox_hours.len(),
         },
-        "configSha256": config_hash(),
         "gitSha": request.git_sha,
         "provenance": provenance,
     });
