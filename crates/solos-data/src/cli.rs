@@ -1393,14 +1393,23 @@ fn combined_cli(args: &[String]) -> i32 {
                     "check-days",
                     "exactly three UTC days outside the lockbox for the HL-Phoenix price-tracking check"
                 )
+                .with(
+                    "hl-hours",
+                    "solos-data augment combined hl-hours --out <root> --fills <hl-fills-v1 root> --ctx-s3 <asset_ctxs dir> --ctx-capture <asset_contexts ALL dir> --lockbox <json> --lockbox-sha256 <hex> --provenance <json> [--since YYYY-MM-DD] [--until YYYY-MM-DD] [--threads 4] [--memory 8GB]"
+                )
+                .with(
+                    "hl-hours out",
+                    "combined store root: hl_coin_hour/date=.../hour=... Parquet, hl_coin_hour/receipts/, catalog.json"
+                )
                 .to_json()
         );
         return 0;
     }
     let result = match unit {
         "mapping" => combined_mapping_run(&args[1..]),
+        "hl-hours" => combined_hl_hours_run(&args[1..]),
         _ => Err(StoreError::Check(format!(
-            "unknown combined unit '{unit}' (units: mapping)"
+            "unknown combined unit '{unit}' (units: mapping, hl-hours)"
         ))),
     };
     match result {
@@ -1440,6 +1449,42 @@ fn combined_mapping_run(args: &[String]) -> Result<i32, StoreError> {
     let report = crate::augment::combined::mapping::run(&request)?;
     println!("{}", report.to_json());
     Ok(report.exit_code())
+}
+
+fn combined_hl_hours_run(args: &[String]) -> Result<i32, StoreError> {
+    let memory = flag(args, "--memory").unwrap_or("8GB").to_owned();
+    let parse_day_hour = |name: &str, end_of_day: i64| -> Result<Option<i64>, StoreError> {
+        match flag(args, name) {
+            Some(text) => {
+                let day = crate::augment::combined::grid::parse_date(text)?;
+                Ok(Some(
+                    crate::augment::combined::grid::hour_of_secs(
+                        crate::augment::combined::grid::day_start_secs(day),
+                    ) + end_of_day,
+                ))
+            }
+            None => Ok(None),
+        }
+    };
+    let since = parse_day_hour("--since", 0)?;
+    let until = parse_day_hour("--until", 23)?;
+    let request = crate::augment::combined::hlhours::Request {
+        out: PathBuf::from(required_flag(args, "--out")?),
+        fills: PathBuf::from(required_flag(args, "--fills")?),
+        ctx_s3: PathBuf::from(required_flag(args, "--ctx-s3")?),
+        ctx_capture: PathBuf::from(required_flag(args, "--ctx-capture")?),
+        lockbox: PathBuf::from(required_flag(args, "--lockbox")?),
+        lockbox_sha256: required_flag(args, "--lockbox-sha256")?.to_owned(),
+        provenance: PathBuf::from(required_flag(args, "--provenance")?),
+        since,
+        until,
+        threads: combined_threads_flag(args)?,
+        memory_limit: memory,
+        git_sha: crate::augment::hlfills::git_sha(),
+    };
+    let report = crate::augment::combined::hlhours::run(&request)?;
+    println!("{}", report.to_json());
+    Ok(0)
 }
 
 /// Combined units cap threads at 8 (PLAN.md).
