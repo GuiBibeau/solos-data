@@ -32,3 +32,42 @@ build.
   full-span run reads all 552 registered files). If that proves too slow for
   the full build, consider checking only epochs whose fills files carry more
   than one batch id (today that is the live epoch only).
+
+## #106 review follow-ups
+
+Left open from the first review of PR #106 (U2b/U2c). The shared-root items
+move to the shared seal PR (`pi/combined-shared-seal`) and are listed here so
+#106 does not lose them.
+
+- [ ] Shared, blocking: the idempotent skip key omits `assets.csv` content,
+  `config_sha256`, the lockbox sha and the requested range, and a skipped hour
+  does not re-hash the sealed file against its receipt (`M11`/`M12`). Fix lands
+  in the shared seal PR's skip-key helper; #106 routes through it afterwards.
+- [ ] Shared, blocking: `lockbox_hours_dropped` counts requested-range hours,
+  while the receipt schema (and ADR-0023) define it as covered input hours the
+  lockbox actually removed. Same shared PR; the U2 call sites switch to the
+  shared computation (`M01`'s filter itself is pinned here by the in-lockbox
+  fixtures).
+- [ ] Shared: a fixture builder with data inside the lockbox. This round ships
+  per-unit local builders (`phoenix`/`perp`/`pyth` lockbox tests with 10-03
+  data); they get swapped for the shared builder when it lands.
+- [ ] The report's `assets`/`pairs`/`feeds` counts cover the whole aggregate
+  (lockbox hours included), not just sealed hours. Report-only cosmetics; the
+  receipts carry the exact per-run facts.
+- [ ] Pyth rows can duplicate on `(hour, feed_id)` across lanes when the two
+  lanes disagree on `symbol` (the dedupe key is `(feed_id, publish_time)`), and
+  the `at_ms` tie-break is arrival-order, not chain order. Needs a decision on
+  which lane's symbol is authoritative.
+- [ ] The Flash `1e6` size scale and the default price exponent `-8` are read
+  off the data and verified against Pyth for SOL/BTC/ETH, but not derived from
+  the Flash program. Pin them from the IDL when one is fetched.
+- [ ] Each run overwrites the per-run receipt; only the per-hour receipts are a
+  durable history. Fine for now (the catalog watermarks repeat the latest
+  run), but a run-history file may be wanted for audits.
+- [ ] Hour files sealed before a lockbox change stay on disk (the plan drops
+  the hours, nothing deletes the old files). The skip-key fix must also
+  invalidate on the lockbox sha; physical cleanup of stale partitions is still
+  open.
+- [ ] `pyth_coin_hour` has no `mapped` column (`asset_id` NULL marks unmapped).
+  Adding one is an output-shape change (unit version bump) so it waits for the
+  next schema window.

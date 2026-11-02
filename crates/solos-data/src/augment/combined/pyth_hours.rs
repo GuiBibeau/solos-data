@@ -89,8 +89,9 @@ pub struct Report {
     pub lockbox_hours_dropped: u64,
     /// Distinct feeds across the built hours.
     pub feeds: u64,
-    /// The input watermark (max publish_time over all lane files).
-    pub watermark_max_publish_time: i64,
+    /// The input watermark: the minimum of the lanes' max publish_time (the
+    /// most-stalled lane holds it back).
+    pub watermark_publish_time: i64,
     /// Sealed hour outputs.
     pub outputs: Vec<HourOutput>,
 }
@@ -116,7 +117,7 @@ impl Report {
             .with("hoursEmpty", self.hours_empty)
             .with("lockboxHoursDropped", self.lockbox_hours_dropped)
             .with("feeds", self.feeds)
-            .with("watermarkMaxPublishTime", self.watermark_max_publish_time)
+            .with("watermarkPublishTime", self.watermark_publish_time)
             .with(
                 "outputs",
                 self.outputs
@@ -142,6 +143,7 @@ fn config_hash() -> String {
         "sort": ["feed_id"],
         "dedupe": "(feed_id, publish_time), later lane then later at_ms wins",
         "ordering": "publish_time (Pythnet clock), never at_ms",
+        "watermark": "the min of the lanes' max publish_time (a stalled lane holds the watermark back)",
         "pyLast": "price_f at max publish_time in the hour",
         "pyRet": "ln(last/first price_f in hour)",
         "pyConfRel": "mean of conf_f/price_f over the hour",
@@ -282,16 +284,17 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let first_hour = grid::hour_of_secs(grid::day_start_secs(first_day));
     let requested_last = grid::hour_of_secs(grid::day_start_secs(last_day)) + 23;
 
-    // Closure: the watermark is the max publish_time over all lane files,
-    // read from Parquet statistics (no data pages).
-    let watermark_max_publish_time = lane_watermark(&conn, &lanes)?;
+    // Closure: the watermark is the minimum of the lanes' max publish_time
+    // (the most-stalled lane holds it back), from Parquet statistics (no data
+    // pages).
+    let watermark_publish_time = lane_watermark(&conn, &lanes)?;
     let last_closed_hour = grid::floor_div(
-        watermark_max_publish_time - grid::HOUR_SECS - HOUR_GUARD_SECS,
+        watermark_publish_time - grid::HOUR_SECS - HOUR_GUARD_SECS,
         grid::HOUR_SECS,
     );
     if requested_last > last_closed_hour {
         return Err(StoreError::Check(format!(
-            "requested range extends past the input watermark: hour {requested_last} ends at {} but the watermark {watermark_max_publish_time} closes only hour {last_closed_hour} (+2h guard)",
+            "requested range extends past the input watermark: hour {requested_last} ends at {} but the watermark {watermark_publish_time} closes only hour {last_closed_hour} (+2h guard)",
             grid::hour_start(requested_last) + grid::HOUR_SECS
         )));
     }
@@ -373,17 +376,14 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let feeds = if outputs.is_empty() {
         0
     } else {
-        query_rows(
+        scalar(
             &conn,
             "SELECT count(DISTINCT feed_id) AS n FROM pyth_coin_hour_agg",
-            &[],
+            "n",
         )?
-        .first()
-        .and_then(|row| row.int("n"))
-        .unwrap_or(0) as u64
     };
     let mut watermark_facts = watermark.clone();
-    watermark_facts["max_publish_time"] = json!(watermark_max_publish_time);
+    watermark_facts["watermark_publish_time"] = json!(watermark_publish_time);
     watermark_facts["last_closed_hour"] = json!(last_closed_hour);
     finish_run(
         request.out,
@@ -411,7 +411,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         hours_empty,
         lockbox_hours_dropped: lockbox_dropped,
         feeds,
-        watermark_max_publish_time,
+        watermark_publish_time,
         outputs,
     })
 }
@@ -425,13 +425,19 @@ fn scalar(conn: &duckdb::Connection, sql: &str, column: &str) -> Result<u64, Sto
         .ok_or_else(|| StoreError::Check(format!("query has no {column}: {sql}")))
 }
 
-/// Max publish_time over every lane file, from Parquet statistics.
+/// Per lane the max publish_time of its files, from Parquet statistics; the
+/// caller takes the minimum across the lanes, so the most-stalled lane defines
+/// when the input counts as arrived.
 fn lane_watermark(
     conn: &duckdb::Connection,
     lanes: &[(PathBuf, Vec<FileRef>)],
 ) -> Result<i64, StoreError> {
-    let mut max: Option<i64> = None;
+    let mut min: Option<i64> = None;
     for (dir, files) in lanes {
+        if files.is_empty() {
+            continue;
+        }
+        let mut lane_max: Option<i64> = None;
         for file in files {
             let table = parquet_list(&[dir.join(&file.relative).to_string_lossy().to_string()])?;
             let rows = query_rows(
@@ -440,11 +446,14 @@ fn lane_watermark(
                 &[],
             )?;
             if let Some(hi) = rows.first().and_then(|row| row.int("hi")) {
-                max = Some(max.map_or(hi, |current| current.max(hi)));
+                lane_max = Some(lane_max.map_or(hi, |current| current.max(hi)));
             }
         }
+        if let Some(lane_max) = lane_max {
+            min = Some(min.map_or(lane_max, |current| current.min(lane_max)));
+        }
     }
-    max.ok_or_else(|| StoreError::Check("lane files have no publish_time".into()))
+    min.ok_or_else(|| StoreError::Check("lane files have no publish_time".into()))
 }
 
 /// Build `pyth_all` (all lane rows of the window with the lane index) and

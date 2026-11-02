@@ -246,7 +246,11 @@ pub fn write_hour_parquet(
     sync_tmp_file(&tmp)?;
     let rows = count_parquet_rows(conn, &tmp)?;
     std::fs::rename(&tmp, final_path)?;
-    sync_dir_after_rename(final_path)?;
+    // The rename's directory entry is what must be durable: fsync the parent
+    // directory, not the renamed file (whose bytes are already synced).
+    if let Some(parent) = final_path.parent() {
+        sync_dir_after_rename(parent)?;
+    }
     let bytes = std::fs::metadata(final_path)?.len();
     let sha256 = file_hash(final_path)?;
     Ok((rows, bytes, sha256))
@@ -316,12 +320,17 @@ pub fn hour_receipt_path(root: &Path, table: &str, hour: i64) -> PathBuf {
         .join(format!("{}.json", hour_file_key(hour)))
 }
 
-/// `YYYYMMDD-H`, the hour file key used by file names and receipts.
+/// `YYYYMMDD-H`, the hour file key used by file names and receipts. Hours
+/// outside the timestamp range (unreachable from a planned run) get a
+/// `hour-<n>` sentinel instead of panicking: it never matches a real
+/// partition key, so a broken hour is isolatable rather than fatal.
 #[must_use]
 pub fn hour_file_key(hour: i64) -> String {
     let secs = crate::augment::combined::grid::hour_start(hour);
-    let dt = chrono::DateTime::from_timestamp(secs, 0).expect("hour start is in range");
-    dt.format("%Y%m%d-%H").to_string()
+    match chrono::DateTime::from_timestamp(secs, 0) {
+        Some(dt) => dt.format("%Y%m%d-%H").to_string(),
+        None => format!("hour-{hour}"),
+    }
 }
 
 /// Write one hour's receipt durably.

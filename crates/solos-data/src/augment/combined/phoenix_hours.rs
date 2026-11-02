@@ -108,8 +108,13 @@ pub struct Report {
     pub fills_kept: u64,
     /// Fills rows dropped as superseded or duplicate revisions.
     pub fills_dropped: u64,
+    /// Deduplicated fills rows the aggregates refused (non-positive price or
+    /// size, NULL symbol).
+    pub fills_filtered: u64,
     /// Distinct assets across the built hours.
     pub assets: u64,
+    /// Distinct symbols the mapping does not cover (NULL asset_id).
+    pub unmapped: u64,
     /// The input watermark facts recorded in the receipt.
     pub watermark_max_block_time: i64,
     /// Sealed hour outputs.
@@ -137,7 +142,9 @@ impl Report {
             .with("lockboxHoursDropped", self.lockbox_hours_dropped)
             .with("fillsKept", self.fills_kept)
             .with("fillsDropped", self.fills_dropped)
+            .with("fillsFiltered", self.fills_filtered)
             .with("assets", self.assets)
+            .with("unmapped", self.unmapped)
             .with("watermarkMaxBlockTime", self.watermark_max_block_time)
             .with(
                 "outputs",
@@ -210,6 +217,8 @@ fn config_hash() -> String {
         "price": "price_ticks * tick_size * 10^(base_lot_decimals - quote_lot_decimals)",
         "quantity": "base_lots / 10^base_lot_decimals",
         "buy": "sum(px*qty) where maker_side = 'ask' (stored taker_side is a constant Bid parity quirk)",
+        "order": "first/last px and the rv minute ordering key are the (slot, tx_index, event_ordinal) tuple, never a packed float",
+        "filtered": "aggregates read only price_ticks > 0 AND base_lots > 0 AND asset_symbol IS NOT NULL rows; the refused rows are counted as fills_filtered",
         "rv": "sum of squared 1-minute last-price log diffs inside the hour",
         "hourGuardSecs": HOUR_GUARD_SECS,
         "dedupe": "decoder reader: latest parent revision per signature, latest event_id per batch_id",
@@ -461,6 +470,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
 
     let mut fills_kept = 0u64;
     let mut fills_dropped = 0u64;
+    let mut fills_filtered = 0u64;
     let mut hours_written = 0u64;
     let mut hours_empty = 0u64;
     if !pending.is_empty() {
@@ -477,6 +487,12 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         fills_kept = scalar(&conn, "SELECT count(*) AS n FROM fills_dedup", "n")?;
         let raw = scalar(&conn, "SELECT count(*) AS n FROM fills_raw_selected", "n")?;
         fills_dropped = raw.saturating_sub(fills_kept);
+        fills_filtered = scalar(
+            &conn,
+            "SELECT count(*) AS n FROM fills_dedup
+             WHERE NOT (price_ticks > 0 AND base_lots > 0 AND asset_symbol IS NOT NULL)",
+            "n",
+        )?;
 
         // The frozen stage-1 aggregates over the whole range in one pass,
         // then the mapping join.
@@ -545,6 +561,16 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             "n",
         )?
     };
+    let unmapped = if outputs.is_empty() {
+        0
+    } else {
+        scalar(
+            &conn,
+            "SELECT count(DISTINCT asset_symbol) AS n FROM phoenix_coin_hour_agg
+             WHERE asset_id IS NULL",
+            "n",
+        )?
+    };
     let mut watermark = inputs.watermark.clone();
     watermark["max_block_time"] = json!(watermark_max_block_time);
     watermark["last_closed_hour"] = json!(last_closed_hour);
@@ -575,7 +601,9 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         lockbox_hours_dropped: lockbox_dropped,
         fills_kept,
         fills_dropped,
+        fills_filtered,
         assets,
+        unmapped,
         watermark_max_block_time,
         outputs,
     })
@@ -608,12 +636,15 @@ fn build_fills_view(
     let fill_entries: Vec<(PathBuf, i64)> = selected
         .iter()
         .map(|(file, _, _)| {
-            (
-                decoded_root.join(&file.path),
-                file.batch_id.parse::<i64>().unwrap_or(0),
-            )
+            let batch_id = file.batch_id.parse::<i64>().map_err(|_| {
+                StoreError::Check(format!(
+                    "registered fills file {} has a non-numeric batch_id {}",
+                    file.path, file.batch_id
+                ))
+            })?;
+            Ok((decoded_root.join(&file.path), batch_id))
         })
-        .collect();
+        .collect::<Result<Vec<_>, StoreError>>()?;
     create_registrations(conn, "fill_registrations", &fill_entries)?;
 
     // Parent revisions of the selected rows share their slots, so the epoch
@@ -622,6 +653,11 @@ fn build_fills_view(
         .iter()
         .filter_map(|(file, _, _)| path_epoch(&file.path))
         .collect();
+    if epochs.len() != selected.len() {
+        return Err(StoreError::Check(
+            "registered fills file outside an epoch= directory".into(),
+        ));
+    }
     let epoch_min = epochs.iter().min().copied().unwrap_or(0);
     let epoch_max = epochs.iter().max().copied().unwrap_or(0);
     let slot_lo = epoch_min * EPOCH_SLOTS;
@@ -646,12 +682,15 @@ fn build_fills_view(
     let tx_entries: Vec<(PathBuf, i64)> = tx_files
         .iter()
         .map(|file| {
-            (
-                decoded_root.join(&file.path),
-                file.batch_id.parse::<i64>().unwrap_or(0),
-            )
+            let batch_id = file.batch_id.parse::<i64>().map_err(|_| {
+                StoreError::Check(format!(
+                    "registered decoded_transactions file {} has a non-numeric batch_id {}",
+                    file.path, file.batch_id
+                ))
+            })?;
+            Ok((decoded_root.join(&file.path), batch_id))
         })
-        .collect();
+        .collect::<Result<Vec<_>, StoreError>>()?;
     create_registrations(conn, "tx_registrations", &tx_entries)?;
 
     conn.execute_batch(&format!(
@@ -727,9 +766,10 @@ fn build_aggregates(conn: &duckdb::Connection) -> Result<(), StoreError> {
              SELECT asset_symbol,
                     (block_time // 3600) * 3600 AS hour,
                     block_time // 60 AS minute,
-                    block_time::HUGEINT * 1000000000000
-                        + tx_index::HUGEINT * 100000
-                        + event_ordinal::HUGEINT AS k,
+                    -- The event order inside an hour is the (slot, tx_index,
+                    -- event_ordinal) tuple: slots are the chain's own order and
+                    -- a packed float can tie or spill across its buckets.
+                    struct_pack(a := slot, b := tx_index, c := event_ordinal) AS k,
                     block_time,
                     price_ticks::DOUBLE * tick_size::DOUBLE
                         * power(10::DOUBLE, (base_lot_decimals - quote_lot_decimals)::DOUBLE) AS px,
@@ -773,7 +813,7 @@ fn create_mapping_table(conn: &duckdb::Connection, mapping: &PhoenixMap) -> Resu
     }
     conn.execute_batch(
         "CREATE TABLE phoenix_coin_hour_agg AS
-         SELECT a.hour, a.asset_symbol, m.asset_id, m.mapped,
+         SELECT a.hour, a.asset_symbol, m.asset_id, coalesce(m.mapped, FALSE) AS mapped,
                 a.n_trades, a.vol_usd, a.buy_usd, a.first_px, a.last_px,
                 a.first_ts, a.last_ts, a.rv2, a.n_minutes, a.ph_liq_usd
          FROM phoenix_agg_stage a

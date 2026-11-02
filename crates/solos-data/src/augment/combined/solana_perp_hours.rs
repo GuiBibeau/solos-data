@@ -125,8 +125,11 @@ pub struct Report {
     pub flash_events: u64,
     /// Distinct (venue, key) pairs across the built hours.
     pub pairs: u64,
-    /// The input watermark (max block_time over all lane files).
-    pub watermark_max_block_time: i64,
+    /// Distinct (venue, key) pairs the mapping does not cover (NULL asset_id).
+    pub unmapped: u64,
+    /// The input watermark: per venue the minimum of its lanes' max block_time
+    /// (the most-stalled lane), then the minimum across the two venues.
+    pub watermark_block_time: i64,
     /// Sealed hour outputs.
     pub outputs: Vec<HourOutput>,
 }
@@ -154,7 +157,8 @@ impl Report {
             .with("jupiterEvents", self.jupiter_events)
             .with("flashEvents", self.flash_events)
             .with("pairs", self.pairs)
-            .with("watermarkMaxBlockTime", self.watermark_max_block_time)
+            .with("unmapped", self.unmapped)
+            .with("watermarkBlockTime", self.watermark_block_time)
             .with(
                 "outputs",
                 self.outputs
@@ -197,6 +201,8 @@ fn config_hash() -> String {
         "jupSideLong": SIDE_LONG,
         "buyShare": "long increase size over all increase size (jupiter only; flash has no side)",
         "ret": "ln(last/first event price in hour), price>0 rows only",
+        "retOrder": "event order is the (slot, signature, ordinal) tuple: the tx is its signature, ordinal the position inside it; no packed bucket can tie or spill",
+        "watermark": "per venue the min of its lanes' max block_time (a stalled lane holds the watermark back), then the min across venues",
         "flashPrice": "coalesce(exit, entry, oracle_account_price) * 10^exponent",
         "dedupe": "(signature, ordinal), later lane wins",
         "hourGuardSecs": HOUR_GUARD_SECS,
@@ -353,18 +359,19 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let first_hour = grid::hour_of_secs(grid::day_start_secs(first_day));
     let requested_last = grid::hour_of_secs(grid::day_start_secs(last_day)) + 23;
 
-    // Closure: the watermark is the max block_time over all lane files, read
-    // from Parquet statistics (no data pages).
-    let mut all_lanes = jupiter_lanes.clone();
-    all_lanes.extend(flash_lanes.iter().cloned());
-    let watermark_max_block_time = lane_watermark(&conn, &all_lanes)?;
+    // Closure: per venue the watermark is the minimum of its lanes' max
+    // block_time (the most-stalled lane holds it back), from Parquet statistics
+    // (no data pages); the run's watermark is the minimum across venues.
+    let jupiter_watermark = lane_watermark(&conn, &jupiter_lanes)?;
+    let flash_watermark = lane_watermark(&conn, &flash_lanes)?;
+    let watermark_block_time = jupiter_watermark.min(flash_watermark);
     let last_closed_hour = grid::floor_div(
-        watermark_max_block_time - grid::HOUR_SECS - HOUR_GUARD_SECS,
+        watermark_block_time - grid::HOUR_SECS - HOUR_GUARD_SECS,
         grid::HOUR_SECS,
     );
     if requested_last > last_closed_hour {
         return Err(StoreError::Check(format!(
-            "requested range extends past the input watermark: hour {requested_last} ends at {} but the watermark {watermark_max_block_time} closes only hour {last_closed_hour} (+2h guard)",
+            "requested range extends past the input watermark: hour {requested_last} ends at {} but the watermark {watermark_block_time} closes only hour {last_closed_hour} (+2h guard)",
             grid::hour_start(requested_last) + grid::HOUR_SECS
         )));
     }
@@ -458,8 +465,18 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             "n",
         )?
     };
+    let unmapped = if outputs.is_empty() {
+        0
+    } else {
+        scalar(
+            &conn,
+            "SELECT count(*) AS n FROM (SELECT venue, venue_key FROM solana_perp_hour_agg
+             WHERE asset_id IS NULL GROUP BY venue, venue_key) unmapped",
+            "n",
+        )?
+    };
     let mut watermark_facts = watermark.clone();
-    watermark_facts["max_block_time"] = json!(watermark_max_block_time);
+    watermark_facts["watermark_block_time"] = json!(watermark_block_time);
     watermark_facts["last_closed_hour"] = json!(last_closed_hour);
     finish_run(
         request.out,
@@ -489,7 +506,8 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         jupiter_events,
         flash_events,
         pairs,
-        watermark_max_block_time,
+        unmapped,
+        watermark_block_time,
         outputs,
     })
 }
@@ -503,10 +521,16 @@ fn scalar(conn: &duckdb::Connection, sql: &str, column: &str) -> Result<u64, Sto
         .ok_or_else(|| StoreError::Check(format!("query has no {column}: {sql}")))
 }
 
-/// Max block_time over every lane file, from Parquet statistics.
+/// Per lane the max block_time of its files, from Parquet statistics; the
+/// caller takes the minimum across a venue's lanes, so the most-stalled lane
+/// defines when the venue's input counts as arrived.
 fn lane_watermark(conn: &duckdb::Connection, lanes: &[Lane]) -> Result<i64, StoreError> {
-    let mut max: Option<i64> = None;
+    let mut min: Option<i64> = None;
     for (dir, files) in lanes {
+        if files.is_empty() {
+            continue;
+        }
+        let mut lane_max: Option<i64> = None;
         for file in files {
             let table = parquet_list(&[dir.join(&file.relative).to_string_lossy().to_string()])?;
             let rows = query_rows(
@@ -515,11 +539,14 @@ fn lane_watermark(conn: &duckdb::Connection, lanes: &[Lane]) -> Result<i64, Stor
                 &[],
             )?;
             if let Some(hi) = rows.first().and_then(|row| row.int("hi")) {
-                max = Some(max.map_or(hi, |current| current.max(hi)));
+                lane_max = Some(lane_max.map_or(hi, |current| current.max(hi)));
             }
         }
+        if let Some(lane_max) = lane_max {
+            min = Some(min.map_or(lane_max, |current| current.min(lane_max)));
+        }
     }
-    max.ok_or_else(|| StoreError::Check("lane files have no block_time".into()))
+    min.ok_or_else(|| StoreError::Check("lane files have no block_time".into()))
 }
 
 /// Build `events_all` (all lane rows of the window with the lane index),
@@ -580,7 +607,7 @@ fn build_event_views(
         .join(", ");
     conn.execute_batch(&format!(
         "CREATE TABLE jup_pos AS
-         SELECT (block_time // 3600) * 3600 AS hour, block_time, ordinal,
+         SELECT (block_time // 3600) * 3600 AS hour, block_time, slot, signature, ordinal,
                 json_extract_string(fields, '$.positionCustody') AS custody,
                 name,
                 try_cast(json_extract_string(fields, '$.sizeUsdDelta') AS HUGEINT) AS size_usd_delta,
@@ -588,7 +615,10 @@ fn build_event_views(
                 try_cast(json_extract_string(fields, '$.fundingFeeUsd') AS HUGEINT) AS funding_fee_usd,
                 try_cast(json_extract_string(fields, '$.positionSide') AS INTEGER) AS side,
                 try_cast(json_extract_string(fields, '$.price') AS HUGEINT) AS price,
-                block_time::BIGINT * 100 + ordinal AS ord_key
+                -- The event order is the (slot, signature, ordinal) tuple: the
+                -- tx is its signature, ordinal the position inside it, so two
+                -- events never tie and no packed bucket spills.
+                struct_pack(a := slot, b := signature, c := ordinal) AS ord_key
          FROM jup_dedup
          WHERE name IN ({jupiter_names})"
     ))
@@ -598,7 +628,7 @@ fn build_event_views(
     // market address; names repeat suffixes, so the match is by substring.
     conn.execute_batch(
         "CREATE TABLE flash_pos AS
-         SELECT (block_time // 3600) * 3600 AS hour, block_time, ordinal, name,
+         SELECT (block_time // 3600) * 3600 AS hour, block_time, slot, signature, ordinal, name,
                 json_extract_string(fields, '$.market') AS market,
                 coalesce(try_cast(json_extract_string(fields,'$.delta_size_usd') AS HUGEINT),
                          try_cast(json_extract_string(fields,'$.deltaSizeUsd') AS HUGEINT)) AS size_usd_delta,
@@ -615,7 +645,7 @@ fn build_event_views(
                          try_cast(json_extract_string(fields,'$.entry_price_exponent') AS INTEGER),
                          try_cast(json_extract_string(fields,'$.entryPriceExponent') AS INTEGER),
                          -8) AS price_exp,
-                block_time::BIGINT * 100 + ordinal AS ord_key
+                struct_pack(a := slot, b := signature, c := ordinal) AS ord_key
          FROM flash_dedup
          WHERE (name LIKE '%OpenPosition%' OR name LIKE '%IncreaseSize%'
                 OR name LIKE '%DecreaseSize%' OR name LIKE '%ClosePosition%'
@@ -687,7 +717,7 @@ fn create_mapping_table(conn: &duckdb::Connection, mapping: &PerpMap) -> Result<
     }
     conn.execute_batch(
         "CREATE TABLE solana_perp_hour_agg AS
-         SELECT s.hour, s.venue, s.venue_key, m.asset_id, m.mapped,
+         SELECT s.hour, s.venue, s.venue_key, m.asset_id, coalesce(m.mapped, FALSE) AS mapped,
                 s.n_inc, s.n_dec, s.n_liq, s.size_usd, s.buy_share,
                 s.funding_fee_usd, s.liq_usd, s.ret, s.present
          FROM solana_perp_hour_stage s
