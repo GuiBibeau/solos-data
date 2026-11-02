@@ -34,13 +34,16 @@
 //! USD sums are carried as integer micro-dollars (BIGINT) end to end. Integer
 //! sums do not depend on accumulation order, so sealed bytes are a pure
 //! function of the input bytes; only the final divisions to doubles happen at
-//! merge time, on exact integer operands. The SOL hourly price itself is a
-//! deterministic max over (publish_time, price), not an order-dependent argmax.
+//! merge time, on exact integer operands. The SOL hourly price is the hour's
+//! last print by `publish_time` (highest price on an exact tie), chosen by a
+//! deterministic `row_number`, not an order-dependent argmax.
 //!
 //! Hours are published only when the input watermark closes them: hour `h`
 //! needs `max(block_time) >= h + 1h + 2h` (the +2h guard). Requested hours
 //! beyond that refuse the run; trailing unclosed hours are dropped and counted.
-//! Lockbox v2 hours are dropped from both tables; receipts record how many.
+//! Lockbox v2 hours are dropped from both tables and from every partial and
+//! price input (ADR-0023: the lockbox applies to every input span); receipts
+//! record the input hours the lockbox actually removed.
 
 use crate::fsutil::{
     create_dir_all_durable, file_hash, sync_dir_after_rename, sync_tmp_file, tmp_path,
@@ -53,11 +56,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::decoder::parquet;
-use std::os::unix::fs::OpenOptionsExt;
 
 use super::catalog;
 use super::grid;
 use super::lockbox;
+use super::mapping;
 use super::receipt;
 
 // ---------------------------------------------------------------------------
@@ -192,7 +195,9 @@ pub struct Report {
     pub hours_skipped: u64,
     /// Hours in range with no swaps at all.
     pub hours_empty: u64,
-    /// Lockbox hours inside the published range (dropped, never written).
+    /// Input hours the lockbox actually removes from this run's swap span:
+    /// hours the inputs covered that fall inside the exclusion set (U1's
+    /// definition, ADR-0023), not the size of the set.
     pub lockbox_hours_dropped: u64,
     /// Trailing hours the watermark had not closed (dropped).
     pub hours_unclosed: u64,
@@ -335,7 +340,9 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     let git = git_sha();
 
     create_dir_all_durable(request.out)?;
-    let _guard = lock_output(request.out)?;
+    // The shared combined-store lock: every unit serializes its catalog.json
+    // load/modify/save on this one file (ADR-0023).
+    let _guard = mapping::lock_output(request.out)?;
     let temp_dir = request.out.join(".tmp-duckdb-spotdex");
     let _ = std::fs::remove_dir_all(&temp_dir);
     create_dir_all_durable(&temp_dir)?;
@@ -383,14 +390,16 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             "no closed hour in the requested range".into(),
         ));
     }
-    let lockbox_in_range = lockbox_hours
-        .iter()
-        .filter(|hour| **hour >= range_lo && **hour <= range_hi)
+    // U1's definition (ADR-0023): input hours the lockbox actually removes —
+    // hours the swap inputs cover that fall inside the exclusion set, over the
+    // whole input span, not the requested range.
+    let lockbox_hours_dropped = lockbox_hours
+        .range(first_data_hour..=last_data_hour)
         .count() as u64;
     let hours_unclosed = last_data_hour.saturating_sub(last_closed_hour) as u64;
 
-    // Pyth SOL hourly last prices.
-    if load_sol_px(&conn, request.pyth_prices)? == 0 {
+    // Pyth SOL hourly last prices (lockbox-hour prints filtered out).
+    if load_sol_px(&conn, request.pyth_prices, &lockbox_hours)? == 0 {
         return Err(StoreError::Check(
             "no Pyth SOL prices in --pyth-prices (wSOL pricing impossible)".into(),
         ));
@@ -437,7 +446,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             )));
         }
         swaps_read += rows;
-        write_partials(&conn, &parts, file)?;
+        write_partials(&conn, &parts, file, &lockbox_hours)?;
         state.files.insert(file.stem.clone(), file.sha256.clone());
         state.config_sha256 = config.clone();
         let mut body = serde_json::to_vec(&state).map_err(|e| StoreError::Check(e.to_string()))?;
@@ -460,7 +469,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         hours_written: 0,
         hours_skipped: 0,
         hours_empty: 0,
-        lockbox_hours_dropped: lockbox_in_range,
+        lockbox_hours_dropped,
         hours_unclosed,
         mint_rows: 0,
         venue_hours: 0,
@@ -494,8 +503,47 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
             &config,
             &checked_lockbox_sha,
         )? {
+            let rebuilt_swaps = existing.rows;
+            let hour_path = under_out(request.out, &existing.path)?;
             sealed.push(existing);
             report.hours_skipped += 1;
+            // A crash between the hour receipt and the venue seal must not
+            // lose the hour from spotdex_venue_hour: rebuild the venue row
+            // from the same partials the hour was merged from, cross-checked
+            // against the receipt's recorded USD and the sealed hour file's
+            // swap count, and let the month seal below re-seal the month.
+            let published = read_hour_receipt(request.out, &key).expect("checked above");
+            let venue = merge_venue_hour(
+                &conn,
+                &parts,
+                hour,
+                rebuilt_swaps as usize,
+                new_pools.as_ref(),
+            )?;
+            if venue.usd_micro != published.usd_micro {
+                return Err(StoreError::Check(format!(
+                    "hour {hour}: rebuilt venue USD {:?} != receipt {:?}",
+                    venue.usd_micro, published.usd_micro
+                )));
+            }
+            let swaps_sum = scalar_i64(
+                &conn,
+                &format!(
+                    "SELECT sum(n_swaps) AS n FROM read_parquet({})",
+                    sql_string(&hour_path.to_string_lossy())
+                ),
+            )?;
+            if swaps_sum != venue.sd_swaps * 2 {
+                return Err(StoreError::Check(format!(
+                    "hour {hour}: sealed file counts {swaps_sum} swap sides, venue row has {}",
+                    venue.sd_swaps
+                )));
+            }
+            usd_micro_total = usd_micro_total.saturating_add(venue.usd_micro.unwrap_or(0));
+            venue_months
+                .entry(month_of_hour(hour))
+                .or_default()
+                .push((hour, venue));
             continue;
         }
         let Some(mint) = merge_mint_hour(&conn, &parts, hour)? else {
@@ -765,10 +813,10 @@ fn config_hash() -> String {
         "maxPriceStalenessHours": MAX_PRICE_STALENESS_HOURS,
         "stableMints": [USDC_MINT, USDT_MINT],
         "wsolMint": WSOL_MINT,
-        "priceSource": "pyth SOL hourly last by publish_time, carried forward",
+        "priceSource": "pyth SOL hourly last by publish_time, carried forward; lockbox-hour prints excluded",
         "programs": PROGRAMS,
-        "newPools": "global first hour when the run covers the input floor, else null",
-        "lockbox": "v2 weeks with guard hours, dropped from every table",
+        "newPools": "global first lockbox-free hour when the run covers the input floor, else null",
+        "lockbox": "v2 weeks with guard hours, dropped from every table, partial and price input",
     });
     crate::fsutil::sha256_hex(body.to_string().as_bytes())
 }
@@ -938,8 +986,14 @@ fn row_count(conn: &duckdb::Connection, path: &Path) -> Result<u64, StoreError> 
 /// `publish_time`, and load it into the `sol_px` temp table. The price of an
 /// hour is the `price_f` of the hour's latest `publish_time` (highest price
 /// breaking an exact tie), picked by a deterministic `row_number` so the
-/// result never depends on scan order.
-fn load_sol_px(conn: &duckdb::Connection, dirs: &[PathBuf]) -> Result<usize, StoreError> {
+/// result never depends on scan order. Prints inside lockbox hours are
+/// dropped first (ADR-0023: the lockbox applies to every input span), so the
+/// 48h carry-forward can never reach across a lockbox print.
+fn load_sol_px(
+    conn: &duckdb::Connection,
+    dirs: &[PathBuf],
+    lockbox_hours: &BTreeSet<i64>,
+) -> Result<usize, StoreError> {
     let mut files: Vec<String> = Vec::new();
     for dir in dirs {
         collect_parquet(dir, &mut files)?;
@@ -950,6 +1004,11 @@ fn load_sol_px(conn: &duckdb::Connection, dirs: &[PathBuf]) -> Result<usize, Sto
         ));
     }
     files.sort();
+    let excluded = lockbox_hours
+        .iter()
+        .map(|hour| hour.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
     conn.execute_batch(&format!(
         "CREATE OR REPLACE TEMP TABLE sol_px AS
          SELECT px_hour, px
@@ -963,6 +1022,8 @@ fn load_sol_px(conn: &duckdb::Connection, dirs: &[PathBuf]) -> Result<usize, Sto
                     publish_time AS pt,
                     max(price_f) AS px
              FROM {} WHERE symbol = 'SOL' AND price_f IS NOT NULL AND price_f > 0
+               AND CAST(floor(publish_time / 3600) AS BIGINT)
+                   NOT IN (SELECT unnest([{excluded}]))
              GROUP BY 1, 2
            )
          )
@@ -1070,18 +1131,25 @@ fn priced_cte(file: &SwapFile, hour: i64) -> String {
     )
 }
 
-/// Write the partials of one batch: per hour the `a1` per-(mint, hour) sums,
-/// `a2` per-(mint, hour) pool hashes and `c` per-(hour, program) sums, then the
-/// `b` per-pool first hours over the whole file. The `b` write is last, so its
-/// existence is the resumability probe.
+/// Write the partials of one batch: per non-lockbox hour the `a1`
+/// per-(mint, hour) sums, `a2` per-(mint, hour) pool hashes and `c`
+/// per-(hour, program) sums, then the `b` per-pool first lockbox-free hours
+/// over the whole file. Lockbox hours get no partials at all (ADR-0023: the
+/// lockbox applies to every input span, intermediates included), so no
+/// published output can read lockbox-derived aggregates. The `b` write is
+/// last, so its existence is the resumability probe.
 fn write_partials(
     conn: &duckdb::Connection,
     parts: &Path,
     file: &SwapFile,
+    lockbox_hours: &BTreeSet<i64>,
 ) -> Result<(), StoreError> {
     let first = grid::hour_of_secs(file.bt_min);
     let last = grid::hour_of_secs(file.bt_max);
     for hour in first..=last {
+        if lockbox_hours.contains(&hour) {
+            continue;
+        }
         let priced = priced_cte(file, hour);
         let key = grid::hour_key(hour);
         let priced_rows = hour_row_count(conn, file, hour)?;
@@ -1093,6 +1161,8 @@ fn write_partials(
             .join(format!("hk={key}"))
             .join(format!("{}.parquet", file.stem));
         create_dir_all_durable(a1_path.parent().expect("a1 parent"))?;
+        let a1_tmp = tmp_path(&a1_path);
+        let _ = std::fs::remove_file(&a1_tmp);
         let sql = format!(
             "COPY (
                WITH proj AS (
@@ -1108,11 +1178,11 @@ fn write_partials(
                  bit_or({mask}) AS programs_mask
                FROM proj GROUP BY mint ORDER BY mint
              ) TO {} ({})",
-            sql_string(&a1_path.to_string_lossy()),
+            sql_string(&a1_tmp.to_string_lossy()),
             parquet::COPY_OPTIONS,
             mask = program_mask_sql(),
         );
-        conn.execute_batch(&sql)?;
+        copy_parquet_durable(conn, &sql, &a1_tmp, &a1_path)?;
         if priced_rows == 0 {
             continue;
         }
@@ -1122,6 +1192,8 @@ fn write_partials(
             .join(format!("hk={key}"))
             .join(format!("{}.parquet", file.stem));
         create_dir_all_durable(a2_path.parent().expect("a2 parent"))?;
+        let a2_tmp = tmp_path(&a2_path);
+        let _ = std::fs::remove_file(&a2_tmp);
         let sql = format!(
             "COPY (
                SELECT DISTINCT mint, hour, pool_hash FROM (
@@ -1130,16 +1202,18 @@ fn write_partials(
                  SELECT out_mint AS mint, {hour} AS hour, hash(pool) AS pool_hash FROM ({priced})
                ) ORDER BY mint, pool_hash
              ) TO {} ({})",
-            sql_string(&a2_path.to_string_lossy()),
+            sql_string(&a2_tmp.to_string_lossy()),
             parquet::COPY_OPTIONS,
         );
-        conn.execute_batch(&sql)?;
+        copy_parquet_durable(conn, &sql, &a2_tmp, &a2_path)?;
         // c: per-(hour, program) sums.
         let c_path = parts
             .join("c")
             .join(format!("hk={key}"))
             .join(format!("{}.parquet", file.stem));
         create_dir_all_durable(c_path.parent().expect("c parent"))?;
+        let c_tmp = tmp_path(&c_path);
+        let _ = std::fs::remove_file(&c_tmp);
         let sql = format!(
             "COPY (
                SELECT {hour} AS hour, program,
@@ -1149,25 +1223,61 @@ fn write_partials(
                FROM ({priced})
                GROUP BY program ORDER BY program
              ) TO {} ({})",
-            sql_string(&c_path.to_string_lossy()),
+            sql_string(&c_tmp.to_string_lossy()),
             parquet::COPY_OPTIONS,
         );
-        conn.execute_batch(&sql)?;
+        copy_parquet_durable(conn, &sql, &c_tmp, &c_path)?;
     }
-    // b: pool first hours over the whole file (the resumability probe).
+    // b: pool first hours over the whole file, lockbox hours filtered out
+    // (the resumability probe). A pool that only ever traded inside the
+    // lockbox gets no row here, and a pool's first published hour is its
+    // first lockbox-free hour, so `sd_new_pools` never depends on
+    // lockbox-week data.
     let b_path = parts.join("b").join(format!("{}.parquet", file.stem));
     create_dir_all_durable(b_path.parent().expect("b parent"))?;
+    let excluded = lockbox_hours
+        .iter()
+        .map(|hour| hour.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let b_tmp = tmp_path(&b_path);
+    let _ = std::fs::remove_file(&b_tmp);
     let sql = format!(
         "COPY (
            SELECT pool, min(CAST(floor(block_time / 3600) * 3600 AS BIGINT)) AS first_hour
            FROM read_parquet({})
+           WHERE CAST(floor(block_time / 3600) AS BIGINT)
+               NOT IN (SELECT unnest([{excluded}]))
            GROUP BY pool ORDER BY pool
          ) TO {} ({})",
         sql_string(&file.path.to_string_lossy()),
-        sql_string(&b_path.to_string_lossy()),
+        sql_string(&b_tmp.to_string_lossy()),
         parquet::COPY_OPTIONS
     );
-    conn.execute_batch(&sql)?;
+    copy_parquet_durable(conn, &sql, &b_tmp, &b_path)?;
+    Ok(())
+}
+
+/// Finish one partial COPY: fsync the staging file, rename it into place,
+/// fsync the directory. Partials are resume state, so a torn COPY must never
+/// look written: `partials_look_written` trusts the renamed file.
+fn copy_parquet_durable(
+    conn: &duckdb::Connection,
+    copy_sql: &str,
+    tmp: &Path,
+    final_path: &Path,
+) -> Result<(), StoreError> {
+    if let Err(error) = conn.execute_batch(copy_sql) {
+        let _ = std::fs::remove_file(tmp);
+        return Err(error.into());
+    }
+    sync_tmp_file(tmp)?;
+    std::fs::rename(tmp, final_path)?;
+    sync_dir_after_rename(
+        final_path
+            .parent()
+            .ok_or_else(|| StoreError::Check("partial has no parent".into()))?,
+    )?;
     Ok(())
 }
 
@@ -1764,29 +1874,6 @@ fn already_published(
     Ok(Some(r.output))
 }
 
-/// Exclusive `.spotdex-hours.lock` beside the output root.
-fn lock_output(out: &Path) -> Result<nix::fcntl::Flock<std::fs::File>, StoreError> {
-    let path = out.join(".spotdex-hours.lock");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(&path)?;
-    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-        Ok(file) => Ok(file),
-        Err((_, errno))
-            if errno == nix::errno::Errno::EWOULDBLOCK || errno == nix::errno::Errno::EAGAIN =>
-        {
-            Err(StoreError::Check(
-                "spotdex-hours output already owned".into(),
-            ))
-        }
-        Err((_, errno)) => Err(std::io::Error::from(errno).into()),
-    }
-}
-
 /// DuckDB memory cap: the shared parser, plus the plan's 32GB ceiling.
 fn parse_memory_cap(text: &str) -> Result<String, StoreError> {
     let limit = crate::augment::hlfills::parse_memory_limit(text)?;
@@ -2296,7 +2383,15 @@ mod tests {
         // 2026-09-30T12:00 = 1_790_769_600 sits inside the busy week plus its
         // 24h guard (2026-09-27T00:00 to 2026-10-06T00:00).
         let hour = 1_790_769_600 / 3_600;
-        write_pyth(&fx.pyth_dir, &[(hour * 3_600 + 10, "SOL", 100.0)]);
+        // One print inside the lockbox hour, one in the free week before it,
+        // so the price table is not empty (the lockbox print is filtered).
+        write_pyth(
+            &fx.pyth_dir,
+            &[
+                (hour * 3_600 + 10, "SOL", 100.0),
+                (1_790_463_610, "SOL", 100.0), // 2026-09-26T23:00:10, free
+            ],
+        );
         let swaps = vec![
             swap(hour * 3_600 + 100, "PX", true, 1_000_000_000, 10_000_000),
             // Watermark swap at 2026-10-02T00:00 closes the requested day.
@@ -2316,7 +2411,11 @@ mod tests {
             report.hours_written, 0,
             "every hour with data is a lockbox hour"
         );
-        assert_eq!(report.lockbox_hours_dropped, 12, "12:00 to 23:00 UTC");
+        // U1's definition: input hours the lockbox actually removes, over the
+        // whole input span (09-30T12:00 to the 10-02T00:00 watermark swap),
+        // not the requested day. The whole span sits inside the busy week's
+        // guard window (to 10-06T00:00): 12 + 24 + 1 = 37 hours.
+        assert_eq!(report.lockbox_hours_dropped, 37, "input span hours dropped");
         assert_eq!(
             report.hours_empty, 0,
             "every in-range hour is a lockbox hour"
@@ -2332,21 +2431,37 @@ mod tests {
         )
         .expect("run receipt json");
         assert_eq!(run_receipt["rows"], 0, "no rows published");
-        // Dropped is the data-derived count of in-range hours the lockbox
-        // removed; excluded is the size of the whole v2 set. The two are
+        // Dropped is the data-derived count of input-span hours the lockbox
+        // removes; excluded is the size of the whole v2 set. The two are
         // different numbers and must never be swapped.
-        assert_eq!(run_receipt["lockbox_hours_dropped"], 12);
+        assert_eq!(run_receipt["lockbox_hours_dropped"], 37);
         assert_eq!(run_receipt["lockbox_hours_excluded"], 864);
-        assert_eq!(run_receipt["inputs"]["lockbox_hours_dropped"], 12);
+        assert_eq!(run_receipt["inputs"]["lockbox_hours_dropped"], 37);
         let catalog: Value = serde_json::from_str(
             &std::fs::read_to_string(fx.root.join("catalog.json")).expect("catalog"),
         )
         .expect("catalog json");
         assert_eq!(
-            catalog["watermarks"][UNIT]["lockbox_hours_dropped"], 12,
+            catalog["watermarks"][UNIT]["lockbox_hours_dropped"], 37,
             "dropped stays data-derived in the catalog"
         );
         assert_eq!(catalog["watermarks"][UNIT]["lockbox_hours_excluded"], 864);
+    }
+
+    #[test]
+    fn a_run_refuses_while_another_unit_holds_the_combined_lock() {
+        let fx = Fixture::new("lock");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000)];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        // Another combined unit (mapping, hl-hours, a concurrent spotdex run)
+        // holds the shared combined.lock while it rewrites catalog.json.
+        let guard = super::mapping::lock_output(&fx.root).expect("hold combined.lock");
+        let error = run(&fx.request(None, None))
+            .expect_err("the shared combined.lock must exclude a second unit");
+        assert!(error.to_string().contains("already owned"), "{error}");
+        drop(guard);
     }
 
     #[test]
@@ -2484,6 +2599,490 @@ mod tests {
             .abs()
                 < 1e-12
         );
+    }
+
+    /// The fixture's lockbox exclusion hours.
+    fn lockbox_set(fx: &Fixture) -> BTreeSet<i64> {
+        let lock = lockbox::load(&fx.lockbox, &fx.lockbox_sha).expect("lockbox");
+        lock.excluded_hours().expect("excluded hours")
+    }
+
+    /// An in-memory DuckDB connection with the Parquet extension.
+    fn test_conn() -> duckdb::Connection {
+        let conn = duckdb::Connection::open_in_memory().expect("fixture conn");
+        parquet::require_connection_duckdb(&conn).expect("parquet extension");
+        conn
+    }
+
+    #[test]
+    fn the_sol_price_is_the_hours_last_print() {
+        let fx = Fixture::new("lastprint");
+        // Two prints in hour H: 110 first, then 100. The hour's price is the
+        // LAST print, so 3 wSOL price to USD 300; the max or the first print
+        // would give 330.
+        write_pyth(
+            &fx.pyth_dir,
+            &[(H_SEC + 10, "SOL", 110.0), (H_SEC + 20, "SOL", 100.0)],
+        );
+        let swaps = vec![
+            Swap {
+                block_time: H_SEC + 100,
+                program: "pumpswap",
+                pool: "PX",
+                mint_a: "TokenA11111111111111111111111111111111111111",
+                mint_b: WSOL_MINT,
+                decimals_a: 6,
+                decimals_b: 9,
+                a_to_b: true,
+                amount_in: 1_000_000,
+                amount_out: 3_000_000_000,
+            },
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        let report = run(&fx.request(None, None)).expect("run");
+        assert_eq!(report.hours_written, 1);
+        let rows = read_rows(&hour_file(&fx.root, H));
+        let wsol = rows
+            .iter()
+            .find(|row| row.str("mint") == Some(WSOL_MINT))
+            .expect("wsol row");
+        let usd = wsol.get("usd_volume").and_then(Value::as_f64).expect("usd");
+        assert!(
+            (usd - 300.0).abs() < 1e-9,
+            "the hour's last print (100) prices the 3 wSOL, got usd {usd}"
+        );
+    }
+
+    #[test]
+    fn lockbox_swaps_never_feed_partials_or_new_pools() {
+        let fx = Fixture::new("lockboxpartials");
+        // 2026-09-30T12:00 sits inside the busy week plus its guard.
+        let lb_sec = 1_790_769_600;
+        let lb_hour = lb_sec / 3_600;
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            // PB trades inside the lockbox and again in free hour H: its
+            // published first hour must be H.
+            swap(lb_sec + 100, "PB", true, 1_000_000_000, 10_000_000),
+            // LONLY only ever trades inside the lockbox: it must not exist
+            // for the published outputs at all.
+            swap(lb_sec + 200, "LONLY", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 100, "PB", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 200, "PW", true, 1_000_000_000, 10_000_000),
+            // Watermark swap in hour H + 13.
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        let report = run(&fx.request(None, None)).expect("run");
+        assert_eq!(report.hours_written, 1, "only free hour H has data");
+        // No partials exist for a lockbox hour.
+        let lb_key = grid::hour_key(lb_hour);
+        for kind in ["a1", "a2", "c"] {
+            assert!(
+                !fx.root
+                    .join(".spotdex-partials")
+                    .join(kind)
+                    .join(format!("hk={lb_key}"))
+                    .exists(),
+                "{kind} partials must not exist for a lockbox hour"
+            );
+        }
+        // LONLY is absent from the b partials, so it can never be new.
+        let conn = test_conn();
+        let b_path = fx
+            .root
+            .join(".spotdex-partials")
+            .join("b")
+            .join("0370000000-0370089999.parquet");
+        let lonly = scalar_i64(
+            &conn,
+            &format!(
+                "SELECT count(*) AS n FROM read_parquet({}) WHERE pool = 'LONLY'",
+                sql_string(&b_path.to_string_lossy())
+            ),
+        )
+        .expect("b partial");
+        assert_eq!(lonly, 0, "a lockbox-only pool has no b partial row");
+        // The venue month: PB's published first hour is H (its lockbox swap
+        // is invisible), and PW is also new at H.
+        let venue = read_rows(&fx.root.join(VENUE_TABLE).join("month=2026-10.parquet"));
+        assert_eq!(venue.len(), 1);
+        assert_eq!(venue[0].int("hour"), Some(H));
+        assert_eq!(
+            venue[0].int("sd_new_pools"),
+            Some(2),
+            "PB and PW are new at H; the lockbox week decides nothing"
+        );
+    }
+
+    #[test]
+    fn a_lockbox_sol_print_never_carries_forward() {
+        let fx = Fixture::new("lockboxpx");
+        // The busy guard window ends at 2026-10-06T00:00. The only near print
+        // sits in its last hour (10-05T23:00:10); free hour 10-06T00 must
+        // price nothing instead of carrying it forward. Two further prints
+        // keep sol_px non-empty and the ASOF join matched without pricing:
+        // one far beyond the 48h staleness cap in a free hour, one in the
+        // future (never matches an earlier hour).
+        let free_sec = 1_791_244_800; // 2026-10-06T00:00:00Z
+        write_pyth(
+            &fx.pyth_dir,
+            &[
+                (free_sec - 3_590, "SOL", 100.0),
+                (1_790_463_610, "SOL", 70.0), // 2026-09-26T23:00:10, free, stale
+                (H_SEC + 10, "SOL", 100.0),
+            ],
+        );
+        let swaps = vec![
+            Swap {
+                block_time: free_sec + 100,
+                program: "pumpswap",
+                pool: "PX",
+                mint_a: "TokenA11111111111111111111111111111111111111",
+                mint_b: WSOL_MINT,
+                decimals_a: 6,
+                decimals_b: 9,
+                a_to_b: true,
+                amount_in: 1_000_000,
+                amount_out: 2_000_000_000,
+            },
+            swap(free_sec + 13_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        let report = run(&fx.request(None, None)).expect("run");
+        assert_eq!(report.hours_written, 1);
+        let rows = read_rows(&hour_file(&fx.root, free_sec / 3_600));
+        let wsol = rows
+            .iter()
+            .find(|row| row.str("mint") == Some(WSOL_MINT))
+            .expect("wsol row");
+        assert!(
+            wsol.get("usd_volume").expect("usd").is_null(),
+            "a lockbox print must not price the first free hour"
+        );
+        assert_eq!(
+            wsol.get("usd_priced").and_then(Value::as_f64),
+            Some(0.0),
+            "nothing priced"
+        );
+    }
+
+    #[test]
+    fn a_rerun_rebuilds_a_lost_venue_month() {
+        let fx = Fixture::new("venuerebuild");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        let first = run(&fx.request(None, None)).expect("first run");
+        assert_eq!(first.hours_written, 1);
+        let month_path = fx.root.join(VENUE_TABLE).join("month=2026-10.parquet");
+        let before = read_rows(&month_path);
+        let before_sha = file_hash(&month_path).expect("month sha");
+        // Crash simulation: the venue month never became durable, but the
+        // hour receipt did.
+        std::fs::remove_dir_all(fx.root.join(VENUE_TABLE)).expect("remove venue dir");
+        let second = run(&fx.request(None, None)).expect("second run");
+        assert_eq!(second.hours_skipped, 1, "the hour is already published");
+        assert_eq!(second.venue_hours, 1, "the rebuilt month is re-sealed");
+        assert!(month_path.is_file(), "the venue month must be rebuilt");
+        assert_eq!(
+            file_hash(&month_path).expect("month sha"),
+            before_sha,
+            "the rebuild must be byte-identical"
+        );
+        assert_eq!(read_rows(&month_path), before, "same rows");
+        let catalog: Value = serde_json::from_str(
+            &std::fs::read_to_string(fx.root.join("catalog.json")).expect("catalog"),
+        )
+        .expect("catalog json");
+        assert!(
+            catalog["files"]
+                .as_array()
+                .expect("files")
+                .iter()
+                .any(|file| file["path"] == format!("{VENUE_TABLE}/month=2026-10.parquet")),
+            "the rebuilt month is registered in the catalog"
+        );
+    }
+
+    #[test]
+    fn venue_seal_drops_lockbox_rows_from_an_existing_month() {
+        let fx = Fixture::new("venueseal");
+        let conn = test_conn();
+        let hours = lockbox_set(&fx);
+        let lb_hour = 1_790_769_600 / 3_600;
+        let month_path = fx.root.join(VENUE_TABLE).join("month=2026-10.parquet");
+        create_dir_all_durable(month_path.parent().expect("parent")).expect("venue dir");
+        // A stale month that still carries a lockbox-hour row.
+        conn.execute_batch(&format!(
+            "COPY (
+               SELECT * FROM (VALUES ({h}, 1.0, 1, 1, 0.5, 1), ({lb}, 1.0, 1, 1, 0.5, 1))
+                 t(hour, sd_log_volume, sd_swaps, sd_mints_active, sd_program_hhi, sd_new_pools)
+               ORDER BY hour
+             ) TO {} ({})",
+            sql_string(&month_path.to_string_lossy()),
+            parquet::COPY_OPTIONS,
+            h = H,
+            lb = lb_hour,
+        ))
+        .expect("existing month");
+        let row = VenueRow {
+            usd_micro: Some(1_000_000),
+            sd_log_volume: (1.0 + 1.0f64).ln(),
+            sd_swaps: 1,
+            sd_mints_active: 1,
+            sd_program_hhi: Some(1.0),
+            sd_new_pools: Some(1),
+        };
+        let output = seal_venue_month(&conn, &fx.root, "2026-10", &[(H, row)], &hours)
+            .expect("seal drops the lockbox row");
+        assert_eq!(output.rows, 1, "lockbox row dropped, free hour replaced");
+        let rows = read_rows(&month_path);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].int("hour"), Some(H));
+    }
+
+    #[test]
+    fn venue_seal_refuses_a_lockbox_hour() {
+        let fx = Fixture::new("venuelbrefuse");
+        let conn = test_conn();
+        let hours = lockbox_set(&fx);
+        let lb_hour = 1_790_769_600 / 3_600;
+        let row = VenueRow {
+            usd_micro: Some(1_000_000),
+            sd_log_volume: 1.0,
+            sd_swaps: 1,
+            sd_mints_active: 1,
+            sd_program_hhi: Some(1.0),
+            sd_new_pools: None,
+        };
+        let error = seal_venue_month(&conn, &fx.root, "2026-09", &[(lb_hour, row)], &hours)
+            .expect_err("a lockbox hour must never reach the venue seal");
+        assert!(error.to_string().contains("lockbox hour"), "{error}");
+    }
+
+    #[test]
+    fn venue_check_refuses_a_lockbox_hour_and_bad_counts() {
+        let fx = Fixture::new("venuecheck");
+        let conn = test_conn();
+        let hours = lockbox_set(&fx);
+        let lb_hour = 1_790_769_600 / 3_600;
+        let path = fx.root.join("venue-check.parquet");
+        conn.execute_batch(&format!(
+            "COPY (
+               SELECT * FROM (VALUES ({h}, 1.0, 1, 1, 0.5, 1), ({lb}, 1.0, 1, 1, 0.5, 1))
+                 t(hour, sd_log_volume, sd_swaps, sd_mints_active, sd_program_hhi, sd_new_pools)
+               ORDER BY hour
+             ) TO {} ({})",
+            sql_string(&path.to_string_lossy()),
+            parquet::COPY_OPTIONS,
+            h = H,
+            lb = lb_hour,
+        ))
+        .expect("check fixture");
+        let error = check_venue_file(&conn, &path, 2, &hours)
+            .expect_err("a lockbox hour in a venue file fails the invariants");
+        assert!(error.to_string().contains("invariant"), "{error}");
+        let error =
+            check_venue_file(&conn, &path, 3, &hours).expect_err("a row-count mismatch fails");
+        assert!(error.to_string().contains("staged 3 rows"), "{error}");
+    }
+
+    #[test]
+    fn mint_check_refuses_inconsistent_rows() {
+        let fx = Fixture::new("mintcheck");
+        let conn = test_conn();
+        let path = fx.root.join("mint-check.parquet");
+        // n_swaps != n_buy + n_sell.
+        conn.execute_batch(&format!(
+            "COPY (
+               SELECT * FROM (VALUES ('M', {h}, 3, 1, 1, 1, 1, 1.0, 1.0))
+                 t(mint, hour, n_swaps, n_buy, n_sell, n_pools, n_programs, usd_volume, usd_priced)
+             ) TO {} ({})",
+            sql_string(&path.to_string_lossy()),
+            parquet::COPY_OPTIONS,
+            h = H,
+        ))
+        .expect("check fixture");
+        let error = check_mint_file(&conn, &path, H, 1)
+            .expect_err("an inconsistent mint row fails the invariants");
+        assert!(error.to_string().contains("invariant"), "{error}");
+        let error = check_mint_file(&conn, &path, H, 2).expect_err("a row-count mismatch fails");
+        assert!(error.to_string().contains("staged 2 rows"), "{error}");
+    }
+
+    #[test]
+    fn hour_seal_fsync_is_the_durable_write() {
+        let fx = Fixture::new("hourfsync");
+        let conn = test_conn();
+        let mint = MintHour {
+            rows: vec![MintRow {
+                mint: USDC_MINT.to_owned(),
+                n_swaps: 1,
+                n_buy: 1,
+                n_sell: 0,
+                n_pools: 1,
+                n_programs: 1,
+                usd_micro: Some(1_000_000),
+                usd_n: 1,
+            }],
+        };
+        crate::fsutil::inject_fsync_eio(crate::fsutil::FsyncStep::TempFile);
+        let error = seal_mint_hour(&conn, &fx.root, H, &mint)
+            .expect_err("the staged hour write must be the fsynced one");
+        assert!(error.to_string().contains("fsync failed"), "{error}");
+        assert!(
+            !hour_file(&fx.root, H).exists(),
+            "no sealed file on fsync fault"
+        );
+    }
+
+    #[test]
+    fn venue_seal_fsync_is_the_durable_write() {
+        let fx = Fixture::new("venuefsync");
+        let conn = test_conn();
+        let hours = lockbox_set(&fx);
+        let row = VenueRow {
+            usd_micro: Some(1_000_000),
+            sd_log_volume: 1.0,
+            sd_swaps: 1,
+            sd_mints_active: 1,
+            sd_program_hhi: Some(1.0),
+            sd_new_pools: None,
+        };
+        crate::fsutil::inject_fsync_eio(crate::fsutil::FsyncStep::TempFile);
+        let error = seal_venue_month(&conn, &fx.root, "2026-10", &[(H, row)], &hours)
+            .expect_err("the staged venue write must be the fsynced one");
+        assert!(error.to_string().contains("fsync failed"), "{error}");
+        assert!(
+            !fx.root
+                .join(VENUE_TABLE)
+                .join("month=2026-10.parquet")
+                .exists(),
+            "no sealed file on fsync fault"
+        );
+    }
+
+    #[test]
+    fn the_run_receipt_write_is_durable() {
+        let fx = Fixture::new("receiptdurable");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        // Arm at the run receipt's own write: the hook fires immediately
+        // before it and faults the durable tmp fsync. A plain fs::write would
+        // never fire the fault, so the run must fail and leave no receipt.
+        receipt::on_before_write(|| {
+            crate::fsutil::inject_fsync_eio(crate::fsutil::FsyncStep::TempFile);
+        });
+        let error = run(&fx.request(None, None))
+            .expect_err("the run receipt write must be the durable one");
+        assert!(error.to_string().contains("fsync failed"), "{error}");
+        assert!(
+            !fx.root
+                .join(MINT_TABLE)
+                .join("receipt-spotdex-hours.json")
+                .exists(),
+            "a failed receipt write leaves no receipt"
+        );
+        receipt::clear_before_write();
+    }
+
+    #[test]
+    fn a_resumed_run_rechecks_a_batch_missing_its_state() {
+        let fx = Fixture::new("recheck");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        run(&fx.request(None, None)).expect("first run");
+        // Tamper the batch (same row count, different bytes) and drop the
+        // resume state: the rerun must re-verify the file against the catalog
+        // instead of silently re-reading it.
+        let tampered = vec![
+            swap(H_SEC + 100, "PX", true, 2_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        write_batch(&fx.swaps_dir, "0370000000-0370089999", &tampered);
+        std::fs::remove_file(fx.root.join(".spotdex-partials").join("state.json"))
+            .expect("remove state");
+        let error = run(&fx.request(None, None))
+            .expect_err("a batch without resume state must be rechecked");
+        assert!(error.to_string().contains("sha256"), "{error}");
+    }
+
+    #[test]
+    fn a_row_count_mismatch_with_the_catalog_fails_the_run() {
+        let fx = Fixture::new("rowcount");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        let catalog = write_catalog(&fx.catalog, &batches);
+        let mut body: Value =
+            serde_json::from_str(&std::fs::read_to_string(&catalog).expect("catalog"))
+                .expect("json");
+        body["files"][0]["row_count"] = Value::String("999".to_owned());
+        std::fs::write(&catalog, serde_json::to_vec(&body).expect("json")).expect("rewrite");
+        let error = run(&fx.request(None, None))
+            .expect_err("a row count contradicting the catalog must fail");
+        assert!(error.to_string().contains("rows != catalog"), "{error}");
+    }
+
+    #[test]
+    fn a_replaced_batch_republishes_despite_recorded_state() {
+        let fx = Fixture::new("replaced");
+        sol_at_100(&fx.pyth_dir, H);
+        let swaps = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(&fx.swaps_dir, "0370000000-0370089999", &swaps)];
+        write_catalog(&fx.catalog, &batches);
+        let first = run(&fx.request(None, None)).expect("first run");
+        assert_eq!(first.hours_written, 1);
+        // Replace the batch with different data and re-catalog it: the run
+        // must notice the state sha no longer matches and rebuild the
+        // partials from the new bytes, not seal from the stale ones.
+        let replaced = vec![
+            swap(H_SEC + 100, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 200, "PX", true, 1_000_000_000, 10_000_000),
+            swap(H_SEC + 50_000, "PY", true, 1_000_000_000, 10_000_000),
+        ];
+        let batches = vec![write_batch(
+            &fx.swaps_dir,
+            "0370000000-0370089999",
+            &replaced,
+        )];
+        write_catalog(&fx.catalog, &batches);
+        let second = run(&fx.request(None, None)).expect("second run");
+        assert_eq!(
+            second.hours_written, 1,
+            "the replaced batch must republish the hour"
+        );
+        let rows = read_rows(&hour_file(&fx.root, H));
+        let usdc = rows
+            .iter()
+            .find(|row| row.str("mint") == Some(USDC_MINT))
+            .expect("usdc row");
+        assert_eq!(usdc.int("n_swaps"), Some(2), "sealed from the new bytes");
     }
 
     #[test]
