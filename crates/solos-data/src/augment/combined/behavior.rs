@@ -183,7 +183,8 @@ fn build_fixtures(dir: &Path) -> Fixtures {
         let dt = chrono::DateTime::from_timestamp(start, 0).unwrap();
         let ymd = dt.format("%Y%m%d");
         let dashed = dt.format("%Y-%m-%d");
-        let hour_of_day = dt.format("%H");
+        // hl-fills writes the hour unpadded (`YYYYMMDD/H`, `hour=YYYYMMDD-H`).
+        let hour_of_day = dt.format("%-H");
         watermark_hours.push(format!("{ymd}/{hour_of_day}"));
         let dir_path = hl.join(format!("train/date={dashed}"));
         std::fs::create_dir_all(&dir_path).unwrap();
@@ -1109,10 +1110,10 @@ fn a_lockbox_fill_outside_the_free_fills_never_becomes_the_span() {
         let hour = super::grid::hour_of_secs(secs);
         let dt = chrono::DateTime::from_timestamp(hour * 3600, 0).unwrap();
         let ymd = dt.format("%Y%m%d");
-        watermark_hours.push(format!("{ymd}/{}", dt.format("%H")));
+        watermark_hours.push(format!("{ymd}/{}", dt.format("%-H")));
         let dir_path = hl.join(format!("train/date={}", dt.format("%Y-%m-%d")));
         std::fs::create_dir_all(&dir_path).unwrap();
-        let path = dir_path.join(format!("hour={ymd}-{}.parquet", dt.format("%H")));
+        let path = dir_path.join(format!("hour={ymd}-{}.parquet", dt.format("%-H")));
         conn.execute_batch(&format!(
             "COPY (SELECT 'MAXSOL' AS coin, 'perp' AS coin_class, {} AS time_ms, 1 AS tid,
                     CAST({price} AS DOUBLE) AS px) TO {} (FORMAT PARQUET)",
@@ -1266,12 +1267,15 @@ fn hl_lockbox_edge_hours_count_only_when_inside() {
     for hour in edge_hours {
         let start = hour * 3600;
         let dt = chrono::DateTime::from_timestamp(start, 0).unwrap();
-        edge_keys.insert(hour, format!("{}/{}", dt.format("%Y%m%d"), dt.format("%H")));
+        edge_keys.insert(
+            hour,
+            format!("{}/{}", dt.format("%Y%m%d"), dt.format("%-H")),
+        );
         let dir_path = fixtures
             .hl
             .join(format!("train/date={}", dt.format("%Y-%m-%d")));
         std::fs::create_dir_all(&dir_path).unwrap();
-        let path = dir_path.join(format!("hour={}.parquet", dt.format("%Y%m%d-%H")));
+        let path = dir_path.join(format!("hour={}.parquet", dt.format("%Y%m%d-%-H")));
         // LOCKEDGE only fills the hours inside the set: it must be
         // lockbox-only, so the free edge hours carry HLEDGE alone.
         let inside = fix.hours.contains(&hour);
@@ -1621,7 +1625,7 @@ fn an_hl_coin_with_two_classes_refuses() {
         "train/date={}/hour={}-{}.parquet",
         dt.format("%Y-%m-%d"),
         dt.format("%Y%m%d"),
-        dt.format("%H")
+        dt.format("%-H")
     ));
     let conn = memory_connection("1", "512MB").unwrap();
     conn.execute_batch(&format!(

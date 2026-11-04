@@ -345,7 +345,7 @@ impl Watermark {
             let key = h
                 .as_str()
                 .ok_or_else(|| StoreError::Check("watermark hour is not a string".into()))?;
-            let unix = source_hour_to_hour(key)?;
+            let unix = grid::parse_source_hour(key)?.unix_hour();
             hours.insert(unix);
             keys.insert(unix, key.to_owned());
         }
@@ -366,28 +366,13 @@ impl Watermark {
     }
 }
 
-/// `YYYYMMDD/H` (the hl-fills-v1 hour key) to a unix hour.
-fn source_hour_to_hour(key: &str) -> Result<i64, StoreError> {
-    let (day, hour) = key
-        .split_once('/')
-        .ok_or_else(|| StoreError::Check(format!("watermark hour {key:?} is not YYYYMMDD/H")))?;
-    let d = grid::parse_date(&format!("{}-{}-{}", &day[0..4], &day[4..6], &day[6..8]))
-        .map_err(|e| StoreError::Check(format!("watermark hour {key:?}: {e}")))?;
-    let h: i64 = hour
-        .parse()
-        .map_err(|_| StoreError::Check(format!("watermark hour {key:?}: bad hour")))?;
-    if !(0..24).contains(&h) {
-        return Err(StoreError::Check(format!(
-            "watermark hour {key:?}: hour out of range"
-        )));
-    }
-    Ok(grid::hour_of_secs(super::grid::day_start_secs(d)) + h)
-}
-
 /// `YYYYMMDD` of a unix hour, for the s3 daily file names.
-#[must_use]
-fn compact_day(hour: i64) -> String {
-    grid::date_of_hour(hour).replace('-', "")
+///
+/// # Errors
+///
+/// The hour is outside the calendar.
+fn compact_day(hour: i64) -> Result<String, StoreError> {
+    Ok(grid::date_of_hour(hour)?.replace('-', ""))
 }
 
 /// One source hour's hl-fills-v1 receipt.
@@ -400,10 +385,12 @@ struct SourceReceipt {
 
 impl SourceReceipt {
     fn load(root: &Path, key: &str) -> Result<Self, StoreError> {
-        let (day, hour) = key
-            .split_once('/')
-            .ok_or_else(|| StoreError::Check(format!("source hour {key:?} is not YYYYMMDD/H")))?;
-        let path = root.join("receipts").join(day).join(format!("{hour}.json"));
+        let source = grid::parse_source_hour(key)?;
+        let day = source.day.format("%Y%m%d").to_string();
+        let path = root
+            .join("receipts")
+            .join(day)
+            .join(format!("{}.json", source.hour));
         let text = std::fs::read_to_string(&path)
             .map_err(|e| StoreError::Check(format!("source receipt {}: {e}", path.display())))?;
         let value: Value =
@@ -624,8 +611,8 @@ impl CtxSource {
         let w1 = w0 + grid::HOUR_MS;
         let pw0 = w0 - grid::HOUR_MS;
         let pw1 = w0;
-        let day = compact_day(bucket);
-        let prev_day = compact_day(bucket - 1);
+        let day = compact_day(bucket)?;
+        let prev_day = compact_day(bucket - 1)?;
 
         let mut s3_cur: BTreeMap<String, CtxRow> = BTreeMap::new();
         let mut s3_prev: BTreeMap<String, f64> = BTreeMap::new();
@@ -755,9 +742,9 @@ fn load_mapping(conn: &Connection, out: &Path) -> Result<Option<u64>, StoreError
 /// baseline), null when absent. Conservative on purpose: a file counts even when
 /// no row of this bucket ends up using its lane, so changed ctx inputs always
 /// rebuild instead of silently keeping stale snapshots.
-fn ctx_input_facts(request: &Request, bucket: i64) -> Value {
-    let day = compact_day(bucket);
-    let prev = compact_day(bucket - 1);
+fn ctx_input_facts(request: &Request, bucket: i64) -> Result<Value, StoreError> {
+    let day = compact_day(bucket)?;
+    let prev = compact_day(bucket - 1)?;
     let mut days = vec![day.clone()];
     if prev != day {
         days.push(prev);
@@ -782,7 +769,7 @@ fn ctx_input_facts(request: &Request, bucket: i64) -> Value {
             ))),
         );
     }
-    json!({"s3": s3, "capture": capture})
+    Ok(json!({"s3": s3, "capture": capture}))
 }
 
 /// Run the unit: stage 1 per receipted source file, merge per bucket, ctx, lockbox,
@@ -820,8 +807,8 @@ pub fn run(request: &Request) -> Result<Report, StoreError> {
     if last_bucket < first_bucket {
         return Err(StoreError::Check(format!(
             "empty bucket range: since {} is after the closed watermark {}",
-            grid::hour_key(first_bucket),
-            grid::hour_key(last_bucket)
+            grid::hour_key(first_bucket)?,
+            grid::hour_key(last_bucket)?
         )));
     }
     let buckets: Vec<i64> = std::iter::successors(Some(first_bucket), |b| {
@@ -1023,7 +1010,7 @@ fn execute(
         if !complete || !closed {
             report.refused_hours += 1;
             if report.refused_examples.len() < 20 {
-                report.refused_examples.push(grid::hour_key(*b));
+                report.refused_examples.push(grid::hour_key(*b)?);
             }
             continue;
         }
@@ -1079,8 +1066,8 @@ fn emit_bucket(
     assets: &Value,
     report: &mut Report,
 ) -> Result<receipt::OutputFile, StoreError> {
-    let date = grid::date_of_hour(bucket);
-    let tag = grid::hour_key(bucket);
+    let date = grid::date_of_hour(bucket)?;
+    let tag = grid::hour_key(bucket)?;
     let final_path = request
         .out
         .join(TABLE)
@@ -1108,7 +1095,7 @@ fn emit_bucket(
         json!({
             "sources": facts,
             "assetsCsvSha256": assets,
-            "ctx": ctx_input_facts(request, bucket),
+            "ctx": ctx_input_facts(request, bucket)?,
         }),
     );
     // Root and sealed path must share one form: the root value handed to
