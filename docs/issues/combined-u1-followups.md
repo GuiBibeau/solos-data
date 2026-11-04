@@ -7,14 +7,22 @@ Non-blocking items the reviewer asked to record rather than fix now.
 - DONE (s1 swarm): the watermark hour key is validated in one helper,
   `grid::parse_source_hour` (`YYYYMMDD/H`, H unpadded 0..=23), used by every combined
   unit; a malformed key is an error that names it, never a skip.
-- A null `coin_class` on an HL row is treated as a perp/HIP-3 coin by the fallthrough
+- [x] A null `coin_class` on an HL row is treated as a perp/HIP-3 coin by the fallthrough
   arm; make the class match exhaustive and refuse unknown classes.
-- Duplicate Pyth feeds or duplicate Jupiter custody labels/addresses in
+  Done (swarm s4): `parse_coin_class` refuses a null or unknown class, naming the
+  coin and the value, before the lockbox skip; `build_rows` matches
+  `hlfills::CoinClass` with no fallthrough arm.
+- [x] Duplicate Pyth feeds or duplicate Jupiter custody labels/addresses in
   `config/venues.json` are unchecked; refuse or dedupe with a count.
+  Done (swarm s4): `refuse_duplicate_keys` refuses a duplicate Pyth symbol, venue
+  symbol or feed id, and a duplicate Jupiter custody label or address, naming the
+  value. The real `config/venues.json` has none.
 - A Pyth feed with no history rows is still `mapped=true` (config-only); decide
   whether it needs a `no_history` marker or stays config-truth.
-- HL coins with no Phoenix candidate carry an empty `reason`; give them a
+- [x] HL coins with no Phoenix candidate carry an empty `reason`; give them a
   `no_candidate` reason and a counter in the report.
+  Done (swarm s4): reason `no_candidate`, report field `noCandidate`; mapping
+  `UNIT_VERSION` 2 (the receipt's config sha256 moves with it).
 - The ADR should spell out that the grid works in unix hour indices while the CSV
   timestamps are unix seconds (done in ADR-0023 round 1, keep in sync).
 - Test the Pyth base-symbol fallback (27 of 39 feeds have no market name) end to

@@ -117,7 +117,10 @@ first_ts, last_ts, source_of_truth, mapped, reason, median_abs_log_ratio,
 n_hours`, sorted by venue then venue symbol. HL perp and HIP-3 coins are one
 row each; a `builder:` prefix is stripped into `builder`. `@N` spot stays
 unmapped (`spot_unnamed`) until spotMeta is available; `#N` outcomes never map
-(`outcome`). A Phoenix candidate comes from the augment asset_contexts
+(`outcome`). An HL perp or HIP-3 coin with no Phoenix candidate reads
+`no_candidate`: neither the asset_contexts seed nor the base name trades on
+Phoenix, so no pair is checked, and the run report counts these as
+`noCandidate`. A Phoenix candidate comes from the augment asset_contexts
 `phoenix_symbol` column when that asset trades on Phoenix, else from the equal
 base name. Phoenix prices are `price_ticks * tick_size *
 10^(base_lot_decimals - quote_lot_decimals)`, the fill's own tick and lot
@@ -135,5 +138,12 @@ price check, no exposure or decimals check, and feed ids are recorded as the
 config carries them, not normalized. Venue names are the store's: `hl`, `phoenix`,
 `jup`, `pyth`. `asset_id` is not unique within a venue on purpose: the perp
 `BTC` and the HIP-3 `dex:BTC` both map to `BTC` and stay separate rows.
+A `coin_class` other than `perp`, `hip3`, `spot` or `outcome`, or a null,
+refuses the run and names the coin and the value; it never falls through to a
+perp row. `config/venues.json` refuses a duplicate Pyth feed symbol, venue
+symbol or feed id, and a duplicate Jupiter custody label or address, naming the
+duplicate rather than deduping it. The mapping unit version is 2: version 1
+wrote an empty reason for these coins, so the same inputs now give different
+`assets.csv` bytes and a different config sha256.
 Unmapped or demoted
 assets keep their per-venue features and get no cross-venue block downstream.
