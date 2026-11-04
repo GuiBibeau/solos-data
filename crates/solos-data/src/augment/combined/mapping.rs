@@ -14,10 +14,13 @@
 //! check over the operator's check days: hourly last price on both venues,
 //! median |ln(hl/ph)| over hours both traded; `mapped=true` iff the median is
 //! under [`PRICE_THRESHOLD`] and at least [`MIN_HOURS`] hours traded, else
-//! `price_divergence` or `thin`. Pyth feeds and Jupiter custodies come from the
-//! venues config. Output rows are sorted, so a rerun writes the same bytes.
+//! `price_divergence` or `thin`; an HL coin with no candidate at all reads
+//! `no_candidate`. An HL `coin_class` outside the four hl-fills classes, or null,
+//! refuses the run. Pyth feeds and Jupiter custodies come from the venues config,
+//! which refuses duplicate feeds and custodies by name. Output rows are sorted, so
+//! a rerun writes the same bytes.
 
-use crate::augment::hlfills;
+use crate::augment::hlfills::{self, CoinClass};
 use crate::fsutil::{create_dir_all_durable, file_hash, write_durable};
 use crate::store::{StoreError, query_rows, sql_string};
 use chrono::NaiveDate;
@@ -36,8 +39,9 @@ use super::seal;
 /// The unit this module runs.
 pub const UNIT: &str = "mapping";
 
-/// Bumped on an output-shape change.
-pub const UNIT_VERSION: u32 = 1;
+/// Bumped on an output-shape or output-vocabulary change. Version 2: an HL coin
+/// with no Phoenix candidate reads `no_candidate` (version 1 wrote an empty reason).
+pub const UNIT_VERSION: u32 = 2;
 
 /// A pair maps when the median |ln(hl/ph)| over common hours is below this.
 pub const PRICE_THRESHOLD: f64 = 0.01;
@@ -56,6 +60,10 @@ pub const REASON_DIVERGENT: &str = "price_divergence";
 
 /// Unmapped reason when fewer than [`MIN_HOURS`] common hours traded.
 pub const REASON_THIN: &str = "thin";
+
+/// Unmapped reason for an HL perp or HIP-3 coin with no Phoenix candidate: neither
+/// the asset_contexts seed nor the equal base name trades on Phoenix.
+pub const REASON_NO_CANDIDATE: &str = "no_candidate";
 
 /// Column order of `mapping/assets.csv` (PLAN.md).
 pub const COLUMNS: &[&str] = &[
@@ -121,6 +129,8 @@ pub struct Report {
     pub spot_unnamed: u64,
     /// `#N` outcome rows.
     pub outcome: u64,
+    /// HL perp + HIP-3 rows with no Phoenix candidate (no pair was checked).
+    pub no_candidate: u64,
     /// Input hours the lockbox actually dropped (the widest input).
     pub lockbox_hours_dropped: u64,
     /// Distinct UTC hours in the lockbox exclusion set (864 for v2).
@@ -158,6 +168,7 @@ impl Report {
             .with("thin", self.thin)
             .with("spotUnnamed", self.spot_unnamed)
             .with("outcome", self.outcome)
+            .with("noCandidate", self.no_candidate)
             .with("lockboxHoursDropped", self.lockbox_hours_dropped)
             .with("lockboxHoursExcluded", self.lockbox_hours_excluded)
             .with_obj("lockboxOnlySymbols", {
@@ -267,7 +278,6 @@ struct VenueEntry {
 
 #[derive(Deserialize)]
 struct VenueAccount {
-    #[allow(dead_code)]
     address: String,
     kind: String,
     label: String,
@@ -490,6 +500,7 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
         thin: counters.thin,
         spot_unnamed: counters.spot_unnamed,
         outcome: counters.outcome,
+        no_candidate: counters.no_candidate,
         lockbox_hours_dropped,
         lockbox_hours_excluded,
         lockbox_only_symbols,
@@ -564,6 +575,7 @@ struct PairCounters {
     thin: u64,
     spot_unnamed: u64,
     outcome: u64,
+    no_candidate: u64,
 }
 
 impl PairCounters {
@@ -576,6 +588,7 @@ impl PairCounters {
             match row.reason.as_str() {
                 REASON_SPOT => counters.spot_unnamed += 1,
                 REASON_OUTCOME => counters.outcome += 1,
+                REASON_NO_CANDIDATE => counters.no_candidate += 1,
                 REASON_DIVERGENT => {
                     counters.pairs_checked += 1;
                     counters.price_divergence += 1;
@@ -642,8 +655,53 @@ pub(crate) fn load_provenance(path: &Path) -> Result<Value, StoreError> {
 fn load_venues_config(path: &Path) -> Result<VenuesConfig, StoreError> {
     let text = std::fs::read_to_string(path)
         .map_err(|error| StoreError::Check(format!("--venues-config: cannot read: {error}")))?;
-    serde_json::from_str(&text)
-        .map_err(|error| StoreError::Check(format!("--venues-config: bad JSON: {error}")))
+    let config: VenuesConfig = serde_json::from_str(&text)
+        .map_err(|error| StoreError::Check(format!("--venues-config: bad JSON: {error}")))?;
+    refuse_duplicate_keys(&config)?;
+    Ok(config)
+}
+
+/// Refuse a duplicate Pyth feed (symbol, venue symbol or feed id) or Jupiter
+/// custody (label or address) by name. A duplicate would write two rows for one
+/// key, so it is refused rather than deduped silently. Only the keys that become
+/// output rows are checked: Jupiter pools and other venues produce none.
+fn refuse_duplicate_keys(config: &VenuesConfig) -> Result<(), StoreError> {
+    let mut symbols = BTreeSet::new();
+    let mut venue_symbols = BTreeSet::new();
+    let mut feed_ids = BTreeSet::new();
+    for feed in &config.pyth.feeds {
+        insert_unique(&mut symbols, &feed.symbol, "pyth feed symbol")?;
+        insert_unique(&mut venue_symbols, feed.venue_symbol(), "pyth venue symbol")?;
+        insert_unique(&mut feed_ids, &feed.feed_id, "pyth feedId")?;
+    }
+    let mut labels = BTreeSet::new();
+    let mut addresses = BTreeSet::new();
+    let custodies = config
+        .venues
+        .iter()
+        .filter(|venue| venue.name == "jupiter")
+        .flat_map(|venue| venue.accounts.iter())
+        .filter(|account| account.kind == "custody");
+    for account in custodies {
+        insert_unique(&mut labels, &account.label, "jupiter custody label")?;
+        insert_unique(&mut addresses, &account.address, "jupiter custody address")?;
+    }
+    Ok(())
+}
+
+/// Insert `value` into `seen`, or refuse it as a duplicate of `what`.
+fn insert_unique<'a>(
+    seen: &mut BTreeSet<&'a str>,
+    value: &'a str,
+    what: &str,
+) -> Result<(), StoreError> {
+    if seen.insert(value) {
+        Ok(())
+    } else {
+        Err(StoreError::Check(format!(
+            "venues config: duplicate {what} '{value}'"
+        )))
+    }
 }
 
 /// SHA-256 over the unit's semantic config: the pin that must move on purpose.
@@ -820,7 +878,7 @@ pub(crate) struct HlInput {
     hours_sha256: String,
     files: Vec<FileRef>,
     /// coin, (coin_class, first/last fill second).
-    pub(crate) universe: BTreeMap<String, (String, Universe)>,
+    pub(crate) universe: BTreeMap<String, (CoinClass, Universe)>,
     /// coin, hour start, last price of the hour (check days only).
     pub(crate) prices: BTreeMap<String, BTreeMap<i64, f64>>,
     /// Coins whose every fill sits inside the lockbox hours.
@@ -875,7 +933,9 @@ impl HlInput {
                 .str("coin")
                 .ok_or_else(|| StoreError::Check("hl universe: null coin".into()))?
                 .to_owned();
-            let class = row.str("coin_class").unwrap_or_default().to_owned();
+            // The class is parsed before the lockbox skip: a null or unknown
+            // class is refused even when the coin's fills all sit in lockbox hours.
+            let class = parse_coin_class(&coin, row.str("coin_class"))?;
             let (Some(first_ms), Some(last_ms)) = (row.int("first_ms"), row.int("last_ms")) else {
                 // Every fill of this coin sits in lockbox hours: it has no row
                 // in any output table, so it is not a mapping row either. It is
@@ -1277,14 +1337,14 @@ fn build_rows(
     let empty_prices: BTreeMap<i64, f64> = BTreeMap::new();
 
     for (coin, (class, span)) in &hl.universe {
-        let (builder, base) = split_builder(coin, class);
-        let row = match class.as_str() {
-            "spot" => AssetRow {
+        let (builder, base) = split_builder(coin, *class);
+        let row = match class {
+            CoinClass::Spot => AssetRow {
                 asset_id: String::new(),
                 venue: "hl",
                 venue_symbol: coin.clone(),
                 builder: String::new(),
-                coin_class: class.clone(),
+                coin_class: class.as_str().to_owned(),
                 venue_market_id: String::new(),
                 first_ts: Some(span.first_ts),
                 last_ts: Some(span.last_ts),
@@ -1294,12 +1354,12 @@ fn build_rows(
                 median_abs_log_ratio: None,
                 n_hours: None,
             },
-            "outcome" => AssetRow {
+            CoinClass::Outcome => AssetRow {
                 asset_id: String::new(),
                 venue: "hl",
                 venue_symbol: coin.clone(),
                 builder: String::new(),
-                coin_class: class.clone(),
+                coin_class: class.as_str().to_owned(),
                 venue_market_id: String::new(),
                 first_ts: Some(span.first_ts),
                 last_ts: Some(span.last_ts),
@@ -1309,13 +1369,13 @@ fn build_rows(
                 median_abs_log_ratio: None,
                 n_hours: None,
             },
-            _ => {
+            CoinClass::Perp | CoinClass::Hip3 => {
                 let candidate = phoenix_candidate(coin, &base, contexts, phoenix);
                 let seed_column = candidate
                     .as_ref()
                     .map_or(String::new(), |(_, seed)| seed_text(seed));
                 let (mapped, reason, median, n_hours) = match &candidate {
-                    None => (false, String::new(), None, None),
+                    None => (false, REASON_NO_CANDIDATE.to_owned(), None, None),
                     Some((asset, seed)) => {
                         let (n, med) = price_check(
                             hl.prices.get(coin).unwrap_or(&empty_prices),
@@ -1341,7 +1401,7 @@ fn build_rows(
                     venue: "hl",
                     venue_symbol: coin.clone(),
                     builder,
-                    coin_class: class.clone(),
+                    coin_class: class.as_str().to_owned(),
                     venue_market_id: String::new(),
                     first_ts: Some(span.first_ts),
                     last_ts: Some(span.last_ts),
@@ -1480,10 +1540,34 @@ fn seed_text(seed: &Seed) -> String {
     }
 }
 
+/// Parse an HL coin's `coin_class` into the hl-fills vocabulary. A null or a value
+/// outside [`CoinClass`] refuses the run, naming the coin and the value: it never
+/// falls through to a perp row.
+fn parse_coin_class(coin: &str, value: Option<&str>) -> Result<CoinClass, StoreError> {
+    let Some(text) = value else {
+        return Err(StoreError::Check(format!(
+            "hl universe: coin {coin} has a null coin_class"
+        )));
+    };
+    [
+        CoinClass::Perp,
+        CoinClass::Hip3,
+        CoinClass::Spot,
+        CoinClass::Outcome,
+    ]
+    .into_iter()
+    .find(|class| class.as_str() == text)
+    .ok_or_else(|| {
+        StoreError::Check(format!(
+            "hl universe: coin {coin} has unknown coin_class '{text}'"
+        ))
+    })
+}
+
 /// Split an HL coin into (builder, base). Only HIP-3 (`builder:SYMBOL`) has a
 /// builder; `@`/`#` classes never reach here.
-fn split_builder(coin: &str, class: &str) -> (String, String) {
-    if class == "hip3"
+fn split_builder(coin: &str, class: CoinClass) -> (String, String) {
+    if class == CoinClass::Hip3
         && let Some((builder, base)) = coin.split_once(':')
     {
         return (builder.to_owned(), base.to_owned());

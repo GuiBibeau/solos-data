@@ -551,6 +551,10 @@ fn mapping_rules_lockbox_filters_and_receipt() {
     assert_eq!(report.thin, 2);
     assert_eq!(report.spot_unnamed, 1);
     assert_eq!(report.outcome, 1);
+    // ONLYHL and GHOST have no Phoenix candidate: counted, not checked.
+    assert_eq!(report.no_candidate, 2);
+    let report_json: Value = serde_json::from_str(&report.to_json()).unwrap();
+    assert_eq!(report_json["noCandidate"], 2);
     // The store-wide drop is the union of the venues' covered-hour sets: HL
     // covers june+1..=3, Phoenix adds june+5, Pyth adds june+7 (dir 0) and
     // june+9 (dir 1): six distinct hours, one more than any venue's own set
@@ -690,10 +694,10 @@ fn mapping_rules_lockbox_filters_and_receipt() {
             first + 2 * 3600
         )
     );
-    // No Phoenix candidate: unmapped with no reason.
+    // No Phoenix candidate: unmapped, reason no_candidate.
     assert_eq!(
         line_of(&lines, "hl", "ONLYHL"),
-        format!("ONLYHL,hl,ONLYHL,,perp,,{first},{last},,false,,,")
+        format!("ONLYHL,hl,ONLYHL,,perp,,{first},{last},,false,no_candidate,,")
     );
     // Phoenix rows: mapped when ANY HL pair for the asset passed (TWO has one
     // mapped and one divergent pair).
@@ -728,7 +732,7 @@ fn mapping_rules_lockbox_filters_and_receipt() {
         std::fs::read_to_string(receipt::receipt_path(&out, "mapping", "mapping")).unwrap();
     let receipt: Value = serde_json::from_str(&receipt_text).unwrap();
     assert_eq!(receipt["unit"], "mapping");
-    assert_eq!(receipt["unit_version"], 1);
+    assert_eq!(receipt["unit_version"], 2);
     assert_eq!(receipt["rows"], 33);
     assert_eq!(receipt["lockbox_hours_dropped"], 6);
     assert_eq!(receipt["lockbox_hours_excluded"], 864);
@@ -865,7 +869,7 @@ fn a_seeded_phoenix_symbol_missing_from_phoenix_is_not_a_candidate() {
     let (_, first, last, _) = check_bounds();
     assert_eq!(
         line_of(&lines, "hl", "GHOST"),
-        format!("GHOST,hl,GHOST,,perp,,{first},{last},,false,,,")
+        format!("GHOST,hl,GHOST,,perp,,{first},{last},,false,no_candidate,,")
     );
     assert_eq!(
         line_of(&lines, "hl", "SEEDED"),
@@ -1339,7 +1343,7 @@ fn hl_lockbox_edge_hours_count_only_when_inside() {
     assert_eq!(
         edge,
         &format!(
-            "HLEDGE,hl,HLEDGE,,perp,,{},{},,false,,,",
+            "HLEDGE,hl,HLEDGE,,perp,,{},{},,false,no_candidate,,",
             fix.secs(fix.hour_before()) + 60,
             fix.secs(fix.hour_after()) + 60
         )
@@ -1725,4 +1729,200 @@ fn an_ambiguous_phoenix_market_id_is_left_empty() {
     mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap();
     let sol = line_of(&assets_lines(&out), "phoenix", "SOL");
     assert!(sol.contains(",spot,,"), "market id empty: {sol}");
+}
+
+/// Replace one receipted HL hour file with the rows of `select`.
+fn overwrite_hl_hour(fixtures: &Fixtures, hour: i64, select: &str) {
+    let dt = chrono::DateTime::from_timestamp(hour * 3600, 0).unwrap();
+    let path = fixtures.hl.join(format!(
+        "train/date={}/hour={}-{}.parquet",
+        dt.format("%Y-%m-%d"),
+        dt.format("%Y%m%d"),
+        dt.format("%-H")
+    ));
+    let conn = memory_connection("1", "512MB").unwrap();
+    conn.execute_batch(&format!(
+        "COPY ({select}) TO {} (FORMAT PARQUET)",
+        sql_string(&path.to_string_lossy())
+    ))
+    .unwrap();
+}
+
+/// One HL fill of `coin` in the first minute of `hour`, with `coin_class` as the
+/// SQL expression `class_sql` (for example `'perp'` or `NULL::VARCHAR`).
+fn hl_fill_select(coin: &str, class_sql: &str, hour: i64) -> String {
+    format!(
+        "SELECT {} AS coin, {class_sql} AS coin_class, {} AS time_ms, 1 AS tid, CAST(7.0 AS DOUBLE) AS px",
+        sql_string(coin),
+        hour * 3_600_000 + 60_000
+    )
+}
+
+/// Run the mapping with `venues` as the venues config.
+fn run_with_venues(
+    tmp: &Tmp,
+    fixtures: &Fixtures,
+    label: &str,
+    venues: &str,
+) -> Result<mapping::Report, crate::store::StoreError> {
+    let path = tmp.dir().join(format!("venues-{label}.json"));
+    std::fs::write(&path, venues).unwrap();
+    let out = tmp.dir().join(format!("store-{label}"));
+    let mut req = request(&out, fixtures, &fixtures.lockbox_sha, CHECK_DAYS);
+    req.venues_config = &path;
+    let result = mapping::run(&req);
+    if result.is_err() {
+        assert!(
+            !out.join("mapping").exists(),
+            "{label}: no output on refusal"
+        );
+    }
+    result
+}
+
+/// A null `coin_class` is refused, naming the coin, in a free hour and in a
+/// lockbox-only hour. The lockbox case pins the order: a class check placed after
+/// the lockbox skip would let a malformed row through when all its fills sit
+/// inside the lockbox.
+#[test]
+fn an_hl_coin_with_a_null_class_refuses() {
+    let (base_hour, june_hour) = hour_bases();
+    for (label, hour) in [("free", base_hour), ("lockbox", june_hour + 1)] {
+        let tmp = Tmp::new(&format!("nullclass-{label}"));
+        let fixtures = build_fixtures(tmp.dir());
+        let out = tmp.dir().join("store");
+        overwrite_hl_hour(
+            &fixtures,
+            hour,
+            &hl_fill_select("ODD", "NULL::VARCHAR", hour),
+        );
+        let error =
+            mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap_err();
+        assert!(
+            error.to_string().contains("coin ODD has a null coin_class"),
+            "{label}: {error}"
+        );
+        assert!(
+            !out.join("mapping").exists(),
+            "{label}: no output on refusal"
+        );
+    }
+}
+
+/// A `coin_class` outside the four hl-fills classes is refused, naming the coin
+/// and the value, instead of falling through to a perp row.
+#[test]
+fn an_hl_coin_with_an_unknown_class_refuses() {
+    let tmp = Tmp::new("unknownclass");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    let (base_hour, _) = hour_bases();
+    overwrite_hl_hour(
+        &fixtures,
+        base_hour,
+        &hl_fill_select("ODD", "'stock'", base_hour),
+    );
+    let error =
+        mapping::run(&request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS)).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("coin ODD has unknown coin_class 'stock'"),
+        "{error}"
+    );
+    assert!(!out.join("mapping").exists(), "no output on refusal");
+}
+
+/// Duplicate Pyth feeds are refused by name. Each of the three checks is pinned
+/// alone: the other two keys differ in every case, so removing one check turns
+/// that case's run green and the `unwrap_err` in `run_with_venues` goes red.
+#[test]
+fn duplicate_pyth_feeds_refuse_by_name() {
+    let tmp = Tmp::new("dupfeed");
+    let fixtures = build_fixtures(tmp.dir());
+    let cases = [
+        (
+            "symbol",
+            r#"{"symbol": "SOL", "pyth": "SOL/USD", "feedId": "f1", "account": "a"},
+               {"symbol": "SOL", "pyth": "SOL/USD2", "feedId": "f2", "account": "b"}"#,
+            "duplicate pyth feed symbol 'SOL'",
+        ),
+        (
+            "venue symbol",
+            r#"{"symbol": "SOL", "pyth": "SOL/USD", "feedId": "f1", "account": "a"},
+               {"symbol": "SOLX", "pyth": "SOL/USD", "feedId": "f2", "account": "b"}"#,
+            "duplicate pyth venue symbol 'SOL/USD'",
+        ),
+        (
+            "feed id",
+            r#"{"symbol": "SOL", "pyth": "SOL/USD", "feedId": "f1", "account": "a"},
+               {"symbol": "BTC", "pyth": "BTC/USD", "feedId": "f1", "account": "a"}"#,
+            "duplicate pyth feedId 'f1'",
+        ),
+    ];
+    for (label, feeds, expected) in cases {
+        let venues = format!(r#"{{"venues": [], "pyth": {{"feeds": [{feeds}]}}}}"#);
+        let error = run_with_venues(&tmp, &fixtures, label, &venues).unwrap_err();
+        assert!(error.to_string().contains(expected), "{label}: {error}");
+    }
+}
+
+/// Duplicate Jupiter custodies are refused by name: a repeated label and a
+/// repeated address. A Jupiter pool that shares a custody's label is not a
+/// custody and makes no row, so it must not collide.
+#[test]
+fn duplicate_jupiter_custody_refuses_by_name() {
+    let tmp = Tmp::new("dupcustody");
+    let fixtures = build_fixtures(tmp.dir());
+    let feeds = r#"{"symbol": "SOL", "pyth": "SOL/USD", "feedId": "f1", "account": "a"}"#;
+    let cases = [
+        (
+            "label",
+            r#"{"address": "A1", "kind": "custody", "label": "SOL"},
+               {"address": "A2", "kind": "custody", "label": "SOL"}"#,
+            "duplicate jupiter custody label 'SOL'",
+        ),
+        (
+            "address",
+            r#"{"address": "A1", "kind": "custody", "label": "SOL"},
+               {"address": "A1", "kind": "custody", "label": "BTC"}"#,
+            "duplicate jupiter custody address 'A1'",
+        ),
+    ];
+    for (label, accounts, expected) in cases {
+        let venues = format!(
+            r#"{{"venues": [{{"name": "jupiter", "accounts": [{accounts}]}}],
+                 "pyth": {{"feeds": [{feeds}]}}}}"#
+        );
+        let error = run_with_venues(&tmp, &fixtures, label, &venues).unwrap_err();
+        assert!(error.to_string().contains(expected), "{label}: {error}");
+    }
+    let venues = format!(
+        r#"{{"venues": [{{"name": "jupiter", "accounts": [
+               {{"address": "P1", "kind": "pool", "label": "SOL"}},
+               {{"address": "A1", "kind": "custody", "label": "SOL"}}]}}],
+             "pyth": {{"feeds": [{feeds}]}}}}"#
+    );
+    let report = run_with_venues(&tmp, &fixtures, "pool-shares-label", &venues).unwrap();
+    assert_eq!(report.per_venue["jup"], 1, "the pool makes no row");
+}
+
+/// The real `config/venues.json` loads through the duplicate checks and maps on
+/// the fixture inputs: 39 Pyth feeds and 6 Jupiter custodies (the Jupiter pool
+/// and the flash venue make no rows).
+#[test]
+fn the_real_venues_config_still_loads() {
+    let tmp = Tmp::new("realcfg");
+    let fixtures = build_fixtures(tmp.dir());
+    let out = tmp.dir().join("store");
+    let real = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../config/venues.json"
+    ));
+    let mut req = request(&out, &fixtures, &fixtures.lockbox_sha, CHECK_DAYS);
+    req.venues_config = real;
+    let report = mapping::run(&req).unwrap();
+    assert_eq!(report.per_venue["pyth"], 39);
+    assert_eq!(report.per_venue["jup"], 6);
+    assert_eq!(report.rows, 17 + 13 + 39 + 6);
 }
