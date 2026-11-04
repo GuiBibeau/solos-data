@@ -2,10 +2,11 @@
 
 Non-blocking items the reviewer asked to record rather than fix now.
 
-- grid.rs `date_of_hour`/`hour_key` `expect` panics on data-derived hours; return
-  a `StoreError` instead so a corrupt input cannot panic the process.
-- The watermark hour key goes into a path with format checks but no canonicalization;
-  validate the full shape (digits, hour range 0..=23) in one place.
+- DONE (s1 swarm): grid.rs `date_of_hour`/`hour_key` return `Result` and every caller
+  propagates; an out-of-calendar hour is an error, not a panic.
+- DONE (s1 swarm): the watermark hour key is validated in one helper,
+  `grid::parse_source_hour` (`YYYYMMDD/H`, H unpadded 0..=23), used by every combined
+  unit; a malformed key is an error that names it, never a skip.
 - A null `coin_class` on an HL row is treated as a perp/HIP-3 coin by the fallthrough
   arm; make the class match exhaustive and refuse unknown classes.
 - Duplicate Pyth feeds or duplicate Jupiter custody labels/addresses in
@@ -27,9 +28,10 @@ Non-blocking items the reviewer asked to record rather than fix now.
   directories, not their union, so it undercounts when the directories cover
   different lockbox hours (the misleading comment was fixed in round 2; the
   behaviour is unchanged).
-- `watermark_unix_hour` silently skips malformed watermark keys (returns
-  `None`) and does not bound the hour of day, so a corrupt key drops an hour
-  from the HL drop count without an error.
+- DONE (s1 swarm): `watermark_unix_hour` is gone; malformed keys (bad day, hour
+  24, padded hour such as 05, no slash) now refuse with an error naming the key
+  in every reader (mapping `watermark_files` and `run`, hlhours `Watermark::load`,
+  which also loses its unchecked `day[6..8]` slice panic).
 - `receipt::write` takes `unit_dir` and the receipt's `unit` as separate
   strings, so a caller can pass a mismatched pair and put a receipt in the
   wrong directory; consider a type that ties the two together.

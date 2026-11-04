@@ -24,7 +24,7 @@ fn src_key(unix: i64) -> String {
 
 /// `YYYYMMDD`, the s3 daily ctx file key.
 fn compact_day(unix: i64) -> String {
-    grid::date_of_hour(unix).replace('-', "")
+    grid::date_of_hour(unix).unwrap().replace('-', "")
 }
 use crate::jsonout::Obj;
 use serde_json::{Value, json};
@@ -285,8 +285,8 @@ impl Fixture {
 
 fn output_path(root: &Path, unix: i64) -> PathBuf {
     root.join(super::TABLE)
-        .join(format!("date={}", grid::date_of_hour(unix)))
-        .join(format!("hour={}.parquet", grid::hour_key(unix)))
+        .join(format!("date={}", grid::date_of_hour(unix).unwrap()))
+        .join(format!("hour={}.parquet", grid::hour_key(unix).unwrap()))
 }
 
 /// Every sealed output file under the store root (the two-level layout).
@@ -299,7 +299,7 @@ fn outputs_glob(root: &Path) -> PathBuf {
 fn hour_receipt_path(root: &Path, unix: i64) -> PathBuf {
     root.join(super::TABLE)
         .join("receipts")
-        .join(format!("hour={}.json", grid::hour_key(unix)))
+        .join(format!("hour={}.json", grid::hour_key(unix).unwrap()))
 }
 
 fn receipt_json(root: &Path, unix: i64) -> Value {
@@ -496,7 +496,10 @@ fn hour_boundary_strays_merge_and_unclosed_buckets_refuse() {
     let report = run(&fx.request(h, h + 2)).unwrap();
     assert_eq!(report.emit_buckets, 2, "the guard clamps until to h+1");
     assert_eq!(report.refused_hours, 1, "bucket h+1 lacks its h+2 file");
-    assert_eq!(report.refused_examples, vec![grid::hour_key(h + 1)]);
+    assert_eq!(
+        report.refused_examples,
+        vec![grid::hour_key(h + 1).unwrap()]
+    );
     assert_eq!(report.built, 1, "report: {}", report.to_json());
 
     let bucket0 = rows_of(&output_path(fx.root.path(), h));
@@ -1194,13 +1197,65 @@ fn hour_keys_and_pins() {
     let h = h0();
     let key = src_key(h);
     assert_eq!(key, "20250720/4");
-    assert_eq!(grid::hour_key(h), "20250720-04", "the common padded key");
-    assert_eq!(grid::date_of_hour(h), "2025-07-20");
+    assert_eq!(
+        grid::hour_key(h).unwrap(),
+        "20250720-04",
+        "the common padded key"
+    );
+    assert_eq!(grid::date_of_hour(h).unwrap(), "2025-07-20");
     assert_eq!(SCHEMA, "combined-hl-coin-hour-v1");
     assert_eq!(STAGE1_VERSION, "s1-v1");
     assert_eq!(GUARD_HOURS, 2);
     assert_eq!(HL_TRAIN_CODE_SHA.len(), 40);
     assert_eq!(UNIT_VERSION, super::UNIT_VERSION);
+}
+
+/// A corrupt watermark hour is an error that names the key; it is never skipped. A
+/// canonical key set still loads.
+#[test]
+fn a_malformed_watermark_hour_refuses_naming_the_key() {
+    let tmp = Tmp::new("badkey");
+    let path = tmp.path().join("watermark.json");
+    for key in ["20261022/24", "20261022/05", "2026102/5", "abc"] {
+        let body = json!({ "schema": "hl-fills-v1", "hours": ["20250720/4", key] });
+        std::fs::write(&path, body.to_string()).unwrap();
+        let Err(error) = super::Watermark::load(&path) else {
+            panic!("{key} must refuse the watermark");
+        };
+        assert!(
+            error.to_string().contains(key),
+            "the error must name {key}: {error}"
+        );
+    }
+    let body = json!({ "schema": "hl-fills-v1", "hours": ["20250720/4", "20250720/23"] });
+    std::fs::write(&path, body.to_string()).unwrap();
+    let loaded = super::Watermark::load(&path).unwrap();
+    assert_eq!(loaded.hours.len(), 2);
+    assert_eq!(loaded.key(h0()), Some("20250720/4"));
+}
+
+/// The ctx input facts of an out-of-calendar bucket are an error, not a panic; an
+/// in-calendar bucket still yields facts.
+#[test]
+fn ctx_facts_of_an_out_of_calendar_bucket_are_an_error() {
+    let fx = Fixture::new("ctx-range");
+    assert!(super::ctx_input_facts(&fx.request(h0(), h0()), i64::MAX).is_err());
+    assert!(super::ctx_input_facts(&fx.request(h0(), h0()), h0()).is_ok());
+}
+
+/// A `since` past the calendar refuses the run with an error, not a panic.
+#[test]
+fn an_out_of_calendar_since_refuses_the_run() {
+    let fx = Fixture::new("since-range");
+    let h = h0();
+    write_watermark(&fx.fills, &(h - 1..=h + 3).collect::<Vec<_>>());
+    let Err(error) = run(&fx.request(i64::MAX, i64::MAX)) else {
+        panic!("an out-of-calendar since must refuse the run");
+    };
+    assert!(
+        error.to_string().contains("outside the calendar"),
+        "{error}"
+    );
 }
 
 /// The hour receipt's skipKey names this unit and writer version, so a receipt
@@ -1730,7 +1785,7 @@ fn a_failed_dir_fsync_after_the_sealed_rename_fails_the_run() {
         synced.file_name(),
         Some(std::ffi::OsStr::new(&format!(
             "date={}",
-            grid::date_of_hour(h)
+            grid::date_of_hour(h).unwrap()
         ))),
         "the fault hit the sealed file's partition dir fsync, got {synced:?}"
     );

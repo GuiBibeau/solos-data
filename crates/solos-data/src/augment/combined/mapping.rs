@@ -371,10 +371,14 @@ pub fn run(request: &Request<'_>) -> Result<Report, StoreError> {
     // the venues' sets (never a max, which would undercount when venues
     // cover different lockbox hours); the set's own size is recorded
     // separately.
-    let hl_dropped = seal::lockbox_dropped_hours(
-        hl.hours.iter().filter_map(|key| watermark_unix_hour(key)),
-        &lockbox_hours,
-    );
+    // Every key was already validated by `watermark_files` in `HlInput::scan`, so the
+    // collect cannot fail here; a malformed key is still an error, never a skip.
+    let hl_hours = hl
+        .hours
+        .iter()
+        .map(|key| grid::parse_source_hour(key).map(grid::SourceHour::unix_hour))
+        .collect::<Result<Vec<i64>, StoreError>>()?;
+    let hl_dropped = seal::lockbox_dropped_hours(hl_hours, &lockbox_hours);
     let phoenix_dropped = seal::lockbox_dropped_hours(
         phoenix.lockbox_dropped_hours.iter().copied(),
         &lockbox_hours,
@@ -507,21 +511,6 @@ fn lockbox_free_sql(ranges: &[(i64, i64)], hour_expression: &str) -> String {
         .collect::<Vec<_>>()
         .join(" OR ");
     format!("NOT ({clauses})")
-}
-
-/// `YYYYMMDD/H` watermark key to the unix hour it names.
-fn watermark_unix_hour(key: &str) -> Option<i64> {
-    let (date, hour_of_day) = key.split_once('/')?;
-    if date.len() != 8 || !date.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let hour_of_day: i64 = hour_of_day.parse().ok()?;
-    let day = chrono::NaiveDate::parse_from_str(
-        &format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..]),
-        "%Y-%m-%d",
-    )
-    .ok()?;
-    Some(grid::hour_of_secs(grid::day_start_secs(day)) + hour_of_day)
 }
 
 /// Test-only ways to force one check so a removed guard goes red.
@@ -954,17 +943,15 @@ impl HlInput {
 fn watermark_files(root: &Path, hours: &BTreeSet<String>) -> Result<Vec<FileRef>, StoreError> {
     let mut files = Vec::new();
     for hour in hours {
-        let (date, hour_of_day) = hour
-            .split_once('/')
-            .ok_or_else(|| StoreError::Check(format!("hl watermark hour '{hour}' is malformed")))?;
-        if date.len() != 8 || !date.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Err(StoreError::Check(format!(
-                "hl watermark hour '{hour}' is malformed"
-            )));
-        }
-        let date_text = format!("{}-{}-{}", &date[..4], &date[4..6], &date[6..]);
+        // A malformed key is an error naming it, never a silently skipped hour.
+        let source = grid::parse_source_hour(hour)?;
+        let date_text = source.day.format("%Y-%m-%d");
+        let date = source.day.format("%Y%m%d");
         for corpus in ["train", "forward"] {
-            let relative = format!("{corpus}/date={date_text}/hour={date}-{hour_of_day}.parquet");
+            let relative = format!(
+                "{corpus}/date={date_text}/hour={date}-{}.parquet",
+                source.hour
+            );
             let path = root.join(&relative);
             if path.is_file() {
                 let size = std::fs::metadata(&path)?.len();
@@ -1702,8 +1689,36 @@ mod tests {
         let day = grid::hour_of_secs(grid::day_start_secs(
             grid::parse_date("2026-10-15").unwrap(),
         ));
-        assert_eq!(watermark_unix_hour("20261015/13"), Some(day + 13));
-        assert_eq!(watermark_unix_hour("bad"), None);
-        assert_eq!(watermark_unix_hour("20261015/x"), None);
+        assert_eq!(
+            grid::parse_source_hour("20261015/13").unwrap().unix_hour(),
+            day + 13
+        );
+        assert!(grid::parse_source_hour("20261015/x").is_err());
+    }
+
+    #[test]
+    fn watermark_files_refuses_malformed_hours_and_finds_canonical_ones() {
+        let root =
+            std::env::temp_dir().join(format!("combined-mapping-watermark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // Each malformed key is an error that names it, even when a valid hour sits
+        // beside it: the malformed one is never skipped.
+        for key in ["20261022/24", "20261022/05", "2026102/5", "abc"] {
+            let hours = BTreeSet::from(["20261022/5".to_owned(), key.to_owned()]);
+            let error = watermark_files(&root, &hours).expect_err(key).to_string();
+            assert!(error.contains(key), "error must name {key}: {error}");
+        }
+        // The canonical unpadded key finds its file under train/ or forward/.
+        let file = root.join("train/date=2026-10-22/hour=20261022-5.parquet");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+        let files = watermark_files(&root, &BTreeSet::from(["20261022/5".to_owned()])).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            files[0].relative,
+            "train/date=2026-10-22/hour=20261022-5.parquet"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

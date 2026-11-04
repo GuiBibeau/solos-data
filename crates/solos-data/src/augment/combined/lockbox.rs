@@ -161,7 +161,10 @@ impl Lockbox {
                 self.version
             )));
         }
-        let days: BTreeSet<String> = hours.iter().map(|h| grid::date_of_hour(*h)).collect();
+        let days = hours
+            .iter()
+            .map(|h| grid::date_of_hour(*h))
+            .collect::<Result<BTreeSet<String>, StoreError>>()?;
         if hours.len() != V2_EXPECTED_HOURS || days.len() != V2_EXPECTED_DAYS {
             return Err(StoreError::Check(format!(
                 "lockbox v2 must exclude exactly {V2_EXPECTED_HOURS} hours over {V2_EXPECTED_DAYS} UTC days, got {} hours over {} days",
@@ -201,13 +204,16 @@ pub fn is_excluded(hours: &BTreeSet<i64>, hour: i64) -> bool {
 }
 
 /// Distinct UTC dates of an excluded-hour set, oldest first (receipts record this).
-#[must_use]
-pub fn excluded_dates(hours: &BTreeSet<i64>) -> Vec<String> {
+///
+/// # Errors
+///
+/// An excluded hour is outside the calendar.
+pub fn excluded_dates(hours: &BTreeSet<i64>) -> Result<Vec<String>, StoreError> {
     let mut dates: BTreeMap<String, ()> = BTreeMap::new();
     for hour in hours {
-        dates.insert(grid::date_of_hour(*hour), ());
+        dates.insert(grid::date_of_hour(*hour)?, ());
     }
-    dates.into_keys().collect()
+    Ok(dates.into_keys().collect())
 }
 
 #[cfg(test)]
@@ -241,7 +247,7 @@ pub(crate) mod tests {
         assert_eq!(lockbox.version, "v2");
         let hours = lockbox.excluded_hours().unwrap();
         assert_eq!(hours.len(), 864);
-        assert_eq!(excluded_dates(&hours).len(), 36);
+        assert_eq!(excluded_dates(&hours).unwrap().len(), 36);
         lockbox.assert_v2_shape(&hours).unwrap();
         // The first excluded hour is Sunday 00:00 before the week (guard 24h); the
         // last is Monday 23:00 after it, and Tuesday 00:00 is kept.
@@ -252,6 +258,19 @@ pub(crate) mod tests {
             grid::hour_of_secs(sunday + 9 * 86_400 - 1)
         ));
         assert!(!hours.contains(&grid::hour_of_secs(sunday + 9 * 86_400)));
+    }
+
+    #[test]
+    fn a_corrupt_excluded_hour_is_refused_not_panicked() {
+        let lockbox: Lockbox = serde_json::from_str(&v2_body()).unwrap();
+        // Same count and day count as v2, but one hour lies outside the calendar. The
+        // day mapping must return an error; a skip would let the shape check pass.
+        let mut hours = lockbox.excluded_hours().unwrap();
+        hours.pop_last();
+        hours.insert(1_000_000_000_000);
+        assert!(lockbox.assert_v2_shape(&hours).is_err());
+        assert!(excluded_dates(&hours).is_err());
+        assert!(excluded_dates(&BTreeSet::from([i64::MAX])).is_err());
     }
 
     #[test]
