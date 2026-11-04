@@ -6,7 +6,7 @@ names are the reviewer's (M8a, M8b), from `augment::hll2book` tests.
 
 ## Acceptance criteria
 
-- [ ] Commit order at `--jobs > 1` is not pinned by any test: the reviewer's
+- [x] Commit order at `--jobs > 1` is not pinned by any test: the reviewer's
   mutant M8b (commit in reverse arrival order instead of `ready.remove(&next)`)
   survived. Harmless today, because `quarantine.jsonl` is a `BTreeMap` merge
   whose content is order-independent by construction, the watermark is a set,
@@ -14,7 +14,8 @@ names are the reviewer's (M8a, M8b), from `augment::hll2book` tests.
   those order-sensitive, there is no test net. Proposed test: run mixed
   outcomes (seal, quarantine, disk floor) at `--jobs > 1` and assert the
   report's `hours` line order and the `quarantine.jsonl` record write order.
-- [ ] The suite has no per-test timeout: the reviewer's mutant M8a (quarantine
+  Done: `commit_order_at_jobs_4_is_hour_order_not_arrival_order` pins both; M8b and M8a go red.
+- [x] The suite has no per-test timeout: the reviewer's mutant M8a (quarantine
   record written immediately on worker arrival, out of commit order) deadlocked
   the test binary (about 0% CPU, killed after 18 minutes), and CI would hang
   until the Actions job timeout instead of failing fast. Propose a per-test
@@ -24,6 +25,7 @@ names are the reviewer's (M8a, M8b), from `augment::hll2book` tests.
   but it replaces the runner and changes how shared fixtures and environment
   are handled; a wrapper needs no migration, but it kills the whole
   `cargo test` process and telling which test hung depends on captured output.
+  Done: verify.sh and the ci.yml test step wrap `cargo test` in a 1500 s limit that prints the timeout message.
 
 ## Ops
 

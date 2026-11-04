@@ -221,6 +221,7 @@ impl Reset {
         super::publish::seams::clear_before_receipt();
         super::batch::clear_before_watermark();
         super::batch::clear_drop_fault();
+        super::batch::clear_sequencing();
         crate::fsutil::clear_fsync_failure();
         crate::fsutil::clear_write_failure();
         Self
@@ -232,6 +233,7 @@ impl Drop for Reset {
         super::publish::seams::clear_before_receipt();
         super::batch::clear_before_watermark();
         super::batch::clear_drop_fault();
+        super::batch::clear_sequencing();
         crate::fsutil::clear_fsync_failure();
         crate::fsutil::clear_write_failure();
     }
@@ -2831,6 +2833,118 @@ fn a_malformed_line_quarantines_the_hour_and_the_rest_still_seals() {
         "the watermark gained a quarantined hour"
     );
     assert!(!out.join("receipts/20261022/0.json").exists());
+}
+
+/// Commit order at `--jobs 4` when the workers finish out of order. The gate sequences the
+/// first batch to arrive as hours 2, 1, 3, 0, so hour 0, the first to commit, arrives last.
+/// Hours 1 and 2 hold a corrupt line, hours 0 and 3 seal, and the free-space probe trips at
+/// its eighth call, the dispatch of hour 6. Hours 4 and 5 were dispatched but never committed:
+/// no receipt, no watermark entry, raw kept. The report's hour lines and the quarantine record
+/// writes must follow hour order, not arrival order. The arrival order is asserted too, so a
+/// broken gate fails here instead of passing by accident.
+/// Mutations: M8b (commit in reverse arrival order) reverses the hour lines, red on the first
+/// assertion; M8a (write the quarantine record on arrival) writes hour 2 before hour 1, red on
+/// the write-order assertion.
+#[test]
+fn commit_order_at_jobs_4_is_hour_order_not_arrival_order() {
+    let _reset = Reset::arm();
+    let root = Tmp::new("commit-order");
+    let input = root.0.join("in");
+    let out = root.0.join("out");
+    let sums = root.0.join("MANIFEST.json");
+    let time = 1_792_627_200_000_i64;
+    let mut files = Vec::new();
+    for hour in 0..8u32 {
+        let at = time + i64::from(hour) * 3_600_000;
+        let body = if hour == 1 || hour == 2 {
+            incident_body("BTC", at).0
+        } else {
+            lines(&[book("BTC", at, 1, "2")])
+        };
+        files.push(write_coin(&input, "20261101", hour, "BTC", &body));
+    }
+    std::fs::write(&sums, manifest(&files)).unwrap();
+    let hour = |h: u32| format!("20261101/{h}");
+    super::batch::sequence_arrivals(&[hour(2), hour(1), hour(3), hour(0)]);
+    // Calls 2..=5 dispatch hours 0..=3 at the start, calls 6 and 7 dispatch hours 4 and 5
+    // once hour 0 commits, and call 8 would dispatch hour 6 and finds no space.
+    let calls = std::cell::Cell::new(0u32);
+    let free = |_: &Path| -> Result<u64, String> {
+        let call = calls.get() + 1;
+        calls.set(call);
+        Ok(if call < 8 { u64::MAX } else { 0 })
+    };
+    let opts = Opts {
+        floor: 1,
+        jobs: 4,
+        ..drop_opts()
+    };
+    let report = run_with(&input, &out, &sums, opts, free).unwrap();
+    let events = super::batch::take_events();
+
+    assert_eq!(report.stop, Stop::DiskFloor);
+    assert_eq!(report.free_bytes, Some(0));
+    let seen: Vec<(String, &str)> = report
+        .hours
+        .iter()
+        .map(|line| (line.hour.clone(), line.status))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (hour(0), "verified"),
+            (hour(1), "quarantined"),
+            (hour(2), "quarantined"),
+            (hour(3), "verified"),
+        ],
+        "the report's hour lines follow hour order, not arrival order"
+    );
+    let arrived: Vec<String> = events
+        .iter()
+        .filter_map(|event| event.strip_prefix("arrived "))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        arrived,
+        vec![hour(2), hour(1), hour(3), hour(0)],
+        "the gate did not produce the arrival order under test"
+    );
+    let written: Vec<String> = events
+        .iter()
+        .filter_map(|event| event.strip_prefix("quarantined "))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        written,
+        vec![hour(1), hour(2)],
+        "the quarantine records were not written in hour order"
+    );
+    assert_eq!(report.hours_verified, 2);
+    assert_eq!(report.hours_quarantined, 2);
+    assert_eq!(report.quarantine_entries_added, 2);
+    assert_eq!(report.exit_code(), 3);
+    assert_eq!(
+        watermark(&out),
+        vec![hour(0), hour(3)],
+        "only the sealed hours entered the watermark"
+    );
+    assert!(
+        !out.join("receipts/20261101/4.json").exists()
+            && !out.join("receipts/20261101/5.json").exists(),
+        "a dispatched hour that never committed got a receipt"
+    );
+    let raw = |h: u32| input.join(format!("20261101/{h}/BTC.lz4"));
+    assert!(!raw(0).exists(), "sealed hour 0 kept its raw");
+    assert!(!raw(3).exists(), "sealed hour 3 kept its raw");
+    for h in [1, 2, 4, 5, 6, 7] {
+        assert!(raw(h).is_file(), "hour {h}'s raw was deleted");
+    }
+    let recorded = std::fs::read_to_string(out.join("quarantine.jsonl")).unwrap();
+    assert_eq!(
+        recorded.lines().count(),
+        2,
+        "one record per quarantined hour"
+    );
 }
 
 /// The manifest's current file list as `(path, sha256, size)` rows.

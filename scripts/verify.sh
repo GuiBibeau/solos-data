@@ -63,12 +63,40 @@ fi
 export CARGO_BUILD_JOBS=${jobs}
 printf 'verify: CARGO_BUILD_JOBS=%s\n' "${jobs}" >&2
 
+# cargo test runs under a wall-clock limit, so a hung test fails the step with a message
+# instead of stalling it. The limit sits above a measured cold-cache run (ADR-0018). GNU
+# timeout is `timeout` on Linux and `gtimeout` with Homebrew coreutils on macOS; with
+# neither, the tests run unbounded and say so.
+test_timeout_secs=${SOLOS_TEST_TIMEOUT_SECS:-1500}
+timeout_cmd=""
+if command -v timeout >/dev/null 2>&1; then
+  timeout_cmd=timeout
+elif command -v gtimeout >/dev/null 2>&1; then
+  timeout_cmd=gtimeout
+else
+  printf 'verify: no timeout or gtimeout on PATH; cargo test runs without a time limit\n' >&2
+fi
+
+cargo_test() {
+  if [[ -z "${timeout_cmd}" ]]; then
+    cargo test --workspace --locked
+    return
+  fi
+  local status=0
+  "${timeout_cmd}" --kill-after=30 "${test_timeout_secs}" cargo test --workspace --locked || status=$?
+  # 124 is the limit firing. 137 is the KILL that follows a limit TERM did not stop.
+  if ((status == 124 || status == 137)); then
+    printf 'cargo test timed out after %ss\n' "${test_timeout_secs}" >&2
+  fi
+  return "${status}"
+}
+
 run lint npm run lint:text
 run ci-check node scripts/check-ci.mjs
 run release-deps scripts/check-release-deps.sh
 run fmt cargo fmt --all --check
 run clippy cargo clippy --workspace --all-targets --locked -- -D warnings
-run test cargo test --workspace --locked
+run test cargo_test
 run tsc npm run check
 run codec cargo build --release --locked -p phoenix-codec
 run node npm test
