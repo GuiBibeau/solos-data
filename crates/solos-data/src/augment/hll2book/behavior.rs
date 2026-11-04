@@ -2163,6 +2163,163 @@ fn reseal_refuses_a_narrower_coins() {
     );
 }
 
+/// `--reseal` of an hour whose receipt is corrupt, truncated, or missing is refused before any
+/// work: no verified receipt means nothing to re-seal from. The hour, its raw, and the
+/// watermark are untouched, and `--drop-raw-after-verify` deletes nothing.
+#[test]
+fn reseal_refused_when_receipt_unreadable() {
+    for label in ["garbage", "truncated", "missing"] {
+        let root = Tmp::new(&format!("reseal-receipt-{label}"));
+        let (input, out, sums) = stage_pair(&root);
+        run_ok(&input, &out, &sums).unwrap();
+        let receipt = out.join("receipts/20261022/0.json");
+        let whole = std::fs::read(&receipt).unwrap();
+        match label {
+            "garbage" => std::fs::write(&receipt, b"{not json").unwrap(),
+            "truncated" => std::fs::write(&receipt, &whole[..whole.len() / 2]).unwrap(),
+            _ => std::fs::remove_file(&receipt).unwrap(),
+        }
+        let train = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+        let train_sha = crate::fsutil::file_hash(&train).unwrap();
+        let watermark_before = watermark(&out);
+        let error = run_with(
+            &input,
+            &out,
+            &sums,
+            Opts {
+                reseal: reseal_hours(&["20261022/0"]),
+                ..drop_opts()
+            },
+            |_| Ok(u64::MAX),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("--reseal 20261022/0"),
+            "{label}: {message}"
+        );
+        assert!(
+            message.contains("receipt is missing or unreadable"),
+            "{label}: {message}"
+        );
+        assert_eq!(
+            crate::fsutil::file_hash(&train).unwrap(),
+            train_sha,
+            "{label}: the hour was touched"
+        );
+        assert_eq!(
+            watermark(&out),
+            watermark_before,
+            "{label}: the watermark moved"
+        );
+        for coin in ["BTC", "ETH"] {
+            assert!(
+                input.join(format!("20261022/0/{coin}.lz4")).is_file(),
+                "{label}: {coin} raw was deleted"
+            );
+        }
+        assert!(
+            !out.join("drops/20261022/0.json").exists(),
+            "{label}: a drop record was written"
+        );
+    }
+}
+
+/// `--reseal` whose manifest does not cover the hour is refused before any work, in two
+/// shapes. A rebuilt manifest without SOL's row, with SOL's `.lz4` still on disk, trips the
+/// in-scope row-less file check. With SOL's file also gone, the in-scope group lacks a
+/// receipt coin and that check refuses. Either way the hour, its raw, its receipt, and the
+/// watermark are untouched.
+#[test]
+fn reseal_refused_when_manifest_lacks_a_row() {
+    for (label, sol_on_disk, reason) in [
+        ("on-disk", true, "has no manifest row"),
+        ("gone", false, "missing receipt coins SOL"),
+    ] {
+        let root = Tmp::new(&format!("reseal-no-row-{label}"));
+        let input = root.0.join("in");
+        let out = root.0.join("out");
+        let sums = root.0.join("MANIFEST.json");
+        let time = 1_792_627_200_000_i64;
+        let btc = write_coin(&input, "20261022", 0, "BTC", &book("BTC", time, 1, "1"));
+        let eth = write_coin(
+            &input,
+            "20261022",
+            0,
+            "ETH",
+            &book("ETH", time + 5_000, 1, "2"),
+        );
+        let sol = write_coin(
+            &input,
+            "20261022",
+            0,
+            "SOL",
+            &book("SOL", time + 10_000, 1, "3"),
+        );
+        std::fs::write(&sums, manifest(&[btc.clone(), eth.clone(), sol.clone()])).unwrap();
+        let first = run_ok(&input, &out, &sums).unwrap();
+        assert_eq!(first.hours_verified, 1, "{label}");
+        let train = out.join("train/date=2026-10-22/hour=20261022-0.parquet");
+        let train_sha = crate::fsutil::file_hash(&train).unwrap();
+        let receipt = std::fs::read(out.join("receipts/20261022/0.json")).unwrap();
+        let watermark_before = watermark(&out);
+
+        // The rebuilt manifest has no SOL row. Its file stays on disk unless the case says gone.
+        std::fs::write(&sums, manifest(&[btc.clone(), eth.clone()])).unwrap();
+        if !sol_on_disk {
+            std::fs::remove_file(input.join(&sol.0)).unwrap();
+        }
+        let error = run_with(
+            &input,
+            &out,
+            &sums,
+            Opts {
+                reseal: reseal_hours(&["20261022/0"]),
+                ..drop_opts()
+            },
+            |_| Ok(u64::MAX),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("--reseal 20261022/0"),
+            "{label}: {message}"
+        );
+        assert!(message.contains(reason), "{label}: {message}");
+        assert_eq!(
+            crate::fsutil::file_hash(&train).unwrap(),
+            train_sha,
+            "{label}: the hour Parquet was touched"
+        );
+        assert_eq!(
+            std::fs::read(out.join("receipts/20261022/0.json")).unwrap(),
+            receipt,
+            "{label}: the receipt was rewritten"
+        );
+        assert_eq!(
+            watermark(&out),
+            watermark_before,
+            "{label}: the watermark moved"
+        );
+        for file in [&btc, &eth] {
+            assert!(
+                input.join(&file.0).is_file(),
+                "{label}: {} was deleted",
+                file.0
+            );
+        }
+        assert_eq!(
+            input.join(&sol.0).is_file(),
+            sol_on_disk,
+            "{label}: SOL's file state changed"
+        );
+        assert!(
+            !out.join("drops/20261022/0.json").exists(),
+            "{label}: a drop record appeared"
+        );
+    }
+}
+
 /// The `--reseal` bypass is scoped to the named hour. With `--reseal X`, two other
 /// watermarked hours whose inputs shrank (a rebuilt manifest with fewer rows, the
 /// dropped coin's raw gone) are still refused by the superset guard: sealed output,

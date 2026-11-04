@@ -230,12 +230,14 @@ the listing time as possibly incomplete.
   `work_one` guard is covered on its own).
 - [ ] The guard compares coin and sha256 only, not path or bytes. Low risk;
   noted.
-- [ ] The `--reseal` parser accepts forms like `20261022/05` and
+- [x] The `--reseal` parser accepts forms like `20261022/05` and
   `20261022/+5` but stores them as typed, so they never match the watermark
   key (`20261022/5`) and the refusal says "not in the watermark" for a real
   hour, which is misleading: normalize the hour or reject non-canonical forms.
-- [ ] The `--reseal` receipt-readable check and the missing-manifest-row check
-  have no tests yet.
+  Closed: `parse_reseal` rejects every form but the canonical `YYYYMMDD/H`.
+- [x] The `--reseal` receipt-readable check and the missing-manifest-row check
+  have no tests yet. Closed: `reseal_refused_when_receipt_unreadable` and
+  `reseal_refused_when_manifest_lacks_a_row` (both manifest refusals).
 - [x] Quarantine rule: a raw line that does not decode quarantines its hour
   (no seal, no raw drop, a durable idempotent `quarantine.jsonl` entry,
   other hours seal, exit 3), with the 2026-11-02 20251114/11 MEGA incident

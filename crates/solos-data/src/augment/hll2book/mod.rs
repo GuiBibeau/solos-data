@@ -268,37 +268,24 @@ pub fn parse_day(value: &str) -> Result<String, crate::store::StoreError> {
 ///
 /// # Errors
 ///
-/// The list is empty, a token is empty or not a `YYYYMMDD/H` calendar hour (the hour is
-/// 0..=23), or a token repeats.
+/// A token is not a canonical `YYYYMMDD/H` hour (a calendar date, then an unpadded hour
+/// 0..=23, so `05`, `+5` and `24` are refused), or a token repeats.
 pub fn parse_reseal(
     value: &str,
 ) -> Result<std::collections::BTreeSet<String>, crate::store::StoreError> {
     let mut hours = std::collections::BTreeSet::new();
     for token in value.split(',') {
-        let bad = || {
-            crate::store::StoreError::Check(format!("--reseal '{value}' is not a YYYYMMDD/H hour"))
-        };
         let token = token.trim();
-        let Some((date, hour)) = token.split_once('/') else {
-            return Err(bad());
-        };
-        if checksum::calendar_date(date).is_none() {
-            return Err(bad());
-        }
-        let Ok(hour) = hour.parse::<u32>() else {
-            return Err(bad());
-        };
-        if hour > 23 {
-            return Err(bad());
+        if !checksum::is_hour_key(token) {
+            return Err(crate::store::StoreError::Check(format!(
+                "--reseal '{token}' is not a YYYYMMDD/H hour: a calendar date, then an unpadded hour 0..23 (for example 20261022/5)"
+            )));
         }
         if !hours.insert(token.to_owned()) {
             return Err(crate::store::StoreError::Check(format!(
                 "--reseal lists {token} twice"
             )));
         }
-    }
-    if hours.is_empty() {
-        return Err(crate::store::StoreError::Check("--reseal is empty".into()));
     }
     Ok(hours)
 }
@@ -384,6 +371,23 @@ mod tests {
         assert!(parse_reseal("20261022/0,20261022/0").is_err());
         assert!(parse_reseal("20261022/0,").is_err());
         assert!(parse_reseal("").is_err());
+    }
+
+    #[test]
+    fn parse_reseal_accepts_only_the_canonical_hour_key() {
+        let hours = parse_reseal("20261022/5").unwrap();
+        assert_eq!(hours.len(), 1);
+        assert!(hours.contains("20261022/5"));
+        for typed in ["20261022/05", "20261022/+5", "20261022/24", "2026-10-22/5"] {
+            let message = parse_reseal(typed).unwrap_err().to_string();
+            assert!(message.contains(&format!("'{typed}'")), "{message}");
+            assert!(message.contains("YYYYMMDD/H"), "{message}");
+        }
+        // One non-canonical token refuses the whole list, and the message names that token.
+        let message = parse_reseal("20261022/5,20261022/05")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("'20261022/05'"), "{message}");
     }
 
     #[test]

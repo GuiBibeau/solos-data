@@ -256,7 +256,10 @@ ADR-0021).
 ```
 
 `--reseal YYYYMMDD/H` (repeatable, comma lists) is the supported way to re-seal
-a corrected re-download of a verified hour. The run validates up front, before
+a corrected re-download of a verified hour. Each value must be the canonical
+form: a calendar date and an unpadded hour `0` to `23`, so `20261022/05`,
+`20261022/+5` and `20261022/24` are refused when the flag is parsed. The run
+validates up front, before
 any work, that each named hour is in the watermark, has a readable receipt,
 sits inside `--since`/`--until`, is covered by in-scope manifest entries for
 every receipt coin, and keeps every receipt input's raw file on disk; the
