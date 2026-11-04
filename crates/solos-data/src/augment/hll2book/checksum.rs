@@ -251,6 +251,23 @@ pub fn calendar_date(value: &str) -> Option<String> {
     Some(value.to_owned())
 }
 
+/// Whether `key` is a canonical `YYYYMMDD/H` hour key, the form [`Entry::hour_key`] writes: a
+/// calendar date, a slash, and an unpadded hour `0`..=`23`. A sign or a leading zero in the
+/// hour (`+5`, `05`) is not canonical, so it never matches a watermark key.
+#[must_use]
+pub fn is_hour_key(key: &str) -> bool {
+    let Some((date, hour)) = key.split_once('/') else {
+        return false;
+    };
+    if calendar_date(date).is_none() {
+        return false;
+    }
+    let Ok(hour) = hour.parse::<u32>() else {
+        return false;
+    };
+    hour <= 23 && format!("{date}/{hour}") == key
+}
+
 /// A single path component that can be a coin file stem.
 #[must_use]
 pub fn valid_coin(coin: &str) -> bool {
