@@ -136,7 +136,22 @@ jobs:
         with:
           shared-key: test
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --workspace --locked
+      # The workspace tests run under a wall-clock limit, so a hung test fails this step with a
+      # message instead of running to the job's 45-minute limit. 1500 s sits above the cold-cache
+      # run measured in ADR-0018 (the test job took 16 m 48 s with nothing cached); a warm run
+      # takes about three minutes. GNU timeout signals the whole process group, so the test
+      # binaries stop with cargo.
+      - name: cargo test
+        env:
+          TEST_TIMEOUT_SECS: 1500
+        run: |
+          status=0
+          timeout --kill-after=30 "$TEST_TIMEOUT_SECS" cargo test --workspace --locked || status=$?
+          # 124 is the limit firing. 137 is the KILL that follows a limit TERM did not stop.
+          if (( status == 124 || status == 137 )); then
+            echo "::error::cargo test timed out after ${TEST_TIMEOUT_SECS}s"
+          fi
+          exit "$status"
       # Seed the cache with the dev-profile binary the verify-skill job drives. `cargo test`
       # resolves libduckdb-sys's build script in test mode and `cargo build` in build mode, so
       # without this line the skill would recompile DuckDB's C++ even after restoring this cache.

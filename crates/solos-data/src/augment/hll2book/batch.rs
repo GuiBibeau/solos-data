@@ -420,6 +420,8 @@ pub fn run(
     let started: std::sync::Arc<std::sync::Mutex<BTreeMap<String, std::time::Instant>>> =
         std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new()));
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    #[cfg(test)]
+    let gate = std::sync::Arc::new(ArrivalGate::take());
     std::thread::scope(|scope| -> Result<(), StoreError> {
         // The task sender is owned by this closure so every return path drops it: the workers
         // block on `recv`, and a sender left alive past the commit loop would keep the scope
@@ -430,6 +432,8 @@ pub fn run(
             let done_tx = done_tx.clone();
             let stop = std::sync::Arc::clone(&stop);
             let started = std::sync::Arc::clone(&started);
+            #[cfg(test)]
+            let gate = std::sync::Arc::clone(&gate);
             let tasks = &tasks;
             let hash = &hash;
             let git = &git;
@@ -466,9 +470,13 @@ pub fn run(
                     if matches!(outcome, WorkerOutcome::Failed(_)) {
                         stop.store(true, std::sync::atomic::Ordering::SeqCst);
                     }
+                    #[cfg(test)]
+                    gate.wait_turn(&tasks[index].key);
                     if done_tx.send((index, outcome)).is_err() {
                         return Ok(());
                     }
+                    #[cfg(test)]
+                    gate.sent(&tasks[index].key);
                 }
             });
         }
@@ -493,6 +501,8 @@ pub fn run(
             let Ok((index, outcome)) = done_rx.recv() else {
                 break;
             };
+            #[cfg(test)]
+            note_event(format!("arrived {}", tasks[index].key));
             if let WorkerOutcome::Failed(error) = outcome {
                 // Hours already staged clean their own temporaries when this map drops.
                 drop(ready);
@@ -1417,6 +1427,8 @@ pub(crate) fn write_quarantine(
     faults: &[LineFault],
     git_sha: &str,
 ) -> Result<(u64, Vec<QuarantineEntry>), StoreError> {
+    #[cfg(test)]
+    note_event(format!("quarantined {hour_key}"));
     let path = quarantine_path(out);
     let mut merged: BTreeMap<QuarantineKey, QuarantineEntry> = BTreeMap::new();
     if path.is_file() {
@@ -1591,6 +1603,88 @@ fn take_drop_fault() -> bool {
             false
         }
     })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Hour keys in the order their workers must reach the commit loop; empty for no
+    /// sequencing. Consumed by the next `run` on this thread.
+    static ARRIVAL_ORDER: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// `arrived <hour>` and `quarantined <hour>` events, in the order the calling thread saw them.
+    static EVENTS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Test hook: the next `run` on this thread sequences its hour workers. Each listed hour
+/// waits until the hour before it in `order` has been sent to the commit loop, so the
+/// arrival order is fixed while the commit order is still free to differ.
+#[cfg(test)]
+pub(crate) fn sequence_arrivals(order: &[String]) {
+    ARRIVAL_ORDER.with(|slot| *slot.borrow_mut() = order.to_vec());
+}
+
+/// Test hook: the events this thread recorded since the last call, cleared.
+#[cfg(test)]
+pub(crate) fn take_events() -> Vec<String> {
+    EVENTS.with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+/// Test hook: clears the sequencing order and the event log on this thread.
+#[cfg(test)]
+pub(crate) fn clear_sequencing() {
+    ARRIVAL_ORDER.with(|slot| slot.borrow_mut().clear());
+    EVENTS.with(|slot| slot.borrow_mut().clear());
+}
+
+#[cfg(test)]
+fn note_event(event: String) {
+    EVENTS.with(|slot| slot.borrow_mut().push(event));
+}
+
+/// Test gate that fixes the order in which the first batch of workers send their outcomes.
+#[cfg(test)]
+struct ArrivalGate {
+    order: Vec<String>,
+    sent_keys: std::sync::Mutex<BTreeSet<String>>,
+    moved: std::sync::Condvar,
+}
+
+#[cfg(test)]
+impl ArrivalGate {
+    fn take() -> Self {
+        let order = ARRIVAL_ORDER.with(|slot| std::mem::take(&mut *slot.borrow_mut()));
+        Self {
+            order,
+            sent_keys: std::sync::Mutex::new(BTreeSet::new()),
+            moved: std::sync::Condvar::new(),
+        }
+    }
+
+    /// Blocks until the hour listed before `key` has been sent. The wait is bounded, so a
+    /// broken sequence fails the test instead of hanging it.
+    fn wait_turn(&self, key: &str) {
+        let Some(at) = self.order.iter().position(|hour| hour == key) else {
+            return;
+        };
+        let Some(before) = at.checked_sub(1).map(|prev| self.order[prev].as_str()) else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut sent = self.sent_keys.lock().expect("gate lock");
+        while !sent.contains(before) {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            assert!(!left.is_zero(), "arrival gate: {before} was never sent");
+            sent = self.moved.wait_timeout(sent, left).expect("gate wait").0;
+        }
+    }
+
+    fn sent(&self, key: &str) {
+        self.sent_keys
+            .lock()
+            .expect("gate lock")
+            .insert(key.to_owned());
+        self.moved.notify_all();
+    }
 }
 
 /// The receipt of an hour that is already verified and still matches its outputs, or `None`
