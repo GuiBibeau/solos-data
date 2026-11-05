@@ -3,6 +3,11 @@
   "startDate": "2026-01-01",
   "requestsPerSecond": 2.0,
   "diskBudgetGb": 1000.0,
+  "absentReprobe": {
+    "dailyProbes": 14,
+    "weeklyProbes": 12,
+    "maxPerRun": 500
+  },
   "sources": {
     "binance": {
       "enabled": true,

@@ -3,6 +3,7 @@
 //! period and records how far the series is complete. The current, open period is rewritten on
 //! every run; a closed period is fetched once.
 
+use super::absent::Counts;
 use super::http::Http;
 use super::ledger::{get_progress, register};
 use super::parquet::{Target, stage_json, write_parquet};
@@ -128,6 +129,8 @@ pub struct Outcome {
     /// A fatal error (a failed fsync, ADR-0016) that must end the lane instead of being
     /// counted and retried.
     pub fatal: Option<String>,
+    /// Absent dump periods (ADR-0024), for the sources that track them.
+    pub absent: Option<Counts>,
 }
 
 impl Outcome {
@@ -147,6 +150,9 @@ impl Outcome {
         self.errors += other.errors;
         self.skipped += other.skipped;
         self.requests += other.requests;
+        if let Some(counts) = &other.absent {
+            self.absent.get_or_insert_with(Counts::default).add(counts);
+        }
         if self.fatal.is_none() {
             self.fatal.clone_from(&other.fatal);
         }
@@ -160,6 +166,10 @@ impl Outcome {
             .with("rows", self.rows)
             .with("errors", self.errors)
             .with("skipped", self.skipped);
+        let obj = match self.absent {
+            Some(counts) => counts.to_obj(obj),
+            None => obj,
+        };
         let obj = match &self.note {
             Some(note) => obj.with("note", note.as_str()),
             None => obj,

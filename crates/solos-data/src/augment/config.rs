@@ -89,6 +89,40 @@ impl Default for DumpWalk {
     }
 }
 
+/// The schedule on which an interior `absent` dump period is asked for again (ADR-0024): at most
+/// once every 24 hours for `dailyProbes` misses, then at most once every 7 days for
+/// `weeklyProbes` more, then never. A run asks for at most `maxPerRun` holes per source, so a
+/// first run that finds many cannot starve the rest of the sync. `dailyProbes` and
+/// `weeklyProbes` both 0 turns the re-probe off; the marks are still logged and counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AbsentReprobe {
+    /// Re-probes spaced a day apart.
+    pub daily_probes: u32,
+    /// Re-probes spaced a week apart, after the daily ones.
+    pub weekly_probes: u32,
+    /// Holes one source asks for in one run; the others wait for the next run.
+    pub max_per_run: u32,
+}
+
+impl Default for AbsentReprobe {
+    fn default() -> Self {
+        AbsentReprobe {
+            daily_probes: 14,
+            weekly_probes: 12,
+            max_per_run: 500,
+        }
+    }
+}
+
+impl AbsentReprobe {
+    /// Misses after which a period is given up.
+    #[must_use]
+    pub fn total(&self) -> u32 {
+        self.daily_probes.saturating_add(self.weekly_probes)
+    }
+}
+
 /// Hyperliquid info API.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -670,6 +704,9 @@ pub struct AugmentConfig {
     /// Bytes the large datasets may bring the root to, in GB; 0 means no large dataset runs.
     #[serde(default)]
     pub disk_budget_gb: f64,
+    /// How often a dump day the venue skipped is asked for again (ADR-0024).
+    #[serde(default)]
+    pub absent_reprobe: AbsentReprobe,
     /// Per-source settings.
     pub sources: Sources,
     /// The symbol map.
@@ -794,6 +831,10 @@ fn validate(config: &AugmentConfig) -> Result<(), StoreError> {
     }
     if !(config.disk_budget_gb >= 0.0 && config.disk_budget_gb.is_finite()) {
         return Err(StoreError::Check("Invalid diskBudgetGb".into()));
+    }
+    let reprobe = &config.absent_reprobe;
+    if reprobe.daily_probes > 400 || reprobe.weekly_probes > 520 || reprobe.max_per_run > 100_000 {
+        return Err(StoreError::Check("Invalid absentReprobe".into()));
     }
     let hl_rps = config.sources.hyperliquid.requests_per_second;
     if !(hl_rps > 0.0 && hl_rps <= 50.0) {

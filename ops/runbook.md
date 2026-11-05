@@ -271,6 +271,14 @@ SOLOS_DATA_AUGMENT_DIR=~/.local/share/solos-data/augment solos-data augment quer
 `status.json` has one entry per source (`files`, `rows`, `errors`, `skipped`) and one per
 dataset (files, symbols, rows, bytes, oldest and newest period). `augment_series_error` lines
 name the source, dataset, symbol and item that failed; the item is retried on the next run.
+A dump day the venue still does not serve three days after it ended is remembered as absent
+(ADR-0024): `augment_absent_marked` names the source, dataset, symbol and day and says whether
+it is `leading` (the market listed later), `interior` (a hole between published days) or
+`trailing`; the Binance, OKX and Bybit entries carry `absentMarked`, `absentInterior`,
+`absentGivenUp` and `absentFilled`, and `health` warns while interior holes are still being
+asked for (`absentReprobe` in `config/augment.json`: daily for 14 misses, weekly for 12, at
+most 500 holes per source per run). A late file logs `augment_absent_filled`; the end of the
+schedule logs `augment_absent_given_up` and the day stays in `absentGivenUp`.
 `--source <name>` (`binance`, `hyperliquid`, `deribit`, `defillama`, `bybit`, `sec`,
 `alternative`, `polymarket`, `kalshi`, `phoenix`, `tardis`, `okx`, `hyperliquid_s3`) and `--symbol <SYM>` restrict a run for a
 check. Query views are named `<source>_<dataset>` (`binance_klines`, `hyperliquid_funding`,
@@ -691,7 +699,7 @@ of `config/health.json`; a field left out keeps its default.
 | venues lane | augment `status-venues.json` (ADR-0012), only when it exists | file > 15 min old, a venue's last cycle > 15 min ago, lag > 3,000 slots, 3 failed cycles in a row, no Pyth poll | lag > 9,000 slots, 10 failed cycles in a row |
 | history backfills | augment `status-venues-history.json` (ADR-0013) and `status-spot-history.json` (ADR-0014), only when they exist and until every source is done | file > 15 min old, stopped before the floor, no batch for 60 min (`historyStallWarnMinutes`), 3 failed batches in a row | no batch for 180 min (`historyStallCriticalMinutes`), 10 failed batches in a row |
 | lane error streaks | raw `status.json` `lanes.{tail,backfill,maintenance}`: consecutive `collector_error`s with no chunk published in between (the lane's progress marker unchanged), last error < 30 min old | 3 in a row | 10 in a row; the finding names the lane and the error class (`oom`, `constraint`, `rollback_failed`, `rpc`, `other`) |
-| augment sync | `status.json` age and `sources.*.errors` | > 150 min old, or errors in the last run | |
+| augment sync | `status.json` age, `sources.*.errors` and `sources.*.absentInterior` | > 150 min old, errors in the last run, or interior absent dump days still being re-probed (ADR-0024) | |
 | augment capture | `status-capture.json` age and the lanes' `errors` | > 10 min old, errors grown since the previous check, the Elfa credit guard tripped, the last Elfa hourly cycle > 150 min ago | |
 | disk free | `statvfs` of the raw root's parent | < 500 GB | < 100 GB |
 

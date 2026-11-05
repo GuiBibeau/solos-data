@@ -500,16 +500,21 @@ fn raw_section(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>, f: &mut Find
 
 /// The sum of every `errors` field one or two levels down.
 fn error_total(status: &Value, sections: &[&str]) -> i64 {
+    field_total(status, sections, "errors")
+}
+
+/// The sum of every `field` one or two levels down.
+fn field_total(status: &Value, sections: &[&str], field: &str) -> i64 {
     sections
         .iter()
         .filter_map(|s| status.get(*s))
         .flat_map(|section| {
-            let own = num(section.get("errors"));
+            let own = num(section.get(field));
             let nested = section
                 .as_object()
                 .into_iter()
                 .flat_map(|o| o.values())
-                .filter_map(|v| num(v.get("errors")));
+                .filter_map(|v| num(v.get(field)));
             own.into_iter().chain(nested)
         })
         .sum()
@@ -528,7 +533,23 @@ fn augment_section(inputs: &Inputs, t: &Thresholds, now: DateTime<Utc>, f: &mut 
                 f.warn
                     .push(format!("augment sync: {errors} errors in the last run"));
             }
-            json!({ "ageSeconds": age, "errors": errors, "stopped": status.get("stopped") })
+            // Dump days the venue skipped between published days (ADR-0024): holes in a
+            // continuous series, still asked for again. Ones whose schedule is spent are
+            // permanent gaps; they stay in the counts, and no longer warn.
+            let holes = field_total(status, &["sources"], "absentInterior");
+            if holes > 0 {
+                f.warn.push(format!(
+                    "augment sync: {holes} interior absent dump days still being re-probed (augment_absent_marked lines name them)"
+                ));
+            }
+            let given_up = field_total(status, &["sources"], "absentGivenUp");
+            json!({
+                "ageSeconds": age,
+                "errors": errors,
+                "stopped": status.get("stopped"),
+                "absentInterior": holes,
+                "absentGivenUp": given_up,
+            })
         }
         None => {
             f.warn.push("augment status.json unreadable".into());
@@ -704,6 +725,39 @@ mod tests {
             "2026-10-10T07:50:00.000Z"
         );
         assert_eq!(health["disk"]["freeGb"], 3000.0);
+    }
+
+    #[test]
+    fn interior_absent_dump_days_warn_until_their_schedule_is_spent() {
+        let now = "2026-10-10T08:00:00Z";
+        let t = Thresholds::default();
+        let mut inputs = healthy(now);
+        inputs.sync_status.value = Some(json!({
+            "sources": {
+                "binance": { "errors": 0, "absentInterior": 2, "absentGivenUp": 1 },
+                "okx": { "errors": 0, "absentInterior": 1, "absentGivenUp": 0 },
+                "bybit": { "errors": 0 },
+            },
+            "stopped": false,
+        }));
+        let health = evaluate(&inputs, &t, at(now));
+        assert_eq!(health["level"], "warn", "{health}");
+        assert!(
+            health["warn"]
+                .to_string()
+                .contains("3 interior absent dump days"),
+            "{health}"
+        );
+        assert_eq!(health["augment"]["sync"]["absentInterior"], 3);
+        assert_eq!(health["augment"]["sync"]["absentGivenUp"], 1);
+        // Only given-up holes: counted, not warned.
+        inputs.sync_status.value = Some(json!({
+            "sources": { "binance": { "errors": 0, "absentInterior": 0, "absentGivenUp": 2 } },
+            "stopped": false,
+        }));
+        let health = evaluate(&inputs, &t, at(now));
+        assert_eq!(health["level"], "ok", "{health}");
+        assert_eq!(health["augment"]["sync"]["absentGivenUp"], 2);
     }
 
     #[test]

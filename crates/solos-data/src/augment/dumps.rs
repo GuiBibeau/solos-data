@@ -3,21 +3,24 @@
 //! Parquet file per period. Every series of a source is walked period by period from the newest
 //! published one down to `walk.startDate`, all series of a period before the next older period,
 //! so whatever a run fetches is whole cross-sections of the recent past. The ledger's `files`
-//! table is the progress record; a period the venue does not serve (a market listed later) is
-//! remembered as `absent` once it is old enough not to be "not published yet". A run stops the
-//! walk after `walk.runMinutes`, at the walk's `budgetGb`, or at the lane's `diskBudgetGb`.
+//! table is the progress record; a period the venue does not serve is remembered as `absent` once
+//! it is old enough not to be "not published yet". A mark is logged and counted, an interior one
+//! (a hole between published periods) is asked for again on a schedule, and a late file fills it
+//! (ADR-0024). A run stops the walk after `walk.runMinutes`, at the walk's `budgetGb`, or at the
+//! lane's `diskBudgetGb`.
 
-use super::config::DumpWalk;
+use super::absent::{self, AbsentSet, Counts};
+use super::config::{AbsentReprobe, DumpWalk};
 use super::http::HttpError;
 use super::ledger::{complete_periods, get_progress, register, set_progress};
 use super::parquet::{Target, staging_path, write_parquet};
 use super::periods::{Granularity, Period, date_of_ms, parse_date};
 use super::series::{Ctx, Outcome, budget_bytes};
 use crate::fsutil::sha256_hex;
-use crate::jsonout::{Obj, log, now, safe_error};
+use crate::jsonout::{Obj, log, safe_error};
 use crate::store::{Store, StoreError};
-use serde_json::{Value, json};
-use std::collections::{BTreeSet, HashSet};
+use serde_json::Value;
+use std::collections::BTreeSet;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -101,15 +104,16 @@ pub fn maybe_unpublished(period: &Period, now_ms: i64) -> bool {
 
 struct Series {
     kind: Arc<dyn Kind>,
-    done: HashSet<String>,
-    absent: BTreeSet<String>,
+    done: BTreeSet<String>,
+    absent: AbsentSet,
     failed: bool,
 }
 
-/// Why the walk stopped early, if it did.
+/// What one run of the walk has done and why it stopped early, if it did.
 #[derive(Default)]
 struct Walker {
     outcome: Outcome,
+    absent: Counts,
     used: i64,
     budget: i64,
     deadline: Option<Instant>,
@@ -117,8 +121,15 @@ struct Walker {
     stop_note: Option<&'static str>,
 }
 
-/// Walk every series of one source.
-pub async fn walk(ctx: &Ctx, source: &str, cfg: &DumpWalk, kinds: Vec<Arc<dyn Kind>>) -> Outcome {
+/// Walk every series of one source. `reprobe` is the schedule on which an interior absent period
+/// is asked for again.
+pub async fn walk(
+    ctx: &Ctx,
+    source: &str,
+    cfg: &DumpWalk,
+    kinds: Vec<Arc<dyn Kind>>,
+    reprobe: &AbsentReprobe,
+) -> Outcome {
     let mut walker = Walker {
         budget: budget_bytes(cfg.budget_gb),
         deadline: Instant::now().checked_add(Duration::from_secs(cfg.run_minutes * 60)),
@@ -131,19 +142,6 @@ pub async fn walk(ctx: &Ctx, source: &str, cfg: &DumpWalk, kinds: Vec<Arc<dyn Ki
     if kinds.is_empty() {
         return walker.outcome;
     }
-    if !ctx.within_budget(source).await {
-        walker.outcome.note = Some("diskBudgetGb is 0 or reached".into());
-        return walker.outcome;
-    }
-    let datasets: BTreeSet<String> = kinds.iter().map(|k| k.dataset().to_owned()).collect();
-    walker.used = match registered_bytes(ctx, source, &datasets).await {
-        Ok(used) => used,
-        Err(error) => {
-            walker.outcome.errors += 1;
-            log_error(source, "*", "*", "ledger", &error.to_string());
-            return walker.outcome;
-        }
-    };
     let mut series = Vec::new();
     for kind in kinds {
         match load(ctx, kind.clone()).await {
@@ -160,28 +158,81 @@ pub async fn walk(ctx: &Ctx, source: &str, cfg: &DumpWalk, kinds: Vec<Arc<dyn Ki
             }
         }
     }
+    if !ctx.within_budget(source).await {
+        walker.outcome.note = Some("diskBudgetGb is 0 or reached".into());
+        return walker.finish(&series, reprobe);
+    }
+    let datasets: BTreeSet<String> = series.iter().map(|s| s.kind.dataset().to_owned()).collect();
+    walker.used = match registered_bytes(ctx, source, &datasets).await {
+        Ok(used) => used,
+        Err(error) => {
+            walker.outcome.errors += 1;
+            log_error(source, "*", "*", "ledger", &error.to_string());
+            return walker.finish(&series, reprobe);
+        }
+    };
+    run(ctx, source, start, &mut series, &mut walker, reprobe).await;
+    if let Some(note) = walker.stop_note {
+        walker.outcome.note = Some(note.into());
+    }
+    walker.finish(&series, reprobe)
+}
+
+/// Interior holes first, then the periods newest first.
+async fn run(
+    ctx: &Ctx,
+    source: &str,
+    start: chrono::NaiveDate,
+    series: &mut [Series],
+    walker: &mut Walker,
+    reprobe: &AbsentReprobe,
+) {
+    // A day the venue skipped is asked for again before the walk goes on, so a late file lands
+    // even while a long backfill is still running.
+    let mut asked = 0;
+    'holes: for s in series.iter_mut() {
+        for label in s.absent.due_interior(&s.done, ctx.now_ms, reprobe) {
+            if asked >= reprobe.max_per_run {
+                break 'holes;
+            }
+            if !walker.may_continue(ctx, source).await {
+                return;
+            }
+            asked += 1;
+            reprobe_period(ctx, s, &label, walker, reprobe).await;
+        }
+    }
     // Months first: the monthly series are a few small files and close the cross-section the
     // daily ones are walked against.
-    'walk: for granularity in [Granularity::Month, Granularity::Day] {
+    for granularity in [Granularity::Month, Granularity::Day] {
         for period in wanted(start, granularity, ctx.now_ms) {
             for s in series
                 .iter_mut()
                 .filter(|s| s.kind.granularity() == granularity)
             {
                 if !walker.may_continue(ctx, source).await {
-                    break 'walk;
+                    return;
                 }
-                sync_period(ctx, s, &period, &mut walker).await;
+                sync_period(ctx, s, &period, walker).await;
             }
         }
     }
-    if let Some(note) = walker.stop_note {
-        walker.outcome.note = Some(note.into());
-    }
-    walker.outcome
 }
 
 impl Walker {
+    /// The run's outcome with the absent counts: what this run marked and filled, and the
+    /// interior holes the series carry now.
+    fn finish(mut self, series: &[Series], reprobe: &AbsentReprobe) -> Outcome {
+        let mut counts = self.absent;
+        for s in series {
+            let (open, given_up) = s.absent.interior(&s.done, reprobe);
+            counts.interior += open;
+            counts.given_up += given_up;
+        }
+        self.outcome.absent = Some(counts);
+        self.outcome
+    }
+
     async fn may_continue(&mut self, ctx: &Ctx, source: &str) -> bool {
         if self.stop_note.is_some() || ctx.stopping() {
             return false;
@@ -249,18 +300,10 @@ async fn load(ctx: &Ctx, kind: Arc<dyn Kind>) -> Result<Series, StoreError> {
             Ok((done, get_progress(store, &key)?))
         })
         .await?;
-    let absent = progress
-        .as_ref()
-        .and_then(|p| p.get("absent"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|v| v.as_str().map(str::to_owned))
-        .collect();
     Ok(Series {
         kind,
         done: done.into_iter().collect(),
-        absent,
+        absent: AbsentSet::from_progress(progress.as_ref()),
         failed: false,
     })
 }
@@ -272,44 +315,132 @@ async fn sync_period(ctx: &Ctx, s: &mut Series, period: &Period, walker: &mut Wa
     }
     let kind = s.kind.clone();
     match fetch(ctx, kind.as_ref(), &label).await {
-        Ok(body) => match convert(ctx, kind.clone(), &label, body).await {
-            Ok((rows, bytes)) => {
-                s.done.insert(label.clone());
-                walker.used += bytes;
-                walker.since_global_check += 1;
-                walker.outcome.files += 1;
-                walker.outcome.rows += u64::try_from(rows).unwrap_or(0);
-                log(
-                    "augment_file",
-                    Obj::new()
-                        .with("source", kind.source())
-                        .with("dataset", kind.dataset())
-                        .with("symbol", kind.symbol())
-                        .with("period", label.as_str())
-                        .with("rows", rows)
-                        .with("complete", true),
-                );
-            }
+        Ok(body) => match convert(ctx, kind.clone(), &label, body, None).await {
+            Ok((rows, bytes)) => stored(s, walker, &label, rows, bytes),
             Err(error) => fail(s, walker, &label, &error.to_string()),
         },
         Err(HttpError::NotFound) => {
             if maybe_unpublished(period, ctx.now_ms) {
                 return;
             }
-            s.absent.insert(label);
-            let value =
-                json!({ "absent": s.absent.iter().collect::<Vec<_>>(), "updatedAt": now() });
-            let key = progress_key(kind.as_ref());
-            if let Err(error) = ctx
-                .db
-                .run(move |store| set_progress(store, &key, &value))
-                .await
-            {
-                fail(s, walker, &period.label(), &error.to_string());
-            }
+            mark_absent(ctx, s, walker, &label).await;
         }
         Err(error) => fail(s, walker, &label, &error.to_string()),
     }
+}
+
+/// Book a file that was converted and registered.
+fn stored(s: &mut Series, walker: &mut Walker, label: &str, rows: i64, bytes: i64) {
+    s.done.insert(label.to_owned());
+    walker.used += bytes;
+    walker.since_global_check += 1;
+    walker.outcome.files += 1;
+    walker.outcome.rows += u64::try_from(rows).unwrap_or(0);
+    log(
+        "augment_file",
+        Obj::new()
+            .with("source", s.kind.source())
+            .with("dataset", s.kind.dataset())
+            .with("symbol", s.kind.symbol())
+            .with("period", label)
+            .with("rows", rows)
+            .with("complete", true),
+    );
+}
+
+/// Remember an old 404 as absent, durably, then log and count it (ADR-0024).
+async fn mark_absent(ctx: &Ctx, s: &mut Series, walker: &mut Walker, label: &str) {
+    let position = absent::position(label, &s.done);
+    s.absent.mark(label, ctx.now_ms);
+    if let Err(error) = save(ctx, s.kind.as_ref(), &s.absent).await {
+        s.absent.clear(label);
+        fail(s, walker, label, &error.to_string());
+        return;
+    }
+    walker.absent.marked += 1;
+    absent::log_marked(
+        s.kind.source(),
+        s.kind.dataset(),
+        s.kind.symbol(),
+        label,
+        position,
+    );
+}
+
+/// Ask again for an interior absent period. A file is verified, written durably and registered
+/// in one transaction with the progress record that no longer lists the period as absent, so a
+/// crash before it leaves the mark and no registered file. A 404 spends one probe of the
+/// schedule; any other failure is an error that waits for the next interval.
+async fn reprobe_period(
+    ctx: &Ctx,
+    s: &mut Series,
+    label: &str,
+    walker: &mut Walker,
+    reprobe: &AbsentReprobe,
+) {
+    let kind = s.kind.clone();
+    let failure = match fetch(ctx, kind.as_ref(), label).await {
+        Ok(body) => {
+            let mut after = s.absent.clone();
+            after.clear(label);
+            let progress = Some((progress_key(kind.as_ref()), after.to_progress()));
+            match convert(ctx, kind.clone(), label, body, progress).await {
+                Ok((rows, bytes)) => {
+                    let misses = s.absent.misses(label);
+                    s.absent = after;
+                    stored(s, walker, label, rows, bytes);
+                    walker.absent.filled += 1;
+                    absent::log_filled(kind.source(), kind.dataset(), kind.symbol(), label, misses);
+                    return;
+                }
+                Err(error) => error.to_string(),
+            }
+        }
+        Err(HttpError::NotFound) => {
+            let spent = s.absent.missed(label, ctx.now_ms, reprobe);
+            match save(ctx, kind.as_ref(), &s.absent).await {
+                Ok(()) if spent => absent::log_given_up(
+                    kind.source(),
+                    kind.dataset(),
+                    kind.symbol(),
+                    label,
+                    s.absent.misses(label),
+                ),
+                Ok(()) => {}
+                Err(error) => {
+                    walker.outcome.errors += 1;
+                    log_error(
+                        kind.source(),
+                        kind.dataset(),
+                        kind.symbol(),
+                        label,
+                        &error.to_string(),
+                    );
+                }
+            }
+            return;
+        }
+        Err(error) => error.to_string(),
+    };
+    // The series' own walk goes on: this is an old hole, not the period it is waiting for.
+    walker.outcome.errors += 1;
+    log_error(
+        kind.source(),
+        kind.dataset(),
+        kind.symbol(),
+        label,
+        &failure,
+    );
+    s.absent.attempted(label, ctx.now_ms);
+    let _ = save(ctx, kind.as_ref(), &s.absent).await;
+}
+
+/// Write a series' absent record.
+async fn save(ctx: &Ctx, kind: &dyn Kind, absent: &AbsentSet) -> Result<(), StoreError> {
+    let (key, value) = (progress_key(kind), absent.to_progress());
+    ctx.db
+        .run(move |store| set_progress(store, &key, &value))
+        .await
 }
 
 /// A failed period stops its series for this run; the next run asks again.
@@ -347,12 +478,14 @@ async fn fetch(ctx: &Ctx, kind: &dyn Kind, label: &str) -> Result<Vec<u8>, HttpE
     Ok(body)
 }
 
-/// Stage the CSV (unzipped off the async threads), type it into Parquet, register it.
+/// Stage the CSV (unzipped off the async threads), type it into Parquet, register it, and with
+/// `progress` write that progress record in the same transaction.
 async fn convert(
     ctx: &Ctx,
     kind: Arc<dyn Kind>,
     label: &str,
     body: Vec<u8>,
+    progress: Option<(String, Value)>,
 ) -> Result<(i64, i64), StoreError> {
     let staging = ctx.staging();
     let container = kind.container();
@@ -373,7 +506,8 @@ async fn convert(
         .run(move |store| {
             let select = kind.select(store, &path, &target.constant_columns())?;
             let record = write_parquet(store, &root, &select, &target)?;
-            register(store, &record, None)?;
+            let progress = progress.as_ref().map(|(key, value)| (key.as_str(), value));
+            register(store, &record, progress)?;
             Ok((record.row_count, record.bytes))
         })
         .await;
