@@ -2,18 +2,24 @@
 //! day (or month for funding), listed through the bucket's S3 index, verified against the
 //! published `.CHECKSUM`, converted to Parquet and deleted. A file is final once published, so
 //! the ledger's `files` table is the progress record and the listing starts after the newest
-//! registered file.
+//! registered file. A period the venue skipped before that file is a hole the listing never
+//! revisits, so each run also asks directly for the periods missing between the oldest and the
+//! newest registered file, marks the ones still missing after three days as absent, and asks
+//! again on the schedule of `absentReprobe` (ADR-0024).
 
-use super::config::{Binance, Symbol};
-use super::http::with_query;
-use super::ledger::register;
+use super::absent::{self, AbsentSet, Counts, Due};
+use super::config::{AbsentReprobe, Binance, Symbol};
+use super::dumps::maybe_unpublished;
+use super::http::{HttpError, with_query};
+use super::ledger::{get_progress, register, set_progress};
 use super::parquet::{Target, read_csv, staging_path, write_parquet};
-use super::periods::Granularity;
-use super::series::{Ctx, Outcome};
+use super::periods::{Granularity, Period};
+use super::series::{Ctx, Outcome, progress_key};
 use crate::fsutil::sha256_hex;
 use crate::jsonout::{Obj, log, safe_error};
 use crate::store::StoreError;
-use std::collections::HashSet;
+use serde_json::Value;
+use std::collections::{BTreeSet, HashSet};
 use std::io::Read;
 
 /// One dump dataset: its path shape and its CSV columns.
@@ -376,14 +382,17 @@ impl super::dumps::Kind for DumpSeries {
 }
 
 /// Sync every phase-1 dataset for every symbol with a Binance market (the large ones are walked
-/// by `dumps`).
+/// by `dumps`). `reprobe` is the schedule on which a missing period between published ones is
+/// asked for again.
 pub async fn sync(
     ctx: &Ctx,
     cfg: &Binance,
     symbols: &[Symbol],
     only_symbol: Option<&str>,
+    reprobe: &AbsentReprobe,
 ) -> Outcome {
     let mut outcome = Outcome::default();
+    let mut asked = 0;
     for name in &cfg.datasets {
         let Some(dataset) = dataset(name) else {
             continue;
@@ -398,19 +407,21 @@ pub async fn sync(
             if only_symbol.is_some_and(|s| s != symbol.phoenix && s != venue) {
                 continue;
             }
-            let result = sync_pair(ctx, cfg, &dataset, venue, &symbol.phoenix).await;
+            let pair = (venue, symbol.phoenix.as_str());
+            let result = sync_pair(ctx, cfg, &dataset, pair, (reprobe, &mut asked)).await;
             outcome.add(&result);
         }
     }
     outcome
 }
 
+/// One dataset of one symbol; `asked` counts the holes the source has asked for in this run.
 async fn sync_pair(
     ctx: &Ctx,
     cfg: &Binance,
     dataset: &Dataset,
-    venue: &str,
-    phoenix: &str,
+    (venue, phoenix): (&str, &str),
+    (reprobe, asked): (&AbsentReprobe, &mut u32),
 ) -> Outcome {
     let mut outcome = Outcome::default();
     let (source, name, venue_owned) = (
@@ -418,7 +429,7 @@ async fn sync_pair(
         dataset.name.to_owned(),
         venue.to_owned(),
     );
-    let registered: HashSet<String> = match ctx
+    let mut registered: HashSet<String> = match ctx
         .db
         .run(move |store| super::ledger::complete_periods(store, &source, &name, &venue_owned))
         .await
@@ -430,6 +441,37 @@ async fn sync_pair(
             return outcome;
         }
     };
+    forward(
+        ctx,
+        cfg,
+        dataset,
+        (venue, phoenix),
+        &mut registered,
+        &mut outcome,
+    )
+    .await;
+    holes(
+        ctx,
+        cfg,
+        dataset,
+        (venue, phoenix),
+        &registered,
+        (reprobe, asked),
+        &mut outcome,
+    )
+    .await;
+    outcome
+}
+
+/// List after the newest registered file and fetch what is new, oldest first.
+async fn forward(
+    ctx: &Ctx,
+    cfg: &Binance,
+    dataset: &Dataset,
+    (venue, phoenix): (&str, &str),
+    registered: &mut HashSet<String>,
+    outcome: &mut Outcome,
+) {
     let start_label = super::periods::Period::containing(ctx.start, dataset.granularity).label();
     let newest = registered
         .iter()
@@ -453,7 +495,7 @@ async fn sync_pair(
             Err(error) => {
                 log_error(dataset, venue, "listing", &error.to_string());
                 outcome.errors += 1;
-                return outcome;
+                return;
             }
         };
         let listing = parse_listing(&String::from_utf8_lossy(&page.body));
@@ -462,7 +504,7 @@ async fn sync_pair(
             dataset,
             venue,
             &start_label,
-            &registered,
+            registered,
         ));
         match listing.next_marker {
             Some(next) if listing.truncated && next != marker => marker = next,
@@ -473,8 +515,9 @@ async fn sync_pair(
         if ctx.stopping() {
             break;
         }
-        match fetch_item(ctx, cfg, dataset, venue, phoenix, &key, &label).await {
+        match fetch_item(ctx, cfg, dataset, (venue, phoenix), &key, &label, None).await {
             Ok(rows) => {
+                registered.insert(label);
                 outcome.files += 1;
                 outcome.rows += rows;
             }
@@ -487,18 +530,200 @@ async fn sync_pair(
             }
         }
     }
-    outcome
 }
 
+/// The periods missing between the oldest registered one at or after `start_label` and the
+/// newest, newest first: holes in a continuous series. Periods before the oldest are a market
+/// listed later and are not holes.
+fn missing_periods(held: &BTreeSet<String>, start_label: &str) -> Vec<Period> {
+    let first = held.iter().find(|label| label.as_str() >= start_label);
+    let (Some(first), Some(last)) = (first, held.last()) else {
+        return Vec::new();
+    };
+    let (Some(mut period), Some(last)) = (Period::parse(first), Period::parse(last)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    while period < last {
+        if !held.contains(&period.label()) {
+            out.push(period);
+        }
+        period = period.next();
+    }
+    out.reverse();
+    out
+}
+
+/// Ask for every period missing between published ones, directly and not through the listing
+/// (which starts after the newest file): a hole is marked absent once three days old (and
+/// logged and counted), asked again on the schedule, and filled when the venue publishes it. A
+/// failed forward pass skips the asking, not the counting.
+async fn holes(
+    ctx: &Ctx,
+    cfg: &Binance,
+    dataset: &Dataset,
+    (venue, phoenix): (&str, &str),
+    registered: &HashSet<String>,
+    (reprobe, asked): (&AbsentReprobe, &mut u32),
+    outcome: &mut Outcome,
+) {
+    let key = progress_key("binance", dataset.name, venue);
+    let lookup = key.clone();
+    let mut absent = match ctx.db.run(move |store| get_progress(store, &lookup)).await {
+        Ok(progress) => AbsentSet::from_progress(progress.as_ref()),
+        Err(error) => {
+            log_error(dataset, venue, "progress", &error.to_string());
+            outcome.errors += 1;
+            return;
+        }
+    };
+    let mut held: BTreeSet<String> = registered.iter().cloned().collect();
+    let mut counts = Counts::default();
+    if outcome.errors == 0 {
+        let start_label =
+            super::periods::Period::containing(ctx.start, dataset.granularity).label();
+        for period in missing_periods(&held, &start_label) {
+            if ctx.stopping() {
+                break;
+            }
+            let label = period.label();
+            let marked = absent.contains(&label);
+            if marked && absent.due(&label, ctx.now_ms, reprobe) != Due::Now {
+                continue;
+            }
+            // The holes left over wait for the next run.
+            if *asked >= reprobe.max_per_run {
+                break;
+            }
+            *asked += 1;
+            let file = format!(
+                "{}{}",
+                dataset.prefix(venue),
+                dataset.file_name(venue, &label)
+            );
+            let mut after = absent.clone();
+            after.clear(&label);
+            let progress = Some((key.clone(), after.to_progress()));
+            match fetch_item(ctx, cfg, dataset, (venue, phoenix), &file, &label, progress).await {
+                Ok(rows) => {
+                    if marked {
+                        counts.filled += 1;
+                        absent::log_filled(
+                            "binance",
+                            dataset.name,
+                            venue,
+                            &label,
+                            absent.misses(&label),
+                        );
+                    }
+                    absent = after;
+                    held.insert(label);
+                    outcome.files += 1;
+                    outcome.rows += rows;
+                }
+                Err(ItemError::NotFound) => {
+                    let saved = if marked {
+                        let spent = absent.missed(&label, ctx.now_ms, reprobe);
+                        let saved = save(ctx, &key, &absent).await;
+                        if spent && saved.is_ok() {
+                            absent::log_given_up(
+                                "binance",
+                                dataset.name,
+                                venue,
+                                &label,
+                                absent.misses(&label),
+                            );
+                        }
+                        saved
+                    } else if maybe_unpublished(&period, ctx.now_ms) {
+                        Ok(())
+                    } else {
+                        let position = absent::position(&label, &held);
+                        absent.mark(&label, ctx.now_ms);
+                        let saved = save(ctx, &key, &absent).await;
+                        if saved.is_ok() {
+                            counts.marked += 1;
+                            absent::log_marked("binance", dataset.name, venue, &label, position);
+                        } else {
+                            absent.clear(&label);
+                        }
+                        saved
+                    };
+                    if let Err(error) = saved {
+                        log_error(dataset, venue, &label, &error.to_string());
+                        outcome.errors += 1;
+                    }
+                }
+                Err(ItemError::Other(error)) => {
+                    log_error(dataset, venue, &label, &error.to_string());
+                    outcome.errors += 1;
+                    if marked {
+                        absent.attempted(&label, ctx.now_ms);
+                        let _ = save(ctx, &key, &absent).await;
+                    }
+                    // The host is likely in trouble: stop asking, count what is standing.
+                    break;
+                }
+            }
+        }
+    }
+    (counts.interior, counts.given_up) = absent.interior(&held, reprobe);
+    outcome.absent = Some(counts);
+}
+
+async fn save(ctx: &Ctx, key: &str, absent: &AbsentSet) -> Result<(), StoreError> {
+    let (key, value) = (key.to_owned(), absent.to_progress());
+    ctx.db
+        .run(move |store| set_progress(store, &key, &value))
+        .await
+}
+
+/// Why one file could not be stored: the venue does not serve it, or something else went wrong.
+enum ItemError {
+    NotFound,
+    Other(StoreError),
+}
+
+impl std::fmt::Display for ItemError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ItemError::NotFound => f.write_str("not found"),
+            ItemError::Other(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl From<HttpError> for ItemError {
+    fn from(error: HttpError) -> Self {
+        match error {
+            HttpError::NotFound => ItemError::NotFound,
+            other => ItemError::Other(other.into()),
+        }
+    }
+}
+
+impl From<StoreError> for ItemError {
+    fn from(error: StoreError) -> Self {
+        ItemError::Other(error)
+    }
+}
+
+/// Fetch, verify, convert and register one file; with `progress`, that progress record is
+/// written in the same transaction as the file's registration.
 async fn fetch_item(
     ctx: &Ctx,
     cfg: &Binance,
     dataset: &Dataset,
-    venue: &str,
-    phoenix: &str,
+    (venue, phoenix): (&str, &str),
     key: &str,
     label: &str,
-) -> Result<u64, StoreError> {
+    progress: Option<(String, Value)>,
+) -> Result<u64, ItemError> {
+    let zip = download(ctx, cfg, key).await?;
+    Ok(store_item(ctx, dataset, (venue, phoenix), label, &zip, progress).await?)
+}
+
+async fn download(ctx: &Ctx, cfg: &Binance, key: &str) -> Result<Vec<u8>, ItemError> {
     let url = format!("{}/{key}", cfg.files_url.trim_end_matches('/'));
     // The zip and its checksum are two origin round trips of about 0.7 s each from the box;
     // issued together (still spaced by the host limiter) they overlap instead of adding up.
@@ -515,10 +740,21 @@ async fn fetch_item(
         let expected = parse_checksum(&String::from_utf8_lossy(&checksum.body))
             .ok_or_else(|| StoreError::Check("unreadable CHECKSUM".into()))?;
         if sha256_hex(&zip.body) != expected {
-            return Err(StoreError::Check("checksum mismatch".into()));
+            return Err(StoreError::Check("checksum mismatch".into()).into());
         }
     }
-    let csv = unzip_single(&zip.body)?;
+    Ok(zip.body)
+}
+
+async fn store_item(
+    ctx: &Ctx,
+    dataset: &Dataset,
+    (venue, phoenix): (&str, &str),
+    label: &str,
+    zip: &[u8],
+    progress: Option<(String, Value)>,
+) -> Result<u64, StoreError> {
+    let csv = unzip_single(zip)?;
     let header = has_header(&csv);
     let staged = staging_path(&ctx.staging(), "csv");
     std::fs::write(&staged, &csv)?;
@@ -541,7 +777,8 @@ async fn fetch_item(
         .db
         .run(move |store| {
             let record = write_parquet(store, &root, &select, &target)?;
-            register(store, &record, None)?;
+            let progress = progress.as_ref().map(|(key, value)| (key.as_str(), value));
+            register(store, &record, progress)?;
             Ok(record.row_count)
         })
         .await;

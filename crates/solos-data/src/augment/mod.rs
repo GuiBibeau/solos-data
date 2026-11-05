@@ -6,6 +6,7 @@
 //! `node_fills_by_block` hours (ADR-0020). `augment hl-l2book` is an offline batch over local
 //! `l2Book` hours (ADR-0021). Neither runs inside `augment sync`.
 
+pub mod absent;
 pub mod alternative;
 pub mod auto;
 pub mod binance;

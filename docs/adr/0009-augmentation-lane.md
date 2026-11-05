@@ -525,7 +525,8 @@ newest wanted period, then every series' next older one, down to `walk.startDate
 run fetches is whole cross-sections of the recent past (monthly series first). A file is final
 once published, so the ledger's `files` table is the progress record; a 404 for a period that
 ended more than three days ago is remembered as `absent` in the series' progress record (a
-market listed later), a younger one is "not published yet" and asked again next run. A failed
+market listed later), a younger one is "not published yet" and asked again next run. ADR-0024
+logs and counts each mark, and asks again for an interior one on a schedule. A failed
 file (transfer, checksum, conversion) stops its series for the run; the others go on. Each
 walk stops at `walk.runMinutes` (45) and the next hourly run continues it, so the sync's other
 sources stay current during the backfill, at `walk.budgetGb` of registered files for the

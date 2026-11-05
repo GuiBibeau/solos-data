@@ -112,13 +112,18 @@ pub fn run_sync(
     ledger::write_status(&config.data_dir, Lane::Sync, &status)?;
     let store = thread.join(db);
     store.close()?;
+    let done = Obj::new()
+        .with("files", totals.files)
+        .with("rows", totals.rows)
+        .with("errors", totals.errors)
+        .with("durationSeconds", started.elapsed().as_secs_f64());
+    // Dump days the venue skipped (ADR-0024) are in the run summary, not only in the status.
     log(
         "augment_sync_done",
-        Obj::new()
-            .with("files", totals.files)
-            .with("rows", totals.rows)
-            .with("errors", totals.errors)
-            .with("durationSeconds", started.elapsed().as_secs_f64()),
+        match totals.absent {
+            Some(counts) => counts.to_obj(done),
+            None => done,
+        },
     );
     Ok(status)
 }
@@ -242,10 +247,11 @@ async fn run_binance(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Opti
         return None;
     }
     let symbol = filter.symbol.as_deref();
-    let mut outcome = super::binance::sync(ctx, cfg, &config.symbols, symbol).await;
+    let reprobe = &config.absent_reprobe;
+    let mut outcome = super::binance::sync(ctx, cfg, &config.symbols, symbol, reprobe).await;
     let kinds = super::binance::dump_kinds(cfg, &config.symbols, symbol);
     if !kinds.is_empty() && !ctx.stopping() {
-        let walked = super::dumps::walk(ctx, "binance", &cfg.walk, kinds).await;
+        let walked = super::dumps::walk(ctx, "binance", &cfg.walk, kinds, reprobe).await;
         outcome.add(&walked);
         outcome.note = walked.note;
     }
@@ -258,7 +264,8 @@ async fn run_okx(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option<O
         return None;
     }
     let kinds = super::okx::kinds(cfg, &config.symbols, filter.symbol.as_deref());
-    Some(super::dumps::walk(ctx, super::okx::SOURCE, &cfg.walk, kinds).await)
+    let reprobe = &config.absent_reprobe;
+    Some(super::dumps::walk(ctx, super::okx::SOURCE, &cfg.walk, kinds, reprobe).await)
 }
 
 async fn run_hl_s3(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option<Outcome> {
@@ -307,7 +314,8 @@ async fn run_bybit(ctx: &Ctx, config: &AugmentConfig, filter: &Filter) -> Option
     }
     if cfg.trades && !ctx.stopping() {
         let kinds = super::bybit::trade_kinds(cfg, &config.symbols, filter.symbol.as_deref());
-        let walked = super::dumps::walk(ctx, "bybit", &cfg.walk, kinds).await;
+        let walked =
+            super::dumps::walk(ctx, "bybit", &cfg.walk, kinds, &config.absent_reprobe).await;
         outcome.add(&walked);
         outcome.note = walked.note;
     }
